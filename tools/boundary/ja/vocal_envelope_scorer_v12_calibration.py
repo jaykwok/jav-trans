@@ -31,7 +31,7 @@ from tools.boundary.ja.vocal_envelope_scorer_v12_teacher_contract import (
 
 
 CONTRACT_ID = "boundary_acoustic_binary_v12"
-CALIBRATION_ID = "vocal_envelope_scorer_v12_broad_vocal_pilot_human_approved_v3"
+CALIBRATION_ID = "vocal_envelope_scorer_v12_broad_vocal_pilot_human_approved_v4"
 # Frozen only after the restored broad-vocal Teacher receives a new human approval.
 CALIBRATION_ARTIFACT_SHA256: dict[str, str] = {}
 CALIBRATION_TEACHER_CONTRACT = {
@@ -43,7 +43,7 @@ CALIBRATION_TEACHER_CONTRACT = {
     "max_tokens": 8192,
     "prompt_profile": "vocal-envelope-single-pass-tristate-v3",
     "prompt_version": (
-        "vocal-envelope-single-pass-tristate-v3-scorer-duty-gemini36-medium-mmss"
+        "vocal-envelope-single-pass-tristate-v4-training-target-gemini36-medium-mmss"
     ),
     "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
     "teacher_execution_contract_id": GEMINI_NATIVE_EXECUTION_CONTRACT,
