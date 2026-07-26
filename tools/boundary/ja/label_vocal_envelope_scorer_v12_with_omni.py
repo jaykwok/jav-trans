@@ -66,7 +66,7 @@ CONTRACT_ID = "boundary_acoustic_binary_v12"
 SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_single_pass_tristate_summary_v3"
 PROGRESS_SCHEMA = "vocal_envelope_scorer_v12_single_pass_tristate_progress_v3"
 PROMPT_PROFILE = "vocal-envelope-single-pass-tristate-v4"
-PROMPT_VERSION = "vocal-envelope-single-pass-tristate-v5-training-target-gemini36-medium-mmss"
+PROMPT_VERSION = "vocal-envelope-single-pass-tristate-v6-training-target-gemini36-medium-mmss"
 EXPECTED_REASONING = "medium"
 EXPECTED_MAX_TOKENS = 8192
 PROVIDER_CONTRACTS: dict[str, dict[str, str]] = {
@@ -103,20 +103,11 @@ Scorer v12 是 pipeline 的首层模型，训练目标是高召回检测所有�
 unsure 只用于确信有声音但完全无法归类的极少数情况，不是"可能是背景"的同义词。
 
 【标注包络的边界原则】
-标注单位是连续的发声事件包络，不是逐音素 VAD。一次连续发声内部的短停顿（< 1 秒）、吸气、释气、弱尾音应随包络保留，不得拆分。
+标注单位是连续的发声事件包络，不是逐音素 VAD。一次连续发声内部的短停顿、吸气、释气、弱尾音应随包络保留。
 
-只在以下情况断开：
-1. 明确的场景切换（> 2 秒的静音或环境音变化）
-2. 长时间的纯非发声区间（> 2 秒的肉体撞击、音乐、机械声）
-3. 对话中明确的话轮转换后的长停顿（> 1.5 秒）
+纯撞击声：若它形成声学上独立且可安全分离的纯非发声区间，标 non_vocal_candidate；若它与人声重叠，标 vocal_candidate；若短暂嵌入且无法安全独立切开，标 unsure。
 
-不要在以下位置断开：
-- 句中换气、词间停顿（< 1 秒）
-- 短暂的思考停顿或呼吸间隙
-- 呻吟/喘息之间的自然间隔
-- 浊音与气声之间的切换
-
-纯撞击声：若它持续超过 1 秒且声学上独立可分离，标 non_vocal；若它与人声重叠或持续 < 1 秒且嵌入发声包络，标 vocal；若无法判断是否独立，标 unsure。
+不要跨越声学上独立的长纯非发声区域合并两个事件，也不得使用固定时长阈值。边界判断基于声学证据，不是机械的时长规则。
 
 【完整覆盖要求】
 - 第一段必须从 00:00.000 开始，最后一段必须精确结束于请求给出的 duration_ts。
