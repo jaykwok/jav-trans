@@ -134,6 +134,14 @@ export async function loadSettings() {
     if (!r.ok) return;
     const s = await r.json();
 
+    // Translation backend
+    const backendSel = $('translation-backend');
+    if (backendSel && s.translation_backend) {
+      backendSel.value = s.translation_backend;
+      backendSel.dispatchEvent(new Event('change'));
+    }
+
+    // OpenAI backend fields
     $('api-key-preview').textContent = s.api_key_preview
       ? '当前：' + s.api_key_preview
       : '当前：未设置';
@@ -148,6 +156,40 @@ export async function loadSettings() {
       sel.disabled = false;
       $('api-model-preview').textContent = '当前：' + s.model;
     }
+
+    // Local model backend fields
+    if (s.local_model_path) {
+      const presets = [
+        'Tencent-Hunyuan/Hunyuan-Large',
+        'Qwen/Qwen2.5-72B-Instruct',
+        'Qwen/Qwen2.5-32B-Instruct',
+      ];
+      const preset = $('local-model-preset');
+      if (preset) {
+        if (presets.includes(s.local_model_path)) {
+          preset.value = s.local_model_path;
+        } else {
+          preset.value = 'custom';
+          const pathField = $('local-model-path-field');
+          if (pathField) pathField.style.display = '';
+          const pathInput = $('local-model-path');
+          if (pathInput) pathInput.value = s.local_model_path;
+        }
+      }
+    }
+    if (s.local_model_device) {
+      const device = $('local-model-device');
+      if (device) device.value = s.local_model_device;
+    }
+    if (s.local_model_max_length) {
+      const maxLen = $('local-model-max-length');
+      if (maxLen) maxLen.value = s.local_model_max_length;
+    }
+    if (s.local_model_auto_download !== undefined) {
+      const autoDownload = $('local-model-auto-download');
+      if (autoDownload) autoDownload.checked = s.local_model_auto_download;
+    }
+
     const proxyProtocol = $('proxy-protocol');
     if (proxyProtocol) proxyProtocol.value = s.proxy_protocol || 'http';
     const proxyHost = $('proxy-host');
@@ -193,13 +235,26 @@ export function readTranslationSettingsFromForm() {
     return normalizedSource && target ? `${normalizedSource}-${target}` : '';
   };
 
-  return {
-    llm_reasoning_effort: $('api-reasoning-effort').value || 'medium',
-    llm_api_format:       $('api-format').value || 'chat',
-    target_lang:          $('api-target-lang').value || '简体中文',
-    translation_glossary: ($('api-glossary').value || '')
+  const backend = $('translation-backend')?.value || 'openai';
+  const body = {
+    translation_backend: backend,
+    llm_reasoning_effort: $('api-reasoning-effort')?.value || 'medium',
+    llm_api_format:       $('api-format')?.value || 'chat',
+    target_lang:          $('api-target-lang')?.value || '简体中文',
+    translation_glossary: ($('api-glossary')?.value || '')
       .split('\n').map(normalizeGlossaryLine).filter(Boolean).join(', '),
   };
+
+  if (backend === 'local') {
+    const preset = $('local-model-preset')?.value || '';
+    const customPath = $('local-model-path')?.value?.trim() || '';
+    body.local_model_path = preset === 'custom' ? customPath : preset;
+    body.local_model_device = $('local-model-device')?.value || 'cuda';
+    body.local_model_max_length = parseInt($('local-model-max-length')?.value || '32768', 10);
+    body.local_model_auto_download = !!$('local-model-auto-download')?.checked;
+  }
+
+  return body;
 }
 
 function updateProxyFieldsState() {
@@ -404,6 +459,22 @@ export function installSettingsPanel() {
       btn.textContent = '获取';
       btn.disabled = false;
     }
+  });
+
+  // Translation backend switcher
+  $('translation-backend')?.addEventListener('change', () => {
+    const backend = $('translation-backend').value;
+    const openaiFields = $('openai-backend-fields');
+    const localFields = $('local-backend-fields');
+    if (openaiFields) openaiFields.style.display = backend === 'openai' ? '' : 'none';
+    if (localFields) localFields.style.display = backend === 'local' ? '' : 'none';
+  });
+
+  // Local model preset switcher
+  $('local-model-preset')?.addEventListener('change', () => {
+    const preset = $('local-model-preset').value;
+    const pathField = $('local-model-path-field');
+    if (pathField) pathField.style.display = preset === 'custom' ? '' : 'none';
   });
 
 }

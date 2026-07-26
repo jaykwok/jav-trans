@@ -83,7 +83,9 @@ $env:PYTHONIOENCODING="utf-8"
 uv run --no-sync python launcher.py
 ```
 
-默认地址为 `http://127.0.0.1:17321`。首次运行可以没有 `.env`；打开页面后在“翻译 API”面板填写 API Key、Base URL、模型和目标语言，保存或开始任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、后端、显存预算等研究项会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，可在“识别设置”里填写代理协议、地址和端口。
+默认地址为 `http://127.0.0.1:17321`。首次运行可以没有 `.env`；打开页面后在”翻译 API”面板填写 API Key、Base URL、模型和目标语言，保存或开始任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、后端、显存预算等研究项会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，可在”识别设置”里填写代理协议、地址和端口。
+
+**翻译后端支持**：项目支持灵活切换翻译引擎，可选择 API 调用或本地模型。通过环境变量 `TRANSLATION_BACKEND` 选择后端类型（`openai` / `local`）。本地模型后端支持混元、通义千问等兼容 transformers 的模型，无需外部 API 即可完成翻译。详细配置和扩展指南见 [翻译后端架构文档](docs/translation_backend_migration.md)。
 
 Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而不是浏览器本身。完整 SpeechBoundary-JA / ASR smoke 应确认日志中出现 `cuda_available=True`、`device=cuda:0` 或 `actual_device=cuda`。
 Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。

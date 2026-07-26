@@ -152,6 +152,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SUBTITLE_BILINGUAL_SECONDARY_WEIGHT": "0.4",
 
     # --- LLM Translation Settings ---
+    # Translation backend type: openai (OpenAI-compatible API) | local (本地模型)
+    "TRANSLATION_BACKEND": "openai",
     # Base URL for providers that expose an OpenAI-compatible API; DeepSeek by default.
     "OPENAI_COMPATIBILITY_BASE_URL": "https://api.deepseek.com",
     # Translation model name sent to the SDK client.
@@ -172,6 +174,17 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "TARGET_LANG": "简体中文",
     # Comma-separated Japanese-to-Chinese term mapping injected into translation prompts.
     "TRANSLATION_GLOSSARY": "ちんぽ-肉棒, チンポ-肉棒, おちんちん-肉棒, チンポコ-肉棒",
+
+    # --- Local Model Settings (when TRANSLATION_BACKEND=local) ---
+    # Local model path (HuggingFace model ID or local path)
+    # Examples: Qwen/Qwen2.5-72B-Instruct, Tencent-Hunyuan/Hunyuan-Large
+    "LOCAL_MODEL_PATH": "",
+    # Device for local model inference: cuda | cpu
+    "LOCAL_MODEL_DEVICE": "cuda",
+    # Maximum context length for local model
+    "LOCAL_MODEL_MAX_LENGTH": "32768",
+    # Auto-download model from HuggingFace if not present locally
+    "LOCAL_MODEL_AUTO_DOWNLOAD": "1",
 
     # --- Output & Cache ---
     # Root directory for per-video temporary files.

@@ -65,6 +65,7 @@ class SettingsRead(BaseModel):
     api_key_set: bool
     api_key_preview: str
     base_url: str
+    model: str = ""
     proxy_protocol: Literal["http", "https", "socks5"] = "http"
     proxy_host: str = ""
     proxy_port: int | None = None
@@ -72,6 +73,11 @@ class SettingsRead(BaseModel):
     llm_api_format: Literal["chat", "responses"] = "chat"
     llm_reasoning_effort: Literal["medium", "xhigh"] = "medium"
     target_lang: str = "简体中文"
+    translation_backend: Literal["openai", "local"] = "openai"
+    local_model_path: str = ""
+    local_model_device: Literal["cuda", "cpu"] = "cuda"
+    local_model_max_length: int = 32768
+    local_model_auto_download: bool = True
 
 
 class SettingsUpdate(BaseModel):
@@ -85,3 +91,8 @@ class SettingsUpdate(BaseModel):
     llm_api_format: Literal["chat", "responses"] | None = None
     llm_reasoning_effort: Literal["medium", "xhigh"] | None = None
     target_lang: str | None = None
+    translation_backend: Literal["openai", "local"] | None = None
+    local_model_path: str | None = None
+    local_model_device: Literal["cuda", "cpu"] | None = None
+    local_model_max_length: int | None = Field(default=None, ge=512, le=1000000)
+    local_model_auto_download: bool | None = None

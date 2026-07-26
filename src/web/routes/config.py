@@ -601,6 +601,12 @@ async def get_settings() -> SettingsRead:
         _runtime_or_env_or_setting("LLM_REASONING_EFFORT", "medium")
     )
     target_lang = _runtime_or_env_or_setting("TARGET_LANG", "简体中文")
+    translation_backend = _runtime_or_env_or_setting("TRANSLATION_BACKEND", "openai")
+    local_model_path = _runtime_or_env_or_setting("LOCAL_MODEL_PATH", "")
+    local_model_device = _runtime_or_env_or_setting("LOCAL_MODEL_DEVICE", "cuda")
+    local_model_max_length = int(_runtime_or_env_or_setting("LOCAL_MODEL_MAX_LENGTH", "32768"))
+    local_model_auto_download = _truthy(_runtime_or_env_or_setting("LOCAL_MODEL_AUTO_DOWNLOAD", "1"))
+
     return SettingsRead(
         api_key_set=bool(api_key),
         api_key_preview=_mask_key(api_key),
@@ -613,6 +619,11 @@ async def get_settings() -> SettingsRead:
         llm_api_format=_normalize_llm_api_format(llm_api_format),
         llm_reasoning_effort=llm_reasoning_effort,
         target_lang=target_lang,
+        translation_backend=translation_backend,
+        local_model_path=local_model_path,
+        local_model_device=local_model_device,
+        local_model_max_length=local_model_max_length,
+        local_model_auto_download=local_model_auto_download,
     )
 
 
@@ -648,6 +659,31 @@ async def post_settings(update: SettingsUpdate) -> dict:
     if update.target_lang is not None:
         changes["TARGET_LANG"] = update.target_lang
         os.environ["TARGET_LANG"] = update.target_lang
+    if update.translation_backend is not None:
+        if update.translation_backend not in {"openai", "local"}:
+            raise HTTPException(
+                status_code=422,
+                detail="translation_backend must be one of: openai, local",
+            )
+        changes["TRANSLATION_BACKEND"] = update.translation_backend
+        os.environ["TRANSLATION_BACKEND"] = update.translation_backend
+    if update.local_model_path is not None:
+        changes["LOCAL_MODEL_PATH"] = update.local_model_path
+        os.environ["LOCAL_MODEL_PATH"] = update.local_model_path
+    if update.local_model_device is not None:
+        if update.local_model_device not in {"cuda", "cpu"}:
+            raise HTTPException(
+                status_code=422,
+                detail="local_model_device must be one of: cuda, cpu",
+            )
+        changes["LOCAL_MODEL_DEVICE"] = update.local_model_device
+        os.environ["LOCAL_MODEL_DEVICE"] = update.local_model_device
+    if update.local_model_max_length is not None:
+        changes["LOCAL_MODEL_MAX_LENGTH"] = str(update.local_model_max_length)
+        os.environ["LOCAL_MODEL_MAX_LENGTH"] = str(update.local_model_max_length)
+    if update.local_model_auto_download is not None:
+        changes["LOCAL_MODEL_AUTO_DOWNLOAD"] = "1" if update.local_model_auto_download else "0"
+        os.environ["LOCAL_MODEL_AUTO_DOWNLOAD"] = "1" if update.local_model_auto_download else "0"
     if changes:
         _clear_saved_hf_mirror_if_present(changes)
         _update_env_file(changes)

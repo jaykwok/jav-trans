@@ -145,52 +145,104 @@
       <!-- Translation API (collapsible) -->
       <div class="panel">
         <details class="panel-collapsible" id="panel-translation">
-          <summary class="panel-title">🔑 翻译 API</summary>
+          <summary class="panel-title">🔑 翻译设置</summary>
           <div class="form-grid">
 
             <label class="field">
-              <span>API Key</span>
-              <div class="input-group">
-                <input type="password" id="api-key" placeholder="留空则不修改当前值" autocomplete="new-password">
-                <button class="btn-icon" id="btn-show-key" type="button" title="显示 / 隐藏">👁</button>
-              </div>
-              <span class="key-preview" id="api-key-preview"></span>
+              <span>翻译后端</span>
+              <select id="translation-backend">
+                <option value="openai" selected>API 调用（OpenAI 兼容）</option>
+                <option value="local">本地模型（transformers）</option>
+              </select>
             </label>
 
-            <label class="field">
-              <span>API Base URL（留空使用 .env 默认）</span>
-              <input type="text" id="api-base-url" placeholder="https://api.deepseek.com/v1">
-            </label>
-
-            <label class="field">
-              <span>模型</span>
-              <div class="model-row">
-                <div id="api-model-wrap" class="model-select-wrap" title="请先填写并保存 API Key 和 Base URL，再点击「获取」">
-                  <select id="api-model" disabled>
-                    <option value="">-- 填好 Key 和 URL 后点获取 --</option>
-                  </select>
+            <div id="openai-backend-fields">
+              <label class="field">
+                <span>API Key</span>
+                <div class="input-group">
+                  <input type="password" id="api-key" placeholder="留空则不修改当前值" autocomplete="new-password">
+                  <button class="btn-icon" id="btn-show-key" type="button" title="显示 / 隐藏">👁</button>
                 </div>
-                <button class="btn-sm btn-outline" id="btn-fetch-models" type="button"
-                  title="从 API 拉取可用模型列表">获取</button>
+                <span class="key-preview" id="api-key-preview"></span>
+              </label>
+
+              <label class="field">
+                <span>API Base URL（留空使用 .env 默认）</span>
+                <input type="text" id="api-base-url" placeholder="https://api.deepseek.com/v1">
+              </label>
+
+              <label class="field">
+                <span>模型</span>
+                <div class="model-row">
+                  <div id="api-model-wrap" class="model-select-wrap" title="请先填写并保存 API Key 和 Base URL，再点击「获取」">
+                    <select id="api-model" disabled>
+                      <option value="">-- 填好 Key 和 URL 后点获取 --</option>
+                    </select>
+                  </div>
+                  <button class="btn-sm btn-outline" id="btn-fetch-models" type="button"
+                    title="从 API 拉取可用模型列表">获取</button>
+                </div>
+                <span class="key-preview" id="api-model-preview"></span>
+              </label>
+
+              <label class="field">
+                <span>推理强度</span>
+                <select id="api-reasoning-effort">
+                  <option value="medium" selected>medium</option>
+                  <option value="xhigh">xhigh</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span>API 格式</span>
+                <select id="api-format">
+                  <option value="chat">OpenAI Chat</option>
+                  <option value="responses">OpenAI Responses</option>
+                </select>
+              </label>
+            </div>
+
+            <div id="local-backend-fields" style="display:none">
+              <label class="field">
+                <span>本地模型</span>
+                <select id="local-model-preset">
+                  <option value="">-- 选择推荐模型 --</option>
+                  <option value="Tencent-Hunyuan/Hunyuan-Large">腾讯混元 Large (389B)</option>
+                  <option value="Qwen/Qwen2.5-72B-Instruct">通义千问 2.5 (72B)</option>
+                  <option value="Qwen/Qwen2.5-32B-Instruct">通义千问 2.5 (32B)</option>
+                  <option value="custom">自定义模型路径</option>
+                </select>
+              </label>
+
+              <label class="field" id="local-model-path-field" style="display:none">
+                <span>模型路径或 HuggingFace ID</span>
+                <input type="text" id="local-model-path" placeholder="例：D:\models\hunyuan 或 Qwen/Qwen2.5-72B-Instruct">
+              </label>
+
+              <label class="field">
+                <span>设备</span>
+                <select id="local-model-device">
+                  <option value="cuda" selected>CUDA（GPU 加速）</option>
+                  <option value="cpu">CPU</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span>最大上下文长度</span>
+                <input type="number" id="local-model-max-length" value="32768" min="1024" max="131072" step="1024">
+              </label>
+
+              <div class="toggle-row">
+                <span>自动下载模型（首次使用）</span>
+                <label class="toggle"><input type="checkbox" id="local-model-auto-download" checked><span class="slider"></span></label>
               </div>
-              <span class="key-preview" id="api-model-preview"></span>
-            </label>
 
-            <label class="field">
-              <span>推理强度</span>
-              <select id="api-reasoning-effort">
-                <option value="medium" selected>medium</option>
-                <option value="xhigh">xhigh</option>
-              </select>
-            </label>
-
-            <label class="field">
-              <span>API 格式</span>
-              <select id="api-format">
-                <option value="chat">OpenAI Chat</option>
-                <option value="responses">OpenAI Responses</option>
-              </select>
-            </label>
+              <p class="field-hint">
+                选择推荐模型后，首次使用会自动从 HuggingFace 下载到 <code>models/</code> 目录。
+                混元 Large 需要约 800GB 显存（多卡或量化），千问 72B 需要约 150GB 显存。
+                建议使用代理加速下载。
+              </p>
+            </div>
 
             <label class="field">
               <span>目标语言</span>
