@@ -26,7 +26,7 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 - Boundary Proposal 只提供高召回候选断点；Acoustic Split v4 学习 `cut/continue`，负责把包络内独立事件隔离成 provisional sub-islands。
 - Pre-ASR CueQC v13 对 provisional sub-island 做 `keep/drop` 二分类 argmax 路由；teacher/data 层可以保留 `unsure`，但模型不会输出它。
 - Inner Edge Refiner v2 对 CueQC 保留的 sub-island 做逐帧二分类 argmax，裁成送入 ASR 的 acoustic semantic core。
-- Outer Edge Refiner 暂不作为默认组件；只在真实 v12 输出上比较 no-Outer 与 edge-only Outer，证明有独立收益后才保留。
+- Outer Edge Refiner v3 已删除（2026-07-26 决策）：其职责与 Scorer 高召回包络 / CueQC 路由 / Inner 尾部裁边重叠，且从未训练部署；边界质量由 Scorer v12 训练目标直接承担，不再依赖中间修补层。决策记录见 `docs/design/20260726_scorer-v12-remove-outer-refiner.md`。
 - 字幕 layout 只处理显示规则，不反向修改 ASR chunk 语义。
 
 这样做是为了避免一个模型同时承担“找语音、切句、删噪声、修边界、做字幕排版”。设计演进、实验记录、失败路线和更新记录都放在 [docs/HISTORY.md](docs/HISTORY.md)。
@@ -119,7 +119,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
      - 主臂：raw PTM2048 -> checkpoint 内 Linear(2048->2048)+GELU
      - 与 normalized MFCC40 拼接后 Linear(2088->256)
      - valid-prefix bidirectional Mamba2(hidden=256)
-     - 四个冻结实验臂：frame argmax / linear-chain CRF / Frame–Event Query-Mask / Dense Span + exact DP
+     - 训练臂：Dense Span + exact DP（主）/ linear-chain CRF（对照）/ frame argmax-CE（fragmentation baseline）；Query-Mask 与 argmax-structured 不再训练
      - vocal_candidate / non_vocal_candidate 二分类；teacher/canonical unsure=-100 不参与训练
   -> Boundary Proposal（高召回候选断点，不直接决定最终 cut）
   -> 按 ASR repo 进入互不混用的边界链
@@ -128,7 +128,6 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
        -> Pre-ASR CueQC v13 binary argmax
        -> Inner Edge Refiner v2 binary acoustic core
        -> chunk packing / boundary-cache
-       -> 可选 edge-only Outer 仅在真实 A/B 证明有收益后加入
      - 0.6B：空 registry placeholder 保持不动，暂不训练或修改
      - drop 的 chunk 不导出 wav、不进入 ASR
   -> ASR wav chunk export
@@ -155,7 +154,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声；是否进入 ASR 由 Pre-ASR CueQC 模型标签决定。
 - Scorer v12 的各 decoder、Split v4、CueQC v13 与 Inner v2 都不读取 runtime threshold，不使用 hysteresis、固定时长、NMS、规则 merge 或 fallback。旧 Scorer 只保留为离线失败证据，v10/v11 checkpoint 和 canonical 不能 warm-start 或转换成 v12。
 - Boundary 阶段按 Scorer → Proposal → Split → CueQC → Inner 串行加载和释放模型；Inner 只对 CueQC argmax keep 的 provisional sub-islands 推理，且只能裁首尾、不能挖内部空洞。Boundary cache 把 provisional chunk JSON 与同一内容签名的 raw PTM/MFCC sidecar 分开保存，缓存命中无需重复提取特征。allocated/reserved/shared VRAM 只写运行诊断，不参与功能判断；显式 CUDA 请求不可用时直接报错，不回退 CPU，任何超过 telemetry noise floor 的 shared VRAM spill 都是 soft OOM。
-- 1.7B production registry 在 v12 数值与人工 gate 完成前保持为空；Outer 不阻塞当前 Scorer v12 训练，也不默认进入生产链。
+- 1.7B production registry 在 v12 数值与人工 gate 完成前保持为空；Outer Refiner v3 已删除，不进入生产链。
 - 0.6B Boundary registry 当前为空；选择该档会在模型加载前明确报告 `pending_binary_retrain`。
 
 ---
@@ -167,7 +166,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`：默认高质量档。
 - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`：仅保留 ASR repo 与空 Boundary registry placeholder；全链重训留作未来 backlog，本轮不训练、不修改。
 
-Scorer v12 主容量合同为逐帧 raw PTM2048→trainable Linear(2048→2048)+GELU，与 normalized MFCC40 拼接后再经 Linear(2088→256) 输入双向 Mamba2(hidden=256)。PTM2048 只是冻结特征提取结果；所有 v12 adapter、时序主干和 decoder 都从 seed=`117` 完全随机初始化。当前固定比较 frame argmax、linear-chain CRF、Frame–Event Query-Mask 与 Dense Span + exact DP 四个结构化 decoder；训练与 runtime 不加入阈值或规则平滑，test 只在 val 选出前两名后运行。
+Scorer v12 主容量合同为逐帧 raw PTM2048→trainable Linear(2048→2048)+GELU，与 normalized MFCC40 拼接后再经 Linear(2088→256) 输入双向 Mamba2(hidden=256)。PTM2048 只是冻结特征提取结果；所有 v12 adapter、时序主干和 decoder 都从 seed=`117` 完全随机初始化。当前训练臂固定为 Dense Span + exact DP（主，structured hinge + 0.5 dense frame CE）、linear-chain CRF（对照，sequence NLL + 0.5 run-balanced emission CE）与 frame argmax-CE（fragmentation baseline）；训练与 runtime 不加入阈值或规则平滑，test 只在 val 选出前两名后运行。完整 decoder/loss/选优方案见 `docs/design/20260726_scorer-v12-decoder-loss-training-plan.md`。
 
 所有小模型统一放在：
 
@@ -177,7 +176,7 @@ src/checkpoints/
 └── jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/
 ```
 
-1.7B 的目标 Boundary pipeline 统一使用合同 `boundary_acoustic_binary_v12`：Scorer v12 → Proposal → Acoustic Split v4 → provisional sub-islands → CueQC v13 → Inner v2 acoustic core → Chunk/ASR。Outer 只保留 no-Outer / edge-only A/B，不再预设为必需组件。模型缺失、repo 不匹配、合同不兼容或选择 0.6B 都会直接报错，不提供规则 fallback 或静默迁移。
+1.7B 的目标 Boundary pipeline 统一使用合同 `boundary_acoustic_binary_v12`：Scorer v12 → Proposal → Acoustic Split v4 → provisional sub-islands → CueQC v13 → Inner v2 acoustic core → Chunk/ASR。Outer Refiner v3 已删除，不再作为组件或 A/B 保留。模型缺失、repo 不匹配、合同不兼容或选择 0.6B 都会直接报错，不提供规则 fallback 或静默迁移。
 
 当前训练数据状态：主线 Gemini 3.6 Flash Medium 以一次完整 source 三态调用输出 `vocal_candidate / non_vocal_candidate / unsure` 连续全覆盖；请求固定 `max_tokens=8192 / MM:SS.mmm`，不发送 temperature/top-p/top-k。职责恢复为 broad human-vocal 后，旧 v11 语义标签、旧人工“去呻吟”审计、旧 voice-only pilot/calibration 和对应 checkpoint 均不能作为当前真值。冻结的 source/core/video partition、WAV、音频/帧 SHA 与严格匹配的 raw PTM2048/MFCC40 可以复用；新的 broad-vocal calibration 尚未冻结，production registry 仍为空。紧凑固定规则 Prompt 和 adaptive rolling Prompt 都只作为 held-out A/B 证据，`training_manifest_allowed=false`。主线完整 source 继续使用严格 `MM:SS.mmm`；adaptive 窗口最多 20 秒，允许 10ms 数字局部坐标，但所有相邻 span 共用同一个切点并按 vocal-safe 方向量化到 Scorer 的 20ms 帧。该 A/B 当前显示 adaptive Teacher 明显更碎，人工 gate 尚未完成，不能进入 canonical。详细合同与选优顺序见 [Scorer v12 structured-decoder training plan](docs/audits/20260725_scorer-v12-structured-decoder-training-plan.md) 和 [adaptive partition/time-grid A/B](docs/audits/20260726_scorer-v12-adaptive-partition-time-grid-ab-v1.md)，旧路线只作为失败证据保存在 [docs/HISTORY.md](docs/HISTORY.md)。
 
@@ -185,7 +184,9 @@ Split v4 当前唯一合法训练数据合同是
 `acoustic_split_v4_sequence_dataset_summary_v1`：raw PTM2048 + MFCC40（frame
 width 2088）、当前 candidate scalar schema、固定 `train/val/test` source
 partition，并绑定 Scorer/Proposal/Outer 三个 checkpoint SHA、音频/特征/dataset
-sidecar SHA 和 `boundary_acoustic_binary_v12`。`compile_joint_boundary_preasr_dataset.py`
+sidecar SHA 和 `boundary_acoustic_binary_v12`。Outer 删除后该合同将改绑
+Scorer v12 输出（`post_candidate_island_scorer_v12`）并用最终 Scorer v12
+重新编译特征重训（见设计文档）；改绑完成前旧数据只作审计。`compile_joint_boundary_preasr_dataset.py`
 与 `merge_semantic_split_datasets.py` 会拒绝旧 row-wise、rehydrate、audit-only
 或缺 summary 的输入；trainer 还会拒绝 CUDA 不可用、非有限值和空监督 batch。
 当前 Runtime 尚未真正实现 `SEMANTIC_SPLIT_FEATURE_EXPORT_PATH` 的 candidate
