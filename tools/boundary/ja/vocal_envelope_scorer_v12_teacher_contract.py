@@ -17,7 +17,7 @@ SCORER_V12_FRAME_HOP_S = 0.02
 # Changing the actual wire prompt/schema requires updating both the version and
 # these values, otherwise Teacher dispatch fails closed before an API call.
 SYSTEM_PROMPT_SHA256 = (
-    "466c647e5673de794e62dfe4863e7c11cdb6d71512d1d75f2a1c39a7bd042d98"
+    "43093fd0829c56dc6546e8f45f984a010d44962bf88c87230887593ad38694f7"
 )
 RESPONSE_SCHEMA_SHA256 = (
     "3686fa00ea8fe5dc31115dcfa4c39c411c1bb2121e246c63f85fbc14db043ea3"
