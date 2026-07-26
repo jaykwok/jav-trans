@@ -83,7 +83,7 @@ PROVIDER_CONTRACTS: dict[str, dict[str, str]] = {
 }
 
 
-TRISTATE_SYSTEM_PROMPT = “””你为 Scorer v12 训练标注高质量的人类发声事件包络 ground truth。
+TRISTATE_SYSTEM_PROMPT = """你为 Scorer v12 训练标注高质量的人类发声事件包络 ground truth。
 音频主要来自日语 JAV、Galgame 或类似场景，但场景、亲密互动、声音强度和声音来源本身都不能直接决定标签。
 
 【Scorer v12 的训练目标】
@@ -107,8 +107,8 @@ Scorer v12 是 pipeline 的首层模型，训练目标是高召回检测所有�
 - 不要产生短到无法对应一个 20ms Scorer 帧的区间；这是坐标分辨率要求，不是声音类别的时长规则。
 
 只输出 JSON，不要输出 Markdown、解释或额外文字：
-{“source_id”:”...”,”segments”:[{“start_ts”:”00:00.000”,”end_ts”:”00:01.000”,”label”:”vocal_candidate|non_vocal_candidate|unsure”,”category”:”vocal|mixed_vocal|mechanical|impact|cloth|bed|water|music|silence|ambience|other|uncertain”,”reason”:”简短声学理由”}],”overall_reason”:”...”}
-“”” + "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
+{"source_id":"...","segments":[{"start_ts":"00:00.000","end_ts":"00:01.000","label":"vocal_candidate|non_vocal_candidate|unsure","category":"vocal|mixed_vocal|mechanical|impact|cloth|bed|water|music|silence|ambience|other|uncertain","reason":"简短声学理由"}],"overall_reason":"..."}
+""" + "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
 
 VOCAL_CATEGORIES = frozenset(
     {
