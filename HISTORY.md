@@ -1,5 +1,18 @@
 # 项目演进历史
 
+## 当前状态
+
+翻译运行时采用“单一编排核心 + 单次请求后端”架构。`translator.py` 统一负责 Prompt、上下文、全局术语、批处理、缓存、重试、修复、进度和取消；后端注册表提供进程级实例生命周期。OpenAI 后端支持 Chat/Responses，本地 Transformers 后端复用单个模型并串行生成。配置统一使用 `TRANSLATION_BACKEND` 与 `LOCAL_MODEL_*`，详细契约见 `docs/translation-backend-architecture.md`。
+
+## 2026-07-27: 翻译后端重构纠偏
+
+- 审计确认 7 月 26 日初版拆分并非等价重构：Responses API 被占位异常替代、全局术语固定为空、取消异常跨模块失配、本地模型按 worker 重复加载、任务级 API 格式和缓存身份丢失，既有翻译测试在收集阶段即失败。
+- 放弃按文件机械拆分强耦合状态，恢复完整编排语义；删除不参与 canonical runtime 的 `batching.py`、`repair.py` 和 `translator_legacy.py`，避免三份实现继续漂移。
+- 新增共享异常层；后端实例改为进程级复用，重复注册默认报错，配置变化时安全释放旧实例。API 与本地模型缓存身份隔离。
+- OpenAI Chat/Responses、Grok provider patch、JSON Schema、流式进度和 usage 恢复为单一实现；全局术语使用独立 `terms` Schema。
+- 本地 Transformers 后端增加单实例串行推理、等待锁可取消、CUDA/dtype/模型配置校验、上下文上限、生成 token 上限、token usage 和配置变更卸载。进程内本地模式不伪称 token streaming；生产并发推荐外部 vLLM/SGLang OpenAI 兼容服务。
+- 翻译聚焦回归 106 passed；除既有 Gemini/scorer-v12 失败文件外的全套回归 1134 passed、6 skipped；完整验证结果见本次任务收尾记录。
+
 ## 2026-07-26: 翻译模块架构重构
 
 ### 背景

@@ -1,42 +1,42 @@
-# Refactored translation module - unified entry point
-
+import json
+import contextlib
+import hashlib
 import os
-import time
+import re
 import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from pathlib import Path
 from typing import Callable
 
-from llm.backends import get_backend
-from llm.cache import (
-    _load_translation_cache,
-    _load_translation_memory,
-    _save_cache_entry,
-    _save_memory_entries,
-    _translation_cache_key,
-    _translation_memory_key,
-    _translation_memory_source_is_cacheable,
-    _compute_prompt_signature,
+from openai import OpenAI
+
+from core.config import load_config
+from llm import cache as translation_cache
+from llm.backends import get_backend, selected_backend_name
+from llm.glossary import normalize_glossary_text, parse_glossary_pairs
+from llm import patch as llm_patch
+from llm import prompt as prompt_module
+from llm.errors import (
+    RetryableTranslationFormatError,
+    TranslationCancelledError,
 )
-from llm.prompt import (
-    _build_translation_messages,
-    _serialize_segments,
-    generate_global_context,
-    PROMPT_VERSION,
-)
-from llm.repair import apply_translation_repair_pass
-from llm.batching import translate_segments_batched
 
 
-# 从环境变量读取配置
-TRANSLATION_BATCH_SIZE = int(os.getenv("TRANSLATION_BATCH_SIZE", "64"))
-DEFAULT_TARGET_LANG = "简体中文"
+load_config()
 
-
-class TranslationCancelledError(RuntimeError):
-    pass
-
-
-class RetryableTranslationFormatError(RuntimeError):
-    pass
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
+_CLIENT: OpenAI | None = None
+_CLIENT_KEY: tuple[str, str] = ("", "")
+_CLIENT_LOCK = threading.Lock()
+_RETRY_CONTEXT = threading.local()
+_cache_lock = threading.Lock()
+PROMPT_VERSION = prompt_module.PROMPT_VERSION
+_LEADING_ROLE_LABEL_RE = prompt_module._LEADING_ROLE_LABEL_RE
+_SYSTEM_PROMPT_FULL = prompt_module._SYSTEM_PROMPT_FULL
+_SYSTEM_PROMPT_COMPACT = prompt_module._SYSTEM_PROMPT_COMPACT
+_JSON_OUTPUT_LABEL = prompt_module._JSON_OUTPUT_LABEL
+_normalize_source_text = prompt_module._normalize_source_text
 
 
 def _cancel_requested(cancel_event: threading.Event | None) -> bool:
@@ -49,6 +49,541 @@ def _cancel_requested(cancel_event: threading.Event | None) -> bool:
 def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
     if _cancel_requested(cancel_event):
         raise TranslationCancelledError("任务已取消")
+
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} must be set in config.py or .env")
+    return value
+
+
+OPENAI_COMPATIBILITY_BASE_URL = (
+    os.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip() or None
+)
+API_KEY = os.getenv("API_KEY", "").strip() or None
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "").strip()
+LLM_API_FORMAT = os.getenv("LLM_API_FORMAT", "chat").strip().lower() or "chat"
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "medium").strip() or "medium"
+
+DEFAULT_TARGET_LANG = "简体中文"
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int_clamped(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.getenv(name, "").strip() or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
+TRANSLATION_MAX_TOKENS = 384000
+TRANSLATION_TEMPERATURE = _env_float("LLM_TEMPERATURE", 0.6)
+TRANSLATION_TOP_P = 0.9
+# Worker-independent request granularity. Env override (restart required);
+# clamped to a sane range so a bad value never produces 0-length or huge batches.
+TRANSLATION_BATCH_SIZE = _env_int_clamped("TRANSLATION_BATCH_SIZE", 64, 8, 400)
+COMPACT_SYSTEM_PROMPT = False
+TRANSLATION_API_RETRIES = 4
+TRANSLATION_BATCH_REPAIR_RETRIES = 2
+# Hard cap on requests a single batch may issue. The repair loop resets its
+# retry budget whenever the missing set shrinks, which can otherwise let a
+# pathological model (one-at-a-time progress) loop indefinitely. Hitting this
+# cap fails the batch via the normal failure path (best-effort partial results
+# are kept in batch_results but not persisted), bounding cost.
+TRANSLATION_BATCH_MAX_REQUESTS = 12
+TRANSLATION_API_BACKOFF_BASE_S = 1.5
+TRANSLATION_API_BACKOFF_MAX_S = 20.0
+TRANSLATION_PREFIX_WARMUP = True
+TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS = 180000
+TRANSLATION_REPAIR_MAX_IDS = 12
+TRANSLATION_REPAIR_CONTEXT_RADIUS = 1
+TRANSLATION_REPAIR_LENGTH_RATIO_MIN = 0.25
+TRANSLATION_REPAIR_LENGTH_RATIO_MAX = 4.0
+
+_TRANSLATION_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "translations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "id": {"type": "integer"},
+                    "text": {"type": "string"},
+                },
+                "required": ["id", "text"],
+            },
+        },
+    },
+    "required": ["translations"],
+}
+
+_GLOSSARY_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "terms": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "ja": {"type": "string"},
+                    "zh": {"type": "string"},
+                },
+                "required": ["ja", "zh"],
+            },
+        }
+    },
+    "required": ["terms"],
+}
+
+
+def _translation_output_schema() -> dict:
+    return json.loads(json.dumps(_TRANSLATION_OUTPUT_SCHEMA))
+
+
+def _is_deepseek_model(model_name: str | None) -> bool:
+    return "deepseek" in (model_name or "").lower()
+
+
+def _chat_response_format(
+    model_name: str | None = None,
+    *,
+    schema: dict | None = None,
+    schema_name: str = "subtitle_translations",
+) -> dict:
+    if _is_deepseek_model(model_name):
+        return {"type": "json_object"}
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema_name,
+            "strict": True,
+            "schema": schema or _translation_output_schema(),
+        },
+    }
+
+
+def _responses_text_format(
+    model_name: str | None = None,
+    *,
+    schema: dict | None = None,
+    schema_name: str = "subtitle_translations",
+) -> dict:
+    if _is_deepseek_model(model_name):
+        return {"format": {"type": "json_object"}}
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": schema_name,
+            "strict": True,
+            "schema": schema or _translation_output_schema(),
+        }
+    }
+
+
+def _normalize_llm_api_format(value: str | None, fallback: str = "chat") -> str:
+    normalized = (value or fallback or "chat").strip().lower()
+    return normalized if normalized in {"chat", "responses"} else "chat"
+
+
+def _llm_api_format(api_format: str | None = None) -> str:
+    if api_format is not None:
+        return _normalize_llm_api_format(api_format, LLM_API_FORMAT)
+    value = os.getenv("LLM_API_FORMAT", LLM_API_FORMAT)
+    return _normalize_llm_api_format(value)
+
+
+def _normalize_reasoning_effort(value: str | None, fallback: str = "medium") -> str:
+    normalized = (value or fallback or "medium").strip().lower()
+    if normalized in {"medium", "xhigh"}:
+        return normalized
+    return fallback if fallback in {"medium", "xhigh"} else "medium"
+
+
+def _normalize_openai_compat_base_url(base_url: str | None) -> str | None:
+    normalized = (base_url or "").strip().rstrip("/")
+    if not normalized:
+        return None
+    lower = normalized.lower()
+    for suffix in ("/chat/completions", "/responses", "/completions", "/models"):
+        if lower.endswith(suffix):
+            normalized = normalized[: -len(suffix)].rstrip("/")
+            lower = normalized.lower()
+            break
+    if lower.endswith("/v1") or "/v1/" in lower:
+        return normalized
+    return f"{normalized}/v1"
+
+
+def _get_client() -> OpenAI:
+    global _CLIENT, _CLIENT_KEY
+    current_key = os.getenv("API_KEY", "").strip() or None
+    current_url = _normalize_openai_compat_base_url(
+        os.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip()
+    )
+    key_tuple = (current_key or "", current_url or "")
+    with _CLIENT_LOCK:
+        if _CLIENT is None or key_tuple != _CLIENT_KEY:
+            _CLIENT = OpenAI(api_key=current_key, base_url=current_url)
+            _CLIENT_KEY = key_tuple
+    return _CLIENT
+
+
+def _current_retry_events() -> list[dict] | None:
+    events = getattr(_RETRY_CONTEXT, "events", None)
+    return events if isinstance(events, list) else None
+
+
+_load_translation_cache = translation_cache._load_translation_cache
+_translation_cache_jsonl_path = translation_cache._translation_cache_jsonl_path
+_read_translation_cache_jsonl = translation_cache._read_translation_cache_jsonl
+_save_cache_entry = translation_cache._save_cache_entry
+_translation_memory_jsonl_path = translation_cache._translation_memory_jsonl_path
+_load_translation_memory = translation_cache._load_translation_memory
+_read_translation_memory_jsonl = translation_cache._read_translation_memory_jsonl
+_save_memory_entries = translation_cache._save_memory_entries
+
+
+def _translation_model_identity() -> str:
+    backend_name = selected_backend_name()
+    return get_backend(backend_name).cache_identity()
+
+
+def _translation_context_char_limit() -> int:
+    """Conservative prompt-context budget before per-batch JSON is added."""
+    if selected_backend_name() != "local":
+        return TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS
+    try:
+        max_length = int(os.getenv("LOCAL_MODEL_MAX_LENGTH", "32768"))
+    except ValueError:
+        max_length = 32768
+    # Japanese/Chinese often approach one token per character. Reserve roughly
+    # half the window for the system prompt, requested batch, and generation.
+    return max(2048, int(max_length * 0.45))
+
+
+def _compute_prompt_signature(
+    extra_glossary: str = "",
+    *,
+    glossary: str = "",
+    target_lang: str = "简体中文",
+    character_reference: str = "",
+) -> str:
+    return translation_cache._compute_prompt_signature(
+        extra_glossary,
+        glossary=glossary,
+        target_lang=target_lang,
+        character_reference=character_reference,
+        prompt_version=PROMPT_VERSION,
+        model_name=_translation_model_identity(),
+        compact_system_prompt=COMPACT_SYSTEM_PROMPT,
+    )
+
+
+def _translation_cache_key(
+    batch_index: int,
+    batch_segments: list[dict],
+    *,
+    extra_glossary: str = "",
+    glossary: str = "",
+    target_lang: str = "简体中文",
+    character_reference: str = "",
+) -> str:
+    return translation_cache._translation_cache_key(
+        batch_index,
+        batch_segments,
+        extra_glossary=extra_glossary,
+        glossary=glossary,
+        target_lang=target_lang,
+        character_reference=character_reference,
+        prompt_version=PROMPT_VERSION,
+        model_name=_translation_model_identity(),
+        compact_system_prompt=COMPACT_SYSTEM_PROMPT,
+    )
+
+
+def _translation_memory_key(
+    source_text: str,
+    extra_glossary: str = "",
+    *,
+    glossary: str = "",
+    target_lang: str = "简体中文",
+    character_reference: str = "",
+) -> str:
+    return translation_cache._translation_memory_key(
+        source_text,
+        extra_glossary,
+        glossary=glossary,
+        target_lang=target_lang,
+        character_reference=character_reference,
+        prompt_version=PROMPT_VERSION,
+        model_name=_translation_model_identity(),
+    )
+
+
+def _translation_memory_source_is_cacheable(source_text: str) -> bool:
+    return translation_cache._translation_memory_source_is_cacheable(source_text)
+
+
+def _get_nested_value(value, *path: str):
+    current = value
+    for key in path:
+        if current is None:
+            return None
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+    return current
+
+
+def _coerce_optional_int(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _extract_usage_metrics(usage) -> dict:
+    cached_tokens = _coerce_optional_int(
+        _get_nested_value(usage, "prompt_tokens_details", "cached_tokens")
+    )
+    cache_hit_tokens = _coerce_optional_int(
+        _get_nested_value(usage, "prompt_cache_hit_tokens")
+    )
+    cache_miss_tokens = _coerce_optional_int(
+        _get_nested_value(usage, "prompt_cache_miss_tokens")
+    )
+    metrics = {
+        "cached_tokens": cached_tokens,
+        "cache_hit_tokens": cache_hit_tokens,
+        "cache_miss_tokens": cache_miss_tokens,
+    }
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = _coerce_optional_int(_get_nested_value(usage, key))
+        if value is not None:
+            metrics[key] = value
+    return metrics
+
+
+def _emit_usage(on_usage: Callable[[dict], None] | None, usage) -> None:
+    if on_usage is None or usage is None:
+        return
+    metrics = _extract_usage_metrics(usage)
+    if not any(value is not None for value in metrics.values()):
+        return
+    try:
+        on_usage(metrics)
+    except Exception:
+        return
+
+
+def _merge_usage_metrics(usages: list[dict]) -> dict:
+    merged = {
+        "cached_tokens": None,
+        "cache_hit_tokens": None,
+        "cache_miss_tokens": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+    }
+    for usage in usages:
+        for key in merged:
+            value = _coerce_optional_int(usage.get(key))
+            if value is None:
+                continue
+            merged[key] = value if merged[key] is None else merged[key] + value
+    return merged
+
+
+def _filter_global_glossary_terms(raw_terms) -> list[dict]:
+    if not isinstance(raw_terms, list):
+        return []
+    filtered: list[dict] = []
+    banned_re = re.compile(r"[,\u3001\u3002\uff0c\uff1f?？\s]")
+    for item in raw_terms:
+        if not isinstance(item, dict):
+            continue
+        ja = str(item.get("ja", "")).strip()
+        zh = str(item.get("zh", "")).strip()
+        if not ja or not zh:
+            continue
+        if len(ja) > 8 or len(zh) > 8:
+            continue
+        if banned_re.search(ja) or banned_re.search(zh):
+            continue
+        filtered.append({"ja": ja, "zh": zh})
+        if len(filtered) >= 15:
+            break
+    return filtered
+
+
+def _format_global_glossary_terms(
+    terms: list[dict],
+    *,
+    glossary: str = "",
+) -> str:
+    lines = []
+    seen: set[str] = set()
+    # Parse the project glossary into its ja keys and match exactly. Treating
+    # the whole glossary text as a haystack (substring `in`) would drop a
+    # global term whenever its ja appeared as a substring of any glossary pair
+    # (e.g. glossary "肉-肉棒" wrongly suppresses both "肉" and "肉棒").
+    glossary_ja_keys = {ja for ja, _zh in parse_glossary_pairs(glossary)}
+    for item in terms:
+        ja = str(item.get("ja", "")).strip()
+        zh = str(item.get("zh", "")).strip()
+        if not ja or not zh or ja in seen:
+            continue
+        if ja in glossary_ja_keys:
+            continue
+        seen.add(ja)
+        lines.append(f"{ja}-{zh}")
+    return "\n".join(lines)
+
+
+def _resolve_translation_extra_glossary(
+    segments: list[dict],
+    cache_path: str,
+    glossary: str,
+    *,
+    api_format: str | None,
+    cancel_event: threading.Event | None,
+) -> str:
+    if not cache_path:
+        return ""
+    all_ja_texts = [str(seg.get("text", "")) for seg in segments]
+    glossary_terms = extract_global_glossary(
+        all_ja_texts,
+        _global_glossary_cache_path_for_texts(cache_path, all_ja_texts),
+        api_format=api_format,
+        cancel_event=cancel_event,
+    )
+    return _format_global_glossary_terms(glossary_terms, glossary=glossary)
+
+
+def _global_glossary_cache_path_for_texts(
+    translation_cache_path: str,
+    all_ja_texts: list[str],
+) -> str:
+    cache_path = Path(translation_cache_path)
+    source_sig = hashlib.sha1(
+        "\n".join(str(text or "") for text in all_ja_texts).encode("utf-8")
+    ).hexdigest()[:12]
+    return str(cache_path.with_name(f"translation_global_glossary.{source_sig}.json"))
+
+
+def extract_global_glossary(
+    all_ja_texts: list[str],
+    cache_path: str,
+    *,
+    api_format: str | None = None,
+    cancel_event: threading.Event | None = None,
+) -> list[dict]:
+    _raise_if_cancelled(cancel_event)
+    if not cache_path:
+        return []
+    path = Path(cache_path)
+    try:
+        if path.exists():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            terms = payload.get("terms") if isinstance(payload, dict) else payload
+            return _filter_global_glossary_terms(terms)
+    except Exception as exc:
+        print(f"[WARN] failed to load translation global glossary cache: {exc}")
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        source_text = "\n".join(str(text or "") for text in all_ja_texts)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是字幕术语提取器。请从全片日文字幕中提取 10-20 个反复出现的核心词，"
+                    "范围包括代词、人名、性器官词、高频形容词。给出推荐中文翻译。"
+                    '只返回合法 JSON：{"terms":[{"ja":"...","zh":"..."}]}。'
+                ),
+            },
+            {"role": "user", "content": f"【全片日文字幕】\n{source_text}"},
+        ]
+        chat_kwargs = {"expected_count": 0, "reasoning_effort": "medium"}
+        if api_format is not None:
+            chat_kwargs["api_format"] = api_format
+        raw_output = _chat(
+            messages,
+            cancel_event=cancel_event,
+            response_schema=_GLOSSARY_OUTPUT_SCHEMA,
+            response_schema_name="translation_glossary",
+            **chat_kwargs,
+        )
+        _raise_if_cancelled(cancel_event)
+        parsed = json.loads(_strip_reasoning_artifacts(raw_output))
+        terms = _filter_global_glossary_terms(parsed.get("terms") if isinstance(parsed, dict) else None)
+        tmp_path = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
+        tmp_path.write_text(
+            json.dumps({"terms": terms}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+        return terms
+    except Exception as exc:
+        if isinstance(exc, TranslationCancelledError):
+            raise
+        print(f"[WARN] failed to extract translation global glossary: {exc}")
+        return []
+
+
+def _test_crash_translation_batch() -> int:
+    raw_value = os.getenv("_TEST_CRASH_TRANSLATION_BATCH", "").strip()
+    if not raw_value:
+        return 0
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return 0
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def generate_global_context(
+    segments: list[dict],
+    max_chars: int | None = None,
+) -> str:
+    lines = []
+    for idx, seg in enumerate(segments):
+        text = _normalize_source_text(seg.get("text", ""))
+        if not text:
+            continue
+        start = _safe_float(seg.get("start"))
+        end = _safe_float(seg.get("end"))
+        lines.append(f"{idx:04d} [{start:.2f}->{end:.2f}] {text}")
+
+    context = "\n".join(lines)
+    if max_chars is not None and max_chars > 0:
+        return context[:max_chars]
+    return context
 
 
 def translate_segments(
@@ -65,137 +600,158 @@ def translate_segments(
     on_progress: Callable[[dict], None] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> tuple[list[str], list[dict], list[dict]]:
-    """
-    翻译字幕段
-
-    Args:
-        segments: 字幕段列表，每个元素包含 text、start、end
-        global_context: 全局上下文（可选，自动生成）
-        max_workers: 最大并发线程数
-        cache_path: 缓存路径
-        target_lang: 目标语言
-        glossary: 术语表
-        character_reference: 人物参考名
-        reasoning_effort: 推理强度（medium/xhigh）
-        api_format: API 格式（chat/responses）
-        on_batch_done: 批次完成回调
-        on_progress: 进度回调
-        cancel_event: 取消事件
-
-    Returns:
-        (翻译结果列表, 时间统计列表, 重试事件列表)
-    """
     _raise_if_cancelled(cancel_event)
-
     if not segments:
         return [], [], []
 
     effective_max_workers = max(1, int(max_workers))
-    effective_batch_size = _auto_translation_batch_size(len(segments), effective_max_workers)
+    if selected_backend_name() == "local":
+        effective_max_workers = 1
+    effective_batch_size = _auto_translation_batch_size(
+        len(segments),
+        effective_max_workers,
+    )
     effective_cache_path = cache_path or ""
     effective_target_lang = (target_lang or DEFAULT_TARGET_LANG).strip() or DEFAULT_TARGET_LANG
-    effective_glossary = _normalize_glossary_text(glossary)
+    effective_glossary = normalize_glossary_text(glossary)
     effective_character_reference = (character_reference or "").strip()
-
-    # 提取全局术语表
-    extra_glossary = ""
-    if effective_cache_path:
-        extra_glossary = _resolve_translation_extra_glossary(
-            segments,
-            effective_cache_path,
-            effective_glossary,
-            api_format=api_format,
-            cancel_event=cancel_event,
-        )
-
+    previous_retry_events = getattr(_RETRY_CONTEXT, "events", None)
     retry_events: list[dict] = []
-
-    # 决定翻译策略
-    if effective_batch_size > 0 and len(segments) > effective_batch_size:
-        # 批量翻译
-        zh_texts, timings, worker_retry_events = translate_segments_batched(
-            segments,
-            batch_size=effective_batch_size,
-            max_workers=effective_max_workers,
-            global_context=global_context,
-            cache_path=effective_cache_path,
-            target_lang=effective_target_lang,
-            glossary=effective_glossary,
-            character_reference=effective_character_reference,
-            extra_glossary=extra_glossary,
-            reasoning_effort=reasoning_effort,
-            api_format=api_format,
-            on_batch_done=on_batch_done,
-            on_progress=on_progress,
-            cancel_event=cancel_event,
-        )
-        retry_events.extend(worker_retry_events)
-    else:
-        # 单次请求翻译
-        zh_texts, timings = _translate_segments_single_request(
-            segments,
-            global_context=global_context,
-            cache_path=effective_cache_path,
-            target_lang=effective_target_lang,
-            glossary=effective_glossary,
-            character_reference=effective_character_reference,
-            extra_glossary=extra_glossary,
-            reasoning_effort=reasoning_effort,
-            api_format=api_format,
-            on_batch_done=on_batch_done,
-            on_progress=on_progress,
-            cancel_event=cancel_event,
-        )
-
-    _raise_if_cancelled(cancel_event)
-
-    # 应用翻译修复 pass
-    def _persist_repaired_translation_cache(repaired_texts: list[str]) -> None:
-        """持久化修复后的翻译缓存"""
-        if not effective_cache_path or not segments:
-            return
-
-        cache_kwargs = {
-            "extra_glossary": extra_glossary,
-            "glossary": effective_glossary,
-            "target_lang": effective_target_lang,
-            "character_reference": effective_character_reference,
-        }
-
+    _RETRY_CONTEXT.events = retry_events
+    try:
+        _raise_if_cancelled(cancel_event)
         if effective_batch_size > 0 and len(segments) > effective_batch_size:
-            # 分批保存
-            for b_index, b_segments in enumerate(_split_into_batches(segments, effective_batch_size)):
-                start = b_index * effective_batch_size
-                local_texts = [
-                    repaired_texts[start + off] if start + off < len(repaired_texts) else ""
-                    for off in range(len(b_segments))
-                ]
-                batch_key = _translation_cache_key(b_index, b_segments, **cache_kwargs)
-                _save_cache_entry(effective_cache_path, batch_key, local_texts, threading.Lock())
+            zh_texts, timings, worker_retry_events = _translate_segments_batched(
+                segments,
+                batch_size=effective_batch_size,
+                max_workers=effective_max_workers,
+                global_context=global_context,
+                cache_path=effective_cache_path,
+                target_lang=effective_target_lang,
+                glossary=effective_glossary,
+                character_reference=effective_character_reference,
+                reasoning_effort=reasoning_effort,
+                api_format=api_format,
+                on_batch_done=on_batch_done,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+            )
+            retry_events.extend(worker_retry_events)
         else:
-            # 整体保存
-            batch_key = _translation_cache_key(0, segments, **cache_kwargs)
-            _save_cache_entry(effective_cache_path, batch_key, repaired_texts, threading.Lock())
+            zh_texts, timings = _translate_segments_single_request(
+                segments,
+                global_context=global_context,
+                cache_path=effective_cache_path,
+                target_lang=effective_target_lang,
+                glossary=effective_glossary,
+                character_reference=effective_character_reference,
+                reasoning_effort=reasoning_effort,
+                api_format=api_format,
+                on_batch_done=on_batch_done,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+            )
+        _raise_if_cancelled(cancel_event)
 
-    zh_texts, repair_timing = apply_translation_repair_pass(
-        segments,
-        zh_texts,
-        target_lang=effective_target_lang,
-        glossary=effective_glossary,
-        character_reference=effective_character_reference,
-        reasoning_effort=reasoning_effort,
-        api_format=api_format,
-        on_progress=on_progress,
-        cancel_event=cancel_event,
-        cache_writer=_persist_repaired_translation_cache,
-    )
+        def _persist_repaired_translation_cache(repaired_texts: list[str]) -> None:
+            # Write repaired texts back under the same batch_key entries the
+            # translation phase used, so subsequent runs reuse the repair.
+            if not effective_cache_path or not segments:
+                return
+            extra_glossary = _resolve_translation_extra_glossary(
+                segments,
+                effective_cache_path,
+                effective_glossary,
+                api_format=api_format,
+                cancel_event=cancel_event,
+            )
+            cache_kwargs = {
+                "extra_glossary": extra_glossary,
+                "glossary": effective_glossary,
+                "target_lang": effective_target_lang,
+                "character_reference": effective_character_reference,
+            }
+            if effective_batch_size > 0 and len(segments) > effective_batch_size:
+                for b_index, b_segments in enumerate(
+                    _split_into_batches(segments, effective_batch_size)
+                ):
+                    start = b_index * effective_batch_size
+                    local_texts = [
+                        repaired_texts[start + off]
+                        if start + off < len(repaired_texts)
+                        else ""
+                        for off in range(len(b_segments))
+                    ]
+                    batch_key = _translation_cache_key(b_index, b_segments, **cache_kwargs)
+                    _save_cache_entry(
+                        effective_cache_path, batch_key, local_texts, _cache_lock
+                    )
+            else:
+                batch_key = _translation_cache_key(0, segments, **cache_kwargs)
+                _save_cache_entry(
+                    effective_cache_path, batch_key, repaired_texts, _cache_lock
+                )
 
+        zh_texts, repair_timing = _apply_translation_repair_pass(
+            segments,
+            zh_texts,
+            target_lang=effective_target_lang,
+            glossary=effective_glossary,
+            character_reference=effective_character_reference,
+            reasoning_effort=reasoning_effort,
+            api_format=api_format,
+            on_progress=on_progress,
+            cancel_event=cancel_event,
+            cache_writer=_persist_repaired_translation_cache,
+        )
+        _raise_if_cancelled(cancel_event)
+        if repair_timing is not None:
+            timings.append(repair_timing)
+        return zh_texts, timings, list(retry_events)
+    finally:
+        if previous_retry_events is None:
+            with contextlib.suppress(AttributeError):
+                delattr(_RETRY_CONTEXT, "events")
+        else:
+            _RETRY_CONTEXT.events = previous_retry_events
+
+
+def _chat_with_reasoning(
+    messages: list[dict],
+    *,
+    expected_count: int,
+    reasoning_effort: str | None = None,
+    api_format: str | None = None,
+    on_progress: Callable[[dict], None] | None = None,
+    on_usage: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> str:
     _raise_if_cancelled(cancel_event)
-
-    if repair_timing is not None:
-        timings.append(repair_timing)
-
-    return zh_texts, timings, retry_events
+    effective_effort = _normalize_reasoning_effort(
+        reasoning_effort or os.getenv("LLM_REASONING_EFFORT", LLM_REASONING_EFFORT)
+    )
+    chat_kwargs = {
+        "expected_count": expected_count,
+        "on_progress": on_progress,
+        "cancel_event": cancel_event,
+        "reasoning_effort": effective_effort,
+    }
+    if api_format is not None:
+        chat_kwargs["api_format"] = api_format
+    if on_usage is not None:
+        chat_kwargs["on_usage"] = on_usage
+    try:
+        return _chat(
+            messages,
+            **chat_kwargs,
+        )
+    except RetryableTranslationFormatError as exc:
+        if effective_effort != "xhigh" or not _is_stream_interrupted_error(exc):
+            raise
+        _record_api_retry_event(exc, 0, 0.0, note="fallback_reasoning_effort_medium")
+        fallback_kwargs = dict(chat_kwargs)
+        fallback_kwargs["reasoning_effort"] = "medium"
+        return _chat(messages, **fallback_kwargs)
 
 
 def _translate_segments_single_request(
@@ -206,28 +762,30 @@ def _translate_segments_single_request(
     target_lang: str,
     glossary: str,
     character_reference: str,
-    extra_glossary: str = "",
     reasoning_effort: str | None = None,
     api_format: str | None = None,
     on_batch_done=None,
     on_progress: Callable[[dict], None] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> tuple[list[str], list[dict]]:
-    """单次请求翻译所有字幕段"""
     _raise_if_cancelled(cancel_event)
-
     started = time.perf_counter()
+    generated_context = generate_global_context(segments)
     full_context = (
-        global_context if global_context is not None else generate_global_context(segments)
+        global_context
+        if global_context is not None
+        else generated_context
     )
     source_payload = _serialize_segments(segments)
     expected_count = len(segments)
+    request_usages: list[dict] = []
+    extra_glossary = _resolve_translation_extra_glossary(
+        segments, cache_path, glossary, api_format=api_format, cancel_event=cancel_event
+    )
 
-    # 检查缓存
     batch_key = ""
     translation_cache = _load_translation_cache(cache_path) if cache_path else {}
     translation_memory = _load_translation_memory(cache_path) if cache_path else {}
-
     if cache_path:
         batch_key = _translation_cache_key(
             0,
@@ -237,7 +795,6 @@ def _translate_segments_single_request(
             target_lang=target_lang,
             character_reference=character_reference,
         )
-
         cached_texts = translation_cache.get(batch_key)
         if isinstance(cached_texts, list) and len(cached_texts) == expected_count:
             timing = {
@@ -245,19 +802,26 @@ def _translate_segments_single_request(
                 "segment_count": expected_count,
                 "elapsed_s": time.perf_counter() - started,
                 "mode": "translation_cache_hit",
+                "request_count": 0,
+                "source_payload_chars": 0,
+                "global_context_chars": len(full_context),
+                "missing_count": 0,
+                "missing_indexes": [],
                 "cache_hit": True,
+                "cache_hit_type": "exact_batch",
+                "translation_memory_hit_count": 0,
+                **_merge_usage_metrics([]),
             }
             if on_batch_done:
+                _raise_if_cancelled(cancel_event)
                 on_batch_done(timing)
-            return list(cached_texts), [timing]
+            return [_normalize_translation_text(text) or "" for text in cached_texts], [timing]
 
-        # 检查 translation memory
         memory_texts: list[str | None] = []
         memory_hit_count = 0
         for seg in segments:
             source_text = str(seg.get("text", ""))
             memory_text = None
-
             if _translation_memory_source_is_cacheable(source_text):
                 memory_key = _translation_memory_key(
                     source_text,
@@ -268,27 +832,32 @@ def _translate_segments_single_request(
                 )
                 cached_memory_text = translation_memory.get(memory_key)
                 if isinstance(cached_memory_text, str) and cached_memory_text.strip():
-                    memory_text = cached_memory_text
+                    memory_text = _normalize_translation_text(cached_memory_text) or ""
                     memory_hit_count += 1
-
             memory_texts.append(memory_text)
-
         if memory_hit_count == expected_count:
             final_texts = [text or "" for text in memory_texts]
-            _save_cache_entry(cache_path, batch_key, final_texts, threading.Lock())
-
+            _save_cache_entry(cache_path, batch_key, final_texts, _cache_lock)
             timing = {
                 "start_index": 0,
                 "segment_count": expected_count,
                 "elapsed_s": time.perf_counter() - started,
                 "mode": "translation_memory_hit",
+                "request_count": 0,
+                "source_payload_chars": 0,
+                "global_context_chars": len(full_context),
+                "missing_count": 0,
+                "missing_indexes": [],
                 "cache_hit": True,
+                "cache_hit_type": "translation_memory",
+                "translation_memory_hit_count": memory_hit_count,
+                **_merge_usage_metrics([]),
             }
             if on_batch_done:
+                _raise_if_cancelled(cancel_event)
                 on_batch_done(timing)
             return final_texts, [timing]
 
-    # 构建翻译请求
     messages = _build_translation_messages(
         source_payload=source_payload,
         expected_count=expected_count,
@@ -297,58 +866,214 @@ def _translate_segments_single_request(
         glossary=glossary,
         character_reference=character_reference,
     )
-
-    backend = get_backend()
-
-    # 执行翻译（带重试）
-    for attempt in range(4):
+    # The source JSON already is the complete context for a normal single
+    # request. Preserve genuinely additional caller context without duplicating
+    # the same transcript that main.py passes for metrics and batch mode.
+    if (
+        global_context is not None
+        and global_context.strip()
+        and global_context.strip() != generated_context.strip()
+    ):
+        messages[0]["content"] += (
+            "\n\n调用者提供的额外全片上下文（仅供指代和语气判断，不要翻译）：\n"
+            + global_context.strip()
+        )
+    missing_indexes: list[int] = []
+    zh_texts: list[str | None] = [None] * expected_count
+    for attempt in range(TRANSLATION_API_RETRIES):
         _raise_if_cancelled(cancel_event)
-
+        _emit_progress(on_progress, {"phase": "reset", "attempt": attempt})
         try:
-            raw_output = backend.chat_completion(
+            raw_output = _chat_with_reasoning(
                 messages,
-                temperature=0.6,
-                top_p=0.9,
-                max_tokens=384000,
+                expected_count=expected_count,
                 reasoning_effort=reasoning_effort,
-                cancel_event=cancel_event,
+                api_format=api_format,
                 on_progress=on_progress,
+                on_usage=request_usages.append,
+                cancel_event=cancel_event,
             )
-
             _raise_if_cancelled(cancel_event)
             zh_texts = _parse_translation_output(raw_output, expected_count)
-            missing_indexes = [i for i, text in enumerate(zh_texts) if not text]
-
-            if not missing_indexes:
-                break
-
-        except Exception as exc:
-            if attempt < 3:
-                time.sleep(min(20.0, 1.5 * (2**attempt)))
+            missing_indexes = _missing_indexes(zh_texts)
+            if missing_indexes:
+                raise RetryableTranslationFormatError(
+                    f"{_JSON_OUTPUT_LABEL} returned incomplete translations: "
+                    f"{len(missing_indexes)} missing of {expected_count}; "
+                    f"missing ids={missing_indexes[:50]}"
+                )
+            break
+        except RetryableTranslationFormatError as exc:
+            if attempt < TRANSLATION_API_RETRIES - 1:
+                _call_request_backoff_sleep(attempt, exc, cancel_event=cancel_event)
                 continue
-            raise RuntimeError(f"Translation failed after {attempt + 1} attempts") from exc
+            raise RuntimeError(
+                "Single-request translation returned invalid or incomplete JSON after "
+                f"{TRANSLATION_API_RETRIES} attempts: {exc}"
+            ) from exc
 
     timing = {
         "start_index": 0,
         "segment_count": expected_count,
         "elapsed_s": time.perf_counter() - started,
         "mode": "single_request_full_context",
+        "request_count": 1,
+        "source_payload_chars": len(source_payload),
+        "global_context_chars": len(full_context),
+        "missing_count": 0,
+        "missing_indexes": [],
+        **_merge_usage_metrics(request_usages),
     }
-
     if on_batch_done:
+        _raise_if_cancelled(cancel_event)
         on_batch_done(timing)
-
     final_texts = [text or "" for text in zh_texts]
-
-    # 保存缓存
     if cache_path and batch_key:
-        _save_cache_entry(cache_path, batch_key, final_texts, threading.Lock())
-
-        # 保存 translation memory
+        _save_cache_entry(cache_path, batch_key, final_texts, _cache_lock)
         memory_entries: list[tuple[str, str]] = []
         for seg, text in zip(segments, final_texts):
             source_text = str(seg.get("text", ""))
             if text and _translation_memory_source_is_cacheable(source_text):
+                memory_entries.append(
+                    (
+                        _translation_memory_key(
+                            source_text,
+                            extra_glossary,
+                            glossary=glossary,
+                            target_lang=target_lang,
+                            character_reference=character_reference,
+                        ),
+                        text,
+                    )
+                )
+        if memory_entries:
+            _save_memory_entries(cache_path, memory_entries, _cache_lock)
+    return final_texts, [timing]
+
+
+def _translate_segments_batched(
+    segments: list[dict],
+    *,
+    batch_size: int,
+    max_workers: int,
+    global_context: str | None = None,
+    cache_path: str = "",
+    target_lang: str,
+    glossary: str,
+    character_reference: str,
+    reasoning_effort: str | None = None,
+    api_format: str | None = None,
+    on_batch_done=None,
+    on_progress: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[list[str], list[dict]]:
+    _raise_if_cancelled(cancel_event)
+    started = time.perf_counter()
+    batches = _split_into_batches(segments, batch_size)
+    expected_total = len(segments)
+    extra_glossary = _resolve_translation_extra_glossary(
+        segments, cache_path, glossary, api_format=api_format, cancel_event=cancel_event
+    )
+    full_context = (
+        global_context
+        if global_context is not None
+        else generate_global_context(segments)
+    )
+    context_char_limit = _translation_context_char_limit()
+    if context_char_limit > 0 and len(full_context) > context_char_limit:
+        full_context = full_context[:context_char_limit]
+    full_source_payload = _serialize_segments(segments, compact=True)
+    use_full_json_prefix = (
+        context_char_limit <= 0
+        or len(full_source_payload) <= context_char_limit
+    )
+    prefix_mode = "full_json_prefix" if use_full_json_prefix else "summary_fallback"
+    progress_callbacks, _ = _make_aggregated_progress_callback(
+        len(batches),
+        expected_total,
+        on_progress,
+    )
+    diagnostic_progress_lock = threading.Lock()
+
+    def emit_batch_diagnostic(payload: dict) -> None:
+        if on_progress is None:
+            return
+        with diagnostic_progress_lock:
+            _emit_progress(on_progress, payload)
+
+    zh_texts: list[str | None] = [None] * expected_total
+    timings_by_batch: dict[int, dict] = {}
+    translation_cache = (
+        _load_translation_cache(cache_path)
+        if cache_path
+        else {}
+    )
+    translation_memory = (
+        _load_translation_memory(cache_path)
+        if cache_path
+        else {}
+    )
+    pending_batches: list[tuple[int, list[dict]]] = []
+    worker_retry_events: list[dict] = []
+    warmup_timing: dict | None = None
+    exact_cache_hit_count = 0
+    translation_memory_hit_count = 0
+
+    for batch_index, batch_segments in enumerate(batches):
+        _raise_if_cancelled(cancel_event)
+        batch_key = _translation_cache_key(
+            batch_index,
+            batch_segments,
+            extra_glossary=extra_glossary,
+            glossary=glossary,
+            target_lang=target_lang,
+            character_reference=character_reference,
+        )
+        cached_texts = translation_cache.get(batch_key)
+        if isinstance(cached_texts, list) and len(cached_texts) == len(batch_segments):
+            exact_cache_hit_count += 1
+            print(f"[translation-cache] restored batch {batch_index} cache_key={batch_key}")
+            start_index = batch_index * batch_size
+            for offset, text in enumerate(cached_texts):
+                zh_texts[start_index + offset] = _normalize_translation_text(text) or ""
+            timing = {
+                "batch_index": batch_index,
+                "start_index": start_index,
+                "segment_count": len(batch_segments),
+                "elapsed_s": 0.0,
+                "mode": "translation_cache_hit",
+                "request_count": 0,
+                "source_payload_chars": 0,
+                "global_context_chars": len(full_context),
+                "prefix_mode": prefix_mode,
+                "requested_ids": list(range(start_index, start_index + len(batch_segments))),
+                "is_warmup": False,
+                **_merge_usage_metrics([]),
+                "missing_count": 0,
+                "missing_indexes": [],
+                "cache_hit": True,
+                "cache_hit_type": "exact_batch",
+                "translation_memory_hit_count": 0,
+            }
+            timings_by_batch[batch_index] = timing
+            _emit_progress(
+                progress_callbacks[batch_index],
+                {
+                    "phase": "done",
+                    "translated": len(batch_segments),
+                    "expected": len(batch_segments),
+                },
+            )
+            if on_batch_done:
+                _raise_if_cancelled(cancel_event)
+                on_batch_done(timing)
+        else:
+            start_index = batch_index * batch_size
+            memory_hit_ids: list[int] = []
+            for offset, seg in enumerate(batch_segments):
+                source_text = str(seg.get("text", ""))
+                if not cache_path or not _translation_memory_source_is_cacheable(source_text):
+                    continue
                 memory_key = _translation_memory_key(
                     source_text,
                     extra_glossary,
@@ -356,104 +1081,1830 @@ def _translate_segments_single_request(
                     target_lang=target_lang,
                     character_reference=character_reference,
                 )
-                memory_entries.append((memory_key, text))
+                memory_text = translation_memory.get(memory_key)
+                if isinstance(memory_text, str) and memory_text.strip():
+                    global_index = start_index + offset
+                    zh_texts[global_index] = _normalize_translation_text(memory_text) or ""
+                    memory_hit_ids.append(global_index)
 
-        if memory_entries:
-            _save_memory_entries(cache_path, memory_entries, threading.Lock())
+            if memory_hit_ids:
+                translation_memory_hit_count += len(memory_hit_ids)
+                print(
+                    "[translation-memory] restored "
+                    f"batch={batch_index} ids={memory_hit_ids[:20]}"
+                )
 
-    return final_texts, [timing]
+            if len(memory_hit_ids) == len(batch_segments):
+                local_texts = [
+                    zh_texts[start_index + offset] or ""
+                    for offset in range(len(batch_segments))
+                ]
+                if cache_path:
+                    _save_cache_entry(cache_path, batch_key, local_texts, _cache_lock)
+                    translation_cache[batch_key] = local_texts
+                timing = {
+                    "batch_index": batch_index,
+                    "start_index": start_index,
+                    "segment_count": len(batch_segments),
+                    "elapsed_s": 0.0,
+                    "mode": "translation_memory_hit",
+                    "request_count": 0,
+                    "source_payload_chars": 0,
+                    "global_context_chars": len(full_context),
+                    "prefix_mode": prefix_mode,
+                    "requested_ids": list(range(start_index, start_index + len(batch_segments))),
+                    "is_warmup": False,
+                    **_merge_usage_metrics([]),
+                    "missing_count": 0,
+                    "missing_indexes": [],
+                    "cache_hit": True,
+                    "cache_hit_type": "translation_memory",
+                    "translation_memory_hit_count": len(memory_hit_ids),
+                }
+                timings_by_batch[batch_index] = timing
+                _emit_progress(
+                    progress_callbacks[batch_index],
+                    {
+                        "phase": "done",
+                        "translated": len(batch_segments),
+                        "expected": len(batch_segments),
+                    },
+                )
+                if on_batch_done:
+                    _raise_if_cancelled(cancel_event)
+                    on_batch_done(timing)
+            else:
+                if memory_hit_ids:
+                    _emit_progress(
+                        progress_callbacks[batch_index],
+                        {
+                            "phase": "translating",
+                            "translated": len(memory_hit_ids),
+                            "expected": len(batch_segments),
+                        },
+                    )
+                pending_batches.append((batch_index, batch_segments))
+
+    _raise_if_cancelled(cancel_event)
+    if (
+        pending_batches
+        and TRANSLATION_PREFIX_WARMUP
+        and selected_backend_name() == "openai"
+    ):
+        warmup_started = time.perf_counter()
+        warmup_usages: list[dict] = []
+        warmup_kwargs = {
+            "batch_index": 0,
+            "extra_glossary": extra_glossary,
+            "target_lang": target_lang,
+            "glossary": glossary,
+            "requested_ids": [],
+            "warmup": True,
+        }
+        if use_full_json_prefix:
+            warmup_kwargs["full_source_payload"] = full_source_payload
+        else:
+            warmup_kwargs["source_payload_override"] = "[]"
+        warmup_messages = _build_batch_messages(
+            [],
+            full_context,
+            character_reference,
+            0,
+            **warmup_kwargs,
+        )
+        try:
+            _raise_if_cancelled(cancel_event)
+            _chat_with_reasoning(
+                warmup_messages,
+                expected_count=0,
+                reasoning_effort=reasoning_effort,
+                api_format=api_format,
+                on_usage=warmup_usages.append,
+                cancel_event=cancel_event,
+            )
+            warmup_timing = {
+                "batch_index": None,
+                "start_index": 0,
+                "segment_count": 0,
+                "elapsed_s": time.perf_counter() - warmup_started,
+                "mode": "translation_prefix_warmup",
+                "request_count": 1,
+                "source_payload_chars": 0,
+                "global_context_chars": (
+                    len(full_source_payload)
+                    if use_full_json_prefix
+                    else len(full_context)
+                ),
+                "prefix_mode": prefix_mode,
+                "requested_ids": [],
+                "is_warmup": True,
+                "missing_count": 0,
+                "missing_indexes": [],
+                **_merge_usage_metrics(warmup_usages),
+            }
+        except Exception as exc:
+            if isinstance(exc, TranslationCancelledError):
+                raise
+            warmup_timing = {
+                "batch_index": None,
+                "start_index": 0,
+                "segment_count": 0,
+                "elapsed_s": time.perf_counter() - warmup_started,
+                "mode": "translation_prefix_warmup_failed",
+                "request_count": 1,
+                "source_payload_chars": 0,
+                "global_context_chars": (
+                    len(full_source_payload)
+                    if use_full_json_prefix
+                    else len(full_context)
+                ),
+                "prefix_mode": prefix_mode,
+                "requested_ids": [],
+                "is_warmup": True,
+                "missing_count": 0,
+                "missing_indexes": [],
+                "error": str(exc)[:500],
+                **_merge_usage_metrics(warmup_usages),
+            }
+            print(f"[WARN] translation prefix warmup failed: {exc}", flush=True)
+
+    def run_batch(batch_index: int, batch_segments: list[dict]) -> tuple[int, list[str | None], dict, list[dict]]:
+        _raise_if_cancelled(cancel_event)
+        # Worker threads do not inherit the caller's thread-local retry events,
+        # so _record_api_retry_event would silently no-op. Bind a per-batch
+        # container here so retry signals are captured, then merge it back on
+        # the main thread. finally-cleanup is unnecessary because these
+        # ThreadPoolExecutor workers are scoped to this single batched call.
+        batch_retry_events: list[dict] = []
+        _RETRY_CONTEXT.events = batch_retry_events
+        batch_started = time.perf_counter()
+        batch_started_ts = time.time()
+        worker_thread = threading.current_thread()
+        worker_thread_id = threading.get_ident()
+        worker_thread_name = worker_thread.name
+        start_index = batch_index * batch_size
+        expected_count = len(batch_segments)
+        all_batch_ids = list(range(start_index, start_index + expected_count))
+        requested_segments: list[dict] = []
+        expected_ids: list[int] = []
+        batch_results: list[str | None] = [None] * expected_total
+        for offset, seg in enumerate(batch_segments):
+            global_index = start_index + offset
+            cached_text = zh_texts[global_index]
+            if cached_text is not None:
+                batch_results[global_index] = cached_text
+                continue
+            requested_segments.append(seg)
+            expected_ids.append(global_index)
+        source_payload = _serialize_segments(
+            requested_segments,
+            explicit_ids=expected_ids,
+        )
+        trace_base = {
+            "diagnostic": True,
+            "batch_index": batch_index,
+            "start_index": start_index,
+            "segment_count": expected_count,
+            "thread_id": worker_thread_id,
+            "thread_name": worker_thread_name,
+            "started_ts": batch_started_ts,
+            "requested_ids": expected_ids,
+        }
+        emit_batch_diagnostic({"phase": "batch_start", **trace_base})
+        messages = _build_batch_messages(
+            requested_segments,
+            full_context,
+            character_reference,
+            len(requested_segments),
+            batch_index=batch_index,
+            extra_glossary=extra_glossary,
+            target_lang=target_lang,
+            glossary=glossary,
+            source_payload_override=source_payload,
+            full_source_payload=full_source_payload if use_full_json_prefix else None,
+            requested_ids=expected_ids,
+        )
+        missing_indexes: list[int] = []
+        progress_callback = progress_callbacks[batch_index]
+        request_count = 0
+        pending_ids = list(expected_ids)
+        pending_segments = list(requested_segments)
+        request_usages: list[dict] = []
+        first_token_ts: float | None = None
+        active_request_index = 0
+        active_requested_ids = list(expected_ids)
+
+        def trace_progress(evt: dict) -> None:
+            nonlocal first_token_ts
+            payload = dict(evt)
+            phase = payload.get("phase")
+            if phase in {"thinking", "translating", "done"} and first_token_ts is None:
+                first_token_ts = time.time()
+                emit_batch_diagnostic(
+                    {
+                        "phase": "batch_first_token",
+                        **trace_base,
+                        "first_token_ts": first_token_ts,
+                        "source_phase": phase,
+                        "request_index": active_request_index,
+                        "requested_ids": list(active_requested_ids),
+                    }
+                )
+            _emit_progress(progress_callback, payload)
+
+        attempts_for_pending = 0
+        retry_limit_for_pending = TRANSLATION_API_RETRIES
+        last_retry_error: RetryableTranslationFormatError | None = None
+
+        while True:
+            _raise_if_cancelled(cancel_event)
+            if request_count >= TRANSLATION_BATCH_MAX_REQUESTS:
+                raise RuntimeError(
+                    "Batch translation exceeded hard request cap "
+                    f"({TRANSLATION_BATCH_MAX_REQUESTS}): batch={batch_index}, "
+                    f"start_index={start_index}, size={expected_count}, "
+                    f"pending_ids={pending_ids[:50]}, error={last_retry_error}"
+                ) from last_retry_error
+            if attempts_for_pending >= retry_limit_for_pending:
+                raise RuntimeError(
+                    "Batch translation returned invalid or incomplete JSON after "
+                    f"{request_count} attempts: batch={batch_index}, "
+                    f"start_index={start_index}, size={expected_count}, "
+                    f"pending_ids={pending_ids[:50]}, error={last_retry_error}"
+                ) from last_retry_error
+
+            requested_ids = list(pending_ids)
+            active_request_index = request_count
+            active_requested_ids = list(requested_ids)
+            trace_progress({"phase": "reset", "attempt": request_count})
+            try:
+                _raise_if_cancelled(cancel_event)
+                if request_count == 0:
+                    request_messages = messages
+                    request_expected_count = len(requested_segments)
+                    request_source_payload = source_payload
+                else:
+                    request_expected_count = len(pending_segments)
+                    request_source_payload = _serialize_segments(
+                        pending_segments,
+                        explicit_ids=pending_ids,
+                    )
+                    request_messages = _build_batch_messages(
+                        pending_segments,
+                        full_context,
+                        character_reference,
+                        request_expected_count,
+                        batch_index=batch_index,
+                        extra_glossary=extra_glossary,
+                        target_lang=target_lang,
+                        glossary=glossary,
+                        source_payload_override=request_source_payload,
+                        full_source_payload=full_source_payload if use_full_json_prefix else None,
+                        requested_ids=pending_ids,
+                    )
+                request_count += 1
+                raw_output = _chat_with_reasoning(
+                    request_messages,
+                    expected_count=request_expected_count,
+                    reasoning_effort=reasoning_effort,
+                    api_format=api_format,
+                    on_progress=trace_progress,
+                    on_usage=request_usages.append,
+                    cancel_event=cancel_event,
+                )
+                _raise_if_cancelled(cancel_event)
+                parsed = _parse_partial_translation_output_by_global_id(
+                    raw_output,
+                    expected_ids=pending_ids,
+                    total_count=expected_total,
+                )
+                for idx in pending_ids:
+                    if parsed[idx]:
+                        batch_results[idx] = parsed[idx]
+                missing_indexes = [
+                    index
+                    for index in all_batch_ids
+                    if batch_results[index] is None
+                ]
+                if not missing_indexes:
+                    break
+
+                pending_ids = list(missing_indexes)
+                pending_segments = [
+                    batch_segments[index - start_index]
+                    for index in pending_ids
+                ]
+                last_retry_error = RetryableTranslationFormatError(
+                    f"{_JSON_OUTPUT_LABEL} returned incomplete batch translations: "
+                    f"{len(missing_indexes)} missing of {expected_count}; "
+                    f"missing ids={missing_indexes[:50]}"
+                )
+                if len(missing_indexes) < len(requested_ids):
+                    attempts_for_pending = 0
+                    retry_limit_for_pending = TRANSLATION_BATCH_REPAIR_RETRIES
+                else:
+                    attempts_for_pending += 1
+            except RetryableTranslationFormatError as exc:
+                last_retry_error = exc
+                attempts_for_pending += 1
+
+            if attempts_for_pending < retry_limit_for_pending:
+                sleep_attempt = max(0, attempts_for_pending - 1)
+                _call_request_backoff_sleep(
+                    sleep_attempt,
+                    last_retry_error,
+                    cancel_event=cancel_event,
+                )
+                continue
+
+            raise RuntimeError(
+                "Batch translation returned invalid or incomplete JSON after "
+                f"{request_count} attempts: batch={batch_index}, "
+                f"start_index={start_index}, size={expected_count}, "
+                f"pending_ids={pending_ids[:50]}, error={last_retry_error}"
+            ) from last_retry_error
+
+        batch_elapsed_s = time.perf_counter() - batch_started
+        batch_finished_ts = time.time()
+        if first_token_ts is None:
+            first_token_ts = batch_finished_ts
+        emit_batch_diagnostic(
+            {
+                "phase": "batch_finish",
+                **trace_base,
+                "first_token_ts": first_token_ts,
+                "finished_ts": batch_finished_ts,
+                "elapsed_s": batch_elapsed_s,
+                "request_count": request_count,
+                "missing_count": len(missing_indexes),
+                "missing_indexes": missing_indexes,
+            }
+        )
+
+        timing = {
+            "batch_index": batch_index,
+            "start_index": start_index,
+            "segment_count": expected_count,
+            "elapsed_s": batch_elapsed_s,
+            "mode": "batched_full_context",
+            "request_count": request_count,
+            "source_payload_chars": len(source_payload),
+            "global_context_chars": len(full_source_payload) if use_full_json_prefix else len(full_context),
+            "prefix_mode": prefix_mode,
+            "requested_ids": expected_ids,
+            "is_warmup": False,
+            "started_ts": batch_started_ts,
+            "first_token_ts": first_token_ts,
+            "finished_ts": batch_finished_ts,
+            "worker_thread_id": worker_thread_id,
+            "worker_thread_name": worker_thread_name,
+            **_merge_usage_metrics(request_usages),
+            "missing_count": len(missing_indexes),
+            "missing_indexes": missing_indexes,
+            "translation_memory_hit_count": expected_count - len(expected_ids),
+            "cache_hit_type": "mixed" if len(expected_ids) < expected_count else "miss",
+        }
+        return batch_index, batch_results, timing, batch_retry_events
+
+    if pending_batches:
+        executor = ThreadPoolExecutor(max_workers=min(max_workers, len(pending_batches)))
+        try:
+            _raise_if_cancelled(cancel_event)
+            pending_by_index = {
+                batch_index: batch for batch_index, batch in pending_batches
+            }
+            futures = {
+                executor.submit(run_batch, batch_index, batch): batch_index
+                for batch_index, batch in pending_batches
+            }
+            try:
+                remaining = set(futures)
+                while remaining:
+                    _raise_if_cancelled(cancel_event)
+                    done, remaining = wait(
+                        remaining,
+                        timeout=0.1,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not done:
+                        continue
+                    for future in sorted(done, key=lambda item: futures[item]):
+                        _raise_if_cancelled(cancel_event)
+                        batch_index, batch_results, timing, batch_retry_events = future.result()
+                        worker_retry_events.extend(batch_retry_events)
+                        timings_by_batch[batch_index] = timing
+                        start_index = int(timing["start_index"])
+                        segment_count = int(timing["segment_count"])
+                        local_texts: list[str] = []
+                        memory_entries: list[tuple[str, str]] = []
+                        for offset in range(segment_count):
+                            global_index = start_index + offset
+                            text = batch_results[global_index] or zh_texts[global_index] or ""
+                            zh_texts[global_index] = text
+                            local_texts.append(text)
+                            source_text = str(
+                                pending_by_index[batch_index][offset].get("text", "")
+                            )
+                            if (
+                                cache_path
+                                and text
+                                and _translation_memory_source_is_cacheable(source_text)
+                            ):
+                                memory_key = _translation_memory_key(
+                                    source_text,
+                                    extra_glossary,
+                                    glossary=glossary,
+                                    target_lang=target_lang,
+                                    character_reference=character_reference,
+                                )
+                                memory_entries.append((memory_key, text))
+                        if cache_path:
+                            batch_key = _translation_cache_key(
+                                batch_index,
+                                pending_by_index[batch_index],
+                                extra_glossary=extra_glossary,
+                                glossary=glossary,
+                                target_lang=target_lang,
+                                character_reference=character_reference,
+                            )
+                            _save_cache_entry(
+                                cache_path,
+                                batch_key,
+                                local_texts,
+                                _cache_lock,
+                            )
+                            translation_cache[batch_key] = local_texts
+                            if memory_entries:
+                                _save_memory_entries(
+                                    cache_path,
+                                    memory_entries,
+                                    _cache_lock,
+                                )
+                                for memory_key, memory_text in memory_entries:
+                                    translation_memory[memory_key] = memory_text
+                            print(f"[translation-cache] saved batch {batch_index} cache_key={batch_key}")
+                            if _test_crash_translation_batch() == batch_index + 1:
+                                for pending_future in futures:
+                                    if pending_future is not future:
+                                        pending_future.cancel()
+                                raise SystemExit(1)
+                        if on_batch_done:
+                            _raise_if_cancelled(cancel_event)
+                            on_batch_done(timing)
+            except BaseException:
+                raise
+        except BaseException:
+            for pending_future in futures:
+                pending_future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+
+    _raise_if_cancelled(cancel_event)
+    missing = _missing_indexes(zh_texts)
+    if missing:
+        raise RuntimeError(
+            "Batched translation finished with missing translations: "
+            f"{len(missing)} missing; ids={missing[:50]}"
+        )
+
+    timings = []
+    if warmup_timing is not None:
+        timings.append(warmup_timing)
+    timings.extend(timings_by_batch[index] for index in sorted(timings_by_batch))
+    timings.append(
+        {
+            "start_index": 0,
+            "segment_count": expected_total,
+            "elapsed_s": time.perf_counter() - started,
+            "mode": "batched_full_context_total",
+            "request_count": len(pending_batches),
+            "batch_size": batch_size,
+            "max_workers": max_workers,
+            "cache_hit_count": exact_cache_hit_count,
+            "translation_memory_hit_count": translation_memory_hit_count,
+            "prefix_mode": prefix_mode,
+            "is_warmup": False,
+            "requested_ids": [],
+            "missing_count": 0,
+            "missing_indexes": [],
+        }
+    )
+    return [text or "" for text in zh_texts], timings, worker_retry_events
 
 
-def _auto_translation_batch_size(segment_count: int, max_workers: int) -> int:
-    """自动计算批次大小"""
-    count = max(0, int(segment_count))
-    if count <= 0:
-        return 0
-    return min(count, TRANSLATION_BATCH_SIZE)
+def _apply_translation_repair_pass(
+    segments: list[dict],
+    zh_texts: list[str],
+    *,
+    target_lang: str,
+    glossary: str,
+    character_reference: str,
+    reasoning_effort: str | None = None,
+    api_format: str | None = None,
+    on_progress: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    cache_writer: Callable[[list[str]], None] | None = None,
+) -> tuple[list[str], dict | None]:
+    _raise_if_cancelled(cancel_event)
+    repair_ids, reasons = _select_translation_repair_ids(segments, zh_texts)
+    if not repair_ids:
+        return zh_texts, None
+
+    if TRANSLATION_REPAIR_MAX_IDS <= 0:
+        return zh_texts, None
+    repair_ids = repair_ids[:TRANSLATION_REPAIR_MAX_IDS]
+    started = time.perf_counter()
+    request_usages: list[dict] = []
+    _emit_progress(
+        on_progress,
+        {
+            "phase": "repair_start",
+            "repair_ids": repair_ids,
+            "candidate_count": len(repair_ids),
+        },
+    )
+    try:
+        _raise_if_cancelled(cancel_event)
+        messages = _build_repair_messages(
+            segments,
+            zh_texts,
+            repair_ids,
+            reasons,
+            target_lang=target_lang,
+            glossary=glossary,
+            character_reference=character_reference,
+        )
+        raw_output = _chat_with_reasoning(
+            messages,
+            expected_count=len(repair_ids),
+            reasoning_effort=reasoning_effort,
+            api_format=api_format,
+            on_usage=request_usages.append,
+            cancel_event=cancel_event,
+        )
+        _raise_if_cancelled(cancel_event)
+        parsed = _parse_translation_output_by_global_id(
+            raw_output,
+            expected_ids=repair_ids,
+            total_count=len(segments),
+        )
+        repaired_texts = list(zh_texts)
+        repaired_count = 0
+        for idx in repair_ids:
+            _raise_if_cancelled(cancel_event)
+            if parsed[idx]:
+                repaired_texts[idx] = parsed[idx] or repaired_texts[idx]
+                repaired_count += 1
+        if repaired_count > 0 and cache_writer is not None:
+            # Persist repaired texts back into the translation cache so a re-run
+            # doesn't pay for the same repair again. Idempotent: _save_cache_entry
+            # appends and reads dedupe by last-write-wins per batch_key.
+            try:
+                cache_writer(repaired_texts)
+            except TranslationCancelledError:
+                raise
+            except Exception as exc:
+                print(
+                    f"[WARN] failed to persist repaired translation cache: {exc}",
+                    flush=True,
+                )
+        timing = {
+            "mode": "translation_repair_pass",
+            "start_index": min(repair_ids),
+            "segment_count": repaired_count,
+            "elapsed_s": time.perf_counter() - started,
+            "request_count": 1,
+            "repair_ids": repair_ids,
+            "candidate_count": len(repair_ids),
+            "missing_count": len(repair_ids) - repaired_count,
+            "missing_indexes": [
+                idx for idx in repair_ids if parsed[idx] is None
+            ],
+            **_merge_usage_metrics(request_usages),
+        }
+        _emit_progress(
+            on_progress,
+            {
+                "phase": "repair_done",
+                "repair_ids": repair_ids,
+                "repaired": repaired_count,
+                "expected": len(repair_ids),
+            },
+        )
+        return repaired_texts, timing
+    except Exception as exc:
+        if isinstance(exc, TranslationCancelledError):
+            raise
+        timing = {
+            "mode": "translation_repair_failed",
+            "start_index": min(repair_ids),
+            "segment_count": 0,
+            "elapsed_s": time.perf_counter() - started,
+            "request_count": 1,
+            "repair_ids": repair_ids,
+            "candidate_count": len(repair_ids),
+            "missing_count": len(repair_ids),
+            "missing_indexes": repair_ids,
+            "error": str(exc)[:500],
+            **_merge_usage_metrics(request_usages),
+        }
+        print(f"[WARN] translation repair failed: {exc}", flush=True)
+        _emit_progress(
+            on_progress,
+            {
+                "phase": "repair_failed",
+                "repair_ids": repair_ids,
+                "error": str(exc)[:200],
+            },
+        )
+        return zh_texts, timing
+
+
+def _select_translation_repair_ids(
+    segments: list[dict],
+    zh_texts: list[str],
+) -> tuple[list[int], dict[int, list[str]]]:
+    repair_ids: list[int] = []
+    reasons: dict[int, list[str]] = {}
+    for idx, seg in enumerate(segments):
+        source = _repair_source_text(seg)
+        target = _repair_translation_text(seg, zh_texts, idx)
+        local_reasons: list[str] = []
+        if _has_translation_length_mismatch(source, target):
+            local_reasons.append("length_mismatch")
+        if not local_reasons:
+            continue
+        repair_ids.append(idx)
+        reasons[idx] = list(dict.fromkeys(local_reasons))
+    repair_ids.sort()
+    return repair_ids, reasons
+
+
+def _repair_source_text(seg: dict) -> str:
+    return _normalize_source_text(
+        seg.get("source")
+        or seg.get("ja_text")
+        or seg.get("text")
+        or seg.get("ja")
+        or ""
+    )
+
+
+def _repair_translation_text(seg: dict, zh_texts: list[str], idx: int) -> str:
+    if idx < len(zh_texts) and zh_texts[idx] is not None:
+        return str(zh_texts[idx]).strip()
+    return str(seg.get("translation") or "").strip()
+
+
+def _has_translation_length_mismatch(source: str, target: str) -> bool:
+    ratio = len(target) / max(len(source), 1)
+    return (
+        ratio < TRANSLATION_REPAIR_LENGTH_RATIO_MIN
+        or ratio > TRANSLATION_REPAIR_LENGTH_RATIO_MAX
+    )
+
+
+def _build_repair_messages(
+    segments: list[dict],
+    zh_texts: list[str],
+    repair_ids: list[int],
+    reasons: dict[int, list[str]],
+    *,
+    target_lang: str,
+    glossary: str,
+    character_reference: str,
+) -> list[dict]:
+    system_prompt = _build_system_prompt(
+        character_reference,
+        target_lang=target_lang,
+        glossary=glossary,
+    )
+    system_prompt += (
+        "\n\n这是翻译后局部修复任务。只修复 requested_ids 中的译文；"
+        "只处理 reason 字段指出的译文长度异常，保持原字幕文本含义，不要根据上下文推测或改写源文。"
+        "reason 只是问题类别提示，不是固定译文；最终译文必须服从原文和既定术语。"
+        "性器官术语继续统一为肉棒/小穴，不要漂移成其他书面或错误译法。"
+    )
+    context_items = _build_repair_context_items(
+        segments,
+        zh_texts,
+        repair_ids,
+        reasons,
+    )
+    user_content = "\n\n".join(
+        [
+            "【翻译修复任务】",
+            f"requested_ids = {_format_requested_ids(repair_ids)}",
+            "只返回 requested_ids 中列出的 id，恰好返回这些 id，不要返回 context_only 项。",
+            "每个 text 只能是修复后的中文字幕；不要解释原因。",
+            "【局部上下文 JSON】",
+            json.dumps(context_items, ensure_ascii=False, indent=2),
+            '输出 JSON：{"translations":[{"id":0,"text":"..."}]}',
+        ]
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _build_repair_context_items(
+    segments: list[dict],
+    zh_texts: list[str],
+    repair_ids: list[int],
+    reasons: dict[int, list[str]],
+) -> list[dict]:
+    indexes: set[int] = set()
+    radius = TRANSLATION_REPAIR_CONTEXT_RADIUS
+    for idx in repair_ids:
+        indexes.update(range(max(0, idx - radius), min(len(segments), idx + radius + 1)))
+
+    items = []
+    repair_id_set = set(repair_ids)
+    for idx in sorted(indexes):
+        seg = segments[idx]
+        items.append(
+            {
+                "id": idx,
+                "role": "repair" if idx in repair_id_set else "context_only",
+                "reason": _public_repair_reasons(reasons.get(idx, [])),
+                "start": _safe_float(seg.get("start")),
+                "end": _safe_float(seg.get("end")),
+                "ja": _repair_source_text(seg),
+                "current_zh": _repair_translation_text(seg, zh_texts, idx),
+            }
+        )
+    return items
+
+
+def _public_repair_reasons(local_reasons: list[str]) -> list[str]:
+    public: list[str] = []
+    for reason in local_reasons:
+        if reason == "length_mismatch":
+            public.append("length_mismatch")
+        else:
+            public.append("translation_quality")
+    return list(dict.fromkeys(public))
 
 
 def _split_into_batches(segments: list[dict], batch_size: int) -> list[list[dict]]:
-    """将字幕段切分成批次"""
     if not segments:
         return []
     if batch_size <= 0:
         return [segments]
-    return [segments[i : i + batch_size] for i in range(0, len(segments), batch_size)]
+    return [segments[index : index + batch_size] for index in range(0, len(segments), batch_size)]
 
 
-def _normalize_glossary_text(text: str) -> str:
-    """标准化术语表文本"""
-    from llm.glossary import normalize_glossary_text
-    return normalize_glossary_text(text)
+def _auto_translation_batch_size(segment_count: int, max_workers: int) -> int:
+    count = max(0, int(segment_count))
+    if count <= 0:
+        return 0
+    if selected_backend_name() == "local":
+        try:
+            local_batch_size = int(os.getenv("LOCAL_MODEL_BATCH_SIZE", "16"))
+        except ValueError:
+            local_batch_size = 16
+        return min(count, max(1, min(64, local_batch_size)))
+    return min(count, TRANSLATION_BATCH_SIZE)
 
 
-def _resolve_translation_extra_glossary(
-    segments: list[dict],
-    cache_path: str,
-    glossary: str,
+_serialize_segments = prompt_module._serialize_segments
+
+
+def _build_system_prompt(
+    character_reference: str,
     *,
-    api_format: str | None,
-    cancel_event: threading.Event | None,
+    target_lang: str,
+    glossary: str,
+    compact: bool = False,
+    extra_glossary: str = "",
 ) -> str:
-    """提取全局术语表"""
-    # 这个功能暂时保持简单实现，后续可以增强
+    return prompt_module._build_system_prompt(
+        character_reference,
+        target_lang=target_lang,
+        glossary=glossary,
+        compact=compact,
+        extra_glossary=extra_glossary,
+    )
+
+
+def _build_translation_messages(
+    source_payload: str,
+    expected_count: int,
+    compact_system_prompt: bool = False,
+    extra_glossary: str = "",
+    target_lang: str = "简体中文",
+    glossary: str = "",
+    character_reference: str | None = None,
+) -> list[dict]:
+    effective_character_reference = (character_reference or "").strip()
+    system_prompt = _build_system_prompt(
+        effective_character_reference,
+        target_lang=target_lang,
+        glossary=glossary,
+        compact=compact_system_prompt,
+        extra_glossary=extra_glossary,
+    )
+    return prompt_module._build_translation_messages(
+        source_payload=source_payload,
+        expected_count=expected_count,
+        compact_system_prompt=compact_system_prompt,
+        extra_glossary=extra_glossary,
+        target_lang=target_lang,
+        glossary=glossary,
+        character_reference=effective_character_reference,
+        system_prompt=system_prompt,
+    )
+
+
+_format_requested_ids = prompt_module._format_requested_ids
+
+
+def _build_batch_messages(
+    batch_segments: list[dict],
+    full_segments_summary: str,
+    character_reference: str,
+    expected_count: int,
+    batch_index: int = 0,
+    extra_glossary: str = "",
+    target_lang: str = "简体中文",
+    glossary: str = "",
+    source_payload_override: str | None = None,
+    full_source_payload: str | None = None,
+    requested_ids: list[int] | None = None,
+    warmup: bool = False,
+) -> list[dict]:
+    return prompt_module._build_batch_messages(
+        batch_segments,
+        full_segments_summary,
+        character_reference,
+        expected_count,
+        batch_index=batch_index,
+        extra_glossary=extra_glossary,
+        target_lang=target_lang,
+        glossary=glossary,
+        source_payload_override=source_payload_override,
+        full_source_payload=full_source_payload,
+        requested_ids=requested_ids,
+        warmup=warmup,
+        compact_system_prompt_enabled=COMPACT_SYSTEM_PROMPT,
+    )
+
+
+_build_character_name_guidance = prompt_module._build_character_name_guidance
+
+
+def _is_retryable_api_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    if status_code in {408, 409, 429, 500, 502, 503, 504}:
+        return True
+
+    name = type(exc).__name__.lower()
+    return any(
+        marker in name
+        for marker in (
+            "ratelimit",
+            "timeout",
+            "connection",
+            "serviceunavailable",
+            "internalserver",
+            "protocol",
+        )
+    )
+
+
+def _is_stream_interrupted_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    name = type(exc).__name__.lower()
+    return (
+        "protocol" in name
+        or "incomplete chunked read" in message
+        or "peer closed connection" in message
+        or "incomplete message body" in message
+    )
+
+
+def _stream_interrupted_format_error(exc: Exception) -> RetryableTranslationFormatError:
+    return RetryableTranslationFormatError(
+        "LLM stream interrupted before complete JSON content: "
+        f"{type(exc).__name__}: {exc}"
+    )
+
+
+def _request_backoff_delay(attempt: int) -> float:
+    return min(
+        TRANSLATION_API_BACKOFF_MAX_S,
+        TRANSLATION_API_BACKOFF_BASE_S * (2**attempt),
+    )
+
+
+def _record_api_retry_event(
+    exc: Exception,
+    attempt: int,
+    delay_s: float,
+    *,
+    note: str = "",
+) -> None:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+
+    event = {
+        "attempt": attempt + 1,
+        "delay_s": delay_s,
+        "status_code": status_code,
+        "error_type": type(exc).__name__,
+        "message": str(exc)[:500],
+    }
+    if note:
+        event["note"] = note
+    local_events = _current_retry_events()
+    if local_events is not None:
+        local_events.append(event)
+
+
+def _interruptible_sleep(
+    total_s: float,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    remaining = max(0.0, float(total_s))
+    while remaining > 0:
+        if _cancel_requested(cancel_event):
+            return
+        sleep_for = min(0.1, remaining)
+        time.sleep(sleep_for)
+        remaining -= sleep_for
+
+
+def _request_backoff_sleep(
+    attempt: int, exc: Exception, cancel_event: threading.Event | None = None
+) -> None:
+    delay = _request_backoff_delay(attempt)
+    _record_api_retry_event(exc, attempt, delay)
+    _interruptible_sleep(delay, cancel_event)
+    _raise_if_cancelled(cancel_event)
+
+
+def _call_request_backoff_sleep(
+    attempt: int,
+    exc: Exception,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    if cancel_event is None:
+        _request_backoff_sleep(attempt, exc)
+        return
+    try:
+        _request_backoff_sleep(attempt, exc, cancel_event=cancel_event)
+    except TypeError as type_error:
+        if "cancel_event" not in str(type_error):
+            raise
+        _request_backoff_sleep(attempt, exc)
+
+
+def _create_chat_completion(
+    request: dict,
+    cancel_event: threading.Event | None = None,
+):
+    last_error: Exception | None = None
+
+    for attempt in range(TRANSLATION_API_RETRIES):
+        _raise_if_cancelled(cancel_event)
+        try:
+            return _get_client().chat.completions.create(**request)
+        except Exception as exc:
+            last_error = exc
+            if not _is_retryable_api_error(exc):
+                raise
+
+            if attempt < TRANSLATION_API_RETRIES - 1:
+                _call_request_backoff_sleep(attempt, exc, cancel_event=cancel_event)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("chat completion failed without an exception")
+
+
+def _create_response(
+    request: dict,
+    cancel_event: threading.Event | None = None,
+):
+    last_error: Exception | None = None
+
+    for attempt in range(TRANSLATION_API_RETRIES):
+        _raise_if_cancelled(cancel_event)
+        try:
+            return _get_client().responses.create(**request)
+        except Exception as exc:
+            last_error = exc
+            if not _is_retryable_api_error(exc):
+                raise
+
+            if attempt < TRANSLATION_API_RETRIES - 1:
+                _call_request_backoff_sleep(attempt, exc, cancel_event=cancel_event)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("response creation failed without an exception")
+
+
+def _call_create_chat_completion(
+    request: dict,
+    cancel_event: threading.Event | None = None,
+):
+    if cancel_event is None:
+        return _create_chat_completion(request)
+    try:
+        return _create_chat_completion(request, cancel_event=cancel_event)
+    except TypeError as exc:
+        if "cancel_event" not in str(exc):
+            raise
+        return _create_chat_completion(request)
+
+
+def _call_create_response(
+    request: dict,
+    cancel_event: threading.Event | None = None,
+):
+    if cancel_event is None:
+        return _create_response(request)
+    try:
+        return _create_response(request, cancel_event=cancel_event)
+    except TypeError as exc:
+        if "cancel_event" not in str(exc):
+            raise
+        return _create_response(request)
+
+
+def _emit_progress(
+    on_progress: Callable[[dict], None] | None,
+    payload: dict,
+) -> None:
+    if on_progress is None:
+        return
+    try:
+        on_progress(payload)
+    except Exception:
+        pass
+
+
+def _make_aggregated_progress_callback(
+    num_batches: int,
+    expected_total: int,
+    on_progress: Callable[[dict], None] | None,
+) -> tuple[list[Callable[[dict], None]], None]:
+    lock = threading.Lock()
+    batch_states: dict[int, dict] = {}
+    last_emit_ts = 0.0
+    done_emitted = False
+
+    def emit(payload: dict, *, force: bool = False) -> None:
+        nonlocal last_emit_ts
+        now = time.monotonic()
+        if not force and now - last_emit_ts < 0.25:
+            return
+        last_emit_ts = now
+        _emit_progress(on_progress, payload)
+
+    def build_payload() -> tuple[dict, bool] | None:
+        nonlocal done_emitted
+        if not batch_states:
+            return None
+
+        translated = sum(
+            int(state.get("translated", 0))
+            for state in batch_states.values()
+            if state.get("phase") in {"translating", "done"}
+        )
+        if (
+            num_batches > 0
+            and len(batch_states) >= num_batches
+            and all(state.get("phase") == "done" for state in batch_states.values())
+        ):
+            if done_emitted:
+                return None
+            done_emitted = True
+            return (
+                {"phase": "done", "translated": expected_total, "expected": expected_total},
+                True,
+            )
+
+        if any(state.get("phase") == "translating" for state in batch_states.values()):
+            return (
+                {
+                    "phase": "translating",
+                    "translated": translated,
+                    "expected": expected_total,
+                    "content_chars": sum(
+                        int(state.get("content_chars", 0))
+                        for state in batch_states.values()
+                    ),
+                },
+                False,
+            )
+
+        if any(state.get("phase") == "thinking" for state in batch_states.values()):
+            return (
+                {
+                    "phase": "thinking",
+                    "reasoning_chars": max(
+                        int(state.get("reasoning_chars", 0))
+                        for state in batch_states.values()
+                    ),
+                },
+                False,
+            )
+
+        if any(state.get("phase") == "reset" for state in batch_states.values()):
+            return (
+                {
+                    "phase": "reset",
+                    "attempt": max(
+                        int(state.get("attempt", 0))
+                        for state in batch_states.values()
+                    ),
+                },
+                True,
+            )
+        return None
+
+    def make_wrapper(batch_id: int) -> Callable[[dict], None]:
+        def wrapper(evt: dict) -> None:
+            try:
+                payload: tuple[dict, bool] | None
+                with lock:
+                    batch_states[batch_id] = dict(evt)
+                    payload = build_payload()
+                if payload is None:
+                    return
+                emit(payload[0], force=payload[1])
+            except Exception:
+                pass
+
+        return wrapper
+
+    return [make_wrapper(batch_id) for batch_id in range(num_batches)], None
+
+
+def _count_translation_markers(
+    *,
+    piece: str,
+    id_scan_tail: str,
+    id_marker: str,
+) -> tuple[int, str]:
+    scan_text = id_scan_tail + piece
+    tail_len = len(id_scan_tail)
+    count = sum(
+        1
+        for match in re.finditer(re.escape(id_marker), scan_text)
+        if match.end() > tail_len
+    )
+    return count, scan_text[-(len(id_marker) - 1) :]
+
+
+def _emit_stream_content_progress(
+    *,
+    piece: str,
+    state: dict,
+    expected_count: int,
+    maybe_emit: Callable[[dict], None],
+) -> None:
+    state["final_content"].append(piece)
+    state["content_chars"] += len(piece)
+    count, state["id_scan_tail"] = _count_translation_markers(
+        piece=piece,
+        id_scan_tail=state["id_scan_tail"],
+        id_marker=state["id_marker"],
+    )
+    state["translated_count"] += count
+    maybe_emit(
+        {
+            "phase": "translating",
+            "translated": state["translated_count"],
+            "expected": expected_count,
+            "content_chars": state["content_chars"],
+        }
+    )
+
+
+def _build_responses_input(
+    messages: list[dict],
+) -> list[dict]:
+    response_input: list[dict] = []
+    for message in messages:
+        role = str(message.get("role") or "user")
+        content = message.get("content", "")
+        response_input.append(
+            {
+                "role": role,
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": str(content),
+                    }
+                ],
+            }
+        )
+    return response_input
+
+
+def _extract_response_output_text(response) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    parts: list[str] = []
+    for item in getattr(response, "output", []) or []:
+        for content in getattr(item, "content", []) or []:
+            text = getattr(content, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+                continue
+            if isinstance(content, dict) and isinstance(content.get("text"), str):
+                parts.append(content["text"])
+    return "".join(parts)
+
+
+def _response_event_type(event) -> str:
+    value = getattr(event, "type", "")
+    if value:
+        return str(value)
+    if isinstance(event, dict):
+        return str(event.get("type", ""))
     return ""
 
 
-def _parse_translation_output(raw_output: str, expected_count: int) -> list[str | None]:
-    """解析翻译输出"""
-    import json
-    import re
+def _response_event_delta(event) -> str:
+    value = getattr(event, "delta", None)
+    if value is None and isinstance(event, dict):
+        value = event.get("delta")
+    return value if isinstance(value, str) else ""
 
-    # 移除 thinking block
-    think_block_re = re.compile(r"<think>.*?</think>", re.S | re.I)
-    raw_output = think_block_re.sub("", raw_output or "").strip()
 
-    if not raw_output:
-        raise RetryableTranslationFormatError("LLM returned empty content.")
+def _response_event_response(event):
+    value = getattr(event, "response", None)
+    if value is None and isinstance(event, dict):
+        value = event.get("response")
+    return value
+
+
+def _response_incomplete_reason(response) -> str:
+    details = getattr(response, "incomplete_details", None)
+    if isinstance(details, dict):
+        return str(details.get("reason", ""))
+    return str(getattr(details, "reason", "") or "")
+
+
+def _chat(
+    messages: list[dict],
+    expected_count: int = 0,
+    on_progress: Callable[[dict], None] | None = None,
+    reasoning_effort: str | None = None,
+    api_format: str | None = None,
+    on_usage: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    response_schema: dict | None = None,
+    response_schema_name: str = "subtitle_translations",
+) -> str:
+    _raise_if_cancelled(cancel_event)
+    backend_name = selected_backend_name()
+    if backend_name != "openai":
+        backend = get_backend(backend_name)
+        return backend.chat_completion(
+            messages,
+            temperature=TRANSLATION_TEMPERATURE,
+            top_p=TRANSLATION_TOP_P,
+            max_tokens=TRANSLATION_MAX_TOKENS,
+            response_format=response_schema or _translation_output_schema(),
+            reasoning_effort=reasoning_effort,
+            api_format=api_format,
+            expected_count=expected_count,
+            cancel_event=cancel_event,
+            on_progress=on_progress,
+            on_usage=on_usage,
+        )
+    if _llm_api_format(api_format) == "responses":
+        return _chat_responses(
+            messages,
+            expected_count=expected_count,
+            on_progress=on_progress,
+            reasoning_effort=reasoning_effort,
+            on_usage=on_usage,
+            cancel_event=cancel_event,
+            response_schema=response_schema,
+            response_schema_name=response_schema_name,
+        )
+    return _chat_completions(
+        messages,
+        expected_count=expected_count,
+        on_progress=on_progress,
+        reasoning_effort=reasoning_effort,
+        on_usage=on_usage,
+        cancel_event=cancel_event,
+        response_schema=response_schema,
+        response_schema_name=response_schema_name,
+    )
+
+
+def _chat_completions(
+    messages: list[dict],
+    expected_count: int = 0,
+    on_progress: Callable[[dict], None] | None = None,
+    reasoning_effort: str | None = None,
+    on_usage: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    response_schema: dict | None = None,
+    response_schema_name: str = "subtitle_translations",
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
+) -> str:
+    _raise_if_cancelled(cancel_event)
+    model_name = os.getenv("LLM_MODEL_NAME", LLM_MODEL_NAME).strip()
+    if not model_name:
+        raise RuntimeError("请先在「翻译设置」中获取并选择翻译模型，再开始任务")
+    request = {
+        "model": model_name,
+        "messages": messages,
+        "stream": True,
+        "response_format": _chat_response_format(
+            model_name,
+            schema=response_schema,
+            schema_name=response_schema_name,
+        ),
+        "reasoning_effort": _normalize_reasoning_effort(
+            reasoning_effort or os.getenv("LLM_REASONING_EFFORT", LLM_REASONING_EFFORT)
+        ),
+        "extra_body": {"thinking": {"type": "enabled"}},
+        "stream_options": {"include_usage": True},
+        "temperature": TRANSLATION_TEMPERATURE if temperature is None else temperature,
+        "top_p": TRANSLATION_TOP_P if top_p is None else top_p,
+    }
+    effective_max_tokens = TRANSLATION_MAX_TOKENS if max_tokens is None else max_tokens
+    if effective_max_tokens > 0:
+        request["max_tokens"] = effective_max_tokens
+
+    try:
+        response_stream = _call_create_chat_completion(request, cancel_event=cancel_event)
+    except Exception as exc:
+        if "stream_options" not in request or "stream_options" not in str(exc):
+            raise
+        request = dict(request)
+        request.pop("stream_options", None)
+        response_stream = _call_create_chat_completion(request, cancel_event=cancel_event)
+
+    finish_reason = None
+    reasoning_chars = 0
+    last_emit = 0.0
+    debounce_s = 0.25
+    stream_state = {
+        "final_content": [],
+        "content_chars": 0,
+        "translated_count": 0,
+        "id_scan_tail": "",
+        "id_marker": '"id":',
+    }
+
+    def maybe_emit(payload: dict, *, force: bool = False) -> None:
+        nonlocal last_emit
+        now = time.monotonic()
+        if not force and now - last_emit < debounce_s:
+            return
+        last_emit = now
+        _emit_progress(on_progress, payload)
+
+    try:
+        for chunk in response_stream:
+            _raise_if_cancelled(cancel_event)
+            _emit_usage(on_usage, getattr(chunk, "usage", None))
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            reasoning_content = getattr(delta, "reasoning_content", None)
+            if reasoning_content:
+                reasoning_chars += len(reasoning_content)
+                maybe_emit(
+                    {"phase": "thinking", "reasoning_chars": reasoning_chars}
+                )
+            if hasattr(delta, "content") and delta.content:
+                _emit_stream_content_progress(
+                    piece=delta.content,
+                    state=stream_state,
+                    expected_count=expected_count,
+                    maybe_emit=maybe_emit,
+                )
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
+            _raise_if_cancelled(cancel_event)
+    except Exception as exc:
+        if _is_retryable_api_error(exc):
+            raise _stream_interrupted_format_error(exc) from exc
+        raise
+
+    _raise_if_cancelled(cancel_event)
+    if finish_reason == "length":
+        # Terminal failure, not retryable: retrying with the same max_tokens
+        # hits the same truncation and only burns budget. Propagates as a
+        # non-RetryableTranslationFormatError so the batch is marked failed via
+        # the normal failure path. JSON-parse failures below stay retryable.
+        raise RuntimeError(
+            f"{_JSON_OUTPUT_LABEL} response was cut off by max_tokens; "
+            "increase TRANSLATION_MAX_TOKENS."
+        )
+
+    final_content_str = "".join(stream_state["final_content"])
+    if not final_content_str.strip():
+        raise RetryableTranslationFormatError(f"{_JSON_OUTPUT_LABEL} returned empty content.")
+    _emit_progress(
+        on_progress,
+        {
+            "phase": "done",
+            "translated": stream_state["translated_count"],
+            "expected": expected_count,
+        },
+    )
+    return final_content_str.strip()
+
+
+def _chat_responses(
+    messages: list[dict],
+    expected_count: int = 0,
+    on_progress: Callable[[dict], None] | None = None,
+    reasoning_effort: str | None = None,
+    on_usage: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    response_schema: dict | None = None,
+    response_schema_name: str = "subtitle_translations",
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
+) -> str:
+    _raise_if_cancelled(cancel_event)
+    model_name = os.getenv("LLM_MODEL_NAME", LLM_MODEL_NAME).strip()
+    if not model_name:
+        raise RuntimeError("请先在「翻译设置」中获取并选择翻译模型，再开始任务")
+
+    effective_reasoning_effort = (
+        _normalize_reasoning_effort(
+            reasoning_effort
+            or os.getenv("LLM_REASONING_EFFORT", LLM_REASONING_EFFORT)
+        )
+    )
+    api_format = "responses"
+    effective_temperature = TRANSLATION_TEMPERATURE if temperature is None else temperature
+    effective_top_p = TRANSLATION_TOP_P if top_p is None else top_p
+    effective_max_tokens = TRANSLATION_MAX_TOKENS if max_tokens is None else max_tokens
+    use_micu_grok_patch = llm_patch.is_micu_grok_responses_request(
+        model_name=model_name,
+        api_format=api_format,
+    )
+    if use_micu_grok_patch:
+        request = llm_patch.build_micu_grok_responses_request(
+            messages=messages,
+            model_name=model_name,
+            max_tokens=effective_max_tokens,
+            reasoning_effort=effective_reasoning_effort,
+            temperature=effective_temperature,
+            top_p=effective_top_p,
+        )
+    else:
+        request = {
+            "model": model_name,
+            "input": _build_responses_input(messages),
+            "stream": True,
+            "reasoning": {
+                "effort": effective_reasoning_effort
+            },
+            "text": _responses_text_format(
+                model_name,
+                schema=response_schema,
+                schema_name=response_schema_name,
+            ),
+            "temperature": effective_temperature,
+            "top_p": effective_top_p,
+        }
+        if effective_max_tokens > 0:
+            request["max_output_tokens"] = effective_max_tokens
+
+    response_stream = (
+        llm_patch.create_micu_grok_response_stream(
+            request,
+            api_key=_required_env("API_KEY"),
+            base_url=_required_env("OPENAI_COMPATIBILITY_BASE_URL"),
+            api_retries=TRANSLATION_API_RETRIES,
+            is_retryable_api_error=_is_retryable_api_error,
+            backoff_sleep=lambda attempt, exc: _call_request_backoff_sleep(
+                attempt,
+                exc,
+                cancel_event=cancel_event,
+            ),
+        )
+        if use_micu_grok_patch
+        else _call_create_response(request, cancel_event=cancel_event)
+    )
+
+    completed_response = None
+    incomplete_response = None
+    failed_error = None
+    reasoning_chars = 0
+    last_emit = 0.0
+    debounce_s = 0.25
+    stream_state = {
+        "final_content": [],
+        "content_chars": 0,
+        "translated_count": 0,
+        "id_scan_tail": "",
+        "id_marker": '"id":',
+    }
+
+    def maybe_emit(payload: dict, *, force: bool = False) -> None:
+        nonlocal last_emit
+        now = time.monotonic()
+        if not force and now - last_emit < debounce_s:
+            return
+        last_emit = now
+        _emit_progress(on_progress, payload)
+
+    try:
+        for event in response_stream:
+            _raise_if_cancelled(cancel_event)
+            event_type = _response_event_type(event)
+            if event_type == "response.output_text.delta":
+                piece = _response_event_delta(event)
+                if piece:
+                    _emit_stream_content_progress(
+                        piece=piece,
+                        state=stream_state,
+                        expected_count=expected_count,
+                        maybe_emit=maybe_emit,
+                    )
+                continue
+
+            if event_type in {
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_text.delta",
+            }:
+                reasoning_piece = _response_event_delta(event)
+                if reasoning_piece:
+                    reasoning_chars += len(reasoning_piece)
+                    maybe_emit(
+                        {"phase": "thinking", "reasoning_chars": reasoning_chars}
+                    )
+                continue
+
+            if event_type == "response.completed":
+                completed_response = _response_event_response(event)
+                _emit_usage(on_usage, _get_nested_value(completed_response, "usage"))
+                continue
+
+            if event_type == "response.incomplete":
+                incomplete_response = _response_event_response(event)
+                continue
+
+            if event_type in {"response.failed", "response.error"}:
+                failed_error = event
+            _raise_if_cancelled(cancel_event)
+    except Exception as exc:
+        if _is_retryable_api_error(exc):
+            raise _stream_interrupted_format_error(exc) from exc
+        raise
+
+    _raise_if_cancelled(cancel_event)
+    if failed_error is not None:
+        raise RetryableTranslationFormatError(
+            f"OpenAI Responses API failed: {failed_error}"
+        )
+
+    if incomplete_response is not None:
+        reason = _response_incomplete_reason(incomplete_response)
+        if reason == "max_output_tokens":
+            # Terminal failure, not retryable: same max_output_tokens cap would
+            # truncate again. JSON-parse / other-reason failures stay retryable.
+            raise RuntimeError(
+                "OpenAI Responses API response was cut off by max_output_tokens; "
+                "increase TRANSLATION_MAX_TOKENS."
+            )
+        raise RetryableTranslationFormatError(
+            f"OpenAI Responses API returned incomplete response: {reason or 'unknown'}"
+        )
+
+    final_content_str = "".join(stream_state["final_content"])
+    if not final_content_str.strip() and completed_response is not None:
+        final_content_str = _extract_response_output_text(completed_response)
+    if not final_content_str.strip():
+        raise RetryableTranslationFormatError("OpenAI Responses API returned empty content.")
+
+    _emit_progress(
+        on_progress,
+        {
+            "phase": "done",
+            "translated": stream_state["translated_count"],
+            "expected": expected_count,
+        },
+    )
+    return final_content_str.strip()
+
+
+def _strip_reasoning_artifacts(raw_output: str) -> str:
+    cleaned = _THINK_BLOCK_RE.sub("", raw_output or "")
+    close_tag = "</think>"
+    close_idx = cleaned.lower().rfind(close_tag)
+    if close_idx != -1:
+        cleaned = cleaned[close_idx + len(close_tag) :]
+    return cleaned.strip()
+
+
+def _parse_translation_output(
+    raw_output: str,
+    expected_count: int,
+) -> list[str | None]:
+    raw_output = _strip_reasoning_artifacts(raw_output)
+    if not raw_output.strip():
+        raise RetryableTranslationFormatError(
+            f"{_JSON_OUTPUT_LABEL} returned empty content."
+        )
 
     try:
         parsed = json.loads(raw_output)
     except json.JSONDecodeError as exc:
-        raise RetryableTranslationFormatError("LLM response was not valid JSON.") from exc
+        raise RetryableTranslationFormatError(
+            f"{_JSON_OUTPUT_LABEL} response was not valid JSON."
+        ) from exc
+    return _extract_translations_from_json(parsed, expected_count)
+
+
+def _parse_translation_output_by_global_id(
+    raw_output: str,
+    *,
+    expected_ids: list[int],
+    total_count: int,
+) -> list[str | None]:
+    raw_output = _strip_reasoning_artifacts(raw_output)
+    if not raw_output.strip():
+        raise RetryableTranslationFormatError(
+            f"{_JSON_OUTPUT_LABEL} returned empty content."
+        )
+
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError as exc:
+        raise RetryableTranslationFormatError(
+            f"{_JSON_OUTPUT_LABEL} response was not valid JSON."
+        ) from exc
 
     if not isinstance(parsed, dict) or not isinstance(parsed.get("translations"), list):
         raise RetryableTranslationFormatError(
-            'LLM response must be {"translations":[...]} .'
+            f'{_JSON_OUTPUT_LABEL} response must be {{"translations":[...]}} .'
         )
 
+    expected_id_set = set(expected_ids)
     translations = parsed["translations"]
-    if len(translations) != expected_count:
+    if len(translations) != len(expected_ids):
         raise RetryableTranslationFormatError(
-            f"LLM returned wrong translation count: {len(translations)} of {expected_count}."
+            f"{_JSON_OUTPUT_LABEL} returned wrong batch translation count: "
+            f"{len(translations)} of {len(expected_ids)}."
         )
 
-    results: list[str | None] = [None] * expected_count
+    results: list[str | None] = [None] * total_count
     seen_ids: set[int] = set()
-
     for item in translations:
         if not isinstance(item, dict):
-            raise RetryableTranslationFormatError("LLM translations must contain objects.")
-
-        idx = item.get("id")
-        if not isinstance(idx, int) or idx < 0 or idx >= expected_count:
-            raise RetryableTranslationFormatError(f"LLM returned invalid translation id: {idx}.")
-
+            raise RetryableTranslationFormatError(
+                f"{_JSON_OUTPUT_LABEL} translations must contain objects."
+            )
+        idx = _coerce_int(item.get("id"))
+        if idx is None or idx not in expected_id_set or idx >= total_count:
+            raise RetryableTranslationFormatError(
+                f"{_JSON_OUTPUT_LABEL} returned invalid batch translation id: {item.get('id')!r}."
+            )
         if idx in seen_ids:
-            raise RetryableTranslationFormatError(f"LLM returned duplicate translation id: {idx}.")
-
+            raise RetryableTranslationFormatError(
+                f"{_JSON_OUTPUT_LABEL} returned duplicate translation id: {idx}."
+            )
         seen_ids.add(idx)
-        text = str(item.get("text", "")).strip()
-        results[idx] = text if text else None
+        results[idx] = _normalize_translation_text(item.get("text"))
 
     return results
 
 
-# 保持向后兼容的导出
-__all__ = [
-    "translate_segments",
-    "generate_global_context",
-    "PROMPT_VERSION",
-    "TranslationCancelledError",
-    "RetryableTranslationFormatError",
-]
+def _parse_partial_translation_output_by_global_id(
+    raw_output: str,
+    *,
+    expected_ids: list[int],
+    total_count: int,
+) -> list[str | None]:
+    raw_output = _strip_reasoning_artifacts(raw_output)
+    if not raw_output.strip():
+        raise RetryableTranslationFormatError(
+            f"{_JSON_OUTPUT_LABEL} returned empty content."
+        )
+
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError as exc:
+        raise RetryableTranslationFormatError(
+            f"{_JSON_OUTPUT_LABEL} response was not valid JSON."
+        ) from exc
+
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("translations"), list):
+        raise RetryableTranslationFormatError(
+            f'{_JSON_OUTPUT_LABEL} response must be {{"translations":[...]}} .'
+        )
+
+    expected_id_set = set(expected_ids)
+    results: list[str | None] = [None] * total_count
+    seen_ids: set[int] = set()
+    for item in parsed["translations"]:
+        if not isinstance(item, dict):
+            continue
+        idx = _coerce_int(item.get("id"))
+        if idx is None or idx not in expected_id_set or idx >= total_count:
+            raise RetryableTranslationFormatError(
+                f"{_JSON_OUTPUT_LABEL} returned invalid batch translation id: {item.get('id')!r}."
+            )
+        if idx in seen_ids:
+            raise RetryableTranslationFormatError(
+                f"{_JSON_OUTPUT_LABEL} returned duplicate translation id: {idx}."
+            )
+        normalized = _normalize_translation_text(item.get("text"))
+        if normalized is None:
+            continue
+        seen_ids.add(idx)
+        results[idx] = normalized
+
+    return results
+
+
+def _extract_translations_from_json(data, expected_count: int) -> list[str | None]:
+    if not isinstance(data, dict) or not isinstance(data.get("translations"), list):
+        raise RetryableTranslationFormatError(
+            f'{_JSON_OUTPUT_LABEL} response must be {{"translations":[...]}} .'
+        )
+
+    translations = data["translations"]
+    if len(translations) != expected_count:
+        raise RetryableTranslationFormatError(
+            f"{_JSON_OUTPUT_LABEL} returned wrong translation count: "
+            f"{len(translations)} of {expected_count}."
+        )
+
+    results: list[str | None] = [None] * expected_count
+    seen_ids: set[int] = set()
+    for item in translations:
+        if not isinstance(item, dict):
+            raise RetryableTranslationFormatError(
+                f"{_JSON_OUTPUT_LABEL} translations must contain objects."
+            )
+
+        idx = _coerce_int(item.get("id"))
+        if idx is None or idx < 0 or idx >= expected_count:
+            raise RetryableTranslationFormatError(
+                f"{_JSON_OUTPUT_LABEL} returned invalid translation id: {item.get('id')!r}."
+            )
+        if idx in seen_ids:
+            raise RetryableTranslationFormatError(
+                f"{_JSON_OUTPUT_LABEL} returned duplicate translation id: {idx}."
+            )
+
+        seen_ids.add(idx)
+        results[idx] = _normalize_translation_text(item.get("text"))
+
+    return results
+
+
+def _coerce_int(value) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _normalize_translation_text(text) -> str | None:
+    if text is None:
+        return None
+
+    cleaned = str(text).strip()
+    if not cleaned:
+        return None
+
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = re.sub(r"^Translation>\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^Original>\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^['\"“”‘’]+|['\"“”‘’]+$", "", cleaned)
+    cleaned = "\n".join(line.strip() for line in cleaned.split("\n") if line.strip())
+    cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
+    cleaned = _LEADING_ROLE_LABEL_RE.sub("", cleaned, count=1)
+    if "\n" in cleaned:
+        cleaned = cleaned.replace("\n", "\\n")
+    return cleaned or None
+
+
+def _missing_indexes(values: list[str | None]) -> list[int]:
+    return [idx for idx, value in enumerate(values) if value is None or value == ""]

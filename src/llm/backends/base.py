@@ -3,6 +3,8 @@
 from abc import ABC, abstractmethod
 from typing import Callable
 
+from llm.errors import TranslationCancelledError
+
 
 class BaseTranslationBackend(ABC):
     """翻译后端抽象基类"""
@@ -18,12 +20,18 @@ class BaseTranslationBackend(ABC):
         response_format: dict | None = None,
         stream: bool = True,
         reasoning_effort: str | None = None,
+        api_format: str | None = None,
+        expected_count: int = 0,
         cancel_event = None,
         on_progress: Callable[[dict], None] | None = None,
         on_usage: Callable[[dict], None] | None = None,
     ) -> str:
         """执行翻译请求，返回完整内容"""
         pass
+
+    def cache_identity(self) -> str:
+        """Stable identity included in translation cache signatures."""
+        return self.name()
 
     def supports_json_schema(self) -> bool:
         """是否支持 JSON schema 约束"""
@@ -67,3 +75,12 @@ class BaseTranslationBackend(ABC):
             on_usage(usage_data)
         except Exception:
             pass
+
+    @staticmethod
+    def _raise_if_cancelled(cancel_event) -> None:
+        try:
+            cancelled = cancel_event is not None and cancel_event.is_set()
+        except Exception:
+            cancelled = False
+        if cancelled:
+            raise TranslationCancelledError("任务已取消")

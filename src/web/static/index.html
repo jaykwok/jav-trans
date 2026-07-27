@@ -229,7 +229,7 @@
 
               <label class="field">
                 <span>最大上下文长度</span>
-                <input type="number" id="local-model-max-length" value="32768" min="1024" max="131072" step="1024">
+                <input type="number" id="local-model-max-length" value="32768" min="512" max="131072" step="512">
               </label>
 
               <div class="toggle-row">
@@ -238,7 +238,7 @@
               </div>
 
               <p class="field-hint">
-                选择推荐模型后，首次使用会自动从 HuggingFace 下载到 <code>models/</code> 目录。
+                选择推荐模型后，首次使用会自动下载到当前 Hugging Face 缓存目录。
                 混元 Large 需要约 800GB 显存（多卡或量化），千问 72B 需要约 150GB 显存。
                 建议使用代理加速下载。
               </p>

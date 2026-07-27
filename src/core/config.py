@@ -181,8 +181,13 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "LOCAL_MODEL_PATH": "",
     # Device for local model inference: cuda | cpu
     "LOCAL_MODEL_DEVICE": "cuda",
+    # Empty selects float32 on CPU and bfloat16 on CUDA.
+    "LOCAL_MODEL_DTYPE": "",
     # Maximum context length for local model
     "LOCAL_MODEL_MAX_LENGTH": "32768",
+    # Conservative batch and generation caps for in-process inference.
+    "LOCAL_MODEL_BATCH_SIZE": "16",
+    "LOCAL_MODEL_MAX_NEW_TOKENS": "8192",
     # Auto-download model from HuggingFace if not present locally
     "LOCAL_MODEL_AUTO_DOWNLOAD": "1",
 

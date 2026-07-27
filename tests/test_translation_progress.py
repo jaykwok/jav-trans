@@ -167,6 +167,29 @@ def test_chat_uses_json_object_for_deepseek(monkeypatch):
     assert requests[0]["response_format"] == {"type": "json_object"}
 
 
+def test_glossary_request_uses_its_own_schema(monkeypatch, tmp_path):
+    requests: list[dict] = []
+    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
+    monkeypatch.setenv("LLM_API_FORMAT", "chat")
+    monkeypatch.setenv("LLM_MODEL_NAME", "gpt-5.5")
+    monkeypatch.setattr(
+        translator,
+        "_create_chat_completion",
+        lambda request: requests.append(request)
+        or _stream([], ['{"terms":[{"ja":"先生","zh":"老师"}]}']),
+    )
+
+    terms = translator.extract_global_glossary(
+        ["先生、ありがとう"],
+        str(tmp_path / "glossary.json"),
+    )
+
+    assert terms == [{"ja": "先生", "zh": "老师"}]
+    json_schema = requests[0]["response_format"]["json_schema"]
+    assert json_schema["name"] == "translation_glossary"
+    assert json_schema["schema"]["required"] == ["terms"]
+
+
 def test_openai_compat_base_url_defaults_to_v1():
     assert (
         translator._normalize_openai_compat_base_url("https://api.ticketpro.cc")

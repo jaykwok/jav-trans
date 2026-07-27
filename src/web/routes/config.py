@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -602,9 +603,19 @@ async def get_settings() -> SettingsRead:
     )
     target_lang = _runtime_or_env_or_setting("TARGET_LANG", "简体中文")
     translation_backend = _runtime_or_env_or_setting("TRANSLATION_BACKEND", "openai")
+    if translation_backend not in {"openai", "local"}:
+        translation_backend = "openai"
     local_model_path = _runtime_or_env_or_setting("LOCAL_MODEL_PATH", "")
     local_model_device = _runtime_or_env_or_setting("LOCAL_MODEL_DEVICE", "cuda")
-    local_model_max_length = int(_runtime_or_env_or_setting("LOCAL_MODEL_MAX_LENGTH", "32768"))
+    if local_model_device not in {"cuda", "cpu"}:
+        local_model_device = "cuda"
+    try:
+        local_model_max_length = int(
+            _runtime_or_env_or_setting("LOCAL_MODEL_MAX_LENGTH", "32768")
+        )
+    except (TypeError, ValueError):
+        local_model_max_length = 32768
+    local_model_max_length = max(512, min(1_000_000, local_model_max_length))
     local_model_auto_download = _truthy(_runtime_or_env_or_setting("LOCAL_MODEL_AUTO_DOWNLOAD", "1"))
 
     return SettingsRead(
@@ -630,6 +641,7 @@ async def get_settings() -> SettingsRead:
 @router.post("/settings")
 async def post_settings(update: SettingsUpdate) -> dict:
     changes: dict[str, str] = {}
+    reset_local_translation_backend = False
     if update.api_key is not None:
         changes["API_KEY"] = update.api_key
         os.environ["API_KEY"] = update.api_key
@@ -667,9 +679,11 @@ async def post_settings(update: SettingsUpdate) -> dict:
             )
         changes["TRANSLATION_BACKEND"] = update.translation_backend
         os.environ["TRANSLATION_BACKEND"] = update.translation_backend
+        reset_local_translation_backend = update.translation_backend != "local"
     if update.local_model_path is not None:
         changes["LOCAL_MODEL_PATH"] = update.local_model_path
         os.environ["LOCAL_MODEL_PATH"] = update.local_model_path
+        reset_local_translation_backend = True
     if update.local_model_device is not None:
         if update.local_model_device not in {"cuda", "cpu"}:
             raise HTTPException(
@@ -678,15 +692,23 @@ async def post_settings(update: SettingsUpdate) -> dict:
             )
         changes["LOCAL_MODEL_DEVICE"] = update.local_model_device
         os.environ["LOCAL_MODEL_DEVICE"] = update.local_model_device
+        reset_local_translation_backend = True
     if update.local_model_max_length is not None:
         changes["LOCAL_MODEL_MAX_LENGTH"] = str(update.local_model_max_length)
         os.environ["LOCAL_MODEL_MAX_LENGTH"] = str(update.local_model_max_length)
     if update.local_model_auto_download is not None:
         changes["LOCAL_MODEL_AUTO_DOWNLOAD"] = "1" if update.local_model_auto_download else "0"
         os.environ["LOCAL_MODEL_AUTO_DOWNLOAD"] = "1" if update.local_model_auto_download else "0"
+        reset_local_translation_backend = True
     if changes:
         _clear_saved_hf_mirror_if_present(changes)
         _update_env_file(changes)
+    if reset_local_translation_backend:
+        from llm.backends import reset_backend
+
+        # Releasing a model may wait for an active generate() call. Keep that
+        # wait off the FastAPI event loop so SSE and cancellation stay alive.
+        await asyncio.to_thread(reset_backend, "local")
     return {"ok": True}
 
 

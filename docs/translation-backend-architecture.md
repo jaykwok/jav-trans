@@ -1,226 +1,111 @@
-# Translation backend architecture documentation
+# 翻译后端架构
 
-## 概览
+## 设计目标
 
-重构后的翻译模块采用可插拔的后端架构，支持：
+翻译系统只有一个编排核心，负责 Prompt、全片上下文、全局术语、批处理、缓存、缺失项重试、修复、进度和取消。后端只负责执行一次消息请求并返回文本。
 
-1. **OpenAI 兼容 API**（DeepSeek、OpenAI、Azure 等）
-2. **本地模型**（transformers、vLLM）
-3. **未来可扩展**（Claude、通义千问等）
+这个边界刻意避免把批处理和修复拆成各自维护状态的副本。此前的拆分曾丢失 Responses API、全局术语提取、取消语义和缓存统计，因此 `batching.py`、`repair.py` 与 `translator_legacy.py` 已删除。
 
-## 架构
-
-```
+```text
 src/llm/
-├── backends/
-│   ├── __init__.py           # 后端注册表和工厂
-│   ├── base.py              # 抽象基类
-│   ├── openai_compat.py     # OpenAI 兼容后端
-│   └── local_model.py       # 本地模型后端
-├── translator.py            # 统一入口（保持 API 兼容）
-├── batching.py              # 批处理和并发
-├── repair.py                # 翻译修复
-├── cache.py                 # 缓存机制（已有）
-├── prompt.py                # Prompt 构建（已有）
-└── glossary.py              # 术语表（已有）
+├── translator.py             # 唯一编排核心与 OpenAI canonical transport
+├── prompt.py                 # Prompt 和字幕 JSON 构造
+├── cache.py                  # batch cache 与 translation memory
+├── glossary.py               # 用户词表解析
+├── errors.py                 # 所有层共享的异常类型
+└── backends/
+    ├── __init__.py           # 注册表、选择和进程级实例生命周期
+    ├── base.py               # 后端抽象基类
+    ├── openai_compat.py      # Chat/Responses canonical transport 适配器
+    └── local_model.py        # 进程内 Transformers 后端
 ```
 
-## 配置
+## 后端契约
 
-### OpenAI 兼容 API
+自定义后端实现 `BaseTranslationBackend.chat_completion()`。输入包括消息、采样参数、结构化输出 schema、任务级 `api_format`、取消事件和进度/用量回调；返回最终文本。
+
+后端必须遵守以下规则：
+
+- 取消统一抛出 `llm.errors.TranslationCancelledError`，不能自行定义同名异常。
+- 临时响应格式错误使用共享的 retryable 异常。
+- `cache_identity()` 必须能区分会改变译文的模型或服务。
+- 一个注册名在进程中只创建一个实例；配置变化通过 `reset_backend()` 释放旧实例。
+- 后端不得自行实现字幕分批、translation memory 或 repair pass。
+
+## OpenAI 兼容后端
 
 ```env
-LLM_BACKEND_TYPE=openai
+TRANSLATION_BACKEND=openai
 OPENAI_COMPATIBILITY_BASE_URL=https://api.deepseek.com
 API_KEY=your-api-key
-LLM_MODEL_NAME=deepseek-v4-flash
+LLM_MODEL_NAME=your-model
 LLM_API_FORMAT=chat
 LLM_REASONING_EFFORT=medium
 ```
 
-### 本地模型（transformers）
+`LLM_API_FORMAT` 支持 `chat` 和 `responses`。调用 `translate_segments(..., api_format=...)` 时，任务级参数优先于进程环境变量。
+
+Chat 和 Responses 的流式进度、usage、JSON Schema、DeepSeek `json_object` 兼容以及 Grok provider patch 只有一份 canonical 实现，避免适配器与主流程分叉。
+
+生产环境运行本地大模型时，推荐启动 vLLM/SGLang 等 OpenAI 兼容服务，然后仍选择 `openai` 后端。这样服务负责 continuous batching、KV cache 和多卡调度，本程序不会与 ASR 在同一进程争抢模型生命周期。
+
+## 进程内 Transformers 后端
 
 ```env
-LLM_BACKEND_TYPE=local
-LLM_LOCAL_BACKEND=transformers
-LLM_LOCAL_MODEL_PATH=Qwen/Qwen2.5-7B-Instruct
-LLM_LOCAL_DEVICE=cuda
-LLM_LOCAL_DTYPE=bfloat16
+TRANSLATION_BACKEND=local
+LOCAL_MODEL_PATH=Qwen/Qwen2.5-7B-Instruct
+LOCAL_MODEL_DEVICE=cuda
+LOCAL_MODEL_DTYPE=bfloat16
+LOCAL_MODEL_MAX_LENGTH=32768
+LOCAL_MODEL_BATCH_SIZE=16
+LOCAL_MODEL_MAX_NEW_TOKENS=8192
+LOCAL_MODEL_AUTO_DOWNLOAD=1
 ```
 
-### 本地模型（vLLM，推荐）
+行为约束：
 
-```env
-LLM_BACKEND_TYPE=local
-LLM_LOCAL_BACKEND=vllm
-LLM_LOCAL_MODEL_PATH=Qwen/Qwen2.5-7B-Instruct
-LLM_LOCAL_DEVICE=cuda
-LLM_LOCAL_DTYPE=bfloat16
-LLM_LOCAL_GPU_MEMORY_UTILIZATION=0.85
-LLM_LOCAL_TENSOR_PARALLEL_SIZE=1
-```
+- 注册表复用一个 `LocalModelBackend`，不会为每个 batch worker 加载模型。
+- `generate()` 串行执行，避免并发 KV cache 放大显存；等待推理锁时可取消。
+- CUDA 不可用、dtype 非法、模型缺失及上下文超限都会给出明确错误。
+- CPU 默认使用 `float32`，CUDA 默认使用 `bfloat16`；可用 `LOCAL_MODEL_DTYPE` 覆盖。
+- 上下文会使用较小 batch 和有界全片摘要；输入仍超过模型窗口时终止，不把负数传给 `max_new_tokens`。
+- 当前实现不是 token streaming，因此 `supports_streaming()` 返回 `False`；仍会发送阶段进度和 token usage。
+- 从 Web 切换后端或修改本地模型关键配置时，会先释放旧实例再允许加载新实例。
 
-### vLLM OpenAI 兼容服务（推荐用于生产）
+## 缓存隔离
 
-启动 vLLM 服务：
-```bash
-vllm serve Qwen/Qwen2.5-7B-Instruct \
-  --api-key dummy \
-  --port 8000 \
-  --dtype bfloat16 \
-  --gpu-memory-utilization 0.9
-```
+缓存签名包含 Prompt 版本、目标语言、词表、人物参考和后端 `cache_identity()`。API 模型与本地模型不会复用同一翻译缓存。
 
-配置：
-```env
-LLM_BACKEND_TYPE=openai
-OPENAI_COMPATIBILITY_BASE_URL=http://localhost:8000/v1
-API_KEY=dummy
-LLM_MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
-```
+全局术语提取使用独立的 `terms` JSON Schema，不再错误套用字幕 `translations` Schema。修复后的译文会写回同一个 batch cache key。
 
-## 本地模型推荐
+## 扩展后端
 
-### 小型（7B-14B，适合 8GB+ 显存）
-- `Qwen/Qwen2.5-7B-Instruct`
-- `internlm/internlm2_5-7b-chat`
-- `THUDM/glm-4-9b-chat`
-
-### 中型（20B-32B，适合 24GB+ 显存）
-- `Qwen/Qwen2.5-32B-Instruct`
-- `internlm/internlm2_5-20b-chat`
-
-### 大型（70B+，需要多卡或量化）
-- `Qwen/Qwen2.5-72B-Instruct`
-- `meta-llama/Llama-3.1-70B-Instruct`
-
-## 显存协调
-
-### 方案 1：外部服务（推荐）
-
-翻译服务独立运行：
-```bash
-# 终端 1：ASR 服务（使用主 GPU）
-uv run python launcher.py
-
-# 终端 2：vLLM 翻译服务（使用另一个 GPU 或 CPU）
-CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen2.5-7B-Instruct --port 8000
-```
-
-### 方案 2：错峰使用
-
-ASR 和翻译串行执行，自动切换：
-```env
-LLM_BACKEND_TYPE=local
-LLM_LOCAL_BACKEND=transformers
-# ASR 完成后自动加载翻译模型
-```
-
-**注意**：本地模型与 ASR 共享显存时，需要预留足够空间。
-
-### 方案 3：降低 ASR 显存占用
-
-```env
-ASR_STAGE_WORKER_VRAM_RATIO=0.50  # ASR 只用 50% 显存
-ASR_BATCH_SIZE=2                   # 降低 ASR batch size
-```
-
-## 性能对比
-
-| 后端 | 优点 | 缺点 |
-|------|------|------|
-| OpenAI API | 质量高、无需显存 | 需要网络、有费用 |
-| vLLM 服务 | 高性能、灵活 | 需要额外服务 |
-| transformers | 一体化、简单 | 性能较低、显存冲突 |
-
-## 扩展新后端
-
-1. 创建新后端文件 `src/llm/backends/my_backend.py`
-2. 继承 `BaseTranslationBackend`
-3. 实现 `chat_completion` 方法
-4. 在 `backends/__init__.py` 中注册
-
-示例：
 ```python
-from llm.backends.base import BaseTranslationBackend
 from llm.backends import register_backend
+from llm.backends.base import BaseTranslationBackend
+
 
 class MyBackend(BaseTranslationBackend):
     def name(self) -> str:
-        return "my_backend"
-    
+        return "my-backend"
+
+    def cache_identity(self) -> str:
+        return "my-backend:model-v1"
+
     def chat_completion(self, messages, **kwargs) -> str:
-        # 实现翻译逻辑
-        ...
+        self._raise_if_cancelled(kwargs.get("cancel_event"))
+        return call_my_model(messages)
 
-# 注册
-register_backend("my_backend", MyBackend)
+
+register_backend("my-backend", MyBackend)
 ```
 
-配置：
-```env
-LLM_BACKEND_TYPE=my_backend
-```
+注册名重复默认报错；开发期确需替换时显式传 `replace=True`。
 
-## 向后兼容
-
-`translator.py` 保持原有 API 接口不变：
-```python
-from llm.translator import translate_segments
-
-zh_texts, timings, retry_events = translate_segments(
-    segments,
-    max_workers=4,
-    cache_path="./cache",
-    target_lang="简体中文",
-    glossary="...",
-)
-```
-
-现有代码无需修改即可使用新架构。
-
-## 测试
+## 验证
 
 ```powershell
-# 测试 OpenAI 后端
-$env:LLM_BACKEND_TYPE="openai"
-uv run pytest tests/test_translation*.py
-
-# 测试本地模型后端
-$env:LLM_BACKEND_TYPE="local"
-$env:LLM_LOCAL_MODEL_PATH="Qwen/Qwen2.5-7B-Instruct"
-uv run pytest tests/test_translation*.py
-```
-
-## 迁移指南
-
-旧代码无需修改，但可以利用新功能：
-
-### 使用本地模型
-
-只需修改 `.env`：
-```env
-LLM_BACKEND_TYPE=local
-LLM_LOCAL_MODEL_PATH=Qwen/Qwen2.5-7B-Instruct
-```
-
-### 切换后端
-
-运行时动态切换：
-```python
-import os
-os.environ["LLM_BACKEND_TYPE"] = "local"
-
-from llm.translator import translate_segments
-# 现在使用本地模型
-```
-
-### 卸载模型释放显存
-
-```python
-from llm.backends import get_backend
-
-backend = get_backend("local")
-if hasattr(backend, "unload_model"):
-    backend.unload_model()  # 释放显存
+$env:PYTHONIOENCODING = "utf-8"
+$translationTests = rg --files tests | Where-Object { $_ -match 'translation|translator|batch_translation|glossary_preextract|compact_prompt|request_backoff' }
+uv run --no-sync pytest -q $translationTests
 ```

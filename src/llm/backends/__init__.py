@@ -1,88 +1,120 @@
-# Translation backend registry and factory
+"""Translation backend registry and process-wide instance lifecycle."""
 
-from typing import Protocol, Any
+from __future__ import annotations
+
 import os
+import threading
+from collections.abc import Callable
+from typing import Protocol
 
 
 class TranslationBackend(Protocol):
-    """翻译后端协议"""
-
-    def chat_completion(
-        self,
-        messages: list[dict],
-        *,
-        temperature: float = 0.6,
-        top_p: float = 0.9,
-        max_tokens: int = 384000,
-        response_format: dict | None = None,
-        stream: bool = True,
-        reasoning_effort: str | None = None,
-        cancel_event = None,
-        on_progress = None,
-        on_usage = None,
-    ) -> str:
-        """执行翻译请求，返回完整内容"""
-        ...
-
-    def supports_json_schema(self) -> bool:
-        """是否支持 JSON schema 约束"""
-        ...
-
-    def supports_reasoning(self) -> bool:
-        """是否支持 reasoning/thinking"""
-        ...
-
-    def supports_streaming(self) -> bool:
-        """是否支持流式输出"""
-        ...
-
-    def name(self) -> str:
-        """后端标识名称"""
-        ...
+    def chat_completion(self, messages: list[dict], **kwargs) -> str: ...
+    def cache_identity(self) -> str: ...
+    def name(self) -> str: ...
 
 
-_BACKEND_REGISTRY: dict[str, type] = {}
+BackendFactory = Callable[[], TranslationBackend]
+
+_BACKEND_REGISTRY: dict[str, BackendFactory] = {}
+_BACKEND_INSTANCES: dict[str, TranslationBackend] = {}
+_REGISTRY_LOCK = threading.RLock()
 
 
-def register_backend(name: str, backend_class: type) -> None:
-    """注册翻译后端"""
-    _BACKEND_REGISTRY[name] = backend_class
+def _normalize_name(name: str) -> str:
+    normalized = str(name or "").strip().lower()
+    if not normalized:
+        raise ValueError("Translation backend name must not be empty")
+    return normalized
 
 
-def get_backend(name: str | None = None) -> Any:
-    """获取翻译后端实例"""
-    if name is None:
-        name = os.getenv("TRANSLATION_BACKEND", "openai").strip().lower()
+def register_backend(
+    name: str,
+    factory: BackendFactory,
+    *,
+    replace: bool = False,
+) -> None:
+    """Register a backend factory.
 
-    if name not in _BACKEND_REGISTRY:
-        raise ValueError(
-            f"Unknown translation backend: {name}. "
-            f"Available: {list(_BACKEND_REGISTRY.keys())}"
-        )
+    Instances are shared process-wide. Re-registering requires ``replace=True``
+    and invalidates the old instance, making extension mistakes visible rather
+    than silently overriding a backend.
+    """
+    normalized = _normalize_name(name)
+    if not callable(factory):
+        raise TypeError("Backend factory must be callable")
+    with _REGISTRY_LOCK:
+        if normalized in _BACKEND_REGISTRY and not replace:
+            raise ValueError(f"Translation backend already registered: {normalized}")
+        previous = _BACKEND_INSTANCES.pop(normalized, None)
+        if previous is not None:
+            close = getattr(previous, "close", None)
+            if callable(close):
+                close()
+        _BACKEND_REGISTRY[normalized] = factory
 
-    backend_class = _BACKEND_REGISTRY[name]
-    return backend_class()
+
+def selected_backend_name(name: str | None = None) -> str:
+    return _normalize_name(
+        name if name is not None else os.getenv("TRANSLATION_BACKEND", "openai")
+    )
+
+
+def get_backend(name: str | None = None) -> TranslationBackend:
+    """Return the shared backend instance for ``name``."""
+    normalized = selected_backend_name(name)
+    with _REGISTRY_LOCK:
+        factory = _BACKEND_REGISTRY.get(normalized)
+        if factory is None:
+            available = ", ".join(sorted(_BACKEND_REGISTRY)) or "<none>"
+            raise ValueError(
+                f"Unknown translation backend: {normalized}. Available: {available}"
+            )
+        instance = _BACKEND_INSTANCES.get(normalized)
+        if instance is None:
+            instance = factory()
+            _BACKEND_INSTANCES[normalized] = instance
+        return instance
+
+
+def reset_backend(name: str | None = None) -> None:
+    """Drop cached instances, primarily for configuration changes and tests."""
+    with _REGISTRY_LOCK:
+        if name is None:
+            instances = list(_BACKEND_INSTANCES.values())
+            _BACKEND_INSTANCES.clear()
+        else:
+            instance = _BACKEND_INSTANCES.pop(selected_backend_name(name), None)
+            instances = [instance] if instance is not None else []
+        # Close while the registry lock is held so another caller cannot load a
+        # replacement GPU model before the previous instance releases memory.
+        for instance in instances:
+            close = getattr(instance, "close", None)
+            if callable(close):
+                close()
 
 
 def list_backends() -> list[str]:
-    """列出所有已注册的后端"""
-    return list(_BACKEND_REGISTRY.keys())
+    with _REGISTRY_LOCK:
+        return sorted(_BACKEND_REGISTRY)
 
 
-# 自动注册内置后端
-def _register_builtin_backends():
-    """注册内置后端"""
-    try:
-        from llm.backends.openai_compat import OpenAICompatBackend
-        register_backend("openai", OpenAICompatBackend)
-    except ImportError:
-        pass
+def _register_builtin_backends() -> None:
+    from llm.backends.local_model import LocalModelBackend
+    from llm.backends.openai_compat import OpenAICompatBackend
 
-    try:
-        from llm.backends.local_model import LocalModelBackend
-        register_backend("local", LocalModelBackend)
-    except ImportError:
-        pass
+    register_backend("openai", OpenAICompatBackend)
+    register_backend("local", LocalModelBackend)
 
 
 _register_builtin_backends()
+
+
+__all__ = [
+    "TranslationBackend",
+    "get_backend",
+    "list_backends",
+    "register_backend",
+    "reset_backend",
+    "selected_backend_name",
+]
