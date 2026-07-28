@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Mapping
+import wave
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
@@ -54,6 +55,8 @@ from tools.boundary.ja.vocal_envelope_scorer_v12_calibration import (  # noqa: E
     load_approved_calibration,
 )
 from tools.boundary.ja.vocal_envelope_scorer_v12_teacher_contract import (  # noqa: E402
+    PROMPT_PROFILE,
+    PROMPT_VERSION,
     SCORER_V12_FRAME_HOP_S,
     TEACHER_TASK_CONTRACT_ID,
     quantize_vocal_partition_boundary_frame,
@@ -65,9 +68,12 @@ FRAME_HOP_S = SCORER_V12_FRAME_HOP_S
 CONTRACT_ID = "boundary_acoustic_binary_v12"
 SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_single_pass_tristate_summary_v3"
 PROGRESS_SCHEMA = "vocal_envelope_scorer_v12_single_pass_tristate_progress_v3"
-PROMPT_PROFILE = "vocal-envelope-single-pass-tristate-v4"
-PROMPT_VERSION = "vocal-envelope-single-pass-tristate-v6-training-target-gemini36-medium-mmss"
 EXPECTED_REASONING = "medium"
+# The contract value above is what a canonical batch must use. An A/B run
+# (--experimental-model) may point this elsewhere; every record below reads
+# the active value, so a run always states the reasoning level it actually
+# dispatched rather than the level it was supposed to.
+_ACTIVE_REASONING = EXPECTED_REASONING
 EXPECTED_MAX_TOKENS = 8192
 PROVIDER_CONTRACTS: dict[str, dict[str, str]] = {
     "openrouter": {
@@ -83,40 +89,24 @@ PROVIDER_CONTRACTS: dict[str, dict[str, str]] = {
 }
 
 
-TRISTATE_SYSTEM_PROMPT = """你为 Scorer v12 训练标注高质量的人类发声事件包络 ground truth。
-音频主要来自日语 JAV、Galgame 或类似场景，但场景、亲密互动、声音强度和声音来源本身都不能直接决定标签。
+TRISTATE_SYSTEM_PROMPT = """你标注人声包络 ground truth。音频来自 JAV，但场景本身不能决定标签。
 
-【Scorer v12 的训练目标】
-Scorer v12 是 pipeline 的首层模型，训练目标是高召回检测所有人类发声事件的物理包络，为下游模型提供完整的候选区域。它只负责声学层面的人声存在性判断，不做语义价值判断、不转写、不切句、不区分说话人。下游模型负责：Split 切分独立事件、CueQC 过滤非语义内容、Inner 精修边界。
+你的任务：输出覆盖完整音频时间轴的 segments，segments 按时间排序、无重叠、无缺口。每段用以下标签之一：
 
-你的标注必须覆盖完整音频时间轴，输出按时间排序、无重叠、无缺口的 segments 数组。每段使用以下三种标签之一：
+vocal_candidate: 人类声道/口腔/呼吸系统产生的发声（清晰或含混对白、耳语、气声、呻吟、喘息、吸气、呼气、叹气、哭、笑、咳嗽、喷嚏、清嗓、抽鼻、亲吻声、唾液声、口腔声、歌唱、远处或背景人声）
 
-1. vocal_candidate：检测到任何由人类声道、口腔或呼吸系统产生的发声能量，或非发声声音与疑似人声重叠。包括清晰或含混对白、耳语、气声、呻吟、喘息、吸气、呼气、叹气、哭、笑、咳嗽、喷嚏、清嗓、抽鼻、亲吻/唾液/口腔声、歌唱、远处或背景人声。像「あ、ん、はぁ」无论是词语、应答还是纯呻吟都属于 vocal。是否有字幕价值不影响标注。
+non_vocal_candidate: 其他（纯音乐、纯器乐、机械声、肉体撞击、动作声、衣物摩擦、床体震动、水声、静音、底噪、环境噪声）
 
-2. non_vocal_candidate：明确的纯背景区间，无人声能量。包括纯机械声、肉体撞击或拍打、动作声、衣物摩擦、床体震动、水声、纯器乐、静音、底噪、风扇空调、电流、环境噪声。肉体撞击由人体动作产生不等于人声，但只要撞击/床体/水声/音乐下叠有任何疑似人声能量，重叠区就不能标 non_vocal。
+unsure: 真的无法判断是人声还是非人声（极少使用）
 
-3. unsure：无法可靠区分弱人声与纯气流/口腔动作，边界无法安全定位，或 voice 与 non-voice 证据不可分离。不要猜测；unsure 在训练中会被忽略。
+关键规则：
+- 纯音乐（器乐、电子音乐、无人声演唱的配乐）标 non_vocal_candidate，即使音色类似人声
+- 音乐叠加真人演唱或说话时，叠加区域才标 vocal_candidate
+- 第一段从 00:00.000 开始，最后一段结束于给出的 duration_ts
+- 相邻段首尾严格相接，不得重叠或留空白
 
-【仲裁优先级】
-判断不了时优先标 vocal_candidate，不要标 non_vocal_candidate。
-短暂停顿（< 1 秒）应标为 vocal_candidate，即使听不到明显发声，除非你确信这是纯粹的机械声、撞击声或静音。
-unsure 只用于确信有声音但完全无法归类的极少数情况，不是"可能是背景"的同义词。
-
-【标注包络的边界原则】
-标注单位是连续的发声事件包络，不是逐音素 VAD。一次连续发声内部的短停顿、吸气、释气、弱尾音应随包络保留。
-
-纯撞击声：若它形成声学上独立且可安全分离的纯非发声区间，标 non_vocal_candidate；若它与人声重叠，标 vocal_candidate；若短暂嵌入且无法安全独立切开，标 unsure。
-
-不要跨越声学上独立的长纯非发声区域合并两个事件，也不得使用固定时长阈值。边界判断基于声学证据，不是机械的时长规则。
-
-【完整覆盖要求】
-- 第一段必须从 00:00.000 开始，最后一段必须精确结束于请求给出的 duration_ts。
-- 相邻段必须首尾严格相接；不得重叠或留空白；相邻同标签必须合并。
-- 覆盖完整词头、气声、衰减和尾音。混合区优先保护 vocal，真正无法判断才用 unsure。
-- 不要产生短到无法对应一个 20ms Scorer 帧的区间；这是坐标分辨率要求，不是声音类别的时长规则。
-
-只输出 JSON，不要输出 Markdown、解释或额外文字：
-{"source_id":"...","segments":[{"start_ts":"00:00.000","end_ts":"00:01.000","label":"vocal_candidate|non_vocal_candidate|unsure","category":"vocal|mixed_vocal|mechanical|impact|cloth|bed|water|music|silence|ambience|other|uncertain","reason":"简短声学理由"}],"overall_reason":"..."}
+只输出 JSON，不要输出 Markdown 或解释：
+{"source_id":"...","segments":[{"start_ts":"00:00.000","end_ts":"...","label":"vocal_candidate|non_vocal_candidate|unsure","category":"vocal|mixed_vocal|music|mechanical|impact|cloth|bed|water|silence|ambience|other|uncertain","reason":"简短理由"}],"overall_reason":"..."}
 """ + "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
 
 VOCAL_CATEGORIES = frozenset(
@@ -238,6 +228,26 @@ def _resolve_audio(row: Mapping[str, Any], *, manifest: Path) -> Path:
         if candidate.is_file():
             return candidate.resolve()
     raise FileNotFoundError(candidates[0])
+
+
+def _decoded_wav_duration_s(audio: Path) -> float | None:
+    """Real duration of a PCM WAV, or None when it cannot be measured.
+
+    Returns None for non-WAV containers and for files this process cannot parse
+    as RIFF; those are left to the audio SHA check and the transport, which
+    reject them anyway.  A measurable WAV is always cross-checked.
+    """
+    if audio.suffix.lower() != ".wav":
+        return None
+    try:
+        with wave.open(str(audio), "rb") as handle:
+            rate = handle.getframerate()
+            frames = handle.getnframes()
+    except (wave.Error, EOFError):
+        return None
+    if rate <= 0:
+        return None
+    return frames / float(rate)
 
 
 def _frame_count(row: Mapping[str, Any], duration_s: float) -> int:
@@ -392,6 +402,16 @@ def _validate_manifest(rows: list[dict[str, Any]], *, manifest: Path) -> list[di
         duration = float(row.get("duration_s") or 0.0)
         if duration <= 0:
             raise ValueError(f"v12 source duration is invalid: {source_id}")
+        # The request prompt advertises this duration as duration_ts and the
+        # Teacher is required to end its last segment there, so a manifest that
+        # disagrees with the decoded audio silently buys labels for a timeline
+        # that does not exist.  Fail closed before spending any API call.
+        decoded_duration = _decoded_wav_duration_s(audio)
+        if decoded_duration is not None and abs(decoded_duration - duration) > FRAME_HOP_S:
+            raise ValueError(
+                "v12 source duration disagrees with decoded audio: "
+                f"{source_id} manifest={duration:.6f}s decoded={decoded_duration:.6f}s"
+            )
         if row.get("audio_sha256") and _sha256(audio) != str(row["audio_sha256"]):
             raise ValueError(f"v12 source audio SHA mismatch: {source_id}")
         copied = dict(row)
@@ -425,7 +445,7 @@ def _call_teacher(
                 system_prompt=TRISTATE_SYSTEM_PROMPT,
                 max_tokens=EXPECTED_MAX_TOKENS,
                 enable_thinking=True,
-                thinking_level=EXPECTED_REASONING,
+                thinking_level=_ACTIVE_REASONING,
                 thinking_budget=0,
                 response_schema=TRISTATE_RESPONSE_SCHEMA,
                 store_stream_chunks=False,
@@ -499,16 +519,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     transport = create_audio_teacher_transport(
         profile=profile,
         env_file=(Path.home() / ".config" / "omni" / profile).resolve(),
-        model_override=str(args.model or ""),
+        model_override=str(args.experimental_model or args.model or ""),
         timeout_s=float(args.timeout_s),
         log=lambda message: print(message, flush=True),
     )
     model = transport.model
     expected_model = provider_contract["model"]
-    if model != expected_model:
-        raise ValueError(
-            f"Scorer v12 {profile} profile requires {expected_model}, got {model}"
+    if args.experimental_model:
+        # A/B escape hatch. The contract pin exists so a canonical batch can
+        # never mix models, and that stays true here by construction rather than
+        # by trust: every preaudit row records `model` and
+        # `training_manifest_allowed: False`, the resume check refuses to extend
+        # a directory labelled by a different model, and canonical compilation
+        # compares the model per row. So the only thing this skips is the
+        # up-front refusal to dial a non-contract model at all.
+        if model != args.experimental_model:
+            raise ValueError(
+                f"experimental model requested {args.experimental_model}, "
+                f"transport resolved {model}"
+            )
+        if args.experimental_reasoning:
+            global _ACTIVE_REASONING
+            _ACTIVE_REASONING = str(args.experimental_reasoning)
+        print(
+            f"EXPERIMENTAL MODEL RUN: {model} (contract model is {expected_model}, "
+            f"reasoning {_ACTIVE_REASONING}). "
+            "Output is an A/B artifact and cannot feed canonical compilation.",
+            flush=True,
         )
+    else:
+        if args.experimental_reasoning:
+            raise ValueError(
+                "--experimental-reasoning requires --experimental-model; a "
+                "contract run must dispatch the contract reasoning level"
+            )
+        if model != expected_model:
+            raise ValueError(
+                f"Scorer v12 {profile} profile requires {expected_model}, got {model}"
+            )
     execution_contract = provider_contract["execution_contract"]
     if transport.execution_contract != execution_contract:
         raise ValueError("Scorer v12 provider execution contract mismatch")
@@ -543,7 +591,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "model": model,
                 "provider_profile": profile,
                 "env_file_name": profile,
-                "reasoning_effort": EXPECTED_REASONING,
+                "reasoning_effort": _ACTIVE_REASONING,
                 "max_tokens": EXPECTED_MAX_TOKENS,
                 "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
                 "prompt_profile": PROMPT_PROFILE,
@@ -680,7 +728,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "status": "running",
             "model": model,
             "provider_profile": profile,
-            "reasoning_effort": EXPECTED_REASONING,
+            "reasoning_effort": _ACTIVE_REASONING,
             "max_tokens": EXPECTED_MAX_TOKENS,
             "worker_count": worker_count,
             "completed": len(existing),
@@ -742,7 +790,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "status": "running_with_failures",
                     "model": model,
                     "provider_profile": profile,
-                    "reasoning_effort": EXPECTED_REASONING,
+                    "reasoning_effort": _ACTIVE_REASONING,
                     "max_tokens": EXPECTED_MAX_TOKENS,
                     "worker_count": worker_count,
                     "completed": len(existing),
@@ -770,7 +818,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "env_file_name": profile,
             "transport": transport.transport_name,
             "api_key_count": transport.api_key_count,
-            "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS,
+            "reasoning_effort": _ACTIVE_REASONING, "max_tokens": EXPECTED_MAX_TOKENS,
             "temperature": None, "top_p": None, "top_k": None,
             "prompt_profile": PROMPT_PROFILE, "prompt_version": PROMPT_VERSION,
             **teacher_contract,
@@ -812,7 +860,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "status": "running_with_failures" if failures else "running",
                 "model": model,
                 "provider_profile": profile,
-                "reasoning_effort": EXPECTED_REASONING,
+                "reasoning_effort": _ACTIVE_REASONING,
                 "max_tokens": EXPECTED_MAX_TOKENS,
                 "worker_count": worker_count,
                 "completed": len(existing),
@@ -832,7 +880,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "status": "failed",
                 "model": model,
                 "provider_profile": profile,
-                "reasoning_effort": EXPECTED_REASONING,
+                "reasoning_effort": _ACTIVE_REASONING,
                 "max_tokens": EXPECTED_MAX_TOKENS,
                 "worker_count": worker_count,
                 "completed": len(existing),
@@ -857,7 +905,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "transport": transport.transport_name,
         "api_key_count": transport.api_key_count,
         "worker_count": worker_count,
-        "reasoning_effort": "medium",
+        "reasoning_effort": _ACTIVE_REASONING,
         "max_tokens": EXPECTED_MAX_TOKENS,
         "request_count": len(existing) - len(calibration_seed_ids),
         "calls_per_new_source": 1,
@@ -892,7 +940,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "status": "completed",
             "model": model,
             "provider_profile": profile,
-            "reasoning_effort": EXPECTED_REASONING,
+            "reasoning_effort": _ACTIVE_REASONING,
             "max_tokens": EXPECTED_MAX_TOKENS,
             "completed": len(existing),
             "total": len(rows),
@@ -917,6 +965,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="openrouter uses its OpenAI-compatible API; gemini uses Google AI Studio Interactions.",
     )
     parser.add_argument("--model", default="")
+    parser.add_argument(
+        "--experimental-reasoning",
+        default="",
+        help="Reasoning effort for an A/B run; requires --experimental-model.",
+    )
+    parser.add_argument(
+        "--experimental-model",
+        default="",
+        help=(
+            "Run an A/B against a non-contract model. Requires its own "
+            "--output-dir; the result is marked non-canonical and will fail "
+            "closed if anyone tries to compile it with contract labels."
+        ),
+    )
     parser.add_argument("--timeout-s", type=float, default=240.0)
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--request-interval-s", type=float, default=0.5)

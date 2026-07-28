@@ -25,7 +25,7 @@ from boundary.ja.vocal_envelope_v12 import (  # noqa: E402
     VOCAL_ENVELOPE_SCORER_V12_VOCAL_COVERAGE_OPTIONS,
     VOCAL_ENVELOPE_SCORER_V12_VOCAL_PURITY_OPTIONS,
 )
-from tools.audits.audit_nav import update_audit_entrypoints  # noqa: E402
+from tools.audits.audit_nav import register_external_audit_page, update_audit_entrypoints  # noqa: E402
 from tools.audits.review_page_core import (  # noqa: E402
     AuditOptionAxis,
     AuditReviewPageSpec,
@@ -455,10 +455,16 @@ def build(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    update_audit_entrypoints(
-        latest_html=index,
+    if register_external_audit_page(
+        page_index=index,
         title="Scorer v12 Human Vocal Envelope Teacher review",
-    )
+    ):
+        pass
+    else:
+        update_audit_entrypoints(
+            latest_html=index,
+            title="Scorer v12 Human Vocal Envelope Teacher review",
+        )
     return summary
 
 

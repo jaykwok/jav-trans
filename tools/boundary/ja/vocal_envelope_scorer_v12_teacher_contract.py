@@ -13,11 +13,20 @@ SCORER_V12_TIME_GRID_CONTRACT_ID = "scorer_v12_10ms_wire_20ms_frame_v1"
 SCORER_V12_LOCAL_TIMESTAMP_STEP_S = 0.01
 SCORER_V12_FRAME_HOP_S = 0.02
 
+# The single source of truth for the Teacher's prompt identity.  The labeler
+# stamps these into every preaudit row and the canonical compiler requires them
+# back, so they must not be duplicated as literals anywhere else: a stale copy
+# silently rejects a whole label set at compile time, long after the API spend.
+PROMPT_PROFILE = "vocal-envelope-single-pass-tristate-v4"
+PROMPT_VERSION = (
+    "vocal-envelope-single-pass-tristate-v7-training-target-gemini36-medium-mmss"
+)
+
 # These hashes are deliberately frozen separately from the prompt version string.
 # Changing the actual wire prompt/schema requires updating both the version and
 # these values, otherwise Teacher dispatch fails closed before an API call.
 SYSTEM_PROMPT_SHA256 = (
-    "43093fd0829c56dc6546e8f45f984a010d44962bf88c87230887593ad38694f7"
+    "91bcf1b976216ba22b131b98881cfd4ba81f9404528d64f0bf5c0550dadbbb50"
 )
 RESPONSE_SCHEMA_SHA256 = (
     "3686fa00ea8fe5dc31115dcfa4c39c411c1bb2121e246c63f85fbc14db043ea3"

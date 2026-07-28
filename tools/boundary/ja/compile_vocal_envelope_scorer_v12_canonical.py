@@ -42,6 +42,8 @@ from tools.boundary.ja.vocal_envelope_scorer_v12_calibration import (  # noqa: E
     load_approved_calibration,
 )
 from tools.boundary.ja.vocal_envelope_scorer_v12_teacher_contract import (  # noqa: E402
+    PROMPT_PROFILE,
+    PROMPT_VERSION,
     teacher_contract_fingerprint_fields,
 )
 
@@ -60,8 +62,8 @@ PROVIDER_CONTRACTS: dict[str, dict[str, str]] = {
         "execution_contract": GEMINI_NATIVE_EXECUTION_CONTRACT,
     },
 }
-EXPECTED_PROMPT_PROFILE = "vocal-envelope-single-pass-tristate-v3"
-EXPECTED_PROMPT_VERSION = "vocal-envelope-single-pass-tristate-v3-scorer-duty-gemini36-medium-mmss"
+EXPECTED_PROMPT_PROFILE = PROMPT_PROFILE
+EXPECTED_PROMPT_VERSION = PROMPT_VERSION
 OUTPUT_SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_canonical_compile_summary_v2"
 EXPECTED_TEACHER_CONTRACT_FINGERPRINTS = teacher_contract_fingerprint_fields()
 

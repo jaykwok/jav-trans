@@ -26,6 +26,8 @@ from tools.omni.gemini_native import (
 )
 from tools.omni.timestamp_contract import TIMESTAMP_CONTRACT_ID
 from tools.boundary.ja.vocal_envelope_scorer_v12_teacher_contract import (
+    PROMPT_PROFILE,
+    PROMPT_VERSION,
     teacher_contract_fingerprint_fields,
 )
 
@@ -41,10 +43,12 @@ CALIBRATION_TEACHER_CONTRACT = {
     "env_file_name": "gemini",
     "reasoning_effort": "medium",
     "max_tokens": 8192,
-    "prompt_profile": "vocal-envelope-single-pass-tristate-v3",
-    "prompt_version": (
-        "vocal-envelope-single-pass-tristate-v4-training-target-gemini36-medium-mmss"
-    ),
+    # Tracks the live Teacher identity on purpose.  Calibration artifacts carry
+    # the prompt version they were approved under inside their own rows, so a
+    # prompt bump makes those rows mismatch this contract and fails closed -
+    # which is exactly the intended "re-approve before reuse" behaviour.
+    "prompt_profile": PROMPT_PROFILE,
+    "prompt_version": PROMPT_VERSION,
     "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
     "teacher_execution_contract_id": GEMINI_NATIVE_EXECUTION_CONTRACT,
     **teacher_contract_fingerprint_fields(),

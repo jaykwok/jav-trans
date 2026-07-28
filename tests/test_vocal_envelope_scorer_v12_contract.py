@@ -410,14 +410,49 @@ def test_v12_structured_checkpoint_schemas_are_runtime_separate(
 
 
 def test_v12_prompts_and_timestamp_quantization_are_task_specific() -> None:
-    assert "连续的人类发声事件候选包络" in TRISTATE_SYSTEM_PROMPT
-    assert "Proposal/Split" in TRISTATE_SYSTEM_PROMPT
-    assert "CueQC" in TRISTATE_SYSTEM_PROMPT
-    assert all(value in TRISTATE_SYSTEM_PROMPT for value in ("呻吟", "喘息", "吸气", "呼气"))
-    assert "也不负责删除呻吟或喘息" in TRISTATE_SYSTEM_PROMPT
-    assert "亲吻/唾液/口腔声" in TRISTATE_SYSTEM_PROMPT
-    assert "完整音频的 segments" in TRISTATE_SYSTEM_PROMPT
+    # The three wire labels must all be defined, or the response schema and the
+    # prompt disagree about what the Teacher may emit.
+    for label in ("vocal_candidate", "non_vocal_candidate", "unsure"):
+        assert label in TRISTATE_SYSTEM_PROMPT
+
+    # broad human-vocal task semantics: these categories are the whole reason
+    # this Teacher exists rather than a speech-only VAD.  Dropping any of them
+    # silently narrows the label and invalidates every existing label set.
+    for category in (
+        "呻吟",
+        "喘息",
+        "吸气",
+        "呼气",
+        "耳语",
+        "咳嗽",
+        "亲吻",
+        "唾液",
+        "口腔",
+        "歌唱",
+        "背景人声",
+    ):
+        assert category in TRISTATE_SYSTEM_PROMPT, category
+
+    # Non-vocal side must stay explicit, otherwise the Teacher drifts to
+    # labelling whole sources vocal (the failure mode tracked in HISTORY).
+    for category in ("纯音乐", "机械", "撞击", "衣物", "水声", "静音"):
+        assert category in TRISTATE_SYSTEM_PROMPT, category
+
+    # Complete-coverage contract: sorted, gapless, non-overlapping, and anchored
+    # to the advertised duration.  The canonical compiler relies on all four.
+    assert "覆盖完整音频时间轴" in TRISTATE_SYSTEM_PROMPT
+    assert "无重叠" in TRISTATE_SYSTEM_PROMPT
+    assert "无缺口" in TRISTATE_SYSTEM_PROMPT
+    assert "00:00.000" in TRISTATE_SYSTEM_PROMPT
+    assert "duration_ts" in TRISTATE_SYSTEM_PROMPT
     assert "MM:SS.mmm" in TRISTATE_SYSTEM_PROMPT
+
+    # Regression guard for the v5 prompt: fixed duration thresholds produced
+    # 5/5 whole-source single-vocal sources and zero splits (commit afa5398).
+    # Boundaries must be justified acoustically, never by a fixed clock rule.
+    for banned in ("秒以上", "秒以下", "超过 1 秒", "至少 2 秒", "不少于"):
+        assert banned not in TRISTATE_SYSTEM_PROMPT, banned
+
     args = parse_args(["--manifest", "m", "--output-dir", "o"])
     assert args.env_file == "gemini"
     assert set(PROVIDER_CONTRACTS) == {"openrouter", "gemini"}
