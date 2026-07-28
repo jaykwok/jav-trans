@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime
 import html
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -15,6 +16,7 @@ AUDIT_ROOT = PROJECT_ROOT / "agents" / "audits"
 AUDIT_RM_ROOT = PROJECT_ROOT / "agents" / "rm" / "audit-deletions"
 AUDIT_SERVER_COMMAND = "tools/audits/serve_audits.ps1"
 AUDIT_TIMESTAMP_RE = re.compile(r"(?<!\d)(\d{8})[_-](\d{6})(?!\d)")
+EXTERNAL_PAGES_FILENAME = "external_pages.jsonl"
 SUMMARY_TIME_KEYS = (
     "generated_at",
     "created_at",
@@ -196,17 +198,149 @@ def _discover_entries(audit_root: Path) -> list[dict[str, str]]:
     return entries
 
 
+def _nav_href(path: Path, *, audit_root: Path) -> str:
+    """Relative href from the audit root; supports ../ for project-local外部 pages."""
+    try:
+        return Path(os.path.relpath(path.resolve(), audit_root.resolve())).as_posix()
+    except ValueError:
+        return path.resolve().as_posix()
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _external_registry_path(audit_root: Path) -> Path:
+    return audit_root / EXTERNAL_PAGES_FILENAME
+
+
+def _read_external_registry(audit_root: Path) -> list[dict[str, str]]:
+    registry = _external_registry_path(audit_root)
+    if not registry.exists():
+        return []
+    rows: list[dict[str, str]] = []
+    for line in registry.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, Mapping) and str(payload.get("href") or "").strip():
+            rows.append({str(key): str(value) for key, value in payload.items()})
+    return rows
+
+
+def _write_external_registry(audit_root: Path, rows: list[dict[str, str]]) -> None:
+    registry = _external_registry_path(audit_root)
+    audit_root.mkdir(parents=True, exist_ok=True)
+    tmp = registry.with_name(registry.name + ".tmp")
+    tmp.write_text(
+        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    tmp.replace(registry)
+
+
+def register_external_audit_page(
+    *,
+    page_index: Path,
+    title: str,
+    audit_root: Path = AUDIT_ROOT,
+    project_root: Path | None = None,
+) -> bool:
+    """Track a generated audit page that lives outside agents/audits.
+
+    Files are never moved; only an href (relative to the audit root, e.g.
+    ../temp/...) is recorded so the navigation index can list it. Pages under
+    the audit root are discovered by scan and are rejected here; pages outside
+    the project root are rejected. pytest runs must not mutate the real
+    navigation because the full regression uses agents/temp as basetemp.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST") and audit_root == AUDIT_ROOT:
+        return False
+    root = (project_root or PROJECT_ROOT).resolve()
+    resolved = page_index.resolve()
+    if resolved.name != "index.html" or not resolved.exists():
+        return False
+    if not _is_under(resolved, root) or _is_under(resolved, audit_root):
+        return False
+    href = _nav_href(resolved, audit_root=audit_root)
+    rows = [row for row in _read_external_registry(audit_root) if row.get("href") != href]
+    rows.append(
+        {
+            "href": href,
+            "title": str(title or resolved.parent.name),
+            "registered_at": _format_datetime(datetime.now()),
+        }
+    )
+    _write_external_registry(audit_root, rows)
+    return True
+
+
+def unregister_external_audit_page(*, href: str, audit_root: Path = AUDIT_ROOT) -> bool:
+    rows = _read_external_registry(audit_root)
+    kept = [row for row in rows if row.get("href") != href]
+    if len(kept) == len(rows):
+        return False
+    _write_external_registry(audit_root, kept)
+    return True
+
+
+def _external_entries(audit_root: Path) -> list[dict[str, str]]:
+    """Registry-backed entries; targets that no longer exist are pruned."""
+    rows = _read_external_registry(audit_root)
+    entries: list[dict[str, str]] = []
+    kept: list[dict[str, str]] = []
+    for row in rows:
+        href = str(row.get("href") or "")
+        index_path = (audit_root / href).resolve()
+        if index_path.name != "index.html" or not index_path.exists():
+            continue
+        kept.append(row)
+        summary = _summary_for(index_path)
+        mtime = _audit_entry_mtime(index_path)
+        title = str(row.get("title") or "") or _entry_title(index_path, summary)
+        entries.append(
+            {
+                "href": href,
+                "title": anonymize_display_text(title),
+                "desc": _entry_desc(summary),
+                "dir": project_rel(index_path.parent),
+                "mtime": str(mtime),
+                "generated_at": _entry_generated_time(index_path, summary, mtime=mtime),
+                "external": "1",
+            }
+        )
+    if len(kept) != len(rows):
+        _write_external_registry(audit_root, kept)
+    return entries
+
+
 def _card(entry: Mapping[str, str], *, latest_href: str) -> str:
     href = str(entry.get("href") or "")
     title = str(entry.get("title") or href)
     desc = str(entry.get("desc") or "审计页面")
     generated_at = str(entry.get("generated_at") or "")
+    is_external = bool(entry.get("external"))
     badge = '<span class="badge">最新</span>' if href == latest_href else ""
     delete_label = f"删除 {title}"
     generated_line = (
         f'      <span class="entry-time">生成：{html.escape(generated_at)}</span>\n'
         if generated_at
         else ""
+    )
+    delete_button = (
+        f'    <button class="unregister-external" type="button" data-href="{html.escape(href)}" '
+        f'data-title="{html.escape(title)}" aria-label="从导航移除">移除</button>\n'
+    ) if is_external else (
+        f'    <button class="delete-audit" type="button" data-href="{html.escape(href)}" '
+        f'data-title="{html.escape(title)}" aria-label="{html.escape(delete_label)}">删除</button>\n'
     )
     return (
         f'  <div class="entry" data-href="{html.escape(href)}">\n'
@@ -215,8 +349,7 @@ def _card(entry: Mapping[str, str], *, latest_href: str) -> str:
         f"      <span>{html.escape(desc)}</span>\n"
         f"{generated_line}"
         "    </a>\n"
-        f'    <button class="delete-audit" type="button" data-href="{html.escape(href)}" '
-        f'data-title="{html.escape(title)}" aria-label="{html.escape(delete_label)}">删除</button>\n'
+        f"{delete_button}"
         "  </div>"
     )
 
@@ -387,9 +520,13 @@ def write_audit_index(
     audit_root: Path = AUDIT_ROOT,
     latest_html: Path | None = None,
     latest_title: str = "",
+    project_root: Path | None = None,
 ) -> None:
     audit_root.mkdir(parents=True, exist_ok=True)
     entries = _discover_entries(audit_root)
+    external = _external_entries(audit_root)
+    entries.extend(external)
+    entries.sort(key=lambda entry: float(entry["mtime"]), reverse=True)
     latest_href = ""
     if latest_html is not None:
         latest_href = rel_url(latest_html, from_dir=audit_root)
@@ -468,6 +605,16 @@ h1 {{ margin: 0 0 18px; font-size: 24px; }}
   white-space: nowrap;
 }}
 .delete-audit:hover {{ background: #ffe3df; }}
+.unregister-external {{
+  border: 1px solid #d8ddd8;
+  border-radius: 6px;
+  background: #fff;
+  color: #66706c;
+  cursor: pointer;
+  padding: 7px 10px;
+  white-space: nowrap;
+}}
+.unregister-external:hover {{ background: #f5f6f4; }}
 .badge {{
   display: inline-block;
   border: 1px solid #0f766e;
@@ -498,7 +645,7 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 {cards}
   <div class="status" id="deleteStatus"></div>
   <p class="muted">{html.escape(latest_meta)}</p>
-  <p class="muted">所有长期审计页统一放在 <code>agents/audits/</code>，从本页进入；按更新时间倒序排列，最上面是最新需要审计的页面。不使用自动跳转。推荐用 <code>{AUDIT_SERVER_COMMAND}</code> 启动轻量审计服务，它从项目根目录提供媒体文件，支持音频 Range seek，不 watch 项目目录也不注入自动刷新脚本。删除按钮只有通过该脚本启动时才能直接移动本地文件并重建导航；否则页面会给出可手动运行的删除命令。删除会移动到 <code>agents/rm/audit-deletions/</code>。</p>
+  <p class="muted">所有长期审计页统一放在 <code>agents/audits/</code>，从本页进入；按更新时间倒序排列，最上面是最新需要审计的页面。不使用自动跳转。推荐用 <code>{AUDIT_SERVER_COMMAND}</code> 启动轻量审计服务，它从项目根目录提供媒体文件，支持音频 Range seek，不 watch 项目目录也不注入自动刷新脚本。删除按钮只有通过该脚本启动时才能直接移动本地文件并重建导航；否则页面会给出可手动运行的删除命令。删除会移动到 <code>agents/rm/audit-deletions/</code>。外部页面（如 <code>agents/temp/</code> 下的页面）通过注册追踪，只保留 href，不会被物理移动；"移除"按钮只从导航注销，文件保持原位。</p>
 </main>
 <script>
 const statusBox = document.getElementById("deleteStatus");
@@ -507,6 +654,9 @@ function setStatus(text) {{
 }}
 function deleteCommand(href) {{
   return `PYTHONIOENCODING=utf-8 UV_CACHE_DIR=agents/temp/uv-cache uv run python tools/audits/audit_nav.py delete --href "${{href.replaceAll('"', '\\"')}}"`;
+}}
+function unregisterCommand(href) {{
+  return `PYTHONIOENCODING=utf-8 UV_CACHE_DIR=agents/temp/uv-cache uv run python tools/audits/audit_nav.py unregister --href "${{href.replaceAll('"', '\\"')}}"`;
 }}
 async function copyText(text) {{
   try {{
@@ -521,6 +671,22 @@ async function postDeleteAudit(href) {{
   const timer = window.setTimeout(() => controller.abort(), 45000);
   try {{
     const response = await fetch("/__audit_api__/delete-audit", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{href}}),
+      signal: controller.signal
+    }});
+    const payload = await response.json().catch(() => ({{}}));
+    return {{response, payload}};
+  }} finally {{
+    window.clearTimeout(timer);
+  }}
+}}
+async function postUnregisterExternal(href) {{
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 15000);
+  try {{
+    const response = await fetch("/__audit_api__/unregister-external", {{
       method: "POST",
       headers: {{"Content-Type": "application/json"}},
       body: JSON.stringify({{href}}),
@@ -561,11 +727,47 @@ async function deleteAudit(button) {{
     button.textContent = "删除";
   }}
 }}
+async function unregisterExternal(button) {{
+  const href = button.dataset.href || "";
+  const title = button.dataset.title || href;
+  if (!href) return;
+  if (!window.confirm(`从导航移除？\\n\\n${{title}}\\n\\n文件不会删除，只从导航注销。`)) return;
+  button.disabled = true;
+  button.textContent = "移除中";
+  try {{
+    const {{response, payload}} = await postUnregisterExternal(href);
+    if (!response.ok || !payload.ok) {{
+      throw new Error(payload.error || `HTTP ${{response.status}}`);
+    }}
+    const card = button.closest(".entry");
+    if (card) card.remove();
+    setStatus(`已从导航移除 ${{title}}。刷新页面可看到最新状态。`);
+  }} catch (error) {{
+    const command = unregisterCommand(href);
+    const copied = await copyText(command);
+    const reason = error && error.name === "AbortError" ? "请求超时。" : `错误：${{error.message || error}}`;
+    setStatus(
+      "审计服务 API 不可用，浏览器静态页不能直接修改注册表。\\n" +
+      "请用以下方式从项目根目录启动：" + {json.dumps(AUDIT_SERVER_COMMAND)} + "\\n" +
+      "或直接运行命令" + (copied ? "（已复制）" : "") + "：\\n" + command + "\\n" +
+      reason
+    );
+    button.disabled = false;
+    button.textContent = "移除";
+  }}
+}}
 for (const button of document.querySelectorAll(".delete-audit")) {{
   button.addEventListener("click", event => {{
     event.preventDefault();
     event.stopPropagation();
     deleteAudit(button);
+  }});
+}}
+for (const button of document.querySelectorAll(".unregister-external")) {{
+  button.addEventListener("click", event => {{
+    event.preventDefault();
+    event.stopPropagation();
+    unregisterExternal(button);
   }});
 }}
 </script>
@@ -602,6 +804,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     rebuild_parser = subparsers.add_parser("rebuild", help="Rebuild index.html/latest-audit.html")
     rebuild_parser.add_argument("--latest-href", help="Optional latest audit href")
 
+    register_parser = subparsers.add_parser("register", help="Register an external audit page (e.g. agents/temp/**/index.html)")
+    register_parser.add_argument("--page-index", required=True, type=_path_arg, help="Path to the audit page's index.html")
+    register_parser.add_argument("--title", required=True, help="Display title for navigation")
+
+    unregister_parser = subparsers.add_parser("unregister", help="Unregister an external audit page from navigation")
+    unregister_parser.add_argument("--href", required=True, help="Audit href from agents/audits/index.html")
+
     return parser.parse_args(argv)
 
 
@@ -619,6 +828,22 @@ def main(argv: list[str] | None = None) -> int:
             latest_html = _resolve_audit_entry_dir(audit_root=audit_root, href=args.latest_href) / "index.html"
         refreshed = refresh_audit_entrypoints_after_change(audit_root=audit_root, latest_html=latest_html)
         print(json.dumps({"ok": True, "latest_href": rel_url(refreshed, from_dir=audit_root) if refreshed else ""}, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "register":
+        ok = register_external_audit_page(
+            page_index=args.page_index,
+            title=args.title,
+            audit_root=audit_root,
+        )
+        if ok:
+            refresh_audit_entrypoints_after_change(audit_root=audit_root)
+        print(json.dumps({"ok": ok}, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "unregister":
+        ok = unregister_external_audit_page(href=args.href, audit_root=audit_root)
+        if ok:
+            refresh_audit_entrypoints_after_change(audit_root=audit_root)
+        print(json.dumps({"ok": ok}, ensure_ascii=False, indent=2))
         return 0
     raise SystemExit(f"unknown command: {args.command}")
 

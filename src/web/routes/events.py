@@ -28,6 +28,7 @@ async def _event_stream(
     job_id: str | None,
 ) -> AsyncIterator[str]:
     queue = await broadcaster.subscribe()
+    try:
         while True:
             if await request.is_disconnected():
                 break
