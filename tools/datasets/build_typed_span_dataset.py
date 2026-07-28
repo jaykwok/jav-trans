@@ -67,9 +67,18 @@ HARDMIX_FIXED_DATASETS = ("hardmix-fixedboundary-4096",)
 # ("groan"/"groaning", "kiss"/"kiss_sound"/"kissing_sound", "breath"/
 # "short_breath"/"only_breathing").  Match on stems, longest first, so
 # "non_speech" is not shadowed by "speech".
-NON_VOCAL_STEMS = (
+# Flags that assert only the ABSENCE of lexical content, never what the sound
+# actually is. The teacher used `non_speech` as a synonym for "drop" - a moan,
+# a breath and a laugh are all non_speech - so reading it as "not a human
+# sound" typed 1866 of the 2945 non_vocal spans (63.4%) from a flag that never
+# made that claim. They carry no type evidence and fall through to `unsure`.
+NON_LEXICAL_STEMS = (
     "non_speech",
     "no_speech",
+    "not_speech",
+    "speechless",
+)
+NON_VOCAL_STEMS = (
     "silence",
     "silent",
     "pause",
@@ -134,13 +143,18 @@ def _classify_flags(flags: Iterable[str]) -> tuple[bool, bool, bool]:
         flag = str(raw).strip().lower()
         if not flag:
             continue
-        # Order matters: non-vocal stems include "non_speech", which must be
-        # tested before the "speech" stem it contains.
+        # Order matters. Concrete acoustic descriptions win first, so a flag
+        # like "non_speech_noise" is still read as noise rather than being
+        # discarded for containing "non_speech". Only a flag with no concrete
+        # evidence at all falls through to NON_LEXICAL_STEMS, which is also
+        # what keeps "non_speech" away from the "speech" stem it contains.
         if any(stem in flag for stem in NON_VOCAL_STEMS):
             has_non_vocal = True
             continue
         if any(stem in flag for stem in NON_SEMANTIC_VOCAL_STEMS):
             has_vocal = True
+            continue
+        if any(stem in flag for stem in NON_LEXICAL_STEMS):
             continue
         if any(stem in flag for stem in SPEECH_STEMS):
             has_speech = True
