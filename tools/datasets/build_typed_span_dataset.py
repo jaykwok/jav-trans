@@ -78,20 +78,50 @@ NON_LEXICAL_STEMS = (
     "not_speech",
     "speechless",
 )
+# Flags that assert only that SOME sound is present, never what produced it.
+# A 70-window audio audit put bare `noise` at 75.5% human-produced, next to the
+# concrete-vocal control at 81.2% and nowhere near concrete non-vocal flags at
+# 36.1%: the teacher writes `noise` for "a sound that is not speech", which is
+# the `non_speech` sense again. The compounds are the tell - `non_speech_noise`
+# and `speechless_noise` pair it with a no-words word and reach 84.6%, more
+# human-produced than the vocal control itself.
+NON_SPECIFIC_STEMS = (
+    "noise",
+    "sound_event",
+    "sound_only",
+    "action_sound",
+    "very_short",
+)
+# Concrete acoustic nouns: each names a source, so it is real evidence even
+# when it also carries a generic word. `mechanical_noise` is matched here by
+# `mechanical`, which is why removing bare `noise` above does not lose it.
 NON_VOCAL_STEMS = (
     "silence",
     "silent",
     "pause",
-    "noise",
     "music",
     "bgm",
     "mechanical",
+    "machinery",
     "impact",
     "water",
     "cloth",
+    "fabric",
     "ambien",
-    "background_only",
+    "station",
+    "background",
     "instrument",
+    "environmental",
+    "movement",
+    "rustl",
+    "footstep",
+    "rain",
+    "door",
+    "thud",
+    "paper",
+    "object",
+    "vehicle",
+    "train",
 )
 NON_SEMANTIC_VOCAL_STEMS = (
     "breath",
@@ -112,6 +142,10 @@ NON_SEMANTIC_VOCAL_STEMS = (
     "shout",
     "grunt",
     "whimper",
+    "cough",
+    "slurp",
+    "exhal",
+    "mouth_sound",
     "non_verbal",
     "nonverbal",
     "vocalization",
@@ -143,16 +177,18 @@ def _classify_flags(flags: Iterable[str]) -> tuple[bool, bool, bool]:
         flag = str(raw).strip().lower()
         if not flag:
             continue
-        # Order matters. Concrete acoustic descriptions win first, so a flag
-        # like "non_speech_noise" is still read as noise rather than being
-        # discarded for containing "non_speech". Only a flag with no concrete
-        # evidence at all falls through to NON_LEXICAL_STEMS, which is also
-        # what keeps "non_speech" away from the "speech" stem it contains.
+        # Order matters. A flag that names a source is evidence and wins first,
+        # so "mechanical_noise" is still read as machinery. Everything that
+        # only reports the absence of words or the mere presence of sound
+        # reaches the two no-evidence tables and contributes nothing - which is
+        # also what keeps "non_speech" away from the "speech" stem it contains.
         if any(stem in flag for stem in NON_VOCAL_STEMS):
             has_non_vocal = True
             continue
         if any(stem in flag for stem in NON_SEMANTIC_VOCAL_STEMS):
             has_vocal = True
+            continue
+        if any(stem in flag for stem in NON_SPECIFIC_STEMS):
             continue
         if any(stem in flag for stem in NON_LEXICAL_STEMS):
             continue
