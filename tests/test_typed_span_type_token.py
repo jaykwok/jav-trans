@@ -299,3 +299,50 @@ def test_auxiliary_head_refuses_to_supplement_a_frame_head() -> None:
         build_model(16, 24, (1, 2), type_head="frame", aux_frame_type=True)
     with pytest.raises(ValueError):
         build_model(16, 24, (1, 2), type_head="none", aux_frame_type=True)
+
+
+def test_modality_mask_zeroes_only_the_other_block() -> None:
+    """Ablation must remove information without changing anything else.
+
+    Zeroing rather than slicing keeps width, parameter count and normalisation
+    identical across arms, so a difference between them can only come from
+    which information reached the stem.
+    """
+    from tools.boundary.ja.train_typed_span_falsification import apply_modality_mask
+
+    features = np.arange(2 * 3 * 6, dtype=np.float32).reshape(2, 3, 6) + 1
+    ptm_only = apply_modality_mask(features, 4, "ptm")
+    mfcc_only = apply_modality_mask(features, 4, "mfcc")
+    assert np.array_equal(ptm_only[..., :4], features[..., :4])
+    assert not ptm_only[..., 4:].any()
+    assert not mfcc_only[..., :4].any()
+    assert np.array_equal(mfcc_only[..., 4:], features[..., 4:])
+
+
+def test_modality_mask_leaves_both_untouched_and_does_not_alias() -> None:
+    from tools.boundary.ja.train_typed_span_falsification import apply_modality_mask
+
+    features = np.ones((2, 4), dtype=np.float32)
+    assert apply_modality_mask(features, 2, "both") is features
+    masked = apply_modality_mask(features, 2, "ptm")
+    assert features.all(), "the caller's array must not be modified in place"
+    assert not masked[..., 2:].any()
+
+
+@pytest.mark.parametrize("modality", ["ptm_only", "", "PTM", "none"])
+def test_unknown_modality_is_rejected(modality: str) -> None:
+    from tools.boundary.ja.train_typed_span_falsification import apply_modality_mask
+
+    with pytest.raises(ValueError):
+        apply_modality_mask(np.ones((2, 4), dtype=np.float32), 2, modality)
+
+
+def test_modality_mask_rejects_a_split_it_cannot_make() -> None:
+    """A ptm_dim covering the whole width would silently ablate nothing."""
+    from tools.boundary.ja.train_typed_span_falsification import apply_modality_mask
+
+    features = np.ones((2, 4), dtype=np.float32)
+    with pytest.raises(ValueError):
+        apply_modality_mask(features, 4, "ptm")
+    with pytest.raises(ValueError):
+        apply_modality_mask(features, 0, "mfcc")

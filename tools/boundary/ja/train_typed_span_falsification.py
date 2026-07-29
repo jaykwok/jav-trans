@@ -325,6 +325,34 @@ def build_model(
     return Net()
 
 
+INPUT_MODALITIES = ("both", "ptm", "mfcc")
+
+
+def apply_modality_mask(
+    features: np.ndarray, ptm_dim: int, modality: str
+) -> np.ndarray:
+    """Zero one input block so the encoder cannot read it.
+
+    Zeroing rather than slicing keeps the architecture, the parameter count and
+    the normalisation statistics identical across arms, so the only thing that
+    differs between them is which information reaches the stem. Applied after
+    normalisation, since a zeroed column is only uninformative once the mean
+    has already been removed.
+    """
+    if modality == "both":
+        return features
+    if modality not in INPUT_MODALITIES:
+        raise ValueError(f"unknown input modality: {modality!r}")
+    if ptm_dim <= 0 or ptm_dim >= features.shape[-1]:
+        raise ValueError("modality ablation needs a real PTM/MFCC split")
+    masked = features.copy()
+    if modality == "ptm":
+        masked[..., ptm_dim:] = 0.0
+    else:
+        masked[..., :ptm_dim] = 0.0
+    return masked
+
+
 def sample_batch(
     store: FrameStore,
     pools: list[tuple[list[dict], float]],
@@ -334,6 +362,7 @@ def sample_batch(
     rng: np.random.Generator,
     mean: np.ndarray,
     std: np.ndarray,
+    modality: str = "both",
 ):
     """Draw a batch, choosing the source pool by weight then the example within.
 
@@ -357,7 +386,7 @@ def sample_batch(
         features[slot, :take] = (block - mean) / std
         labels[slot, :take] = store.speech[start : start + take]
         types[slot, :take] = store.type[start : start + take]
-    return features, labels, types
+    return apply_modality_mask(features, store.ptm_dim, modality), labels, types
 
 
 def constant_runs(values: np.ndarray) -> list[tuple[int, int]]:
@@ -533,6 +562,7 @@ def evaluate(
     window: int,
     iou: float,
     decode_mode: str = "argmax",
+    modality: str = "both",
 ) -> dict:
     import torch
 
@@ -548,7 +578,9 @@ def evaluate(
     with torch.no_grad():
         for row in examples:
             offset, count = int(row["frame_offset"]), int(row["frame_count"])
-            block = (store.read(offset, count) - mean) / std
+            block = apply_modality_mask(
+                (store.read(offset, count) - mean) / std, store.ptm_dim, modality
+            )
             truth = store.speech[offset : offset + count].astype(np.int64)
 
             predicted = np.zeros(count, dtype=np.int64)
@@ -788,6 +820,7 @@ def run_arm(
     type_weight: float = 1.0,
     type_class_weighting: str = "none",
     aux_frame_type_weight: float = 0.0,
+    modality: str = "both",
 ) -> dict:
     import torch
     from torch import nn
@@ -861,6 +894,7 @@ def run_arm(
             rng=rng,
             mean=mean,
             std=std,
+            modality=modality,
         )
         x = torch.from_numpy(features).to(device)
         y = torch.from_numpy(labels).to(device)
@@ -1076,6 +1110,17 @@ def main(argv: list[str] | None = None) -> int:
             "`type_aux_frame` so span-vs-frame separability can be compared."
         ),
     )
+    parser.add_argument(
+        "--input-modality",
+        choices=list(INPUT_MODALITIES),
+        default="both",
+        help=(
+            "Zero one input block to measure what it contributes. The stem "
+            "sees PTM and MFCC concatenated with no alignment layer between "
+            "them, so a branch the encoder learned to ignore would look "
+            "exactly like a branch that carries nothing."
+        ),
+    )
     parser.add_argument("--dense-span-rank", type=int, default=32)
     parser.add_argument("--dense-span-duration-hidden", type=int, default=32)
     parser.add_argument(
@@ -1195,6 +1240,7 @@ def main(argv: list[str] | None = None) -> int:
                 type_weight=float(args.type_weight),
                 type_class_weighting=str(args.type_class_weighting),
                 aux_frame_type_weight=float(args.aux_frame_type_weight),
+                modality=str(args.input_modality),
             )
         )
 
