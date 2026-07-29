@@ -214,6 +214,7 @@ def build_model(
     ptm_in: int = 0,
     projector_dim: int = 0,
     type_head: str = "none",
+    aux_frame_type: bool = False,
 ):
     """Frame classifier, optionally behind a learnable PTM projection.
 
@@ -283,6 +284,19 @@ def build_model(
                 self.type_span = nn.Linear(3 * hidden, NONSPEECH_TYPE_CLASSES)
             elif self.type_head != "none":
                 raise ValueError(f"unknown type head: {type_head!r}")
+            # Training-only auxiliary head. The span head sees one gradient per
+            # span, which for a class holding 1.9% of supervised frames is thin
+            # enough that two seeds in three collapse onto the other class.
+            # This one supervises every non-speech frame, so the encoder is
+            # pushed toward local separability even when the span token is not
+            # learning. It never participates in decoding.
+            self.aux_frame_type = bool(aux_frame_type)
+            if self.aux_frame_type:
+                if self.type_head not in ("span", "span_cond"):
+                    raise ValueError(
+                        "auxiliary frame typing only supplements a span type head"
+                    )
+                self.type_frame_aux = nn.Conv1d(hidden, NONSPEECH_TYPE_CLASSES, 1)
 
         def forward_features(self, x):
             """x: [B,T,width] -> (encoded [B,T,hidden], logits [B,T,2]).
@@ -432,6 +446,21 @@ def inverse_frequency_weights(counts: np.ndarray) -> np.ndarray:
     return weights / weights.mean()
 
 
+def nonspeech_frame_targets(types: np.ndarray) -> np.ndarray:
+    """Per-frame nsv/nv targets, with speech and unknown frames masked out.
+
+    The auxiliary head answers the same question as `span_cond` - which of the
+    two non-speech kinds is this - so it must be blind to speech for the same
+    reason: speech is already decided by the segmentation, and letting the
+    majority class into the target is what made the unconditional span head
+    collapse.
+    """
+    targets = np.full(types.shape, IGNORE_INDEX, dtype=np.int64)
+    non_speech = (types == 1) | (types == 2)
+    targets[non_speech] = types[non_speech] - 1
+    return targets
+
+
 def pool_spans(encoded, spans: list[tuple[int, int]]):
     """Mean-over-span concatenated with both endpoints, vectorised by cumsum.
 
@@ -511,6 +540,9 @@ def evaluate(
     frame = Counter()
     events = Counter()
     type_confusion = np.zeros((TYPE_CLASSES, TYPE_CLASSES), dtype=np.int64)
+    aux_confusion = np.zeros(
+        (NONSPEECH_TYPE_CLASSES, NONSPEECH_TYPE_CLASSES), dtype=np.int64
+    )
     type_head = getattr(model, "type_head", "none")
     per_window: list[dict] = []
     with torch.no_grad():
@@ -521,6 +553,7 @@ def evaluate(
 
             predicted = np.zeros(count, dtype=np.int64)
             predicted_type = np.full(count, IGNORE_INDEX, dtype=np.int64)
+            aux_predicted_type = np.zeros(count, dtype=np.int64)
             encoded_window = (
                 np.zeros((count, model.head.in_channels), dtype=np.float32)
                 if type_head in ("span", "span_cond")
@@ -555,6 +588,14 @@ def evaluate(
                     )
                 elif type_head in ("span", "span_cond"):
                     encoded_window[start:end] = encoded.squeeze(0).cpu().numpy()
+                if getattr(model, "aux_frame_type", False):
+                    aux_predicted_type[start:end] = (
+                        model.type_frame_aux(encoded.transpose(1, 2))
+                        .argmax(dim=1)
+                        .squeeze(0)
+                        .cpu()
+                        .numpy()
+                    )
 
             if type_head in ("span", "span_cond"):
                 # Type the spans the model actually produced, then project the
@@ -587,6 +628,24 @@ def evaluate(
                             non_speech, assigned.tolist(), strict=True
                         ):
                             predicted_type[span_start:span_end] = 1 + int(value)
+
+            if getattr(model, "aux_frame_type", False):
+                # Scored only where the truth is non-speech, which is the only
+                # place this head is defined. Comparing it against the span
+                # head on the same frames is the diagnostic: frame separable
+                # but span not points at pooling, neither separable points at
+                # the encoder or the labels.
+                truth_type = store.type[offset : offset + count].astype(np.int64)
+                aux_scored = (truth_type == 1) | (truth_type == 2)
+                if bool(aux_scored.any()):
+                    np.add.at(
+                        aux_confusion,
+                        (
+                            truth_type[aux_scored] - 1,
+                            aux_predicted_type[aux_scored],
+                        ),
+                        1,
+                    )
 
             if type_head != "none":
                 truth_type = store.type[offset : offset + count].astype(np.int64)
@@ -660,9 +719,30 @@ def evaluate(
             "confusion": type_confusion.tolist(),
         }
 
+    aux_report: dict = {}
+    if aux_confusion.sum():
+        aux_per_class = {}
+        for index, name in enumerate(TYPE_NAMES[1:]):
+            tp = int(aux_confusion[index, index])
+            fp = int(aux_confusion[:, index].sum()) - tp
+            fn = int(aux_confusion[index, :].sum()) - tp
+            aux_per_class[name] = {**prf(tp, fp, fn), "support": tp + fn}
+        aux_total = int(aux_confusion.sum())
+        aux_report = {
+            "frames_scored": aux_total,
+            "accuracy": round(int(np.trace(aux_confusion)) / aux_total, 4),
+            "macro_f1": round(
+                sum(v["f1"] for v in aux_per_class.values()) / NONSPEECH_TYPE_CLASSES,
+                4,
+            ),
+            "per_class": aux_per_class,
+            "confusion": aux_confusion.tolist(),
+        }
+
     n = frame["n"] or 1
     return {
         **({"type": type_report} if type_report else {}),
+        **({"type_aux_frame": aux_report} if aux_report else {}),
         "frames_scored": int(frame["n"]),
         "frame_accuracy": round(frame["correct"] / n, 4),
         "speech_positive_rate_truth": round((frame["tp"] + frame["fn"]) / n, 4),
@@ -707,6 +787,7 @@ def run_arm(
     type_head: str = "none",
     type_weight: float = 1.0,
     type_class_weighting: str = "none",
+    aux_frame_type_weight: float = 0.0,
 ) -> dict:
     import torch
     from torch import nn
@@ -720,6 +801,7 @@ def run_arm(
         ptm_in=store.ptm_dim,
         projector_dim=projector_dim,
         type_head=type_head,
+        aux_frame_type=aux_frame_type_weight > 0.0,
     ).to(device)
     if decoder == "dense_span":
         from boundary.dense_span import BinaryDenseSpanDecoder
@@ -751,6 +833,10 @@ def run_arm(
             else torch.tensor(type_class_weights, dtype=torch.float32, device=device)
         ),
     )
+    # Unweighted on purpose: the auxiliary head exists to densify the gradient,
+    # and stacking class weighting on top would confound "more supervision"
+    # with "reweighted supervision", which was already measured separately.
+    aux_loss_fn = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
 
     history: list[dict] = []
     started = time.time()
@@ -809,6 +895,14 @@ def run_arm(
                 loss = loss + type_weight * type_loss_fn(
                     model.type_span(torch.cat(pooled, dim=0)),
                     torch.tensor(targets, device=device, dtype=torch.long),
+                )
+        if getattr(model, "aux_frame_type", False):
+            aux_logits = model.type_frame_aux(encoded.transpose(1, 2)).transpose(1, 2)
+            aux_targets = torch.from_numpy(nonspeech_frame_targets(types)).to(device)
+            if bool((aux_targets != IGNORE_INDEX).any()):
+                loss = loss + aux_frame_type_weight * aux_loss_fn(
+                    aux_logits.reshape(-1, NONSPEECH_TYPE_CLASSES),
+                    aux_targets.reshape(-1),
                 )
         if decoder == "dense_span":
             supervised = y != IGNORE_INDEX
@@ -969,6 +1063,19 @@ def main(argv: list[str] | None = None) -> int:
             "spans for the span heads) and normalised to mean 1."
         ),
     )
+    parser.add_argument(
+        "--aux-frame-type-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of a training-only per-frame nsv/nv head that supplements "
+            "a span type head. The span head gets one gradient per span, which "
+            "is thin for a class holding under 2%% of supervised frames; this "
+            "one supervises every non-speech frame. It never takes part in "
+            "decoding, and its own frame-level score is reported separately as "
+            "`type_aux_frame` so span-vs-frame separability can be compared."
+        ),
+    )
     parser.add_argument("--dense-span-rank", type=int, default=32)
     parser.add_argument("--dense-span-duration-hidden", type=int, default=32)
     parser.add_argument(
@@ -1087,6 +1194,7 @@ def main(argv: list[str] | None = None) -> int:
                 type_head=str(args.type_head),
                 type_weight=float(args.type_weight),
                 type_class_weighting=str(args.type_class_weighting),
+                aux_frame_type_weight=float(args.aux_frame_type_weight),
             )
         )
 

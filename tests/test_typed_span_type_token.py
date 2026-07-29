@@ -244,3 +244,58 @@ def test_span_typing_is_constant_within_a_span() -> None:
     assert (projected != IGNORE_INDEX).all()
     for start, end in spans:
         assert len(set(projected[start:end].tolist())) == 1
+
+
+def test_auxiliary_targets_mask_speech_and_unknown_frames() -> None:
+    """The aux head answers `span_cond`'s question, so it must share its blindness.
+
+    Speech is already settled by the segmentation. Letting the majority class
+    into a per-frame target is exactly what collapsed the unconditional span
+    head, and the aux head supervises far more frames, so it would collapse
+    harder.
+    """
+    from tools.boundary.ja.train_typed_span_falsification import (
+        nonspeech_frame_targets,
+    )
+
+    types = np.array([0, 1, 1, 2, IGNORE_INDEX, 2, 0])
+    assert nonspeech_frame_targets(types).tolist() == [
+        IGNORE_INDEX, 0, 0, 1, IGNORE_INDEX, 1, IGNORE_INDEX
+    ]
+
+
+def test_auxiliary_targets_stay_inside_the_head_output_space() -> None:
+    from tools.boundary.ja.train_typed_span_falsification import (
+        nonspeech_frame_targets,
+    )
+
+    rng = np.random.default_rng(3)
+    types = rng.integers(-1, TYPE_CLASSES, size=500)
+    types[types < 0] = IGNORE_INDEX
+    targets = nonspeech_frame_targets(types)
+    known = targets != IGNORE_INDEX
+    assert ((targets[known] >= 0) & (targets[known] < NONSPEECH_TYPE_CLASSES)).all()
+    # supervised exactly where the truth is one of the two non-speech kinds
+    assert np.array_equal(known, (types == 1) | (types == 2))
+
+
+def test_auxiliary_head_is_absent_unless_asked_for() -> None:
+    """It is training-only scaffolding; the default arms must be unchanged."""
+    plain = build_model(16, 24, (1, 2), type_head="span_cond")
+    assert not hasattr(plain, "type_frame_aux")
+    assert plain.aux_frame_type is False
+
+
+def test_auxiliary_head_emits_two_classes_per_frame() -> None:
+    model = build_model(16, 24, (1, 2), type_head="span_cond", aux_frame_type=True)
+    encoded, _ = model.forward_features(torch.randn(2, 40, 16))
+    logits = model.type_frame_aux(encoded.transpose(1, 2))
+    assert logits.shape == (2, NONSPEECH_TYPE_CLASSES, 40)
+
+
+def test_auxiliary_head_refuses_to_supplement_a_frame_head() -> None:
+    """Supplementing the frame head with a frame head would measure nothing."""
+    with pytest.raises(ValueError):
+        build_model(16, 24, (1, 2), type_head="frame", aux_frame_type=True)
+    with pytest.raises(ValueError):
+        build_model(16, 24, (1, 2), type_head="none", aux_frame_type=True)
