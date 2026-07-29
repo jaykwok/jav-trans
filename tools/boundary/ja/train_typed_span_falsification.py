@@ -326,6 +326,20 @@ def build_model(
 
 
 INPUT_MODALITIES = ("both", "ptm", "mfcc")
+# Index of `non_vocal` in the packed type track.
+RARE_TYPE_INDEX = 2
+
+
+def windows_containing_type(
+    store: FrameStore, examples: list[dict], type_index: int
+) -> list[dict]:
+    """Examples holding at least one frame of the given type."""
+    selected = []
+    for row in examples:
+        offset, count = int(row["frame_offset"]), int(row["frame_count"])
+        if bool((store.type[offset : offset + count] == type_index).any()):
+            selected.append(row)
+    return selected
 
 
 def apply_modality_mask(
@@ -363,6 +377,8 @@ def sample_batch(
     mean: np.ndarray,
     std: np.ndarray,
     modality: str = "both",
+    rare_pools: list[list[dict]] | None = None,
+    rare_fraction: float = 0.0,
 ):
     """Draw a batch, choosing the source pool by weight then the example within.
 
@@ -377,7 +393,17 @@ def sample_batch(
     labels = np.full((batch_size, window), IGNORE_INDEX, dtype=np.int64)
     types = np.full((batch_size, window), IGNORE_INDEX, dtype=np.int64)
     for slot in range(batch_size):
-        examples = pools[int(rng.choice(len(pools), p=weights))][0]
+        pool_index = int(rng.choice(len(pools), p=weights))
+        examples = pools[pool_index][0]
+        # Window-level oversampling. This is a different lever from class
+        # weighting, which was tried and hurt: weighting scales the gradient of
+        # whatever was drawn, while `non_vocal` appears in only 20.5% of real
+        # windows with a per-window median of 0.00%, so most steps have no
+        # gradient for it at all. Reweighting nothing is still nothing.
+        if rare_fraction > 0.0 and rare_pools is not None:
+            rare = rare_pools[pool_index]
+            if rare and float(rng.random()) < rare_fraction:
+                examples = rare
         row = examples[int(rng.integers(0, len(examples)))]
         offset, count = int(row["frame_offset"]), int(row["frame_count"])
         take = min(window, count)
@@ -821,6 +847,7 @@ def run_arm(
     type_class_weighting: str = "none",
     aux_frame_type_weight: float = 0.0,
     modality: str = "both",
+    rare_window_fraction: float = 0.0,
 ) -> dict:
     import torch
     from torch import nn
@@ -849,6 +876,21 @@ def run_arm(
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
     loss_fn = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
+    rare_pools = None
+    if rare_window_fraction > 0.0:
+        rare_pools = [
+            windows_containing_type(store, examples, RARE_TYPE_INDEX)
+            for examples, _ in train_pools
+        ]
+        print(
+            f"  [{arm}] rare-window oversampling {rare_window_fraction:.2f}: "
+            + ", ".join(
+                f"{len(rare)}/{len(examples)}"
+                for rare, (examples, _) in zip(rare_pools, train_pools, strict=True)
+            ),
+            flush=True,
+        )
+
     type_class_weights = None
     if type_head != "none" and type_class_weighting == "inverse":
         counts = type_class_counts(store, train_pools, type_head=type_head)
@@ -895,6 +937,8 @@ def run_arm(
             mean=mean,
             std=std,
             modality=modality,
+            rare_pools=rare_pools,
+            rare_fraction=rare_window_fraction,
         )
         x = torch.from_numpy(features).to(device)
         y = torch.from_numpy(labels).to(device)
@@ -1111,6 +1155,18 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--rare-window-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of batch slots drawn from windows that contain at least "
+            "one non_vocal frame. Only 20.5%% of real training windows do, and "
+            "the median window contains none, so most steps carry no gradient "
+            "for the class. This changes WHICH windows are drawn, unlike "
+            "--type-class-weighting, which changes how a drawn one is scored."
+        ),
+    )
+    parser.add_argument(
         "--input-modality",
         choices=list(INPUT_MODALITIES),
         default="both",
@@ -1241,6 +1297,7 @@ def main(argv: list[str] | None = None) -> int:
                 type_class_weighting=str(args.type_class_weighting),
                 aux_frame_type_weight=float(args.aux_frame_type_weight),
                 modality=str(args.input_modality),
+                rare_window_fraction=float(args.rare_window_fraction),
             )
         )
 

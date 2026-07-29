@@ -346,3 +346,90 @@ def test_modality_mask_rejects_a_split_it_cannot_make() -> None:
         apply_modality_mask(features, 4, "ptm")
     with pytest.raises(ValueError):
         apply_modality_mask(features, 0, "mfcc")
+
+
+class _TypeTrackStore:
+    """Minimal FrameStore stand-in: only the type track and a constant read."""
+
+    width = 4
+    ptm_dim = 2
+
+    def __init__(self, type_track: np.ndarray) -> None:
+        self.type = type_track
+        self.speech = np.zeros_like(type_track)
+
+    def read(self, start: int, count: int) -> np.ndarray:
+        return np.ones((count, self.width), dtype=np.float32)
+
+
+def test_rare_windows_are_exactly_those_holding_the_class() -> None:
+    from tools.boundary.ja.train_typed_span_falsification import (
+        RARE_TYPE_INDEX,
+        windows_containing_type,
+    )
+
+    store = _TypeTrackStore(np.array([2, 1, 0, 0, 1, 1, 0, 0, 0, 0, 2, 0]))
+    rows = [
+        {"frame_offset": 0, "frame_count": 4},   # holds a non_vocal frame
+        {"frame_offset": 4, "frame_count": 4},   # does not
+        {"frame_offset": 8, "frame_count": 4},   # holds one
+    ]
+    selected = windows_containing_type(store, rows, RARE_TYPE_INDEX)
+    assert [r["frame_offset"] for r in selected] == [0, 8]
+
+
+def test_oversampling_changes_which_windows_are_drawn() -> None:
+    """The whole point: at fraction 1.0 every slot must carry the class.
+
+    Class weighting was already tried and hurt. It scales the gradient of
+    whatever was drawn, which does nothing on the ~80% of steps that contain no
+    non_vocal frame at all - this lever is what changes that.
+    """
+    from tools.boundary.ja.train_typed_span_falsification import (
+        RARE_TYPE_INDEX,
+        sample_batch,
+    )
+
+    store = _TypeTrackStore(np.array([2, 1, 1, 0, 1, 1, 0, 0]))
+    rows = [
+        {"frame_offset": 0, "frame_count": 4},
+        {"frame_offset": 4, "frame_count": 4},
+    ]
+    pools = [(rows, 1.0)]
+    rare = [[rows[0]]]
+    mean = np.zeros(4, dtype=np.float32)
+    std = np.ones(4, dtype=np.float32)
+
+    def rate(fraction: float) -> float:
+        rng = np.random.default_rng(0)
+        hits = 0
+        for _ in range(200):
+            _, _, types = sample_batch(
+                store, pools, batch_size=1, window=4, rng=rng, mean=mean, std=std,
+                rare_pools=rare, rare_fraction=fraction,
+            )
+            hits += int((types == RARE_TYPE_INDEX).any())
+        return hits / 200
+
+    assert rate(1.0) == 1.0
+    assert 0.3 < rate(0.0) < 0.7
+
+
+def test_oversampling_falls_back_when_no_window_holds_the_class() -> None:
+    """Synthetic pools carry no non-speech type at all, so this must not divide
+    by zero or raise - it has to degrade to ordinary sampling."""
+    from tools.boundary.ja.train_typed_span_falsification import sample_batch
+
+    store = _TypeTrackStore(np.zeros(8, dtype=np.int64))
+    rows = [
+        {"frame_offset": 0, "frame_count": 4},
+        {"frame_offset": 4, "frame_count": 4},
+    ]
+    features, labels, types = sample_batch(
+        store, [(rows, 1.0)], batch_size=3, window=4,
+        rng=np.random.default_rng(0),
+        mean=np.zeros(4, dtype=np.float32), std=np.ones(4, dtype=np.float32),
+        rare_pools=[[]], rare_fraction=1.0,
+    )
+    assert features.shape == (3, 4, 4)
+    assert labels.shape == types.shape == (3, 4)
