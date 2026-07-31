@@ -38,11 +38,9 @@ class GpuWorkerTimeoutError(GpuWorkerError):
         super().__init__("timeout", detail)
 
 
-LOW_VRAM_ASR_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
 _PROFILE_MARKER_SUFFIX = "__PROFILE_ACTIVE"
 _PROFILE_STAGE_BY_SETTING = {
     "ASR_BATCH_SIZE": "asr_text_transcribe",
-    "ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES": "semantic_split_model",
 }
 
 
@@ -135,9 +133,10 @@ def _clear_worker_cuda() -> None:
 
 def _load_asr_pipeline_for_request():
     # No per-request reload. The settings that vary per job (ASR_BACKEND,
-    # ASR_BATCH_SIZE, dtype/attention, boundary/pre-asr-cueqc flags) are all read
-    # from env at CALL time -- current_asr_backend(), _resolve_asr_batch_size(),
-    # _detect_dtype(), _boundary_config(), pre_asr_cueqc.enabled(), ... -- so a
+    # ASR_BATCH_SIZE, dtype/attention, chunking and alignment-head paths) are
+    # all read from env at CALL time -- current_asr_backend(),
+    # _resolve_asr_batch_size(), _detect_dtype(), _chunking_config(),
+    # AlignmentHead.from_env() -- so a
     # persistent worker picks up each job's _temporary_env without re-importing.
     # The only env frozen at CUDA init (PYTORCH_CUDA_ALLOC_CONF,
     # CUDA_VISIBLE_DEVICES) is handled by the client's restart-on-change.
@@ -629,28 +628,6 @@ def _adaptive_runtime_tuning(
                 else "auto_scaled_from_vram"
             )
 
-    semantic_raw = str(
-        env.get("ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES")
-        or os.getenv("ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES", "auto")
-    ).strip().lower()
-    semantic_identity = _profile_identity(
-        stage="semantic_split_model",
-        device_name=device_name,
-        total_mb=total_mb,
-        budget_mb=budget_mb,
-        env=env,
-    )
-    semantic_batch, semantic_profile = _auto_batch_setting(
-        setting="ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES",
-        stage="semantic_split_model",
-        raw_value=semantic_raw,
-        base_batch=128,
-        scale=scale,
-        identity=semantic_identity,
-    )
-    batch_profiles["ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES"] = semantic_profile
-    os.environ["ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES"] = str(semantic_batch)
-
     return {
         "device_name": device_name,
         "physical_vram_mb": round(total_mb, 1),
@@ -667,7 +644,6 @@ def _adaptive_runtime_tuning(
         ),
         "asr_batch_size": effective_batch,
         "asr_batch_source": batch_source,
-        "acoustic_split_max_batch_candidates": semantic_batch,
         "batch_profiles": batch_profiles,
     }
 
@@ -750,8 +726,6 @@ def _downshift_asr_batch_env(
 
 def _oom_stage_from_message(message: str) -> str:
     text = str(message or "")
-    if "语音岛检测" in text or "speech_island" in text:
-        return "speech_island_scorer"
     if (
         "ASR 文本转写" in text
         or "asr_text_transcribe" in text
@@ -761,12 +735,10 @@ def _oom_stage_from_message(message: str) -> str:
         return "asr_text_transcribe"
     if "字幕时间轴" in text or "subtitle_timing" in text:
         return "subtitle_timing"
-    if "Pre-ASR" in text:
-        return "pre_asr_cueqc"
-    if "语义切分" in text:
-        return "semantic_split_model"
-    if "外边界" in text:
-        return "outer_edge_refiner"
+    # Chunking runs one encoder forward per 30s window and holds no batch knob;
+    # naming it here would only produce a downshift that cannot be applied.
+    if "切分" in text or "音频切块" in text:
+        return "audio_chunking"
     return ""
 
 
@@ -777,24 +749,10 @@ def _oom_downshift(
     stage = str(exc.stage or "")
     detail = str(exc.detail or "").lower()
     tuning = exc.runtime_tuning
-    selected_profile = _profile_for_stage(tuning, stage)
-    if selected_profile is not None and stage == "semantic_split_model":
-        setting, profile = selected_profile
-        current = max(1, int(profile.get("batch_size") or 1))
-        if current <= 1:
-            return None
-        lowered = max(1, current // 2)
-        updated = dict(env)
-        updated[setting] = str(lowered)
-        updated[f"{setting}{_PROFILE_MARKER_SUFFIX}"] = "1"
-        return updated, setting, float(current), float(lowered)
-    if stage in {
-        "speech_island_scorer",
-        "outer_edge_refiner",
-        "pre_asr_cueqc",
-    } or "stage=split_done" in detail or "stage=pre_asr_boundary" in detail:
-        # Boundary/PTM inputs are temporal. Shrinking the 20-second window would
-        # change embeddings and overlap averaging, so it is not a batch knob.
+    if stage == "audio_chunking" or "stage=split_done" in detail:
+        # Chunking encodes fixed 30-second windows one at a time. There is no
+        # batch to halve, and shortening the window would change the features
+        # the blank runs are read from.
         return None
 
     lowered = _downshift_asr_batch_env(
@@ -817,7 +775,6 @@ def _terminal_oom_detail(
     retry_limit_exhausted: bool = False,
     failed_setting: str = "ASR_BATCH_SIZE",
 ) -> str:
-    backend = str(env.get("ASR_BACKEND") or os.getenv("ASR_BACKEND", "")).strip()
     budget_mb = _vram_budget_for_env(env)
     retry_summary = ""
     if retry_records:
@@ -831,15 +788,10 @@ def _terminal_oom_detail(
         ]
         retry_summary = f" 已尝试降 batch：{', '.join(steps)}。"
     budget_text = f" 当前显存预算为 {budget_mb:.0f}MB。" if budget_mb > 0 else ""
-    if failed_setting == "SPEECH_BOUNDARY_JA_WINDOW_S":
+    if failed_setting == "ASR_CHUNK_ENCODER":
         headline = (
-            "GPU 显存不足：OOM 出现在 SpeechBoundary/PTM 时序推理；"
-            "为避免缩短窗口改变推理结果，任务已停止。"
-        )
-    elif failed_setting == "ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES":
-        headline = (
-            "GPU 显存不足：Semantic Split batch 已降到 1 后仍然 OOM，"
-            "任务已停止。"
+            "GPU 显存不足：OOM 出现在切分用的 encoder 前向；"
+            "该阶段逐个编码固定 30 秒窗口，没有可降的 batch，任务已停止。"
         )
     elif batch_size is not None and batch_size <= 1:
         headline = "GPU 显存不足：ASR_BATCH_SIZE 已降到 1 后仍然 OOM，任务已停止。"
@@ -848,16 +800,14 @@ def _terminal_oom_detail(
     else:
         headline = "GPU 显存不足：无法继续降低 ASR_BATCH_SIZE，任务已停止。"
 
-    if LOW_VRAM_ASR_BACKEND not in backend:
-        action = (
-            "建议在前端将 ASR 后端切换为 0.6B 低显存档 "
-            f"({LOW_VRAM_ASR_BACKEND}) 后重试；也可以关闭其他占用 GPU 的程序。"
-        )
-    else:
-        action = (
-            "当前已经是 0.6B 最低显存档；在当前硬件/可用显存下无法运行，"
-            "本程序不会改用 CPU 或缩短时序窗口继续推理。"
-        )
+    # The 0.6B tier was dropped on 2026-07-31, so there is no smaller model to
+    # suggest. Pointing at one that no longer ships would be worse than saying
+    # plainly that this hardware cannot run the job.
+    action = (
+        "只有 1.7B 一档，没有更小的模型可切换；请关闭其他占用 GPU 的程序后重试。"
+        "在当前硬件/可用显存下仍然不行时任务只能停止，"
+        "本程序不会改用 CPU 或缩短时序窗口继续推理。"
+    )
     return (
         f"{headline}{retry_summary}{budget_text}{action} "
         f"原始错误：{detail}"
@@ -1499,14 +1449,8 @@ class _GpuWorkerClient:
                         _effective_asr_batch_size(current_env)
                     )
                     failed_setting = (
-                        "ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES"
-                        if exc.stage == "semantic_split_model"
-                        else "SPEECH_BOUNDARY_JA_WINDOW_S"
-                        if exc.stage in {
-                            "speech_island_scorer",
-                            "outer_edge_refiner",
-                            "pre_asr_cueqc",
-                        }
+                        "ASR_CHUNK_ENCODER"
+                        if exc.stage == "audio_chunking"
                         or "stage=split_done" in str(exc.detail or "").lower()
                         else "ASR_BATCH_SIZE"
                     )

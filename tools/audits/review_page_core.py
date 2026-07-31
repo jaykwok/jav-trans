@@ -58,8 +58,36 @@ function waitForMetadata(audio){
     audio.load();
   });
 }
+// One clip may be audible at a time. `stop()` only knows about the element the
+// span player is driving, so it cannot silence a card the auditor started from
+// its own native controls - and two clips playing at once is heard as the new
+// one having inherited the old one's position.
+function pauseOtherAudio(keep){
+  document.querySelectorAll('audio').forEach(other=>{
+    if(other===keep)return;
+    other.pause();
+    // Rewound, not just paused: the auditor has moved on, so this card must
+    // start from its beginning whenever they come back to it.
+    if(other.currentTime)try{other.currentTime=0;}catch(error){}
+  });
+}
+// Native controls bypass `play()` entirely, so the same rule is enforced from
+// the event itself, in the capture phase, whatever started the playback.
+document.addEventListener('play',event=>{
+  const target=event.target;
+  if(!target||target.tagName!=='AUDIO')return;
+  if(activeAudio&&activeAudio!==target)stop();
+  pauseOtherAudio(target);
+  // A clip played to its end parks just short of `duration`, because mp3
+  // encoder padding makes the file marginally longer than the cut. Pressing
+  // play again would then run out only that padding and sound like silence.
+  if(Number.isFinite(target.duration)&&target.currentTime>=target.duration-.05){
+    target.currentTime=0;
+  }
+},true);
 async function play(audio,button,start,end){
   stop();
+  pauseOtherAudio(audio);
   if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start){
     document.getElementById('status').textContent='播放区间无效';
     return;

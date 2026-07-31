@@ -4,7 +4,7 @@ import { addLog } from './log.js';
 import { btnAddFolder, btnSubmit, dropZone } from './dom.js';
 import { fetchAllJobs } from './jobsApi.js';
 import { renderJobs } from './jobsRender.js';
-import { readTranslationSettingsFromForm, syncSettingsFromFormForSubmit } from './settings.js';
+import { readJobTranslationSpecFromForm, syncSettingsFromFormForSubmit } from './settings.js';
 
 let nextPendingId = 1;
 
@@ -95,12 +95,11 @@ export function installFiles() {
 
     const spec = {
       video_paths:              paths,
-      asr_backend:              $('r-backend').value,
       subtitle_mode:            $('r-mode').value,
       skip_translation:         $('r-skip-translation').checked,
       keep_quality_report:      $('t-quality-report').checked,
       translation_max_workers:  readTranslationMaxWorkers(),
-      ...readTranslationSettingsFromForm(),
+      ...readJobTranslationSpecFromForm(),
       keep_temp_files:          $('t-keep-temp').checked,
     };
     const outputDir = $('f-output-dir').value.trim();

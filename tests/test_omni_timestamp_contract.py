@@ -1,26 +1,7 @@
 from __future__ import annotations
 
-import json
-
 import pytest
 
-from tools.boundary.ja import (
-    label_acoustic_split_canonical_candidates_with_omni as split_teacher,
-)
-from tools.boundary.ja import (
-    label_candidate_island_scorer_v11_dual_evidence_with_omni as dual_teacher,
-)
-from tools.boundary.ja import (
-    label_candidate_island_scorer_v11_with_omni as scorer_teacher,
-)
-from tools.boundary.ja import (
-    label_semantic_source_text_alignment_with_omni as source_alignment_teacher,
-)
-from tools.boundary.ja import (
-    label_semantic_timeline_with_omni as semantic_timeline_teacher,
-)
-from tools.datasets import label_joint_boundary_preasr_with_omni as joint_teacher
-from tools.datasets import label_timeline_with_omni as timeline_teacher
 from tools.omni.timestamp_contract import (
     TIMESTAMP_CONTRACT_ID,
     TIMESTAMP_FORMAT,
@@ -131,77 +112,3 @@ def test_duration_contract_never_rounds_past_audio() -> None:
         "timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
         "coordinate_system": "0-based current uploaded-audio timeline",
     }
-
-
-def test_all_current_interval_teacher_prompts_share_timestamp_contract() -> None:
-    prompts = (
-        scorer_teacher.SYSTEM_PROMPT,
-        scorer_teacher.SAFE_OUTSIDE_SYSTEM_PROMPT,
-        scorer_teacher.SIMPLE_SAFE_OUTSIDE_SYSTEM_PROMPT,
-        scorer_teacher.GREENLIGHT_SAFE_OUTSIDE_SYSTEM_PROMPT,
-        scorer_teacher.FUNNEL_SAFE_OUTSIDE_SYSTEM_PROMPT,
-        scorer_teacher.ASSERTIVE_SAFE_OUTSIDE_SYSTEM_PROMPT,
-        scorer_teacher.BALANCED_V12_SAFE_OUTSIDE_SYSTEM_PROMPT,
-        dual_teacher.PROTECT_SYSTEM_PROMPT,
-        dual_teacher.REMOVE_SYSTEM_PROMPT,
-        source_alignment_teacher.SYSTEM_PROMPT,
-        semantic_timeline_teacher.SYSTEM_PROMPT,
-        timeline_teacher.SYSTEM_PROMPT,
-        split_teacher.SYSTEM_PROMPT,
-    )
-    for prompt in prompts:
-        assert "MM:SS.mmm" in prompt
-        assert '"start_s":' not in prompt
-        assert '"end_s":' not in prompt
-
-
-def test_current_teacher_requests_use_timestamp_strings_on_the_wire() -> None:
-    requests = (
-        scorer_teacher._prompt({"source_id": "s", "duration_s": 65.153}),
-        dual_teacher._request_prompt(
-            {"source_id": "s", "duration_s": 65.153},
-            pass_name="protect",
-        ),
-        source_alignment_teacher.build_prompt(
-            {
-                "sample_id": "s",
-                "duration_s": 65.153,
-                "reference_text": "待って",
-            }
-        ),
-        semantic_timeline_teacher.build_prompt(
-            {
-                "sample_id": "s",
-                "duration_s": 65.153,
-                "reference_text": "待って",
-            }
-        ),
-        timeline_teacher.build_prompt(
-            {
-                "duration_s": 65.153,
-                "text_units": [{"unit_id": "u0000", "text": "待って"}],
-            }
-        ),
-        split_teacher.build_prompt(
-            {"feature_index": 1, "time_s": 65.0},
-            clip_start=60.0,
-            clip_end=65.153,
-        ),
-    )
-    for serialized in requests:
-        payload = json.loads(serialized)
-        assert payload["duration_ts"].count(":") == 1
-        assert payload["timestamp_contract_id"] == TIMESTAMP_CONTRACT_ID
-        assert "duration_s" not in payload
-
-    split_prompt = joint_teacher._build_split_prompt(
-        [{"time_s": 65.0, "label": "continue", "p_cut": 0.5}],
-        duration_s=65.153,
-    )
-    cueqc_prompt = joint_teacher._build_pre_asr_prompt({"duration_s": 65.153})
-    assert '"time_ts":"01:05.000"' in split_prompt
-    assert '"duration_ts":"01:05.153"' in split_prompt
-    assert '"time_s"' not in split_prompt
-    assert '"duration_s"' not in split_prompt
-    assert '"duration_ts":"01:05.153"' in cueqc_prompt
-    assert '"duration_s"' not in cueqc_prompt

@@ -52,14 +52,12 @@ def _mock_minimal_pipeline(monkeypatch, segments: list[dict]) -> None:
         assert job_id
         assert cancel_requested is not None
         if on_stage:
+            # Mirrors what `asr.pipeline` really emits through `on_stage`.
             for message in (
-                "语音岛检测 1/1",
-                "外边界精修 1/1",
-                "语义切分判断 1/1",
-                "内部切点精修 1/1",
-                "Pre-ASR CueQC 1/1",
+                "切分 1/1",
                 "音频切块 1/1",
                 "ASR 文本转写 1/1",
+                "字幕时间轴 1/1",
             ):
                 on_stage(message)
         return (
@@ -113,11 +111,19 @@ def test_stage_events_memory_sink_records_pipeline_events(monkeypatch, tmp_path)
     assert ("audio_prepare", "done") in observed
     assert ("asr_text_transcribe", "start") in observed
     assert ("asr_text_transcribe", "done") in observed
-    assert ("speech_island_scorer", "done") in observed
-    assert ("outer_edge_refiner", "done") in observed
-    assert ("semantic_split_model", "done") in observed
-    assert ("pre_asr_cueqc", "done") in observed
+    assert ("audio_chunking", "done") in observed
     assert ("audio_chunk_export", "done") in observed
+    # The five acoustic stages were retired on 2026-07-31. They are pinned as
+    # absent rather than simply deleted from the list: a stage event for a stage
+    # that no longer runs would mean something is still being invoked.
+    for retired in (
+        "speech_island_scorer",
+        "outer_edge_refiner",
+        "semantic_split_model",
+        "pre_asr_cueqc",
+        "inner_edge_refiner",
+    ):
+        assert not any(stage == retired for stage, _phase in observed)
     assert ("write_output", "done") in observed
     assert ("timing_summary", "done") in observed
 
@@ -155,15 +161,23 @@ def test_empty_stage_event_sink_is_silent(monkeypatch, tmp_path, capsys):
     assert events.get_memory_events() == []
 
 
-def test_five_model_progress_labels_map_to_frontend_stages():
-    assert _parse_asr_stage_event("语音岛检测 1/1") == (
-        "speech_island_scorer",
-        {"label": "语音岛检测", "current": 1, "total": 1},
+def test_progress_labels_map_to_frontend_stages():
+    """Every label the ASR pipeline emits must be parsed into a stage.
+
+    The table and the emitter drifted apart once already: after the boundary
+    chain was retired, all five labels here matched nothing and the chunking
+    label that replaced them was not in the table, so the front end saw no
+    progress at all between audio extraction and transcription.
+    """
+    assert _parse_asr_stage_event("切分 1/1") == (
+        "audio_chunking",
+        {"label": "切分", "current": 1, "total": 1},
     )
-    assert _parse_asr_stage_event("外边界精修 1/1")[0] == "outer_edge_refiner"
-    assert _parse_asr_stage_event("语义切分判断 3/8")[0] == "semantic_split_model"
-    assert _parse_asr_stage_event("Pre-ASR CueQC 1/1")[0] == "pre_asr_cueqc"
     assert _parse_asr_stage_event("音频切块 2/5")[0] == "audio_chunk_export"
+    assert _parse_asr_stage_event("ASR 文本转写 3/8")[0] == "asr_text_transcribe"
+    assert _parse_asr_stage_event("字幕时间轴 4/4")[0] == "subtitle_timing"
+    for retired in ("语音岛检测 1/1", "外边界精修 1/1", "语义切分判断 3/8", "Pre-ASR CueQC 1/1"):
+        assert _parse_asr_stage_event(retired) is None
 
 
 def test_timing_summary_matches_current_non_overlapping_pipeline_stages():

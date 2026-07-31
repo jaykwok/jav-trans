@@ -25,10 +25,6 @@ class JobSpec(BaseModel):
 
     video_paths: list[str] = Field(min_length=1, max_length=200)
     output_dir: str | None = None
-    asr_backend: Literal[
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf",
-        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
-    ] = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
     subtitle_mode: Literal["zh", "bilingual"] = "zh"
     skip_translation: bool = False
     keep_quality_report: bool = False

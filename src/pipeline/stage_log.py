@@ -9,20 +9,19 @@ from core import events
 from rich.table import Table
 
 
+# The labels here must match what the ASR pipeline actually emits through
+# `on_stage`. When the boundary chain was retired on 2026-07-31 its five labels
+# stopped being emitted and `切分` took their place, so every one of these
+# entries was matching nothing and the new stage was reported as nothing at all.
 _ASR_PROGRESS_RE = re.compile(
-    r"(?P<label>边界缓存|语音岛检测|外边界精修|语义切分判断|"
-    r"Pre-ASR CueQC|音频切块|ASR 文本转写|字幕时间轴)"
+    r"(?P<label>切分|音频切块|ASR 文本转写|字幕时间轴)"
     r"\s+(?P<current>\d+)/(?P<total>\d+)"
 )
 _STAGE_LOG_RE = re.compile(
     r"^stage_(?P<phase>start|done|skip|blocked|degraded)\s+(?P<stage>[A-Za-z0-9_]+)(?:\s+(?P<extra>.*))?$"
 )
 _ASR_STAGE_MAP = {
-    "边界缓存": "boundary_cache",
-    "语音岛检测": "speech_island_scorer",
-    "外边界精修": "outer_edge_refiner",
-    "语义切分判断": "semantic_split_model",
-    "Pre-ASR CueQC": "pre_asr_cueqc",
+    "切分": "audio_chunking",
     "音频切块": "audio_chunk_export",
     "ASR 文本转写": "asr_text_transcribe",
     "字幕时间轴": "subtitle_timing",
@@ -30,7 +29,7 @@ _ASR_STAGE_MAP = {
 
 _TIMING_SUMMARY_ROWS = (
     ("音频准备", "audio_prepare_s", "pipeline"),
-    ("语音边界与音频切块", "split_s", "asr"),
+    ("静音分析与切块", "split_s", "asr"),
     ("ASR 模型加载", "asr_model_load_s", "asr"),
     ("ASR 文本转写", "asr_text_transcribe_s", "asr"),
     ("ASR 模型卸载", "asr_model_unload_s", "asr"),
@@ -151,6 +150,7 @@ def _log_timing_snapshot(
     labels = (
         ("audio_prepare_s", "audio_prepare"),
         ("audio_extract_s", "audio_extract"),
+        ("split_s", "audio_chunking"),
         ("asr_model_load_s", "asr_model_load"),
         ("asr_text_transcribe_s", "asr_text_transcribe"),
         ("asr_model_unload_s", "asr_model_unload"),
@@ -173,12 +173,7 @@ def _log_timing_snapshot(
 
 def _format_asr_stage_label(raw_label: str) -> str:
     mapping = {
-        "边界缓存": "边界缓存",
-        "语音岛检测": "语音岛检测",
-        "外边界精修": "外边界精修",
-        "语义切分判断": "语义切分判断",
-        "内部切点精修": "内部切点精修",
-        "Pre-ASR CueQC": "Pre-ASR CueQC",
+        "切分": "音频切分",
         "音频切块": "音频切块",
         "ASR 文本转写": "ASR 转写",
         "字幕时间轴": "字幕时间轴",

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import main
-from helpers import ASR_06B_BACKEND, ASR_17B_BACKEND, make_job_context
+from helpers import ASR_17B_BACKEND, make_job_context
 from pipeline import audio as pipeline_audio
 
 
@@ -14,13 +14,14 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         video_path,
         output_dir,
         temp_root,
-        asr_backend=ASR_17B_BACKEND,
         skip_translation=True,
         keep_temp_files=True,
     )
-    monkeypatch.setenv("ASR_BACKEND", ASR_06B_BACKEND)
+    # ASR_BACKEND is a deployment setting: the job carries no backend choice,
+    # so the process value must reach every stage unchanged.
+    monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
     monkeypatch.setenv("ASR_CONTEXT", "process actor")
-    monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
+    monkeypatch.setenv("ASR_CHUNK_TARGET_S", "20.0")
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
 
     seen = {}
@@ -28,8 +29,8 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     def fake_get_backend_label():
         seen["backend_label_env"] = {
             "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
-            "BOUNDARY_FEATURE_FRAME_HOP_S": main.os.environ.get(
-                "BOUNDARY_FEATURE_FRAME_HOP_S"
+            "ASR_CHUNK_TARGET_S": main.os.environ.get(
+                "ASR_CHUNK_TARGET_S"
             ),
         }
         return f"backend:{main.os.environ['ASR_BACKEND']}"
@@ -44,8 +45,8 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         seen["cache_signature"] = expected_signature
         seen["cache_env"] = {
             "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
-            "BOUNDARY_FEATURE_FRAME_HOP_S": main.os.environ.get(
-                "BOUNDARY_FEATURE_FRAME_HOP_S"
+            "ASR_CHUNK_TARGET_S": main.os.environ.get(
+                "ASR_CHUNK_TARGET_S"
             ),
         }
         return None
@@ -65,8 +66,8 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     ):
         seen["transcribe_env"] = {
             "ASR_BACKEND": env_overrides.get("ASR_BACKEND"),
-            "BOUNDARY_FEATURE_FRAME_HOP_S": env_overrides.get(
-                "BOUNDARY_FEATURE_FRAME_HOP_S"
+            "ASR_CHUNK_TARGET_S": env_overrides.get(
+                "ASR_CHUNK_TARGET_S"
             ),
         }
         assert device == "auto"
@@ -99,7 +100,7 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
 
     expected_env = {
         "ASR_BACKEND": ASR_17B_BACKEND,
-        "BOUNDARY_FEATURE_FRAME_HOP_S": "0.02",
+        "ASR_CHUNK_TARGET_S": "20.0",
     }
     assert seen["backend_label_env"] == expected_env
     assert seen["cache_env"] == expected_env
@@ -107,19 +108,26 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     assert seen["cache_backend"] == f"backend:{ASR_17B_BACKEND}"
     assert seen["cache_signature"]["backend_label"] == f"backend:{ASR_17B_BACKEND}"
     assert (
-        seen["cache_signature"]["asr_stage_config"]["BOUNDARY_FEATURE_FRAME_HOP_S"]
-        == "0.02"
+        seen["cache_signature"]["asr_stage_config"]["ASR_CHUNK_TARGET_S"]
+        == "20.0"
     )
     assert "video_fps" not in seen["cache_signature"]["subtitle"]
     assert "effective_video_fps" not in seen["cache_signature"]["subtitle"]
     assert seen["cache_signature"]["subtitle"]["frame_gap_s"] == main.subtitle_module.SubtitleOptions().frame_gap_s
     assert "dense_cue_merge_enabled" not in seen["cache_signature"]["subtitle"]
     assert artifacts.backend_label == f"backend:{ASR_17B_BACKEND}"
-    assert main.os.environ["ASR_BACKEND"] == ASR_06B_BACKEND
+    assert main.os.environ["ASR_BACKEND"] == ASR_17B_BACKEND
     assert main.os.environ["ASR_CONTEXT"] == "process actor"
 
 
-def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path):
+def test_asr_stage_env_scope_passes_chunking_and_alignment_flags(monkeypatch, tmp_path):
+    """Per-job advanced settings must survive the allowlist that feeds the worker.
+
+    The allowlist listed only the retired chain's prefixes until 2026-07-31, so
+    `ASR_ALIGNMENT_HEAD_PATH` set on a job was filtered out and the head simply
+    never loaded - the failure looked like "alignment is off", not like a
+    dropped setting.
+    """
     video_path = tmp_path / "sample.mp4"
     video_path.write_bytes(b"fake-video")
     output_dir = tmp_path / "out"
@@ -128,12 +136,11 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         video_path,
         output_dir,
         temp_root,
-        asr_backend=ASR_17B_BACKEND,
         skip_translation=True,
         keep_temp_files=True,
         advanced={
-            "OUTER_EDGE_REFINER_DEVICE": "cpu",
-            "PRE_ASR_CUEQC_ENABLED": "0",
+            "ASR_ALIGNMENT_HEAD_PATH": "src/checkpoints/ctc_aligner.pt",
+            "ASR_CHUNK_MIN_PAUSE_S": "0.8",
         },
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
@@ -156,8 +163,8 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         on_stage=None,
         cancel_requested=None,
     ):
-        seen["device"] = env_overrides.get("OUTER_EDGE_REFINER_DEVICE")
-        seen["pre_asr_cueqc"] = env_overrides.get("PRE_ASR_CUEQC_ENABLED")
+        seen["head_path"] = env_overrides.get("ASR_ALIGNMENT_HEAD_PATH")
+        seen["min_pause"] = env_overrides.get("ASR_CHUNK_MIN_PAUSE_S")
         assert device == "auto"
         assert job_id
         assert cancel_requested is not None
@@ -181,12 +188,12 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
     )
 
     assert seen == {
-        "device": "cpu",
-        "pre_asr_cueqc": "0",
+        "head_path": "src/checkpoints/ctc_aligner.pt",
+        "min_pause": "0.8",
     }
 
 
-def test_boundary_cache_dir_reaches_transcribe_but_not_aligned_signature(
+def test_chunk_root_reaches_transcribe_but_not_aligned_signature(
     monkeypatch,
     tmp_path,
 ):
@@ -198,10 +205,9 @@ def test_boundary_cache_dir_reaches_transcribe_but_not_aligned_signature(
         video_path,
         output_dir,
         temp_root,
-        asr_backend=ASR_06B_BACKEND,
         skip_translation=True,
         keep_temp_files=True,
-        advanced={"BOUNDARY_CACHE_DIR": str(tmp_path / "boundary-cache-a")},
+        advanced={"ASR_CHUNK_ROOT": str(tmp_path / "chunks-a")},
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(main.asr_module, "get_backend_label", lambda: "mock_asr")
@@ -235,7 +241,7 @@ def test_boundary_cache_dir_reaches_transcribe_but_not_aligned_signature(
         on_stage=None,
         cancel_requested=None,
     ):
-        seen["transcribe_cache_dir"] = env_overrides.get("BOUNDARY_CACHE_DIR")
+        seen["transcribe_chunk_root"] = env_overrides.get("ASR_CHUNK_ROOT")
         assert device == "auto"
         assert job_id
         assert cancel_requested is not None
@@ -259,6 +265,7 @@ def test_boundary_cache_dir_reaches_transcribe_but_not_aligned_signature(
 
     main.run_asr_alignment(str(video_path), ctx=ctx, job_id=ctx.job_id)
 
-    assert seen["transcribe_cache_dir"] == str(tmp_path / "boundary-cache-a")
-    assert "BOUNDARY_CACHE_DIR" not in seen["cache_signature"]["asr_stage_config"]
-    assert "BOUNDARY_CACHE_ENABLED" not in seen["cache_signature"]["asr_stage_config"]
+    assert seen["transcribe_chunk_root"] == str(tmp_path / "chunks-a")
+    # Where the chunks are written does not change what they contain, so it
+    # must not invalidate the aligned-segment cache.
+    assert "ASR_CHUNK_ROOT" not in seen["cache_signature"]["asr_stage_config"]

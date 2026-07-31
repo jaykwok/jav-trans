@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-_DEFAULT_ASR_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
 _MAX_TRANSLATION_WORKERS = 64
 
 from core.config import DEFAULT_SETTINGS
@@ -61,7 +60,6 @@ def _llm_reasoning_effort(value: str) -> str:
 
 @dataclass
 class JobContext:
-    asr_backend: str
     subtitle_mode: str
     skip_translation: bool
     target_lang: str
@@ -93,10 +91,6 @@ class JobContext:
             if key
         }
         return cls(
-            asr_backend=str(
-                getattr(spec, "asr_backend", _DEFAULT_ASR_BACKEND)
-                or _DEFAULT_ASR_BACKEND
-            ),
             subtitle_mode=str(getattr(spec, "subtitle_mode", "bilingual") or "bilingual"),
             skip_translation=bool(getattr(spec, "skip_translation", False)),
             target_lang=_translation_setting(

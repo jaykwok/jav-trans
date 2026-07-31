@@ -1,61 +1,28 @@
 import importlib
+from collections import Counter
 import gc
 import hashlib
-import json
 import os
 import time
-from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 
-from audio.chunk_packer import PackedChunk
-from boundary import cache as _boundary_cache_module
-from boundary.sequence_features import (
-    CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
-    FRAME_SEQUENCE_FRAMES_SCHEMA,
-    FrameSequenceFeatureConfig,
-    FrameSequenceFeatureProvider,
-)
-from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
-from boundary.inner_refiner_v2 import (
-    INNER_EDGE_REFINER_V2_SCHEMA,
-    load_inner_edge_refiner_v2,
-)
-from boundary.outer_refiner_v3 import load_outer_edge_refiner_v3
-from boundary.runtime_pipeline import (
-    annotate_inner_edge_predictions,
-    apply_binary_inner_edges_after_cueqc,
-    build_acoustic_split_v4_provisional_chunks_from_refined,
-    refine_outer_islands,
-)
-from boundary.split_model import (
-    SEMANTIC_SPLIT_V4_SCHEMA,
-    load_acoustic_split_v4_planner,
-)
 from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
-from asr import pre_asr_cueqc as _pre_asr_cueqc_module
 from asr import transcribe as _transcribe_module
-from asr.backends.qwen import (
-    DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
-    DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
-    DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
-    checkpoint_path_for_repo_env,
-    require_boundary_pipeline_ready,
-)
-
-ACOUSTIC_SPLIT_SCHEMAS = {SEMANTIC_SPLIT_V4_SCHEMA}
+from asr.alignment import AlignmentHead, blank_runs
+from asr.cueqc import build_candidate as build_cueqc_candidate
+from asr.postgate import POSTGATE_SCHEMA, review_all as postgate_review_all
+from asr.pregate import PREGATE_SCHEMA, cut_at_pauses
 from asr.backends import registry as _registry_module
 from pipeline import memory_safety as _memory_safety_module
 
 _registry_module = importlib.reload(_registry_module)
 _chunking_module = importlib.reload(_chunking_module)
 _checkpoint_module = importlib.reload(_checkpoint_module)
-_pre_asr_cueqc_module = importlib.reload(_pre_asr_cueqc_module)
 _transcribe_module = importlib.reload(_transcribe_module)
-_boundary_cache_module = importlib.reload(_boundary_cache_module)
 
 # Call-time backend resolution: reads ASR_BACKEND env at each call so a
 # persistent worker serves jobs with different backends without reloading.
@@ -64,23 +31,41 @@ _QWEN_BACKENDS = _registry_module._QWEN_BACKENDS
 _VALID_ASR_BACKENDS = _registry_module._VALID_ASR_BACKENDS
 
 _LAST_BOUNDARY_SIGNATURE: dict = _chunking_module._LAST_BOUNDARY_SIGNATURE
-_LAST_BOUNDARY_CACHE_EVENT: dict | None = None
-_LAST_BOUNDARY_STAGE_MEMORY: list[dict] = []
-# APPEND=0 overwrites once per export path in this process; later same-path writes append for multi-video workflows.
-_PRE_ASR_EXPORT_OVERWRITTEN_PATHS: set[str] = set()
 _JSON_PAYLOAD_INLINE_ARRAY_LIMIT = 4096
 
+# Audio is encoded in pieces of this length when looking for pauses; it is the
+# window the ASR encoder is happiest with, not a property of the chunking.
+_FEATURE_CHUNK_S = 30.0
+ASR_LANGUAGE_FOR_CHUNKING = os.getenv("ASR_LANGUAGE", "Japanese").strip() or "Japanese"
+# Loaded at most once per process, and only when an alignment head is actually
+# configured. With no head the chunker never touches a model at all.
+_FEATURE_MODEL: tuple[Any, Any] | None = None
 
-@dataclass
-class _BoundaryProcessingContext:
-    """Explicit hand-off from Boundary to the post-CueQC Inner stage."""
 
-    spans: list[tuple[float, float]] | list[PackedChunk]
-    sequence_feature_provider: FrameSequenceFeatureProvider | None
-    inner_checkpoint_path: Path
-    inner_device: str
-    inner_schema: str
-    runtime_boundary_signature: dict
+def _load_asr_model_for_features() -> tuple[Any, Any]:
+    global _FEATURE_MODEL
+    if _FEATURE_MODEL is not None:
+        return _FEATURE_MODEL
+    import torch
+    from transformers import AutoModelForMultimodalLM, AutoProcessor
+
+    from asr.backends.qwen import active_qwen_asr_model_id, active_qwen_asr_model_path
+    from utils.model_paths import resolve_model_spec
+
+    spec = resolve_model_spec(
+        active_qwen_asr_model_path() or None, active_qwen_asr_model_id(), download=True
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    processor = AutoProcessor.from_pretrained(spec)
+    model = AutoModelForMultimodalLM.from_pretrained(
+        spec, dtype=dtype, device_map=str(device)
+    )
+    model.eval()
+    _FEATURE_MODEL = (model, processor)
+    return _FEATURE_MODEL
+
+
 
 
 def current_asr_chunk_root() -> Path:
@@ -99,132 +84,12 @@ def _env_int(name: str, default: str) -> int:
     return int(float(os.getenv(name, default)))
 
 
-def _boundary_config() -> dict:
-    selected_repo = require_boundary_pipeline_ready(_current_asr_backend())
-    outer_refiner_path = checkpoint_path_for_repo_env(
-        repo_id=selected_repo,
-        mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        default_mapping=DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
-    )
-    split_model_path = checkpoint_path_for_repo_env(
-        repo_id=selected_repo,
-        mapping_env="SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
-        default_mapping=DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
-    )
-    inner_refiner_path = checkpoint_path_for_repo_env(
-        repo_id=selected_repo,
-        mapping_env="INNER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        default_mapping=DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
-    )
-    return {
-        "feature_frame_hop_s": _env_float("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02"),
-        "outer_edge_refiner_model_path": outer_refiner_path,
-        "semantic_split_model_path": split_model_path,
-        "inner_edge_refiner_model_path": inner_refiner_path,
-        "outer_edge_refiner_device": os.getenv("OUTER_EDGE_REFINER_DEVICE", "auto").strip()
-        or "auto",
-        "semantic_split_device": os.getenv("SEMANTIC_SPLIT_DEVICE", "auto").strip() or "auto",
-        "inner_edge_refiner_device": os.getenv("INNER_EDGE_REFINER_DEVICE", "auto").strip() or "auto",
-        "inner_execution_order": "post_pre_asr_cueqc_v1",
-    }
 
 
-def _require_learned_split_candidates(boundary_parameters) -> None:
-    """Require the learned proposal distribution consumed by Split v4."""
-
-    if str((boundary_parameters or {}).get("proposal_checkpoint") or "").strip():
-        return
-    raise RuntimeError(
-        "Acoustic Split v4 requires learned boundary-proposal candidates, but "
-        "the boundary backend produced bootstrap energy-valley candidates (no "
-        "proposal checkpoint resolved for this ASR repo). Promote the "
-        "BoundaryProposalScorer checkpoint or set "
-        "SPEECH_BOUNDARY_JA_PROPOSAL_CHECKPOINT_BY_REPO; bootstrap candidates "
-        "are not a valid input distribution for Split v4."
-    )
 
 
-def _sequence_feature_provider_from_result(
-    payload,
-    *,
-    duration_s: float,
-    max_ptm_dims: int | None = None,
-    required_ptm_dim: int | None = None,
-) -> FrameSequenceFeatureProvider | None:
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("schema") != FRAME_SEQUENCE_FRAMES_SCHEMA:
-        return None
-    ptm = payload.get("ptm")
-    mfcc = payload.get("mfcc")
-    frame_hop_s = payload.get("frame_hop_s")
-    if not isinstance(ptm, (list, np.ndarray)) or not isinstance(mfcc, (list, np.ndarray)):
-        return None
-    if required_ptm_dim is not None:
-        try:
-            ptm_shape = np.asarray(ptm).shape
-            if len(ptm_shape) != 2 or int(ptm_shape[1]) != int(required_ptm_dim):
-                return None
-        except (TypeError, ValueError):
-            return None
-    try:
-        hop = float(frame_hop_s)
-    except (TypeError, ValueError):
-        return None
-    if hop <= 0.0:
-        return None
-    ptm_projected = payload.get("ptm_projected")
-    if not isinstance(ptm_projected, (list, np.ndarray)):
-        ptm_projected = None
-    semantic_ptm_projected = payload.get("semantic_ptm_projected")
-    if not isinstance(semantic_ptm_projected, (list, np.ndarray)):
-        semantic_ptm_projected = None
-    return FrameSequenceFeatureProvider(
-        duration_s=float(duration_s),
-        frame_hop_s=hop,
-        ptm=ptm,
-        mfcc=mfcc,
-        ptm_projected=ptm_projected,
-        ptm_projected_digest=str(payload.get("ptm_projection_digest") or ""),
-        semantic_ptm_projected=semantic_ptm_projected,
-        semantic_scorer_sha256=str(payload.get("semantic_scorer_sha256") or ""),
-        config=FrameSequenceFeatureConfig(
-            left_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S", "0.60"),
-            right_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S", "0.60"),
-            max_ptm_dims=(
-                int(max_ptm_dims)
-                if max_ptm_dims is not None
-                else _env_int("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "128")
-            ),
-            include_mfcc=_env_bool("BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC", "1"),
-        ),
-    )
 
 
-def _required_sequence_feature_provider_from_result(
-    payload,
-    *,
-    duration_s: float,
-    max_ptm_dims: int | None = None,
-    required_ptm_dim: int | None = None,
-) -> FrameSequenceFeatureProvider:
-    provider = _sequence_feature_provider_from_result(
-        payload,
-        duration_s=duration_s,
-        max_ptm_dims=max_ptm_dims,
-        required_ptm_dim=required_ptm_dim,
-    )
-    if provider is None:
-        raise ValueError(
-            "edge_sequence_v2 Boundary Refiner requires "
-            f"{FRAME_SEQUENCE_FRAMES_SCHEMA} in SpeechBoundary-JA output"
-            + (
-                f" with raw PTM dimension {int(required_ptm_dim)}"
-                if required_ptm_dim is not None
-                else ""
-            )
-        )
-    return provider
 
 
 get_backend_label = _registry_module.get_backend_label
@@ -337,18 +202,6 @@ def _set_last_boundary_signature(signature: dict) -> None:
     _sync_checkpoint_state()
 
 
-def _set_last_boundary_cache_event(event: dict | None) -> None:
-    global _LAST_BOUNDARY_CACHE_EVENT
-    _LAST_BOUNDARY_CACHE_EVENT = dict(event) if isinstance(event, dict) else None
-
-
-def _display_cache_path(path: str) -> str:
-    try:
-        return str(Path(path).resolve().relative_to(Path.cwd().resolve()))
-    except Exception:
-        return str(path)
-
-
 def _json_payload(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -378,1090 +231,177 @@ def _json_payload(value: Any) -> Any:
     return str(value)
 
 
-def _boundary_cache_log_entry(event: dict | None) -> str | None:
-    if not event:
-        return None
-    status = str(event.get("status") or "")
-    path = _display_cache_path(str(event.get("path") or ""))
-    digest = str(event.get("digest") or "")
-    if status == "hit":
-        return f"Boundary cache hit: path={path} digest={digest}"
-    if status == "miss":
-        return f"Boundary cache saved: path={path} digest={digest}"
-    return None
+def _chunking_config() -> dict:
+    return {
+        "target_chunk_s": _env_float("ASR_CHUNK_TARGET_S", "20.0"),
+        "max_chunk_s": _env_float("ASR_CHUNK_MAX_S", "30.0"),
+        "min_chunk_s": _env_float("ASR_CHUNK_MIN_S", "2.0"),
+        "min_blank_s": _env_float("ASR_CHUNK_MIN_PAUSE_S", "0.6"),
+    }
 
 
-def _release_boundary_model_stage(stage: str) -> dict:
-    """Release one boundary model before the next stage is loaded."""
+def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], float, str]:
+    """Pauses found by the alignment head, or nothing if it is not configured.
 
-    gc.collect()
+    Returns `(runs, duration_s, source)`. `source` records which path produced
+    the cuts, because "the head was not loaded" and "the head found no pauses"
+    lead to the same chunking and must not be indistinguishable in the log.
+    """
+    duration_s = float(_get_wav_duration(audio_path))
+    head = None
     try:
+        head = AlignmentHead.from_env()
+    except Exception as error:  # noqa: BLE001
+        _pipeline_logger.warning("[chunking] alignment head unavailable: %s", error)
+        return [], duration_s, "fixed_length_head_unavailable"
+    if head is None:
+        return [], duration_s, "fixed_length_no_head_configured"
+
+    try:
+        import numpy as _np
         import torch
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-    snapshot = _cuda_memory_snapshot(stage)
-    _enforce_vram_budget_from_snapshot(snapshot)
-    _LAST_BOUNDARY_STAGE_MEMORY.append(snapshot)
-    _pipeline_logger.info(
-        "[boundary] stage released stage=%s allocated=%s reserved=%s shared=%s",
-        stage,
-        snapshot.get("allocated_mb", 0.0),
-        snapshot.get("reserved_mb", 0.0),
-        snapshot.get("shared_vram_mb", 0.0),
-    )
-    return snapshot
+        from asr.qwen_native import move_processor_inputs, prepare_transcription_inputs
+        from audio.loading import load_audio_16k_mono
+        from asr.encoder_features import qwen3_asr_audio_output_lengths
+
+        model, processor = _load_asr_model_for_features()
+        audio, rate = load_audio_16k_mono(audio_path)
+        if rate != 16000:
+            return [], duration_s, "fixed_length_unexpected_sample_rate"
+        clip = _np.asarray(audio, dtype=_np.float32)
+        duration_s = len(clip) / 16000.0
+
+        pieces = []
+        width = int(_FEATURE_CHUNK_S * 16000)
+        for offset in range(0, len(clip), width):
+            piece = _np.ascontiguousarray(clip[offset : offset + width])
+            if len(piece) < 8000:
+                continue
+            inputs = prepare_transcription_inputs(
+                processor, audio=[piece], language=ASR_LANGUAGE_FOR_CHUNKING
+            )
+            moved = move_processor_inputs(
+                inputs, device=model.device, dtype=model.dtype
+            )
+            with torch.inference_mode():
+                features = model.get_audio_features(
+                    input_features=moved["input_features"],
+                    input_features_mask=moved["input_features_mask"],
+                ).pooler_output
+            frames = int(
+                qwen3_asr_audio_output_lengths(
+                    moved["input_features_mask"].sum(dim=1)
+                )[0]
+            )
+            pieces.append(head.log_probs(features[:frames].detach().float().cpu().numpy()))
+        if not pieces:
+            return [], duration_s, "fixed_length_no_features"
+        # Concatenated before deriving runs: a pause straddling a feature-chunk
+        # seam would otherwise arrive as two shorter runs, fail the minimum
+        # length, and stop being a legal cut point exactly at the seams.
+        log_probs = torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0]
+        runs = blank_runs(
+            log_probs,
+            upsample=head.upsample,
+            min_seconds=_chunking_config()["min_blank_s"],
+        )
+        return runs, duration_s, "alignment_head_blank_runs"
+    except Exception as error:  # noqa: BLE001
+        # Chunking must never take transcription down with it. Fixed-length
+        # cuts are worse placed, not wrong, because nothing is dropped either way.
+        _pipeline_logger.warning("[chunking] blank runs unavailable: %s", error)
+        return [], duration_s, "fixed_length_blank_runs_failed"
 
 
 def _build_processing_spans(
     audio_path: str,
     *,
     on_stage: Callable[[str], None] | None = None,
-    return_context: bool = False,
-) -> (
-    list[tuple[float, float]]
-    | list[PackedChunk]
-    | _BoundaryProcessingContext
-):
-    def progress(label: str, current: int, total: int) -> None:
-        if on_stage is not None:
-            on_stage(f"{label} {current}/{total}")
+) -> list[tuple[float, float]]:
+    """Contiguous chunks covering the whole file, cut inside pauses.
 
-    def finish(
-        spans: list[tuple[float, float]] | list[PackedChunk],
-        *,
-        sequence_feature_provider: FrameSequenceFeatureProvider | None,
-        runtime_boundary_signature: dict,
-    ):
-        if not return_context:
-            return spans
-        return _BoundaryProcessingContext(
-            spans=spans,
-            sequence_feature_provider=sequence_feature_provider,
-            inner_checkpoint_path=inner_checkpoint_path,
-            inner_device=str(cfg["inner_edge_refiner_device"]),
-            inner_schema=inner_schema,
-            runtime_boundary_signature=runtime_boundary_signature,
-        )
+    This replaced the Scorer/Outer/Split/CueQC/Inner chain on 2026-07-31. That
+    chain decided *which audio to keep* from acoustics alone, before any text
+    existed, and its errors were unrecoverable - it had been unrunnable since
+    2026-07-18 because two of its stages were never trained.
 
-    cfg = _boundary_config()
-    _set_last_boundary_cache_event(None)
-    _LAST_BOUNDARY_STAGE_MEMORY.clear()
-    outer_checkpoint_path = Path(cfg["outer_edge_refiner_model_path"])
-    import torch
+    What is here instead does not decide anything irreversible. The alignment
+    head's blank runs are used only to choose where the boundaries fall; the
+    output tiles the file exactly, so every second still reaches the decoder and
+    a badly placed cut costs a worse boundary rather than a lost line. The
+    stronger reading of the same signal - skipping the blank stretches entirely
+    - was measured on 2026-07-31 and falsified: it dropped real lines embedded
+    in non-semantic vocalisation. See `asr.pregate`.
 
-    outer_schema = str(
-        torch.load(outer_checkpoint_path, map_location="cpu", weights_only=False).get(
-            "schema"
-        )
-        or ""
-    )
-    split_checkpoint_path = Path(cfg["semantic_split_model_path"])
-    split_checkpoint_payload = torch.load(
-        split_checkpoint_path, map_location="cpu", weights_only=False
-    )
-    split_schema = str(split_checkpoint_payload.get("schema") or "")
-    if split_schema != SEMANTIC_SPLIT_V4_SCHEMA:
-        raise ValueError("current Boundary contract requires Acoustic Split v4")
-    if outer_schema != "outer_edge_refiner_v3":
-        raise ValueError("current Boundary contract requires Outer Edge Refiner v3")
-    inner_checkpoint_path = Path(cfg["inner_edge_refiner_model_path"])
-    inner_schema = str(
-        torch.load(inner_checkpoint_path, map_location="cpu", weights_only=False).get(
-            "schema"
-        )
-        or ""
-    )
-    if inner_schema != INNER_EDGE_REFINER_V2_SCHEMA:
-        raise ValueError("current Boundary contract requires binary Inner v2")
-    projection_weight = (split_checkpoint_payload.get("model_state_dict") or {}).get(
-        "ptm_projector.weight"
-    )
-    if projection_weight is None:
-        raise ValueError("Semantic Split v4 checkpoint is missing ptm_projector.weight")
-    cueqc_ptm_projection_weight = np.ascontiguousarray(
-        projection_weight.detach().cpu().float().numpy(), dtype=np.float32
-    )
-    if cueqc_ptm_projection_weight.shape != (128, 2048):
-        raise ValueError("CueQC v13 requires learned Linear(2048->128) Split projection")
-    cueqc_ptm_projection_digest = hashlib.sha256(
-        cueqc_ptm_projection_weight.tobytes()
-    ).hexdigest()
-    cfg = {
-        **cfg,
-        "pre_asr_cueqc_feature_schema": _pre_asr_cueqc_module.PRE_ASR_CUEQC_FEATURE_SCHEMA,
-        "pre_asr_ptm_projection": "semantic_split_v4_checkpoint_linear_2048_to_128",
-        "pre_asr_ptm_projection_digest": cueqc_ptm_projection_digest,
-    }
-    del split_checkpoint_payload
-
-    restore_sequence_export = os.environ.get("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES")
-    os.environ["SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES"] = "1"
-    restore_sequence_max_ptm_dims = os.environ.get(
-        "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS"
-    )
-    os.environ["BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS"] = "2048"
-    try:
-        from boundary import get_boundary_backend
-
-        boundary_backend = get_boundary_backend()
-        boundary_signature = boundary_backend.signature()
-        progress("边界缓存", 0, 1)
-        cached = _boundary_cache_module.load_processing_spans(
-            audio_path,
-            boundary_signature=boundary_signature,
-            boundary_config=cfg,
-        )
-        if cached is not None:
-            spans, runtime_boundary_signature, event = cached
-            if any(
-                isinstance(span, PackedChunk) and span.inner_edge_prediction
-                for span in spans
-            ):
-                _pipeline_logger.warning(
-                    "[boundary-cache] ignored cache containing pre-CueQC Inner "
-                    "predictions path=%s",
-                    event["path"],
-                )
-                cached = None
-            sequence_feature_provider = None
-            if cached is not None and return_context and spans:
-                cached_sequence_features = (
-                    _boundary_cache_module.load_sequence_feature_frames(
-                        event["path"],
-                        expected_binding=dict(
-                            event.get("sequence_feature_binding") or {}
-                        ),
-                        expected_sha256=str(
-                            event.get("sequence_feature_sha256") or ""
-                        ),
-                    )
-                )
-                if cached_sequence_features is None:
-                    _pipeline_logger.warning(
-                        "[boundary-cache] ignored provisional cache without "
-                        "post-CueQC Inner feature sidecar path=%s",
-                        event["path"],
-                    )
-                    cached = None
-                else:
-                    sequence_feature_provider = (
-                        _required_sequence_feature_provider_from_result(
-                            cached_sequence_features,
-                            duration_s=_get_wav_duration(audio_path),
-                            max_ptm_dims=2048,
-                            required_ptm_dim=2048,
-                        )
-                    )
-            if cached is not None:
-                progress("边界缓存", 1, 1)
-                if on_stage is not None:
-                    on_stage("边界缓存命中：已复用 provisional sub-islands 与原始帧特征")
-                _set_last_boundary_signature(runtime_boundary_signature)
-                _pipeline_logger.info(
-                    "[boundary-cache] hit path=%s digest=%s",
-                    event["path"],
-                    event["digest"],
-                )
-                _set_last_boundary_cache_event(event)
-                return finish(
-                    spans,
-                    sequence_feature_provider=sequence_feature_provider,
-                    runtime_boundary_signature=runtime_boundary_signature,
-                )
-
-        progress("边界缓存", 1, 1)
-        progress("语音岛检测", 0, 1)
-        result = boundary_backend.segment(audio_path)
-        progress("语音岛检测", 1, 1)
-    finally:
-        if restore_sequence_export is not None:
-            os.environ["SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES"] = restore_sequence_export
-        else:
-            os.environ.pop("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", None)
-        if restore_sequence_max_ptm_dims is not None:
-            os.environ["BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS"] = (
-                restore_sequence_max_ptm_dims
-            )
-        else:
-            os.environ.pop("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", None)
-    frame_scores = result.parameters.get("frame_scores")
-    candidate_frame_scores = result.parameters.get("candidate_frame_scores")
-    score_frame_hop_s = result.parameters.get("frame_hop_s")
-    sequence_feature_frames = result.parameters.get("sequence_feature_frames")
-    _require_learned_split_candidates(result.parameters)
-    sequence_feature_provider = _required_sequence_feature_provider_from_result(
-        sequence_feature_frames,
-        duration_s=result.audio_duration_sec,
-        max_ptm_dims=2048,
-        required_ptm_dim=2048,
-    )
-    speech_feature_export_path = os.getenv(
-        "SPEECH_ISLAND_FEATURE_EXPORT_PATH", ""
-    ).strip()
-    if speech_feature_export_path:
-        speech_feature_path = Path(speech_feature_export_path)
-        speech_feature_path.parent.mkdir(parents=True, exist_ok=True)
-        speech_feature_arrays = {
-            "ptm": np.asarray(sequence_feature_frames["ptm"], dtype=np.float32),
-            "mfcc": np.asarray(sequence_feature_frames["mfcc"], dtype=np.float32),
-            "frame_hop_s": np.asarray(
-                [sequence_feature_frames["frame_hop_s"]], dtype=np.float32
-            ),
-        }
-        exported_ptm_projected = sequence_feature_frames.get("ptm_projected")
-        if exported_ptm_projected is not None:
-            speech_feature_arrays["ptm_projected"] = np.asarray(
-                exported_ptm_projected, dtype=np.float32
-            )
-            speech_feature_arrays["ptm_projection_digest"] = np.asarray(
-                [str(sequence_feature_frames.get("ptm_projection_digest") or "")]
-            )
-        np.savez_compressed(speech_feature_path, **speech_feature_arrays)
-    result_parameters = {
-        key: value
-        for key, value in result.parameters.items()
-        if key not in {
-            "frame_scores",
-            "candidate_frame_scores",
-            "sequence_feature_frames",
-            "stage_memory_diagnostics",
-        }
-    }
-    _LAST_BOUNDARY_STAGE_MEMORY.extend(
-        dict(row) for row in result.parameters.get("stage_memory_diagnostics") or ()
-    )
-    segments = result.segments
-    if segments and frame_scores is None:
-        raise ValueError("semantic boundary pipeline requires speech frame scores")
-    outer_refiner = load_outer_edge_refiner_v3(
-        outer_checkpoint_path,
-        device=cfg["outer_edge_refiner_device"],
-        expected_ptm_repo_id=_current_asr_backend(),
-    )
-    try:
-        outer_signature = outer_refiner.signature()
-        _pipeline_logger.info(
-            "[boundary] outer model requested=%s actual=%s",
-            cfg["outer_edge_refiner_device"],
-            getattr(outer_refiner, "device", "unknown"),
-        )
-        if on_stage is not None:
-            on_stage("外边界精修 0/1")
-        refined = refine_outer_islands(
-            segments,
-            duration_s=result.audio_duration_sec,
-            feature_provider=sequence_feature_provider,
-            outer_refiner=outer_refiner,
-        ) if segments else []
-        if on_stage is not None:
-            on_stage("外边界精修 1/1")
-    finally:
-        outer_refiner = None
-        _release_boundary_model_stage("outer_released")
-
-    split_verifier = load_acoustic_split_v4_planner(
-        split_checkpoint_path,
-        device=cfg["semantic_split_device"],
-        expected_ptm_repo_id=_current_asr_backend(),
-    )
-    try:
-        split_signature = split_verifier.signature()
-        _pipeline_logger.info(
-            "[boundary] split model requested=%s actual=%s",
-            cfg["semantic_split_device"],
-            getattr(split_verifier, "device", "unknown"),
-        )
-        packed = build_acoustic_split_v4_provisional_chunks_from_refined(
-            refined,
-            speech_probabilities=frame_scores,
-            feature_provider=sequence_feature_provider,
-            split_planner=split_verifier,
-        ) if refined else []
-    finally:
-        refined = []
-        split_verifier = None
-        _release_boundary_model_stage("split_released")
-    if any(chunk.inner_edge_prediction for chunk in packed):
-        raise ValueError(
-            "provisional sub-islands must not contain Inner predictions before CueQC"
-        )
-
-    runtime_boundary_signature = {
-        **result_parameters,
-        "boundary_pipeline": {
-            "contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
-            "order": [
-                "speech_island_scorer",
-                "outer_edge_refiner_v3",
-                "acoustic_split_v4",
-                "provisional_subislands",
-                "pre_asr_cueqc_v13",
-                inner_schema,
-                "chunk_extraction",
-            ],
-            "feature_frame_hop_s": cfg["feature_frame_hop_s"],
-            "score_frame_hop_s": score_frame_hop_s,
-            "feature_sources": {
-                "speech_scores": frame_scores is not None,
-                "acoustic_candidate_scores": candidate_frame_scores is not None,
-            },
-            "outer_edge_refiner": outer_signature,
-            "semantic_split_model": split_signature,
-            "inner_edge_refiner": {
-                "schema": inner_schema,
-                "status": "deferred_until_post_pre_asr_cueqc_keep",
-                "execution_order": cfg["inner_execution_order"],
-            },
-            "sequence_feature_provider": sequence_feature_provider.signature(),
-            "semantic_boundary_config": {"decision_mode": "argmax_cut"},
-        },
-    }
-    _set_last_boundary_signature(runtime_boundary_signature)
-    if not segments:
-        event = _boundary_cache_module.save_processing_spans(
-            audio_path,
-            boundary_signature=boundary_signature,
-            boundary_config=cfg,
-            processing_spans=[],
-            runtime_boundary_signature=runtime_boundary_signature,
-            speech_segments=result.segments,
-            speech_groups=result.groups,
-        )
-        if event is not None:
-            _pipeline_logger.info(
-                "[boundary-cache] saved path=%s digest=%s",
-                event["path"],
-                event["digest"],
-            )
-            _set_last_boundary_cache_event(event)
-        return finish(
-            [],
-            sequence_feature_provider=None,
-            runtime_boundary_signature=runtime_boundary_signature,
-        )
-    packed = _annotate_scorer_stats_on_packed_chunks(
-        packed,
-        frame_scores=frame_scores,
-        split_scores=candidate_frame_scores,
-        frame_hop_s=float(score_frame_hop_s or cfg["feature_frame_hop_s"]),
-    )
-    packed = _annotate_pre_asr_ptm_pooling_on_packed_chunks(
-        packed,
-        sequence_feature_provider=sequence_feature_provider,
-        learned_projection_weight=cueqc_ptm_projection_weight,
-        learned_projection_digest=cueqc_ptm_projection_digest,
-    )
-    event = _boundary_cache_module.save_processing_spans(
-        audio_path,
-        boundary_signature=boundary_signature,
-        boundary_config=cfg,
-        processing_spans=packed,
-        runtime_boundary_signature=runtime_boundary_signature,
-        speech_segments=result.segments,
-        speech_groups=result.groups,
-        sequence_feature_frames=sequence_feature_frames,
-    )
-    if event is not None:
-        _pipeline_logger.info(
-            "[boundary-cache] saved path=%s digest=%s",
-            event["path"],
-            event["digest"],
-        )
-        _set_last_boundary_cache_event(event)
-    return finish(
-        packed,
-        sequence_feature_provider=sequence_feature_provider,
-        runtime_boundary_signature=runtime_boundary_signature,
-    )
-
-
-def _run_inner_after_pre_asr_cueqc(
-    context: _BoundaryProcessingContext,
-    spans: list[tuple[float, float]] | list[PackedChunk],
-    *,
-    on_stage: Callable[[str], None] | None = None,
-) -> tuple[list[tuple[float, float]] | list[PackedChunk], dict | None]:
-    """Run Inner only on CueQC-kept provisional sub-islands, then apply it."""
-
-    def update_signature(inner_signature: dict) -> None:
-        runtime_signature = dict(context.runtime_boundary_signature)
-        pipeline_signature = dict(runtime_signature.get("boundary_pipeline") or {})
-        pipeline_signature["inner_edge_refiner"] = dict(inner_signature)
-        pipeline_signature["inner_input"] = "post_pre_asr_cueqc_keep_subislands"
-        runtime_signature["boundary_pipeline"] = pipeline_signature
-        context.runtime_boundary_signature = runtime_signature
-        _set_last_boundary_signature(runtime_signature)
-
-    if not spans:
-        context.sequence_feature_provider = None
-        update_signature(
-            {
-                "schema": context.inner_schema,
-                "status": "skipped_no_cueqc_keep_subislands",
-                "input_count": 0,
-            }
-        )
-        return spans, None
-    if not all(isinstance(span, PackedChunk) for span in spans):
-        raise ValueError("post-CueQC Inner requires current PackedChunk sub-islands")
-    if context.sequence_feature_provider is None:
-        raise ValueError(
-            "post-CueQC Inner requires the explicit raw PTM/MFCC feature context"
-        )
-
+    With no head configured this degrades to fixed-length chunks, which is a
+    placement change and not a correctness one.
+    """
     if on_stage is not None:
-        on_stage("Inner acoustic semantic core 0/1")
-    inner_refiner = None
-    memory_after_release: dict | None = None
-    try:
-        inner_refiner = load_inner_edge_refiner_v2(
-            context.inner_checkpoint_path,
-            device=context.inner_device,
-            expected_ptm_repo_id=_current_asr_backend(),
-        )
-        inner_signature = inner_refiner.signature()
-        _pipeline_logger.info(
-            "[boundary] post-CueQC inner model requested=%s actual=%s kept=%s",
-            context.inner_device,
-            getattr(inner_refiner, "device", "unknown"),
-            len(spans),
-        )
-        predicted = annotate_inner_edge_predictions(
-            spans,
-            feature_provider=context.sequence_feature_provider,
-            inner_refiner=inner_refiner,
-        )
-    finally:
-        inner_refiner = None
-        context.sequence_feature_provider = None
-        memory_after_release = _release_boundary_model_stage("inner_released")
-    update_signature(
+        on_stage("切分 0/1")
+    cfg = _chunking_config()
+    runs, duration_s, source = _blank_runs_for_audio(audio_path)
+    spans = cut_at_pauses(
+        runs,
+        duration_s,
+        target_s=cfg["target_chunk_s"],
+        max_s=cfg["max_chunk_s"],
+        min_s=cfg["min_chunk_s"],
+    )
+    _set_last_boundary_signature(
         {
-            **inner_signature,
-            "execution_order": "post_pre_asr_cueqc_v1",
-            "input": "cueqc_keep_only",
-            "input_count": len(spans),
+            "chunking": {
+                "schema": PREGATE_SCHEMA,
+                "source": source,
+                "pause_count": len(runs),
+                "chunk_count": len(spans),
+                "duration_s": round(duration_s, 3),
+                **{key: cfg[key] for key in sorted(cfg)},
+            }
         }
     )
+    _pipeline_logger.info(
+        "[chunking] source=%s pauses=%d chunks=%d duration=%.2fs",
+        source,
+        len(runs),
+        len(spans),
+        duration_s,
+    )
     if on_stage is not None:
-        on_stage("Inner acoustic semantic core 1/1")
-    return apply_binary_inner_edges_after_cueqc(predicted), memory_after_release
+        on_stage("切分 1/1")
+    return spans
+
+
 
 
 def _span_boundaries(
-    spans: list[tuple[float, float]] | list[PackedChunk],
+    spans: list[tuple[float, float]],
 ) -> list[tuple[float, float]]:
-    return [
-        (span.start, span.end) if isinstance(span, PackedChunk) else span
-        for span in spans
-    ]
+    return [(float(start), float(end)) for start, end in spans]
 
 
-def _pre_asr_audio_id(audio_path: str) -> str:
-    stem = Path(audio_path).stem
-    if "." in stem:
-        prefix, suffix = stem.rsplit(".", 1)
-        if len(suffix) == 8 and all(char in "0123456789abcdefABCDEF" for char in suffix):
-            return prefix
-    return stem
 
 
-def _pre_asr_candidates_for_spans(
-    audio_path: str,
-    spans: list[tuple[float, float]] | list[PackedChunk],
-) -> list[dict]:
-    audio_id = _pre_asr_audio_id(audio_path)
-    candidates: list[dict] = []
-    for index in range(len(spans)):
-        candidate = _pre_asr_cueqc_module.candidate_from_span(
-            spans,
-            index,
-            require_ptm_pooling=_pre_asr_cueqc_module.enabled(),
-        )
-        chunk_index = int(candidate.get("index", index))
-        start = float(candidate.get("start", 0.0))
-        end = float(candidate.get("end", start))
-        sample_id = f"preasr-{audio_id}-chunk{chunk_index:05d}"
-        candidates.append(
-            _json_payload(
-                {
-                    **candidate,
-                    "sample_id": sample_id,
-                    "candidate_id": sample_id,
-                    "audio_id": audio_id,
-                    "video_id": audio_id,
-                    "chunk_index": chunk_index,
-                    "duration_s": round(max(0.0, end - start), 6),
-                }
-            )
-        )
-    return candidates
 
 
-def _pre_asr_candidates_with_decisions(candidates: list[dict], report: dict) -> list[dict]:
-    decisions: dict[int, dict] = {}
-    for decision in report.get("decisions") or []:
-        try:
-            decisions[int(decision.get("index"))] = dict(decision)
-        except (TypeError, ValueError):
-            continue
-    annotated: list[dict] = []
-    for candidate in candidates:
-        item = dict(candidate)
-        try:
-            index = int(candidate.get("index"))
-        except (TypeError, ValueError):
-            index = int(candidate.get("chunk_index", len(annotated)))
-        decision = decisions.get(index)
-        if decision:
-            item["pre_asr_cueqc"] = decision
-            item["pre_asr_route"] = str(decision.get("route") or "")
-            item["pre_asr_prob_drop"] = decision.get("prob_drop")
-            item["pre_asr_prob_keep"] = decision.get("prob_keep")
-        annotated.append(_json_payload(item))
-    return annotated
 
 
-def _write_pre_asr_candidates_if_requested(
-    candidates: list[dict],
-    *,
-    log: list[str],
-) -> None:
-    if not candidates:
-        return
-    output_path_raw = os.getenv("PRE_ASR_CUEQC_EXPORT_CANDIDATES_PATH", "").strip()
-    if not output_path_raw:
-        return
-    output_path = Path(output_path_raw).expanduser()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    append_requested = os.getenv("PRE_ASR_CUEQC_EXPORT_CANDIDATES_APPEND", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
-    output_key = str(output_path.resolve())
-    mode = "a" if append_requested or output_key in _PRE_ASR_EXPORT_OVERWRITTEN_PATHS else "w"
-    with output_path.open(mode, encoding="utf-8") as handle:
-        for row in candidates:
-            handle.write(
-                json.dumps(_json_payload(row), ensure_ascii=False, sort_keys=True) + "\n"
-            )
-    if not append_requested:
-        _PRE_ASR_EXPORT_OVERWRITTEN_PATHS.add(output_key)
-    log.append(
-        "Pre-ASR CueQC: exported candidates path={path} count={count} mode={mode}".format(
-            path=_display_cache_path(str(output_path)),
-            count=len(candidates),
-            mode=mode,
-        )
-    )
 
 
-def _score_stats_for_span(
-    values: list[float] | tuple[float, ...] | None,
-    *,
-    start_s: float,
-    end_s: float,
-    frame_hop_s: float,
-) -> dict[str, float | None]:
-    empty = {
-        "mean": None,
-        "max": None,
-        "p10": None,
-        "p50": None,
-        "p90": None,
-        "std": None,
-        "active_ratio_05": None,
-        "active_ratio_07": None,
-        "active_ratio_09": None,
-    }
-    if not values:
-        return empty
-    hop = max(1e-6, float(frame_hop_s))
-    data = np.asarray(values, dtype=np.float32).reshape(-1)
-    start = max(0, min(data.size, int(float(start_s) / hop)))
-    end = max(start, min(data.size, int(np.ceil(float(end_s) / hop))))
-    if end <= start:
-        return empty
-    window = data[start:end]
-    if window.size == 0:
-        return empty
-    return {
-        "mean": float(window.mean()),
-        "max": float(window.max()),
-        "p10": float(np.quantile(window, 0.10)),
-        "p50": float(np.quantile(window, 0.50)),
-        "p90": float(np.quantile(window, 0.90)),
-        "std": float(window.std()),
-        "active_ratio_05": float(np.mean(window >= 0.50)),
-        "active_ratio_07": float(np.mean(window >= 0.70)),
-        "active_ratio_09": float(np.mean(window >= 0.90)),
-    }
 
 
-def _annotate_scorer_stats_on_packed_chunks(
-    spans: list[tuple[float, float]] | list[PackedChunk],
-    *,
-    frame_scores: list[float] | None,
-    split_scores: list[float] | None,
-    frame_hop_s: float,
-) -> list[tuple[float, float]] | list[PackedChunk]:
-    if not spans or not all(isinstance(span, PackedChunk) for span in spans):
-        return spans
-    annotated: list[PackedChunk] = []
-    for span in spans:
-        speech_stats = _score_stats_for_span(
-            frame_scores,
-            start_s=span.start,
-            end_s=span.end,
-            frame_hop_s=frame_hop_s,
-        )
-        split_stats = _score_stats_for_span(
-            split_scores,
-            start_s=span.start,
-            end_s=span.end,
-            frame_hop_s=frame_hop_s,
-        )
-        annotated.append(
-            replace(
-                span,
-                scorer_speech_mean=speech_stats["mean"],
-                scorer_speech_max=speech_stats["max"],
-                scorer_speech_p90=speech_stats["p90"],
-                scorer_speech_p10=speech_stats["p10"],
-                scorer_speech_p50=speech_stats["p50"],
-                scorer_speech_std=speech_stats["std"],
-                scorer_speech_active_ratio_05=speech_stats["active_ratio_05"],
-                scorer_speech_active_ratio_07=speech_stats["active_ratio_07"],
-                scorer_speech_active_ratio_09=speech_stats["active_ratio_09"],
-                scorer_split_mean=split_stats["mean"],
-                scorer_split_max=split_stats["max"],
-                scorer_split_p90=split_stats["p90"],
-                scorer_split_std=split_stats["std"],
-            )
-        )
-    return annotated
 
 
-def _annotate_pre_asr_ptm_pooling_on_packed_chunks(
-    spans: list[tuple[float, float]] | list[PackedChunk],
-    *,
-    sequence_feature_provider: FrameSequenceFeatureProvider,
-    learned_projection_weight: np.ndarray | None = None,
-    learned_projection_digest: str = "",
-) -> list[tuple[float, float]] | list[PackedChunk]:
-    if not spans or not all(isinstance(span, PackedChunk) for span in spans):
-        return spans
-    if not all(
-        ACOUSTIC_BINARY_V12_CONTRACT.matches(
-            getattr(span, "boundary_contract_id", "")
-        )
-        for span in spans
-    ):
-        raise ValueError("Pre-ASR pooling received an unsupported Boundary contract")
-    if learned_projection_weight is None:
-        raise ValueError("CueQC v13 learned PTM projection weight is required")
-    signature = sequence_feature_provider.chunk_pooled_checkpoint_linear_ptm_signature(
-        projection_weight=learned_projection_weight,
-        projection_digest=learned_projection_digest,
-        bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
-    )
-    annotated: list[PackedChunk] = []
-    for span in spans:
-        values = sequence_feature_provider.chunk_pooled_checkpoint_linear_ptm_features(
-            projection_weight=learned_projection_weight,
-            start_s=span.start,
-            end_s=span.end,
-            bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
-        )
-        annotated.append(
-            replace(
-                span,
-                pre_asr_ptm_pooling_schema=CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
-                pre_asr_ptm_pooling_bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
-                pre_asr_ptm_pooling_dim=int(signature["feature_dim"]),
-                pre_asr_ptm_pooled_features=values,
-                pre_asr_ptm_projection_digest=str(
-                    signature.get("ptm_projection_digest") or ""
-                ),
-            )
-        )
-    return annotated
 
 
-def _apply_pre_asr_cueqc(
-    spans: list[tuple[float, float]] | list[PackedChunk],
-    *,
-    log: list[str],
-    candidates: list[dict] | None = None,
-    on_stage: Callable[[str], None] | None = None,
-) -> tuple[list[tuple[float, float]] | list[PackedChunk], dict]:
-    def _progress(message: str) -> None:
-        log.append(message)
-        if on_stage:
-            on_stage(message)
-        print(message, flush=True)
-
-    report = {
-        "schema": "pre_asr_cueqc_report_v3",
-        "enabled": _pre_asr_cueqc_module.enabled(),
-        "candidate_count": len(spans),
-        "drop_count": 0,
-        "decisions": [],
-    }
-    _progress("Pre-ASR CueQC 0/1")
-    if not spans:
-        _progress("Pre-ASR CueQC 1/1")
-        return spans, report
-    if not _pre_asr_cueqc_module.enabled():
-        _progress(
-            f"Pre-ASR CueQC disabled candidates={len(spans)} pass_to_asr={len(spans)}"
-        )
-        _progress("Pre-ASR CueQC 1/1")
-        return spans, report
-    started = time.perf_counter()
-    model = _pre_asr_cueqc_module.load_active(expected_asr_repo_id=_current_asr_backend())
-    candidates = candidates or [
-        _pre_asr_cueqc_module.candidate_from_span(
-            spans,
-            index,
-            require_ptm_pooling=True,
-        )
-        for index in range(len(spans))
-    ]
-    _progress(
-        "Pre-ASR CueQC route start candidates={candidates} decision_mode={mode}".format(
-            candidates=len(candidates),
-            mode=getattr(model, "decision_mode", ""),
-        )
-    )
-    try:
-        decisions = model.decide(candidates)
-        model_signature = model.signature()
-    finally:
-        model = None
-        cueqc_memory_after_release = _release_boundary_model_stage(
-            "cueqc_released"
-        )
-    candidate_by_index = {
-        int(candidate.get("index", index)): candidate
-        for index, candidate in enumerate(candidates)
-    }
-    for decision in decisions:
-        try:
-            decision_index = int(decision.get("index"))
-        except (TypeError, ValueError):
-            continue
-        candidate = candidate_by_index.get(decision_index)
-        if candidate is None:
-            continue
-        for key in ("sample_id", "candidate_id", "audio_id", "video_id", "chunk_index"):
-            if key in candidate:
-                decision[key] = candidate[key]
-    drop_indexes = {
-        int(decision.get("index"))
-        for decision in decisions
-        if decision.get("route") == "drop_before_asr"
-    }
-    kept = [span for index, span in enumerate(spans) if index not in drop_indexes]
-    keep_count = sum(
-        1 for decision in decisions if decision.get("route") == "keep_for_asr"
-    )
-    drop_count = len(drop_indexes)
-    confidences = sorted(
-        float(decision.get("confidence"))
-        for decision in decisions
-        if decision.get("confidence") is not None
-    )
-    confidence_stats = {}
-    if confidences:
-        confidence_stats = {
-            "confidence_min": round(confidences[0], 4),
-            "confidence_p10": round(
-                confidences[min(len(confidences) - 1, int(len(confidences) * 0.10))],
-                4,
-            ),
-            "confidence_p50": round(confidences[len(confidences) // 2], 4),
-            "confidence_mean": round(sum(confidences) / len(confidences), 4),
-        }
-    report.update(
-        {
-            "enabled": True,
-            "candidate_count": len(spans),
-            "drop_count": drop_count,
-            "keep_count": keep_count,
-            **confidence_stats,
-            "model": model_signature,
-            "memory_after_release": cueqc_memory_after_release,
-            "decisions": decisions,
-        }
-    )
-    elapsed = time.perf_counter() - started
-    _progress(
-        (
-            "Pre-ASR CueQC route done candidates={candidates} decisions={decisions} "
-            "keep_for_asr={keep} drop_before_asr={drop} pass_to_asr={pass_to_asr} "
-            "confidence_min={confidence_min} confidence_p10={confidence_p10} "
-            "confidence_p50={confidence_p50} confidence_mean={confidence_mean} "
-            "elapsed={elapsed:.2f}s"
-        ).format(
-            candidates=len(spans),
-            decisions=len(decisions),
-            keep=keep_count,
-            drop=drop_count,
-            pass_to_asr=len(kept),
-            confidence_min=confidence_stats.get("confidence_min", ""),
-            confidence_p10=confidence_stats.get("confidence_p10", ""),
-            confidence_p50=confidence_stats.get("confidence_p50", ""),
-            confidence_mean=confidence_stats.get("confidence_mean", ""),
-            elapsed=elapsed,
-        )
-    )
-    _progress("Pre-ASR CueQC 1/1")
-    return kept, report
 
 
-def _normalize_cut_candidates(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        return []
-    candidates: list[dict[str, Any]] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        try:
-            candidate = {
-                "kind": str(item.get("kind") or ""),
-                "time_s": float(item["time_s"]),
-                "frame": int(item["frame"]),
-                "score": float(item.get("score") or 0.0),
-                "prominence": float(item.get("prominence") or 0.0),
-                "speech_valley": float(item.get("speech_valley") or 0.0),
-                "strength": float(item.get("strength") or 0.0),
-            }
-        except (KeyError, TypeError, ValueError):
-            continue
-        if item.get("downgraded_from") is not None:
-            candidate["downgraded_from"] = str(item.get("downgraded_from") or "")
-        for key in ("proposal_time_s", "p_cut", "p_continue", "p_unsure"):
-            if item.get(key) is not None:
-                candidate[key] = float(item[key])
-        if item.get("label") is not None:
-            candidate["label"] = str(item.get("label") or "")
-        if item.get("event_id") is not None:
-            candidate["event_id"] = str(item.get("event_id") or "")
-        for key in (
-            "candidate_start_index",
-            "candidate_end_index",
-            "representative_index",
-        ):
-            if item.get(key) is not None:
-                candidate[key] = int(item[key])
-        if item.get("shared_absolute_timestamp") is not None:
-            candidate["shared_absolute_timestamp"] = bool(item["shared_absolute_timestamp"])
-        candidates.append(candidate)
-    return _dedupe_cut_candidates(candidates)
 
 
-def _dedupe_cut_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_key: dict[tuple[str, int], dict[str, Any]] = {}
-    for candidate in candidates:
-        try:
-            time_s = float(candidate["time_s"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        kind = str(candidate.get("kind") or "")
-        key = (kind, int(round(time_s * 1000.0)))
-        existing = by_key.get(key)
-        strength = float(candidate.get("strength") or 0.0)
-        existing_strength = float(existing.get("strength") or 0.0) if existing else -1.0
-        if existing is None or strength > existing_strength:
-            by_key[key] = dict(candidate)
-    return [
-        by_key[key]
-        for key in sorted(
-            by_key,
-            key=lambda item: (float(by_key[item].get("time_s") or 0.0), item[0]),
-        )
-    ]
 
 
-def _cut_candidates_for_segment(
-    segment: dict,
-    chunks_by_index: dict[int, dict],
-    *,
-    key: str,
-) -> list[dict[str, Any]]:
-    start = float(segment.get("start", 0.0))
-    end = max(start, float(segment.get("end", start)))
-    chunk_indexes: list[int] = []
-    for word in segment.get("words") or []:
-        try:
-            chunk_indexes.append(int(word.get("source_chunk_index")))
-        except (TypeError, ValueError):
-            continue
-    if not chunk_indexes:
-        try:
-            chunk_indexes.append(int(segment.get("source_chunk_index")))
-        except (TypeError, ValueError):
-            pass
-    selected: list[dict[str, Any]] = []
-    for chunk_index in list(dict.fromkeys(chunk_indexes)):
-        chunk = chunks_by_index.get(chunk_index)
-        if not chunk:
-            continue
-        for candidate in _normalize_cut_candidates(chunk.get(key)):
-            try:
-                time_s = float(candidate["time_s"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if start < time_s < end:
-                selected.append(candidate)
-    return _dedupe_cut_candidates(selected)
 
 
-def _annotate_packed_chunks(
-    chunk_infos: list[dict],
-    spans: list[tuple[float, float]] | list[PackedChunk],
-    log: list[str],
-) -> None:
-    packed_spans = [span for span in spans if isinstance(span, PackedChunk)]
-    if not packed_spans:
-        return
-    for idx, chunk in enumerate(chunk_infos):
-        span_index = int(chunk.get("source_span_index", idx))
-        if span_index < 0 or span_index >= len(packed_spans):
-            continue
-        packed = packed_spans[span_index]
-        chunk["source_abs_start"] = packed.source_abs_start
-        chunk["source_abs_end"] = packed.source_abs_end
-        chunk["speech_segment_count"] = len(packed.speech_segments)
-        chunk["boundary_split_reason"] = packed.split_reason
-        chunk["boundary_parent_chunk_id"] = packed.parent_chunk_id
-        chunk["speech_island_id"] = packed.island_id
-        chunk["speech_island_count"] = packed.island_count
-        chunk["speech_internal_gap_count"] = packed.internal_gap_count
-        chunk["speech_internal_gap_max_s"] = packed.internal_gap_max_s
-        chunk["raw_start"] = packed.raw_start
-        chunk["raw_end"] = packed.raw_end
-        chunk["raw_duration"] = packed.raw_duration
-        chunk["acoustic_start"] = packed.acoustic_start
-        chunk["acoustic_end"] = packed.acoustic_end
-        chunk["acoustic_duration"] = packed.acoustic_duration
-        chunk["display_start"] = packed.display_start
-        chunk["display_end"] = packed.display_end
-        chunk["display_duration"] = packed.display_duration
-        chunk["boundary_contract_id"] = packed.boundary_contract_id
-        chunk["semantic_event_ids"] = list(packed.semantic_event_ids or [])
-        chunk["semantic_event_probabilities"] = list(
-            packed.semantic_event_probabilities or []
-        )
-        chunk["paired_inner_edges"] = dict(packed.paired_inner_edges or {})
-        chunk["removed_gap_spans"] = list(packed.removed_gap_spans or [])
-        chunk["removed_gap_duration_s"] = packed.removed_gap_duration_s
-        chunk["boundary_score"] = packed.boundary_score
-        chunk["boundary_reason"] = packed.boundary_reason
-        chunk["boundary_source"] = packed.boundary_source
-        chunk["boundary_start_refine_delta_s"] = packed.boundary_start_refine_delta_s
-        chunk["boundary_end_refine_delta_s"] = packed.boundary_end_refine_delta_s
-        chunk["boundary_decision_source"] = packed.boundary_decision_source
-        chunk["refiner_pred_start_delta_s"] = packed.refiner_pred_start_delta_s
-        chunk["refiner_pred_end_delta_s"] = packed.refiner_pred_end_delta_s
-        chunk["refiner_applied_start_delta_s"] = packed.refiner_applied_start_delta_s
-        chunk["refiner_applied_end_delta_s"] = packed.refiner_applied_end_delta_s
-        chunk["refiner_start_confidence"] = packed.refiner_start_confidence
-        chunk["refiner_end_confidence"] = packed.refiner_end_confidence
-        chunk["refiner_start_source"] = packed.refiner_start_source
-        chunk["refiner_end_source"] = packed.refiner_end_source
-        chunk["refiner_safety_action"] = packed.refiner_safety_action
-        chunk["refiner_safety_reason"] = packed.refiner_safety_reason
-        chunk["refiner_effective_start_delta_max_s"] = packed.refiner_effective_start_delta_max_s
-        chunk["refiner_effective_end_delta_max_s"] = packed.refiner_effective_end_delta_max_s
-        chunk["refiner_fallback_used"] = packed.refiner_fallback_used
-        chunk["refiner_shared_boundary_adjusted"] = packed.refiner_shared_boundary_adjusted
-        chunk["scorer_speech_mean"] = packed.scorer_speech_mean
-        chunk["scorer_speech_max"] = packed.scorer_speech_max
-        chunk["scorer_speech_p90"] = packed.scorer_speech_p90
-        chunk["scorer_speech_p10"] = packed.scorer_speech_p10
-        chunk["scorer_speech_p50"] = packed.scorer_speech_p50
-        chunk["scorer_speech_std"] = packed.scorer_speech_std
-        chunk["scorer_speech_active_ratio_05"] = packed.scorer_speech_active_ratio_05
-        chunk["scorer_speech_active_ratio_07"] = packed.scorer_speech_active_ratio_07
-        chunk["scorer_speech_active_ratio_09"] = packed.scorer_speech_active_ratio_09
-        chunk["scorer_split_mean"] = packed.scorer_split_mean
-        chunk["scorer_split_max"] = packed.scorer_split_max
-        chunk["scorer_split_p90"] = packed.scorer_split_p90
-        chunk["scorer_split_std"] = packed.scorer_split_std
-        chunk["subtitle_min_duration_s"] = packed.subtitle_min_duration_s
-        chunk["below_subtitle_min_duration"] = packed.below_subtitle_min_duration
-        chunk["micro_chunk_candidate"] = packed.micro_chunk_candidate
-        chunk["micro_resolve_action"] = packed.micro_resolve_action
-        chunk["micro_resolve_reason"] = packed.micro_resolve_reason
-        chunk["left_split_score"] = packed.left_split_score
-        chunk["right_split_score"] = packed.right_split_score
-        chunk["left_split_prominence"] = packed.left_split_prominence
-        chunk["right_split_prominence"] = packed.right_split_prominence
-        chunk["left_split_speech_valley"] = packed.left_split_speech_valley
-        chunk["right_split_speech_valley"] = packed.right_split_speech_valley
-        chunk["primary_cut_candidates"] = _normalize_cut_candidates(
-            packed.primary_cut_candidates
-        )
-        chunk["weak_cut_candidates"] = _normalize_cut_candidates(
-            packed.weak_cut_candidates
-        )
-        chunk["pre_asr_ptm_pooling_schema"] = packed.pre_asr_ptm_pooling_schema
-        chunk["pre_asr_ptm_pooling_bins"] = packed.pre_asr_ptm_pooling_bins
-        chunk["pre_asr_ptm_pooling_dim"] = packed.pre_asr_ptm_pooling_dim
-        chunk["pre_asr_ptm_pooled_features"] = list(packed.pre_asr_ptm_pooled_features or [])
-        chunk["pre_asr_ptm_projection_digest"] = packed.pre_asr_ptm_projection_digest
-        log.append(
-            "[chunk] idx={idx} dur={duration:.1f} speech_segment_count={count} "
-            "reason={reason} "
-            "parent={parent} island={island}/{islands} gap_max={gap:.2f} "
-            "boundary={boundary_reason} source={boundary_source} score={boundary_score} "
-            "micro={micro_action} below_subtitle_min={below_min} "
-            "delta=({start_delta},{end_delta}) "
-            "decision_source={decision_source} "
-            "conf=({start_conf},{end_conf}) safety={safety}".format(
-                idx=idx,
-                duration=packed.duration,
-                count=len(packed.speech_segments),
-                reason=packed.split_reason,
-                parent=packed.parent_chunk_id,
-                island=packed.island_id,
-                islands=packed.island_count,
-                gap=packed.internal_gap_max_s,
-                boundary_reason=packed.boundary_reason,
-                boundary_source=packed.boundary_source,
-                boundary_score=packed.boundary_score,
-                micro_action=packed.micro_resolve_action,
-                below_min=packed.below_subtitle_min_duration,
-                start_delta=packed.boundary_start_refine_delta_s,
-                end_delta=packed.boundary_end_refine_delta_s,
-                decision_source=packed.boundary_decision_source,
-                start_conf=packed.refiner_start_confidence,
-                end_conf=packed.refiner_end_confidence,
-                safety=packed.refiner_safety_action,
-            )
-        )
-        log.append(
-            "[boundary-v12] idx={idx} events={events} inner={inner} "
-            "removed_gap_s={gap:.3f} acoustic=({astart:.3f},{aend:.3f}) "
-            "display=({dstart:.3f},{dend:.3f})".format(
-                idx=idx,
-                events=len(packed.semantic_event_ids or []),
-                inner=(packed.paired_inner_edges or {}).get("action", "pending"),
-                gap=packed.removed_gap_duration_s,
-                astart=float(packed.acoustic_start or packed.start),
-                aend=float(packed.acoustic_end or packed.end),
-                dstart=float(packed.display_start or packed.start),
-                dend=float(packed.display_end or packed.end),
-            )
-        )
 
 
 def _record_stage_timing(
@@ -1647,19 +587,98 @@ def _model_lifecycle_event(
         on_stage(f"GPU model manager {stage} {action}")
 
 
-def _segment_alignment_outcome(segment: dict, outcomes: dict[int, dict]) -> dict:
-    chunk_indices: list[int] = []
-    for word in segment.get("words") or []:
-        try:
-            chunk_indices.append(int(word.get("source_chunk_index")))
-        except (TypeError, ValueError):
+def _empty_postgate_report() -> dict:
+    return {
+        "schema": POSTGATE_SCHEMA,
+        "reviewed": 0,
+        "flagged": 0,
+        "flags": {},
+        "alignment_score_checked": 0,
+    }
+
+
+def _apply_postgate(
+    chunk_infos: list[dict],
+    prepared_results: list,
+    transcript_chunks: list[dict],
+    *,
+    log: list[str],
+) -> dict:
+    """Flag cues the audio does not support. Nothing is removed here.
+
+    This is the reversible half of the redesign. The chain that used to sit
+    *before* the decoder decided what to keep from acoustics alone and could not
+    be second-guessed; every finding here is a mark on a cue that still exists,
+    and the subtitle layer and any later audit can read or ignore it.
+
+    `alignment_score` is the signal the old design never had: a runaway loop is
+    caught by `unique_ratio`, but fluent invented text is not, and text the
+    acoustics do not support aligns badly. The threshold for it is not
+    calibrated yet, so `asr.postgate` leaves that check off - see its docstring.
+    """
+    text_results = [
+        {
+            "text": str(result.get("text") or ""),
+            "raw_text": str(result.get("raw_text") or result.get("text") or ""),
+        }
+        for result, _ in prepared_results
+    ]
+    if not text_results or len(text_results) != len(chunk_infos):
+        return _empty_postgate_report()
+
+    scores: list[float | None] = []
+    for result, _ in prepared_results:
+        meta = result.get("timing_meta")
+        value = meta.get("alignment_score") if isinstance(meta, dict) else None
+        scores.append(float(value) if isinstance(value, (int, float)) else None)
+
+    candidates = [
+        build_cueqc_candidate(
+            chunk=chunk,
+            text_result=text_results[position],
+            position=position,
+            chunks=chunk_infos,
+            text_results=text_results,
+        )
+        for position, chunk in enumerate(chunk_infos)
+    ]
+    verdicts = postgate_review_all(candidates, alignment_scores=scores)
+
+    counts: Counter[str] = Counter()
+    by_index = {
+        int(chunk.get("index", position)): position
+        for position, chunk in enumerate(chunk_infos)
+    }
+    for chunk_entry in transcript_chunks:
+        position = by_index.get(int(chunk_entry.get("index", -1)))
+        if position is None:
             continue
-    if not chunk_indices:
-        try:
-            chunk_indices.append(int(segment.get("source_chunk_index")))
-        except (TypeError, ValueError):
-            pass
-    unique_indices = list(dict.fromkeys(chunk_indices))
+        verdict = verdicts[position]
+        chunk_entry["postgate_flags"] = list(verdict["flags"])
+        chunk_entry["alignment_score"] = verdict["alignment_score"]
+    for verdict in verdicts:
+        for flag in verdict["flags"]:
+            counts[flag] += 1
+
+    flagged = sum(1 for verdict in verdicts if verdict["flags"])
+    if flagged:
+        log.append(
+            f"后置闸标记 {flagged}/{len(verdicts)} 块（不删除）: "
+            + ", ".join(f"{flag}×{count}" for flag, count in counts.most_common())
+        )
+    return {
+        "schema": POSTGATE_SCHEMA,
+        "reviewed": len(verdicts),
+        "flagged": flagged,
+        "flags": dict(counts),
+        "alignment_score_checked": sum(
+            1 for verdict in verdicts if verdict["alignment_score_checked"]
+        ),
+    }
+
+
+def _segment_alignment_outcome(segment: dict, outcomes: dict[int, dict]) -> dict:
+    unique_indices = _segment_chunk_indices(segment)
     if not unique_indices:
         return {}
     members = [outcomes[index] for index in unique_indices if index in outcomes]
@@ -1700,6 +719,50 @@ def _annotate_segments_with_alignment_outcomes(
     return annotated
 
 
+def _segment_chunk_indices(segment: dict) -> list[int]:
+    chunk_indices: list[int] = []
+    for word in segment.get("words") or []:
+        try:
+            chunk_indices.append(int(word.get("source_chunk_index")))
+        except (TypeError, ValueError):
+            continue
+    if not chunk_indices:
+        try:
+            chunk_indices.append(int(segment.get("source_chunk_index")))
+        except (TypeError, ValueError):
+            pass
+    return list(dict.fromkeys(chunk_indices))
+
+
+def _annotate_segments_with_postgate(
+    segments: list[dict],
+    transcript_chunks: list[dict],
+) -> list[dict]:
+    """Carry the chunk-level flags down to the cues they were raised against.
+
+    The gate reviews a chunk, but the subtitle layer filters segments, so a flag
+    that stopped at the chunk would be a verdict nobody downstream can act on. A
+    segment can straddle two chunks; it takes the union, because the point of
+    flagging is to be readable by whoever wants to skip it.
+    """
+    flags_by_chunk = {
+        int(entry.get("index", -1)): list(entry.get("postgate_flags") or [])
+        for entry in transcript_chunks
+        if entry.get("postgate_flags")
+    }
+    if not flags_by_chunk:
+        return segments
+    for segment in segments:
+        flags: list[str] = []
+        for index in _segment_chunk_indices(segment):
+            for flag in flags_by_chunk.get(index, ()):
+                if flag not in flags:
+                    flags.append(flag)
+        if flags:
+            segment["postgate_flags"] = flags
+    return segments
+
+
 def _transcribe_and_align_local(
     audio_path: str,
     device: str,
@@ -1714,9 +777,7 @@ def _transcribe_and_align_local(
     timings: dict[str, float] = {}
     cuda_memory: list[dict] = []
     transcript_chunks: list[dict] = []
-    pre_asr_cueqc_report: dict = _pre_asr_cueqc_module.runtime_signature()
     chunk_dir: Path | None = None
-    boundary_context: _BoundaryProcessingContext | None = None
     total_started = time.perf_counter()
     _record_cuda_memory(log, cuda_memory, "asr_start", elapsed_s=0.0)
 
@@ -1725,60 +786,26 @@ def _transcribe_and_align_local(
         split_started = time.perf_counter()
         _model_lifecycle_event(
             model_manager,
-            stage="boundary",
+            stage="chunking",
             action="load",
             on_stage=on_stage,
         )
-        boundary_context = _build_processing_spans(
-            audio_path,
-            on_stage=on_stage,
-            return_context=True,
-        )
-        if not isinstance(boundary_context, _BoundaryProcessingContext):
-            raise TypeError("Boundary pipeline did not return its post-CueQC context")
-        chunk_spans = boundary_context.spans
-        cuda_memory.extend(dict(row) for row in _LAST_BOUNDARY_STAGE_MEMORY)
+        chunk_spans = _build_processing_spans(audio_path, on_stage=on_stage)
         _release_stage_gpu_cache(
             log,
             cuda_memory,
-            "boundary_models_released_before_pre_asr_cueqc",
+            "chunking_released",
             elapsed_s=time.perf_counter() - total_started,
         )
-        cache_log_entry = _boundary_cache_log_entry(_LAST_BOUNDARY_CACHE_EVENT)
-        if cache_log_entry:
-            log.append(cache_log_entry)
-        pre_asr_candidates = _pre_asr_candidates_for_spans(audio_path, chunk_spans)
-        chunk_spans, pre_asr_cueqc_report = _apply_pre_asr_cueqc(
-            chunk_spans,
-            log=log,
-            candidates=pre_asr_candidates,
-            on_stage=on_stage,
-        )
-        cueqc_release_memory = pre_asr_cueqc_report.get("memory_after_release")
-        if isinstance(cueqc_release_memory, dict):
-            cuda_memory.append(dict(cueqc_release_memory))
-        chunk_spans, inner_release_memory = _run_inner_after_pre_asr_cueqc(
-            boundary_context,
-            chunk_spans,
-            on_stage=on_stage,
-        )
-        if isinstance(inner_release_memory, dict):
-            cuda_memory.append(dict(inner_release_memory))
-        pre_asr_candidates = _pre_asr_candidates_with_decisions(
-            pre_asr_candidates,
-            pre_asr_cueqc_report,
-        )
-        _write_pre_asr_candidates_if_requested(pre_asr_candidates, log=log)
         _model_lifecycle_event(
             model_manager,
-            stage="boundary_pre_asr",
+            stage="chunking",
             action="unload",
             on_stage=on_stage,
         )
         chunk_dir, chunk_infos = _extract_wav_chunks(
             audio_path, _span_boundaries(chunk_spans), on_stage=on_stage
         )
-        _annotate_packed_chunks(chunk_infos, chunk_spans, log)
         split_elapsed = time.perf_counter() - split_started
         log.append(f"切分完成：共 {len(chunk_infos)} 个处理块")
         _record_stage_timing(log, timings, "split_s", "静音分析与切块", split_elapsed)
@@ -1827,8 +854,7 @@ def _transcribe_and_align_local(
                 "segment_count": 0,
                 "boundary_no_speech": True,
                 "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
-                "pre_asr_cueqc": pre_asr_cueqc_report,
-                "pre_asr_candidates": pre_asr_candidates,
+                "postgate": _empty_postgate_report(),
             })
             return [], log, details
 
@@ -1970,6 +996,12 @@ def _transcribe_and_align_local(
                 text_results,
                 alignment_outcomes,
             )
+            postgate_report = _apply_postgate(
+                chunk_infos,
+                prepared_results,
+                transcript_chunks,
+                log=log,
+            )
         finally:
             backend.close()
 
@@ -1979,22 +1011,13 @@ def _transcribe_and_align_local(
         segments = _group_words_to_segments(word_dicts)
         segments = _postprocess_segments(segments)
         segments = _annotate_segments_with_alignment_outcomes(segments, alignment_outcomes)
+        segments = _annotate_segments_with_postgate(segments, transcript_chunks)
         chunks_by_index = {
             int(chunk.get("index", index)): chunk
             for index, chunk in enumerate(chunk_infos)
         }
         for segment in segments:
-            chunk_indices: list[int] = []
-            for word in segment.get("words") or []:
-                try:
-                    chunk_indices.append(int(word.get("source_chunk_index")))
-                except (TypeError, ValueError):
-                    continue
-            if not chunk_indices:
-                try:
-                    chunk_indices.append(int(segment.get("source_chunk_index")))
-                except (TypeError, ValueError):
-                    pass
+            chunk_indices = _segment_chunk_indices(segment)
             try:
                 acoustic_start = float(segment.get("start", 0.0))
                 acoustic_end = max(acoustic_start, float(segment.get("end", acoustic_start)))
@@ -2004,59 +1027,25 @@ def _transcribe_and_align_local(
             segment["acoustic_start"] = acoustic_start
             segment["acoustic_end"] = acoustic_end
             segment["acoustic_duration"] = max(0.0, acoustic_end - acoustic_start)
+            # A segment's source chunks used to carry the edge refiner's own
+            # boundaries and confidences, which were copied up to here. Chunks
+            # produced by `_extract_wav_chunks` carry only index/start/end/path,
+            # so that copying moved nothing after the refiners were retired.
             source_chunks = [
                 chunks_by_index[index]
-                for index in list(dict.fromkeys(chunk_indices))
+                for index in chunk_indices
                 if index in chunks_by_index
             ]
+            # The `chunk_acoustic_*` names are kept: downstream readers such as
+            # `tools/datasets/prepare_timeline_teacher_dataset.py` fall back to
+            # the segment's own bounds when they are absent, so dropping them
+            # would silently change what that dataset is built from.
             if source_chunks:
-                chunk_start_values = [
-                    float(chunk["acoustic_start"])
-                    for chunk in source_chunks
-                    if chunk.get("acoustic_start") is not None
-                ]
-                chunk_end_values = [
-                    float(chunk["acoustic_end"])
-                    for chunk in source_chunks
-                    if chunk.get("acoustic_end") is not None
-                ]
-                if chunk_start_values and chunk_end_values:
-                    segment["chunk_acoustic_start"] = min(chunk_start_values)
-                    segment["chunk_acoustic_end"] = max(chunk_end_values)
-                    segment["chunk_acoustic_duration"] = max(
-                        0.0,
-                        segment["chunk_acoustic_end"] - segment["chunk_acoustic_start"],
-                    )
-                for key in (
-                    "raw_start",
-                    "raw_end",
-                    "raw_duration",
-                    "refiner_start_confidence",
-                    "refiner_end_confidence",
-                    "refiner_start_source",
-                    "refiner_end_source",
-                    "refiner_safety_action",
-                    "refiner_safety_reason",
-                    "refiner_fallback_used",
-                    "refiner_shared_boundary_adjusted",
-                ):
-                    values = [chunk.get(key) for chunk in source_chunks if chunk.get(key) is not None]
-                    if values:
-                        segment[key] = values[0]
-            primary_cut_candidates = _cut_candidates_for_segment(
-                segment,
-                chunks_by_index,
-                key="primary_cut_candidates",
-            )
-            weak_cut_candidates = _cut_candidates_for_segment(
-                segment,
-                chunks_by_index,
-                key="weak_cut_candidates",
-            )
-            if primary_cut_candidates:
-                segment["primary_cut_candidates"] = primary_cut_candidates
-            if weak_cut_candidates:
-                segment["weak_cut_candidates"] = weak_cut_candidates
+                chunk_start = min(float(chunk["start"]) for chunk in source_chunks)
+                chunk_end = max(float(chunk["end"]) for chunk in source_chunks)
+                segment["chunk_acoustic_start"] = chunk_start
+                segment["chunk_acoustic_end"] = chunk_end
+                segment["chunk_acoustic_duration"] = max(0.0, chunk_end - chunk_start)
         segment_elapsed = time.perf_counter() - segment_started
         _record_stage_timing(
             log, timings, "subtitle_segment_s", "字幕分段", segment_elapsed
@@ -2090,13 +1079,12 @@ def _transcribe_and_align_local(
             "device": device,
             "chunk_count": len(chunk_infos),
             "transcript_chunks": transcript_chunks,
-            "pre_asr_cueqc": pre_asr_cueqc_report,
-            "pre_asr_candidates": pre_asr_candidates,
             "stage_timings": timings,
             "cuda_memory": cuda_memory,
             "word_count": len(word_dicts),
             "segment_count": len(segments),
             "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
+            "postgate": postgate_report,
             "alignment_issue_count": sum(
                 1
                 for outcome in alignment_outcomes.values()
@@ -2133,11 +1121,6 @@ def _transcribe_and_align_local(
         })
         return segments, log, details
     finally:
-        if boundary_context is not None:
-            # The provider owns raw PTM/MFCC arrays and must not survive an
-            # exceptional CueQC/Inner path into the next workflow stage.
-            boundary_context.sequence_feature_provider = None
-            gc.collect()
         if (
             chunk_dir is not None
             and chunk_dir.exists()

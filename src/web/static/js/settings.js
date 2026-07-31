@@ -3,33 +3,14 @@ import { $, escHtml, showToast } from './util.js';
 import { loadFormMemory, saveFormMemory, applyFormMemory } from './formMemory.js';
 import { setActivePreset } from './presets.js';
 
-const _BACKEND_LABELS = {
-  'jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf': 'Qwen3-ASR-0.6B-JA-Anime-Galgame-hf（低显存）',
-  'jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf': 'Qwen3-ASR-1.7B-JA-Anime-Galgame-hf',
-};
 const _SUBTITLE_MODE_LABELS = { zh: '中文字幕', bilingual: '中日双语' };
 
-function formatBackendLabel(repoId, recommendedRepoId) {
-  const id = String(repoId || '');
-  const label = _BACKEND_LABELS[id] || id.split('/').pop() || id;
-  return id === recommendedRepoId ? `${label}（推荐）` : label;
-}
-
 let _modelRequirementsRequestSeq = 0;
-
-function formatRequirementLabel(item) {
-  const labels = Array.isArray(item.role_labels) ? item.role_labels.join('/') : '';
-  const name = item.short_name || String(item.repo_id || '').split('/').pop() || item.repo_id || '';
-  if (labels === name) return labels;
-  return labels ? `${labels} ${name}` : name;
-}
 
 function renderModelRequirements(payload) {
   const notice = $('model-requirements-notice');
   if (!notice) return;
-  const missingModels = (payload.required_models || []).filter(item => !item.present);
-  const missingCheckpoints = (payload.required_checkpoints || []).filter(item => !item.present);
-  const missing = [...missingModels, ...missingCheckpoints];
+  const missing = (payload.required_models || []).filter(item => !item.present);
   const cuda = payload.cuda || {};
   const cudaProblem = cuda.status && cuda.status !== 'ok';
   if (!missing.length && !cudaProblem) {
@@ -41,18 +22,15 @@ function renderModelRequirements(payload) {
   const sections = [];
   if (missing.length) {
     let message;
-    if (missingCheckpoints.length && missingModels.length) {
-      message = `当前配置缺少 ${missingModels.length} 个基础模型和 ${missingCheckpoints.length} 个前置 checkpoint；基础模型可按配置下载，checkpoint 需要先准备。`;
-    } else if (missingCheckpoints.length) {
-      message = `当前 ASR 后端缺少 ${missingCheckpoints.length} 个前置 checkpoint，不能运行完整五模型链。`;
-    } else if (payload.download_disabled && payload.needs_download) {
-      message = `当前配置缺少 ${missingModels.length} 个模型；可自动下载的模型会在首次运行下载，已关闭自动下载的模型需要先准备。`;
-    } else if (payload.download_disabled) {
-      message = '当前配置缺少基础模型文件，且已关闭自动下载，需要先准备本地模型。';
+    if (payload.download_disabled) {
+      message = '缺少本地模型文件，且已关闭自动下载，需要先准备本地模型。';
     } else {
-      message = `首次使用该配置需要下载 ${missingModels.length} 个模型；下载完成后会复用本地缓存。`;
+      message = `首次使用需要下载 ${missing.length} 个模型；下载完成后会复用本地缓存。`;
     }
-    const missingText = missing.map(formatRequirementLabel).join('、');
+    const missingText = missing
+      .map(item => item.short_name || item.repo_id || '')
+      .filter(Boolean)
+      .join('、');
     sections.push(`${escHtml(message)}<br><strong>缺少：</strong>${escHtml(missingText)}`);
   }
 
@@ -72,12 +50,11 @@ function renderModelRequirements(payload) {
 
 export async function refreshModelRequirements() {
   const notice = $('model-requirements-notice');
-  const backendSel = $('r-backend');
-  if (!notice || !backendSel?.value) return;
+  if (!notice) return;
 
   const requestSeq = ++_modelRequirementsRequestSeq;
   try {
-    const r = await fetch(`/api/model-requirements?asr_backend=${encodeURIComponent(backendSel.value)}`);
+    const r = await fetch('/api/model-requirements');
     if (requestSeq !== _modelRequirementsRequestSeq) return;
     if (!r.ok) {
       notice.hidden = true;
@@ -94,20 +71,6 @@ export async function loadConfig() {
     const r = await fetch('/api/config');
     if (!r.ok) return;
     const cfg = await r.json();
-
-    const backendSel = $('r-backend');
-    backendSel.innerHTML = '';
-    for (const b of (cfg.backends || [])) {
-      const opt = document.createElement('option');
-      opt.value = b;
-      opt.dataset.repoId = b;
-      opt.title = b;
-      opt.textContent = formatBackendLabel(b, cfg.recommended_asr_backend);
-      backendSel.appendChild(opt);
-    }
-    if (cfg.defaults?.asr_backend && !Object.hasOwn(loadFormMemory().controls, 'r-backend')) {
-      backendSel.value = cfg.defaults.asr_backend;
-    }
 
     const modeSel = $('r-mode');
     modeSel.innerHTML = '';
@@ -160,9 +123,9 @@ export async function loadSettings() {
     // Local model backend fields
     if (s.local_model_path) {
       const presets = [
-        'Tencent-Hunyuan/Hunyuan-Large',
-        'Qwen/Qwen2.5-72B-Instruct',
-        'Qwen/Qwen2.5-32B-Instruct',
+        'Qwen/Qwen3-4B',
+        'Qwen/Qwen3-8B',
+        'Qwen/Qwen3-14B',
       ];
       const preset = $('local-model-preset');
       if (preset) {
@@ -225,24 +188,34 @@ export async function loadSettings() {
   } catch {}
 }
 
-export function readTranslationSettingsFromForm() {
-  const normalizeGlossaryLine = line => {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.includes('→') || trimmed.includes('->') || !trimmed.includes('-')) return '';
-    const [source, ...rest] = trimmed.split('-');
-    const target = rest.join('-').trim();
-    const normalizedSource = source.trim();
-    return normalizedSource && target ? `${normalizedSource}-${target}` : '';
-  };
+function normalizeGlossaryLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.includes('→') || trimmed.includes('->') || !trimmed.includes('-')) return '';
+  const [source, ...rest] = trimmed.split('-');
+  const target = rest.join('-').trim();
+  const normalizedSource = source.trim();
+  return normalizedSource && target ? `${normalizedSource}-${target}` : '';
+}
 
-  const backend = $('translation-backend')?.value || 'openai';
-  const body = {
-    translation_backend: backend,
+// JobSpec is `extra="forbid"`, so the job body may carry only fields it
+// declares. Backend choice and local-model config belong to the settings API
+// (already persisted by `syncSettingsFromFormForSubmit` before submit) and
+// would make POST /api/jobs fail with 422 if they leaked in here.
+export function readJobTranslationSpecFromForm() {
+  return {
     llm_reasoning_effort: $('api-reasoning-effort')?.value || 'medium',
     llm_api_format:       $('api-format')?.value || 'chat',
     target_lang:          $('api-target-lang')?.value || '简体中文',
     translation_glossary: ($('api-glossary')?.value || '')
       .split('\n').map(normalizeGlossaryLine).filter(Boolean).join(', '),
+  };
+}
+
+export function readTranslationSettingsFromForm() {
+  const backend = $('translation-backend')?.value || 'openai';
+  const body = {
+    translation_backend: backend,
+    ...readJobTranslationSpecFromForm(),
   };
 
   if (backend === 'local') {
@@ -332,8 +305,6 @@ export async function syncSettingsFromFormForSubmit() {
 }
 
 export function installSettingsPanel() {
-  $('r-backend')?.addEventListener('change', refreshModelRequirements);
-
   const saveProxySettings = async () => {
     try {
       await saveSettingsBody(buildSettingsBodyFromForm({ includeProxy: true }));

@@ -108,12 +108,14 @@ def _ctx_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
     return default
 
 
+# Prefixes whose settings reach the ASR stage worker. The boundary/CueQC
+# prefixes were dropped on 2026-07-31 with the chain they configured - a
+# forwarded setting for a stage that no longer runs is not neutral, because it
+# still participates in the stage's cache signature.
 _ASR_STAGE_ADVANCED_PREFIXES = (
     "ASR_NATIVE_",
-    "CUEQC_",
-    "PRE_ASR_CUEQC_",
-    "BOUNDARY_",
-    "SPEECH_BOUNDARY_JA_",
+    "ASR_CHUNK_",
+    "ASR_ALIGNMENT_",
 )
 _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_STAGE_WORKER_TIMEOUT_S",
@@ -128,7 +130,6 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "GPU_BATCH_PROFILE_ENABLED",
     "GPU_BATCH_PROFILE_GROWTH_THRESHOLD",
     "GPU_BATCH_PROFILE_PATH",
-    "ASR_BOUNDARY_BACKEND",
     "ASR_LANGUAGE",
     "ASR_FORCE_LANGUAGE",
     "ASR_MODEL_PATH",
@@ -142,15 +143,6 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_BATCH_SIZE_BY_REPO",
     "ASR_CHUNK_ROOT",
     "KEEP_ASR_CHUNKS",
-    "BOUNDARY_CACHE_DIR",
-    "BOUNDARY_CACHE_ENABLED",
-    "OUTER_EDGE_REFINER_DEVICE",
-    "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-    "SEMANTIC_SPLIT_DEVICE",
-    "ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES",
-    "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
-    "INNER_EDGE_REFINER_DEVICE",
-    "INNER_EDGE_REFINER_MODEL_PATH_BY_REPO",
 }
 _ASR_STAGE_CACHE_NEUTRAL_KEYS = {
     "ASR_BATCH_SIZE",
@@ -168,12 +160,7 @@ _ASR_STAGE_CACHE_NEUTRAL_KEYS = {
     "GPU_BATCH_PROFILE_GROWTH_THRESHOLD",
     "GPU_BATCH_PROFILE_PATH",
     "ASR_CHUNK_ROOT",
-    "BOUNDARY_CACHE_DIR",
-    "BOUNDARY_CACHE_ENABLED",
-    "ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES",
     "KEEP_ASR_CHUNKS",
-    "PRE_ASR_CUEQC_EXPORT_CANDIDATES_APPEND",
-    "PRE_ASR_CUEQC_EXPORT_CANDIDATES_PATH",
     "TRANSCRIPTION_TIMEOUT_S",
 }
 
@@ -186,15 +173,13 @@ def _is_asr_stage_advanced_key(name: str) -> bool:
 
 
 def _asr_stage_env_overrides(ctx: JobContext) -> dict[str, str]:
-    overrides = {
+    # Only one ASR repo ships, so ASR_BACKEND is a deployment setting rather
+    # than a per-job choice; it reaches the worker through the process env.
+    return {
         str(key).strip(): str(value)
         for key, value in (ctx.advanced or {}).items()
         if str(key).strip() and _is_asr_stage_advanced_key(str(key).strip())
     }
-    asr_backend = str(ctx.asr_backend or "").strip()
-    if asr_backend:
-        overrides["ASR_BACKEND"] = asr_backend
-    return overrides
 
 
 def _asr_stage_env_for_ctx(ctx: JobContext) -> dict[str, str]:
@@ -359,7 +344,6 @@ def _aligned_segments_payload(
 
 _ASR_DETAILS_LARGE_SIDECAR_KEYS = {
     "transcript_chunks",
-    "pre_asr_candidates",
 }
 
 
@@ -374,9 +358,6 @@ def _compact_asr_details_for_sidecar(asr_details: dict | None) -> dict:
     transcript_chunks = asr_details.get("transcript_chunks")
     if isinstance(transcript_chunks, list):
         compact["transcript_chunk_count"] = len(transcript_chunks)
-    pre_asr_candidates = asr_details.get("pre_asr_candidates")
-    if isinstance(pre_asr_candidates, list):
-        compact["pre_asr_candidate_count"] = len(pre_asr_candidates)
     return compact
 
 
@@ -904,11 +885,6 @@ def _run_asr_alignment_impl(
             console.print(f"[dim]运行日志：{_project_relative(run_log_path)}[/dim]")
 
         subtitle_options = _subtitle_options_for_ctx(effective_ctx)
-        _log_stage(
-            logger,
-            "boundary_feature_frame_hop_s="
-            f"{os.environ.get('BOUNDARY_FEATURE_FRAME_HOP_S', '')}",
-        )
         _log_stage(
             logger,
             "subtitle_frame_gap_s="

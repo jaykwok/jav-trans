@@ -159,6 +159,54 @@ def test_local_backend_rejects_full_context_before_generate():
         )
 
 
+def test_local_backend_disables_thinking_in_chat_template():
+    import torch
+
+    from llm.backends.local_model import LocalModelBackend
+
+    seen_kwargs = {}
+
+    class FakeTokenizer:
+        model_max_length = 64
+        pad_token_id = 0
+        eos_token_id = 1
+
+        def apply_chat_template(self, _messages, **kwargs):
+            seen_kwargs.update(kwargs)
+            return "prompt"
+
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": torch.ones((1, 4), dtype=torch.long)}
+
+        def decode(self, *_args, **_kwargs):
+            return '{"translations":[]}'
+
+    class FakeModel:
+        device = torch.device("cpu")
+
+        def generate(self, **kwargs):
+            return torch.ones((1, 5), dtype=torch.long)
+
+    backend = LocalModelBackend()
+    backend._tokenizer = FakeTokenizer()
+    backend._model = FakeModel()
+    backend._max_length = 64
+
+    backend._generate(
+        [{"role": "user", "content": "x"}],
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=8,
+        cancel_event=None,
+        on_progress=None,
+        on_usage=None,
+    )
+
+    # Qwen3-style templates read this flag to skip the <think> prelude; without
+    # it a thinking model spends most of the generation budget before the JSON.
+    assert seen_kwargs.get("enable_thinking") is False
+
+
 def test_translator_routes_custom_backend_and_preserves_task_format(monkeypatch):
     from llm.backends import register_backend
     from llm import translator

@@ -42,8 +42,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # --- ASR Model Settings ---
     # Transcription backend. Use the Hugging Face repo id as the stable key.
     "ASR_BACKEND": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
-    # Voice activity detection backend used before ASR chunking.
-    "ASR_BOUNDARY_BACKEND": "speech_boundary_ja",
     # Optional explicit HuggingFace model id override. Empty auto-selects by ASR_BACKEND.
     "ASR_MODEL_ID": "",
     # Optional local ASR model directory override. Empty uses models/<namespace>-<repo> for the selected backend.
@@ -72,10 +70,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # A numeric MB value remains available as an exact expert override.
     "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "auto",
     "ASR_STAGE_WORKER_VRAM_RATIO": "0.95",
-    "ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO": (
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=4096,"
-        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144"
-    ),
+    "ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144",
     "ASR_STAGE_WORKER_RAM_RATIO": "0.95",
     "ASR_STAGE_WORKER_HEARTBEAT_S": "10",
     # Cross-job auto-batch learning. Successful jobs below the utilization
@@ -94,48 +89,25 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # The repo table is the 5600MB baseline. In auto mode the worker scales it
     # to the resolved VRAM budget, while an explicit ASR_BATCH_SIZE stays exact.
     "ASR_BATCH_SIZE": "auto",
-    "ASR_BATCH_SIZE_BY_REPO": (
-        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4,"
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12"
-    ),
+    "ASR_BATCH_SIZE_BY_REPO": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4",
     # Max generated tokens configured when loading the Qwen ASR wrapper.
     "ASR_MAX_NEW_TOKENS": "128",
     # Generation penalty to reduce repeated ASR text.
     "ASR_REPETITION_PENALTY": "1.05",
 
-    # --- Semantic boundary pipeline / ASR Chunking ---
-    # 1.7B: Outer v3 placeholder -> Acoustic Split v4 binary -> CueQC v13 binary -> Inner v2.
-    # 0.6B Boundary is intentionally unavailable pending full binary retraining.
-    # This is a feature-score grid fallback, not the source video frame rate.
-    "BOUNDARY_FEATURE_FRAME_HOP_S": "0.02",
-    "OUTER_EDGE_REFINER_DEVICE": "auto",
-    "SEMANTIC_SPLIT_DEVICE": "auto",
-    # Whole-island Split v4 batches are bounded by padded candidate slots.
-    # Candidate sequences remain intact; this changes execution shape only.
-    "ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES": "auto",
-    "INNER_EDGE_REFINER_DEVICE": "auto",
-    "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S": "0.60",
-    "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S": "0.60",
-    "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS": "2048",
-    "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC": "1",
-    "SPEECH_BOUNDARY_JA_WINDOW_S": "20.0",
-    "SPEECH_BOUNDARY_JA_OVERLAP_S": "4.0",
-    # Optional learned SpeechBoundary-JA Mamba2 scorer override. Empty uses the registered repo-id scorer when available; auto resolves the same registry explicitly.
-    "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO": "",
-    "SPEECH_BOUNDARY_JA_SCORER_DEVICE": "auto",
-    # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
-    "BOUNDARY_CACHE_ENABLED": "1",
-    # Persistent boundary cache directory. Versioned by src/boundary/cache.py.
-    "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
-
-    # --- Pre-ASR CueQC v13 binary semantic chunk router ---
-    # Low-VRAM default: drop obvious non-speech chunks before ASR.
-    "PRE_ASR_CUEQC_ENABLED": "1",
-    "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": "",
-    "PRE_ASR_CUEQC_DEVICE": "auto",
-    # Optional JSONL export for cold-start clustering/training candidates.
-    "PRE_ASR_CUEQC_EXPORT_CANDIDATES_PATH": "",
-    "PRE_ASR_CUEQC_EXPORT_CANDIDATES_APPEND": "1",
+    # --- ASR Chunking ---
+    # Cuts are chosen at blank runs read from the CTC alignment head, and the
+    # chunks tile the file exactly - nothing here can drop audio. The five
+    # acoustic models that used to live in front of the decoder (Scorer, Outer,
+    # Split v4, CueQC v13, Inner v2) were retired on 2026-07-31; their settings
+    # are gone from here because leaving them advertised knobs that do nothing.
+    # With no alignment head configured this degrades to fixed-length chunks.
+    "ASR_CHUNK_TARGET_S": "20.0",
+    "ASR_CHUNK_MAX_S": "30.0",
+    "ASR_CHUNK_MIN_S": "2.0",
+    # Below ~0.5s a pause is between words, not between sentences: an earlier
+    # 0.35s cut produced ~1s fragments that the decoder answered with whole lines.
+    "ASR_CHUNK_MIN_PAUSE_S": "0.6",
 
     # --- Subtitle Timings ---
     # Minimum displayed subtitle duration in seconds.

@@ -6,27 +6,33 @@ from tools.web.smoke import submit_job
 from tools.web.smoke import summarize_job
 
 
-def test_web_smoke_summary_reads_pre_asr_cueqc_report() -> None:
+def test_web_smoke_summary_reads_postgate_report() -> None:
     asr_details = {
-        "transcript_chunks": [{"text": "keep"}],
-        "pre_asr_cueqc": {
-            "schema": "pre_asr_cueqc_report_v2",
-            "enabled": True,
-            "candidate_count": 3,
-            "keep_count": 2,
-            "drop_count": 1,
-            "decisions": [],
+        "transcript_chunks": [{"text": "keep"}, {"text": "んっ" * 40}],
+        "postgate": {
+            "schema": "text_alignment_postgate_v1",
+            "reviewed": 2,
+            "flagged": 1,
+            "flags": {"runaway_repetition": 1},
+            "alignment_score_checked": 0,
         },
     }
 
-    summary = summarize_job._pre_asr_cueqc_summary(asr_details)
+    summary = summarize_job._postgate_summary(asr_details)
 
-    assert summary["source"] == "asr_details.pre_asr_cueqc"
-    assert summary["enabled"] is True
-    assert summary["candidate_count"] == 3
-    assert summary["keep_count"] == 2
-    assert summary["drop_count"] == 1
-    assert summary["transcript_chunks"] == 1
+    assert summary["source"] == "asr_details.postgate"
+    assert summary["reviewed"] == 2
+    assert summary["flagged"] == 1
+    assert summary["flags"] == {"runaway_repetition": 1}
+    assert summary["transcript_chunks"] == 2
+
+
+def test_web_smoke_summary_is_empty_without_a_postgate_report() -> None:
+    # The old version read a key nothing writes any more and reported blanks,
+    # which is indistinguishable from a clean run. Absent must stay absent.
+    summary = summarize_job._postgate_summary({"transcript_chunks": []})
+    assert summary["reviewed"] is None
+    assert summary["flags"] == {}
 
 
 def test_web_smoke_submit_does_not_emit_asr_after_cueqc_runtime_env(monkeypatch, tmp_path) -> None:

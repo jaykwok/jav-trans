@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from tools.asr.cueqc.label_pre_asr_with_omni import (
+from tools.omni.openai_compat import (
     DEFAULT_API_KEY_ENV_CANDIDATES,
     DEFAULT_BASE_URL_ENV_CANDIDATES,
     audio_content_mode_for_profile,

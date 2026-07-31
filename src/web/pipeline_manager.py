@@ -16,7 +16,6 @@ from typing import Any
 from core import events
 from core.config import DEFAULT_SETTINGS
 from core.job_context import JobContext
-from boundary.cache import delete_for_audio_cache_key
 from pipeline.artifacts import (
     AsrArtifacts,
     load_translation_artifacts_snapshot,
@@ -246,25 +245,9 @@ def _remove_job_temp_dir(job_id: str) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def _job_audio_cache_keys(job: JobState) -> set[str]:
-    keys: set[str] = set()
-    for video_path in job.spec.video_paths:
-        try:
-            keys.add(get_audio_cache_key(video_path))
-        except OSError:
-            pass
-    audio_dir = Path(_job_temp_dir(job.id)) / "audio"
-    if audio_dir.is_dir():
-        for audio_path in audio_dir.glob("*.wav"):
-            candidate = audio_path.stem.rsplit(".", 1)[-1].strip().lower()
-            if candidate:
-                keys.add(candidate)
-    return keys
-
-
 def _remove_job_caches(job: JobState) -> None:
-    for audio_cache_key in _job_audio_cache_keys(job):
-        delete_for_audio_cache_key(audio_cache_key)
+    # The boundary cache this used to purge was retired on 2026-07-31 together
+    # with the acoustic chain that wrote it; nothing produces those files now.
     chunk_root = Path(
         os.getenv("ASR_CHUNK_ROOT", PROJECT_ROOT / "tmp" / "chunks")
     ).resolve()

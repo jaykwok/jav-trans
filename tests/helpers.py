@@ -6,8 +6,10 @@ import main
 from core.job_context import JobContext
 from pipeline.ids import sanitize_job_id
 
-ASR_06B_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
 ASR_17B_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+# Dropped on 2026-07-31. Kept only so tests can assert it is now rejected:
+# a repo id that used to be valid is exactly the one a stale `.env` will carry.
+RETIRED_06B_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
 
 
 def make_job_context(
@@ -16,7 +18,6 @@ def make_job_context(
     job_temp_root: Path | str,
     *,
     job_id: str | None = None,
-    asr_backend: str = ASR_17B_BACKEND,
     subtitle_mode: str = "zh",
     skip_translation: bool = False,
     translation_max_workers: int = 4,
@@ -32,7 +33,6 @@ def make_job_context(
     job_temp_dir = Path(job_temp_root) / effective_job_id
     effective_advanced = dict(advanced or {})
     return JobContext(
-        asr_backend=asr_backend,
         subtitle_mode=subtitle_mode,
         skip_translation=skip_translation,
         target_lang="简体中文",

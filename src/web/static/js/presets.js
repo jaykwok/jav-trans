@@ -7,7 +7,7 @@ const CUSTOM_PRESET_KEY = 'jav-trans.customPreset.v1';
 export const TUNING_FIELDS = {
   'r-mode':                    'zh',
   'r-skip-translation':        false,
-  't-translation-max-workers': '4',
+  't-translation-max-workers': '16',
   't-quality-report':          false,
   't-keep-temp':               false,
 };

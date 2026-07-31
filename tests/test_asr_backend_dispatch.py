@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from asr.backends.base import BaseAsrBackend
-from helpers import ASR_06B_BACKEND, ASR_17B_BACKEND
+from helpers import ASR_17B_BACKEND, RETIRED_06B_BACKEND
 
 
 def _reload_asr(monkeypatch, *, backend: str):
@@ -27,13 +27,13 @@ def test_qwen3_asr_repo_backend_dispatch_uses_gpu_worker_local_backend(monkeypat
 
 def test_legacy_asr_worker_mode_env_is_ignored(monkeypatch):
     monkeypatch.setenv("ASR_WORKER_MODE", "subprocess")
-    asr = _reload_asr(monkeypatch, backend=ASR_06B_BACKEND)
+    asr = _reload_asr(monkeypatch, backend=ASR_17B_BACKEND)
     backend = asr._resolve_asr_backend("cpu")
 
     assert isinstance(backend, BaseAsrBackend)
     assert type(backend).__name__ == "LocalAsrBackend"
     assert backend.is_subprocess is False
-    assert asr.get_backend_label() == ASR_06B_BACKEND
+    assert asr.get_backend_label() == ASR_17B_BACKEND
 
 
 def test_qwen3_asr_default_runtime_mode_is_gpu_worker(monkeypatch):
@@ -41,17 +41,21 @@ def test_qwen3_asr_default_runtime_mode_is_gpu_worker(monkeypatch):
     monkeypatch.delenv("ASR_WORKER_MODE_BY_REPO", raising=False)
     from asr import pipeline as asr
 
-    monkeypatch.setenv("ASR_BACKEND", ASR_06B_BACKEND)
-    asr = importlib.reload(asr)
-    backend_06b = asr._resolve_asr_backend("cpu")
-    assert backend_06b.is_subprocess is False
-    assert asr.get_backend_label() == ASR_06B_BACKEND
-
     monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
     asr = importlib.reload(asr)
     backend_17b = asr._resolve_asr_backend("cpu")
     assert backend_17b.is_subprocess is False
     assert asr.get_backend_label() == ASR_17B_BACKEND
+
+
+def test_retired_06b_backend_is_rejected(monkeypatch):
+    # A stale `.env` from before 2026-07-31 still names the 0.6B repo.
+    # Failing loudly beats silently transcribing with a model the user
+    # did not pick, and beats a KeyError deep inside a batch-size lookup.
+    asr = _reload_asr(monkeypatch, backend=RETIRED_06B_BACKEND)
+
+    with pytest.raises(ValueError, match="Unsupported ASR_BACKEND"):
+        asr._resolve_asr_backend("cpu")
 
 
 def test_invalid_asr_backend_is_rejected(monkeypatch):
@@ -72,20 +76,20 @@ def test_internal_asr_backend_names_are_rejected(monkeypatch):
     try:
         asr._resolve_asr_backend("cpu")
     except ValueError as exc:
-        assert ASR_06B_BACKEND in str(exc)
         assert ASR_17B_BACKEND in str(exc)
+        assert RETIRED_06B_BACKEND not in str(exc)
     else:
         raise AssertionError("ValueError was not raised")
 
 
 def test_short_qwen_backend_aliases_are_rejected(monkeypatch):
-    asr = _reload_asr(monkeypatch, backend="qwen3-asr-0.6b")
+    asr = _reload_asr(monkeypatch, backend="qwen3-asr-1.7b")
 
     try:
         asr._resolve_asr_backend("cpu")
     except ValueError as exc:
         assert "Unsupported ASR_BACKEND" in str(exc)
-        assert ASR_06B_BACKEND in str(exc)
+        assert ASR_17B_BACKEND in str(exc)
     else:
         raise AssertionError("ValueError was not raised")
 
@@ -101,211 +105,70 @@ def test_legacy_non_hf_repo_id_is_rejected(monkeypatch):
 def test_qwen_asr_batch_size_auto_uses_repo_table(monkeypatch):
     from asr.backends import qwen
 
+    monkeypatch.setenv("ASR_BATCH_SIZE_BY_REPO", f"{ASR_17B_BACKEND}=32")
+    assert qwen.qwen_asr_default_batch_size(ASR_17B_BACKEND) == 32
+
+    # A stale table naming the dropped repo must fail, not be ignored.
     monkeypatch.setenv(
         "ASR_BATCH_SIZE_BY_REPO",
-        f"{ASR_06B_BACKEND}=64,{ASR_17B_BACKEND}=32",
+        f"{RETIRED_06B_BACKEND}=64,{ASR_17B_BACKEND}=32",
     )
-
-    assert qwen.qwen_asr_default_batch_size(ASR_06B_BACKEND) == 64
-    assert qwen.qwen_asr_default_batch_size(ASR_17B_BACKEND) == 32
+    with pytest.raises(ValueError, match="Invalid ASR_BATCH_SIZE_BY_REPO repo"):
+        qwen.qwen_asr_default_batch_size(ASR_17B_BACKEND)
 
 
 def test_qwen_asr_minimum_physical_vram_uses_repo_table(monkeypatch):
     from asr.backends import qwen
 
-    monkeypatch.setenv(
-        "ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO",
-        f"{ASR_06B_BACKEND}=4096,{ASR_17B_BACKEND}=6144",
-    )
-
-    assert qwen.qwen_asr_min_physical_vram_mb(ASR_06B_BACKEND) == 4096
+    monkeypatch.setenv("ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO", f"{ASR_17B_BACKEND}=6144")
     assert qwen.qwen_asr_min_physical_vram_mb(ASR_17B_BACKEND) == 6144
 
-
-def test_qwen_checkpoint_path_mapping_uses_repo_id_keys(monkeypatch, tmp_path):
-    from asr.backends import qwen
-
-    checkpoint_06b = tmp_path / "06b.pt"
-    checkpoint_17b = tmp_path / "17b.pt"
-    checkpoint_06b.write_bytes(b"06b")
-    checkpoint_17b.write_bytes(b"17b")
-    monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
     monkeypatch.setenv(
-        "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        f"{ASR_06B_BACKEND}={checkpoint_06b},{ASR_17B_BACKEND}={checkpoint_17b}",
+        "ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO",
+        f"{RETIRED_06B_BACKEND}=4096,{ASR_17B_BACKEND}=6144",
     )
+    with pytest.raises(
+        ValueError, match="Invalid ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO repo"
+    ):
+        qwen.qwen_asr_min_physical_vram_mb(ASR_17B_BACKEND)
+
+
+def test_repo_tag_and_default_model_path(monkeypatch):
+    from asr.backends import qwen
 
     assert qwen.qwen_asr_repo_tag(ASR_17B_BACKEND) == "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
-    assert (
-        qwen.checkpoint_path_for_repo_env(
-            repo_id=ASR_17B_BACKEND,
-            mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        )
-        == str(checkpoint_17b.resolve())
+    assert qwen.qwen_asr_default_model_path(ASR_17B_BACKEND) == (
+        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
     )
 
 
-def test_qwen_checkpoint_path_defaults_to_registry_when_env_is_absent(monkeypatch, tmp_path):
+def test_retired_checkpoint_mapping_machinery_is_gone():
+    # The per-repo checkpoint registries and their env resolution went with the
+    # boundary chain on 2026-07-31. The alignment head binds through
+    # ASR_ALIGNMENT_HEAD_PATH instead; nothing may quietly resurrect the
+    # <repo_id>=<path> mapping surface.
     from asr.backends import qwen
 
-    checkpoint = tmp_path / "outer_edge_refiner_v1.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
-    checkpoint.write_bytes(b"v1")
-    monkeypatch.delenv("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", raising=False)
-
-    path = qwen.checkpoint_path_for_repo_env(
-        repo_id=ASR_17B_BACKEND,
-        mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        default_mapping={ASR_17B_BACKEND: str(checkpoint)},
-    )
-
-    assert path.endswith("outer_edge_refiner_v1.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt")
-
-
-def test_default_outer_registry_is_empty_until_v3_audit() -> None:
-    from asr.backends import qwen
-
-    assert qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO[ASR_06B_BACKEND] == ""
-    assert qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO[ASR_17B_BACKEND] == ""
-
-
-def test_qwen_checkpoint_path_defaults_fall_back_to_resource_root(monkeypatch, tmp_path):
-    from asr.backends import qwen
-
-    runtime_root = tmp_path / "runtime"
-    resource_root = tmp_path / "resource"
-    relative = Path("src/checkpoints/test-repo/outer_edge_refiner_v1.test.pt")
-    checkpoint = resource_root / relative
-    checkpoint.parent.mkdir(parents=True)
-    checkpoint.write_bytes(b"bundled")
-
-    def fake_runtime_path(path: Path) -> Path:
-        candidate = Path(path)
-        return candidate.resolve() if candidate.is_absolute() else (runtime_root / candidate).resolve()
-
-    def fake_resource_path(path: Path) -> Path:
-        candidate = Path(path)
-        return candidate.resolve() if candidate.is_absolute() else (resource_root / candidate).resolve()
-
-    monkeypatch.delenv("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", raising=False)
-    monkeypatch.setattr(qwen, "runtime_path", fake_runtime_path)
-    monkeypatch.setattr(qwen, "resource_path", fake_resource_path)
-
-    path = qwen.checkpoint_path_for_repo_env(
-        repo_id=ASR_17B_BACKEND,
-        mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        default_mapping={ASR_17B_BACKEND: relative.as_posix()},
-    )
-
-    assert path == str(checkpoint.resolve())
-
-
-def test_qwen_checkpoint_path_auto_uses_registered_scorer(monkeypatch, tmp_path):
-    from asr.backends import qwen
-
-    checkpoint_06b = tmp_path / "speech_island_scorer_v8.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
-    checkpoint_17b = tmp_path / "speech_island_scorer_v8.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
-    checkpoint_06b.write_bytes(b"v8-06b")
-    checkpoint_17b.write_bytes(b"v8-17b")
-    monkeypatch.setenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", "auto")
-
-    default_mapping = {
-        ASR_06B_BACKEND: str(checkpoint_06b),
-        ASR_17B_BACKEND: str(checkpoint_17b),
-    }
-    path_06b = qwen.checkpoint_path_for_repo_env(
-        repo_id=ASR_06B_BACKEND,
-        mapping_env="SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
-        default_mapping=default_mapping,
-    )
-    path_17b = qwen.checkpoint_path_for_repo_env(
-        repo_id=ASR_17B_BACKEND,
-        mapping_env="SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
-        default_mapping=default_mapping,
-    )
-
-    assert path_06b.endswith(
-        "speech_island_scorer_v8.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
-    )
-    assert path_17b.endswith(
-        "speech_island_scorer_v8.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
-    )
-
-
-def test_qwen_checkpoint_path_mapping_requires_env(monkeypatch):
-    from asr.backends import qwen
-
-    monkeypatch.delenv("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", raising=False)
-
-    with pytest.raises(RuntimeError, match="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO is required"):
-        qwen.checkpoint_path_for_repo_env(
-            repo_id=ASR_17B_BACKEND,
-            mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        )
-
-
-def test_qwen_checkpoint_path_mapping_requires_selected_repo(monkeypatch, tmp_path):
-    from asr.backends import qwen
-
-    checkpoint_06b = tmp_path / "06b.pt"
-    checkpoint_06b.write_bytes(b"06b")
-    monkeypatch.setenv(
-        "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        f"{ASR_06B_BACKEND}={checkpoint_06b}",
-    )
-
-    with pytest.raises(RuntimeError, match="has no checkpoint for ASR repo"):
-        qwen.checkpoint_path_for_repo_env(
-            repo_id=ASR_17B_BACKEND,
-            mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        )
-
-
-def test_qwen_checkpoint_path_mapping_requires_existing_file(monkeypatch, tmp_path):
-    from asr.backends import qwen
-
-    missing = tmp_path / "missing.pt"
-    monkeypatch.setenv(
-        "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        f"{ASR_17B_BACKEND}={missing}",
-    )
-
-    with pytest.raises(FileNotFoundError, match="does not exist"):
-        qwen.checkpoint_path_for_repo_env(
-            repo_id=ASR_17B_BACKEND,
-            mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        )
-
-
-def test_qwen_checkpoint_path_mapping_rejects_malformed_env(monkeypatch):
-    from asr.backends import qwen
-
-    monkeypatch.setenv("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", "not-a-mapping-entry")
-
-    with pytest.raises(RuntimeError, match="is malformed"):
-        qwen.checkpoint_path_for_repo_env(
-            repo_id=ASR_17B_BACKEND,
-            mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        )
-
-
-def test_checkpoint_metadata_rejects_legacy_non_hf_repo_id():
-    from asr.backends import qwen
-
-    with pytest.raises(ValueError, match="does not match"):
-        qwen.validate_checkpoint_repo_id(
-            ASR_17B_BACKEND.removesuffix("-hf"),
-            ASR_17B_BACKEND,
-            checkpoint_kind="test",
-            metadata_key="metadata.ptm_repo_id",
-        )
+    for name in (
+        "checkpoint_path_for_repo_env",
+        "repo_path_mapping",
+        "repo_checkpoint_path",
+        "validate_checkpoint_repo_id",
+        "SMALL_MODEL_CHECKPOINT_ROOT",
+        "BOUNDARY_PIPELINE_STATUS_BY_REPO",
+        "DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO",
+        "DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO",
+        "DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO",
+        "DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO",
+        "DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO",
+        "DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO",
+    ):
+        assert not hasattr(qwen, name), name
 
 
 def test_local_backend_asr_batch_size_auto_and_numeric_override(monkeypatch):
     monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
-    monkeypatch.setenv(
-        "ASR_BATCH_SIZE_BY_REPO",
-        f"{ASR_06B_BACKEND}=64,{ASR_17B_BACKEND}=32",
-    )
+    monkeypatch.setenv("ASR_BATCH_SIZE_BY_REPO", f"{ASR_17B_BACKEND}=32")
     monkeypatch.setenv("ASR_BATCH_SIZE", "auto")
 
     from asr import local_backend

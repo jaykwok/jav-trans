@@ -70,11 +70,6 @@ def serialize_asr_artifacts(artifacts: AsrArtifacts) -> dict:
         if name == "logger":
             continue
         value = getattr(artifacts, name)
-        if name == "asr_details" and isinstance(value, dict):
-            value = dict(value)
-            pre_asr_candidates = value.pop("pre_asr_candidates", None)
-            if isinstance(pre_asr_candidates, list):
-                value["pre_asr_candidate_count"] = len(pre_asr_candidates)
         if name in ASR_ARTIFACT_PATH_FIELDS:
             payload[name] = _project_relative(value)
         elif isinstance(value, Path):

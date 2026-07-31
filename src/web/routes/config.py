@@ -14,19 +14,9 @@ from pathlib import Path
 from typing import Any, get_args
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException
 
-from asr.backends.qwen import (
-    BOUNDARY_PIPELINE_STATUS_BY_REPO,
-    DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
-    DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
-    DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
-    DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
-    DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
-    checkpoint_path_for_repo_env,
-    qwen_asr_default_model_path,
-    qwen_asr_repo_id,
-)
+from asr.backends.qwen import active_qwen_asr_model_id
 from core.config import (
     DEFAULT_SETTINGS,
     apply_network_proxy_environment,
@@ -47,8 +37,6 @@ from web.models import (
 
 router = APIRouter()
 
-BACKENDS = list(get_args(JobSpec.model_fields["asr_backend"].annotation))
-RECOMMENDED_ASR_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
 SUBTITLE_MODES = list(get_args(JobSpec.model_fields["subtitle_mode"].annotation))
 DEFAULT_JOB_DEFAULTS = {
     name: field.default
@@ -56,42 +44,6 @@ DEFAULT_JOB_DEFAULTS = {
     if not field.is_required()
 }
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_MODEL_ROLE_LABELS = {
-    "asr": "ASR",
-    "boundary_feature": "Boundary",
-}
-_CHECKPOINT_SPECS = (
-    (
-        "speech_island_scorer",
-        "SpeechIslandScorer",
-        "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
-        DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
-    ),
-    (
-        "outer_edge_refiner",
-        "Outer Edge Refiner",
-        "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
-    ),
-    (
-        "semantic_split_model",
-        "Semantic Split Model",
-        "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
-        DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
-    ),
-    (
-        "inner_edge_refiner",
-        "Inner Edge Refiner",
-        "INNER_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
-    ),
-    (
-        "pre_asr_cueqc",
-        "Pre-ASR CueQC",
-        "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO",
-        DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
-    ),
-)
 
 
 def _format_env_line(key: str, value: str) -> str:
@@ -146,21 +98,23 @@ def _initial_env_template_lines() -> list[str]:
         "\n",
         "# --- ASR / VRAM tuning examples ---\n",
         "# ASR_BACKEND=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf\n",
-        "# ASR_BACKEND=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf\n",
         "# ASR_BATCH_SIZE=auto\n",
-        "# ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4\n",
+        "# ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4\n",
         "# ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto\n",
         "# ASR_STAGE_WORKER_VRAM_RATIO=0.95\n",
-        "# ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=4096,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144\n",
+        "# ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144\n",
         "# ASR_STAGE_WORKER_RAM_RATIO=0.95\n",
         "# ASR_STAGE_WORKER_HEARTBEAT_S=10\n",
         "# GPU_BATCH_PROFILE_ENABLED=1\n",
         "# GPU_BATCH_PROFILE_GROWTH_THRESHOLD=0.80\n",
-        "# ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES=auto\n",
         "# ASR_STAGE_WORKER_OOM_RETRY_LIMIT=6\n",
-        "# SPEECH_BOUNDARY_JA_WINDOW_S=20\n",
-        "# SPEECH_BOUNDARY_JA_OVERLAP_S=4\n",
-        "# PRE_ASR_CUEQC_ENABLED=1\n",
+        "\n",
+        "# --- Chunking / alignment examples ---\n",
+        "# Without a head the chunks are fixed length; nothing is dropped either way.\n",
+        "# ASR_ALIGNMENT_HEAD_PATH=./src/checkpoints/ctc_aligner.pt\n",
+        "# ASR_CHUNK_TARGET_S=20\n",
+        "# ASR_CHUNK_MAX_S=30\n",
+        "# ASR_CHUNK_MIN_PAUSE_S=0.6\n",
         "\n",
         "# --- Model/cache examples ---\n",
         "# HF_HOME=./models\n",
@@ -211,13 +165,6 @@ def _mask_key(k: str) -> str:
     return k[:4] + "****..." + k[-4:]
 
 
-def _ordered_backends(backends: list[str]) -> list[str]:
-    return sorted(
-        backends,
-        key=lambda item: (item != RECOMMENDED_ASR_BACKEND, BACKENDS.index(item)),
-    )
-
-
 def _truthy(value: str) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -228,7 +175,6 @@ def _short_model_name(repo_id: str) -> str:
 
 def _model_requirement(
     *,
-    role: str,
     repo_id: str,
     explicit_path: str = "",
     download_enabled: bool = True,
@@ -239,8 +185,6 @@ def _model_requirement(
         download=download_enabled,
     )
     return {
-        "roles": [role],
-        "role_labels": [_MODEL_ROLE_LABELS.get(role, role)],
         "repo_id": repo_id,
         "short_name": _short_model_name(repo_id),
         "local_path": status["path"],
@@ -248,37 +192,6 @@ def _model_requirement(
         "present": bool(status["present"]),
         "download_enabled": bool(download_enabled),
     }
-
-
-def _merge_model_requirements(requirements: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
-    by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    for requirement in requirements:
-        key = (str(requirement["repo_id"]), str(requirement["local_path"]))
-        existing = by_key.get(key)
-        if existing is None:
-            clone = dict(requirement)
-            clone["roles"] = list(requirement.get("roles") or [])
-            clone["role_labels"] = list(requirement.get("role_labels") or [])
-            clone["checked_paths"] = list(requirement.get("checked_paths") or [])
-            by_key[key] = clone
-            merged.append(clone)
-            continue
-
-        for role in requirement.get("roles") or []:
-            if role not in existing["roles"]:
-                existing["roles"].append(role)
-        for label in requirement.get("role_labels") or []:
-            if label not in existing["role_labels"]:
-                existing["role_labels"].append(label)
-        for path in requirement.get("checked_paths") or []:
-            if path not in existing["checked_paths"]:
-                existing["checked_paths"].append(path)
-        existing["present"] = bool(existing["present"] or requirement.get("present"))
-        existing["download_enabled"] = bool(
-            existing["download_enabled"] or requirement.get("download_enabled")
-        )
-    return merged
 
 
 def _cuda_probe_command() -> list[str]:
@@ -368,53 +281,6 @@ def _cuda_environment_status() -> dict[str, Any]:
     if completed.stderr.strip():
         payload["stderr"] = completed.stderr.strip()
     return payload
-
-
-def _checkpoint_requirements(repo_id: str) -> list[dict[str, Any]]:
-    boundary_status = BOUNDARY_PIPELINE_STATUS_BY_REPO[repo_id]
-    if boundary_status != "ready":
-        return [
-            {
-                "roles": ["boundary_pipeline"],
-                "role_labels": ["Boundary Pipeline"],
-                "repo_id": repo_id,
-                "short_name": "Boundary Pipeline",
-                "local_path": "",
-                "present": False,
-                "download_enabled": False,
-                "mapping_env": "",
-                "error": boundary_status,
-            }
-        ]
-    requirements: list[dict[str, Any]] = []
-    for role, label, mapping_env, default_mapping in _CHECKPOINT_SPECS:
-        if not default_mapping.get(repo_id):
-            continue
-        path = ""
-        error = ""
-        try:
-            path = checkpoint_path_for_repo_env(
-                repo_id=repo_id,
-                mapping_env=mapping_env,
-                default_mapping=default_mapping,
-                required=False,
-            )
-        except (FileNotFoundError, RuntimeError, ValueError) as exc:
-            error = str(exc)
-        requirements.append(
-            {
-                "roles": [role],
-                "role_labels": [label],
-                "repo_id": repo_id,
-                "short_name": label,
-                "local_path": path,
-                "present": bool(path),
-                "download_enabled": False,
-                "mapping_env": mapping_env,
-                "error": error,
-            }
-        )
-    return requirements
 
 
 def _proxy_settings_from_runtime() -> tuple[str, str, int | None]:
@@ -520,14 +386,8 @@ def _extract_model_ids(payload: Any) -> list[str]:
 async def get_config() -> dict[str, Any]:
     load_config()
     return {
-        "backends": _ordered_backends(BACKENDS),
         "subtitle_modes": SUBTITLE_MODES,
-        "engine_defaults": {
-            "asr_backend": DEFAULT_SETTINGS.get("ASR_BACKEND", ""),
-        },
-        "recommended_asr_backend": RECOMMENDED_ASR_BACKEND,
         "defaults": {
-            "asr_backend": DEFAULT_JOB_DEFAULTS["asr_backend"],
             "subtitle_mode": DEFAULT_JOB_DEFAULTS["subtitle_mode"],
             "skip_translation": DEFAULT_JOB_DEFAULTS["skip_translation"],
             "translation_max_workers": DEFAULT_JOB_DEFAULTS["translation_max_workers"],
@@ -536,57 +396,29 @@ async def get_config() -> dict[str, Any]:
 
 
 @router.get("/model-requirements")
-async def get_model_requirements(
-    asr_backend: str | None = Query(default=None),
-) -> dict[str, Any]:
+async def get_model_requirements() -> dict[str, Any]:
     load_config()
-    backend = (asr_backend or DEFAULT_JOB_DEFAULTS["asr_backend"]).strip()
-    try:
-        selected_asr_repo = qwen_asr_repo_id(backend)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    asr_model_id = _runtime_or_env_or_setting("ASR_MODEL_ID").strip() or selected_asr_repo
-    asr_model_path = _runtime_or_env_or_setting("ASR_MODEL_PATH")
-    boundary_model_id = selected_asr_repo
-    boundary_model_path = _runtime_or_env_or_setting("SPEECH_BOUNDARY_JA_MODEL_PATH", "")
-    if not boundary_model_path:
-        boundary_model_path = qwen_asr_default_model_path(selected_asr_repo)
-    boundary_download_enabled = not _truthy(
-        _runtime_or_env_or_setting("SPEECH_BOUNDARY_JA_NO_DOWNLOAD", "0")
-    )
+    # One ASR model serves transcription, the encoder features, and the
+    # alignment head; the optional aligner checkpoint rides on
+    # ASR_ALIGNMENT_HEAD_PATH and never blocks a run, so readiness is one model
+    # row plus the CUDA probe.
     requirements = [
         _model_requirement(
-            role="asr",
-            repo_id=asr_model_id,
-            explicit_path=asr_model_path,
-        ),
-        _model_requirement(
-            role="boundary_feature",
-            repo_id=boundary_model_id,
-            explicit_path=boundary_model_path,
-            download_enabled=boundary_download_enabled,
+            repo_id=active_qwen_asr_model_id(),
+            explicit_path=_runtime_or_env_or_setting("ASR_MODEL_PATH"),
         ),
     ]
-    requirements = _merge_model_requirements(requirements)
     missing = [item for item in requirements if not item["present"]]
-    checkpoint_requirements = _checkpoint_requirements(selected_asr_repo)
-    missing_checkpoints = [
-        item for item in checkpoint_requirements if not item["present"]
-    ]
     cuda_status = _cuda_environment_status()
     return {
-        "asr_backend": backend,
         "required_models": requirements,
-        "required_checkpoints": checkpoint_requirements,
         "cuda": cuda_status,
         "missing_count": len(missing),
-        "checkpoint_missing_count": len(missing_checkpoints),
         "needs_download": any(item["download_enabled"] for item in missing),
         "download_disabled": any(not item["download_enabled"] for item in missing),
         "all_present": not missing,
         "gpu_ready": bool(cuda_status.get("ok")),
-        "pipeline_ready": not missing and not missing_checkpoints and bool(cuda_status.get("ok")),
+        "pipeline_ready": not missing and bool(cuda_status.get("ok")),
     }
 
 

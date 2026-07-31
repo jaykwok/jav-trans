@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import threading
@@ -16,12 +15,6 @@ from tools.omni.audio_teacher_transport import AudioTeacherResult
 from tools.omni.run_audio_teacher import parse_args as parse_generic_args
 from tools.omni.run_audio_teacher import run as run_generic_teacher
 from tools.omni.inspect_gemini_quota import summarize_quota
-from tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni import (
-    parse_args as parse_v12_args,
-)
-from tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni import (
-    run as run_v12_teacher,
-)
 
 
 def test_worker_count_uses_provider_limit_and_rejects_oversubscription() -> None:
@@ -81,33 +74,14 @@ class _ConcurrentFakeTransport:
     audio_content_mode = "native_inline_audio"
     execution_contract = "google_ai_interactions_inline_audio_medium_json_v1"
 
-    def __init__(self, workers: int, *, v12: bool = False) -> None:
+    def __init__(self, workers: int) -> None:
         self.api_key_count = workers
         self.max_concurrency = workers
         self._barrier = threading.Barrier(workers)
-        self._v12 = v12
 
     def call_json(self, **kwargs) -> AudioTeacherResult:
         self._barrier.wait(timeout=2.0)
-        prompt = json.loads(kwargs["prompt"]) if self._v12 else {}
-        parsed = (
-            {
-                "source_id": prompt["source_id"],
-                "segments": [
-                    {
-                        "start_ts": "00:00.000",
-                        "end_ts": prompt["duration_ts"],
-                        "label": "vocal_candidate",
-                        "category": "vocal",
-                        "reason": "test",
-                    }
-                ],
-                "overall_reason": "test",
-            }
-            if self._v12
-            else {"ok": True}
-        )
-        return AudioTeacherResult(parsed=parsed, raw={"ok": True})
+        return AudioTeacherResult(parsed={"ok": True}, raw={"ok": True})
 
 
 def test_generic_teacher_uses_provider_key_count_for_parallel_workers(
@@ -191,53 +165,6 @@ def test_generic_teacher_persists_successes_when_another_parallel_item_fails(
     assert progress["status"] == "failed"
     assert progress["completed"] == 1
     assert progress["failed"] == 1
-
-
-def test_v12_teacher_parallelizes_sources_but_keeps_main_thread_persistence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    manifest = tmp_path / "sources.jsonl"
-    rows = []
-    for partition in ("train", "val", "test"):
-        audio = tmp_path / f"{partition}.wav"
-        audio.write_bytes(f"audio-{partition}".encode())
-        rows.append(
-            {
-                "source_id": partition,
-                "video_id": f"video-{partition}",
-                "partition": partition,
-                "core_ids": [f"core-{partition}"],
-                "audio": str(audio),
-                "audio_sha256": hashlib.sha256(audio.read_bytes()).hexdigest(),
-                "duration_s": 0.1,
-                "frame_count": 5,
-            }
-        )
-    manifest.write_text(
-        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
-    )
-    transport = _ConcurrentFakeTransport(3, v12=True)
-    monkeypatch.setattr(
-        "tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni.create_audio_teacher_transport",
-        lambda **_kwargs: transport,
-    )
-    output = tmp_path / "v12-output"
-    summary = run_v12_teacher(
-        parse_v12_args(
-            [
-                "--manifest",
-                str(manifest),
-                "--output-dir",
-                str(output),
-                "--env-file",
-                "gemini",
-            ]
-        )
-    )
-    assert summary["worker_count"] == 3
-    assert summary["result_count"] == 3
-    assert len((output / "preaudit.jsonl").read_text().splitlines()) == 3
-    assert len((output / "raw_responses.jsonl").read_text().splitlines()) == 3
 
 
 def test_quota_summary_is_secret_free_and_reports_aggregate_capacity(

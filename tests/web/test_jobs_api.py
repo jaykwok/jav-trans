@@ -44,20 +44,16 @@ def test_app_exposes_icon_assets(tmp_path, monkeypatch):
     asyncio.run(_test_app_exposes_icon_assets(tmp_path, monkeypatch))
 
 
-def test_config_lists_recommended_asr_backend_first(monkeypatch):
-    asyncio.run(_test_config_lists_recommended_asr_backend_first(monkeypatch))
+def test_config_payload_has_no_backend_select(monkeypatch):
+    asyncio.run(_test_config_payload_has_no_backend_select(monkeypatch))
 
 
-def test_model_requirements_for_17b_include_boundary(tmp_path, monkeypatch):
-    asyncio.run(_test_model_requirements_for_17b_include_boundary(tmp_path, monkeypatch))
+def test_model_requirements_single_asr_model_present(tmp_path, monkeypatch):
+    asyncio.run(_test_model_requirements_single_asr_model_present(tmp_path, monkeypatch))
 
 
-def test_model_requirements_dedupe_default_asr_and_boundary(tmp_path, monkeypatch):
-    asyncio.run(_test_model_requirements_dedupe_default_asr_and_boundary(tmp_path, monkeypatch))
-
-
-def test_model_requirements_marks_disabled_boundary_download(tmp_path, monkeypatch):
-    asyncio.run(_test_model_requirements_marks_disabled_boundary_download(tmp_path, monkeypatch))
+def test_model_requirements_missing_model_needs_download(tmp_path, monkeypatch):
+    asyncio.run(_test_model_requirements_missing_model_needs_download(tmp_path, monkeypatch))
 
 
 def test_model_requirements_includes_cuda_driver_warning(tmp_path, monkeypatch):
@@ -169,12 +165,12 @@ def test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch):
 
 def test_public_error_message_prefers_exception_detail():
     class DetailError(RuntimeError):
-        detail = "GPU 显存不足：请切换到 0.6B"
+        detail = "GPU 显存不足：只有 1.7B 一档"
 
         def __str__(self) -> str:
             return "oom: internal wrapper"
 
-    assert pm._public_error_message(DetailError()) == "GPU 显存不足：请切换到 0.6B"
+    assert pm._public_error_message(DetailError()) == "GPU 显存不足：只有 1.7B 一档"
 
 
 def test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch):
@@ -214,7 +210,7 @@ async def _test_app_exposes_icon_assets(tmp_path, monkeypatch):
     assert "favicon.ico" not in index_html
 
 
-async def _test_config_lists_recommended_asr_backend_first(monkeypatch):
+async def _test_config_payload_has_no_backend_select(monkeypatch):
     monkeypatch.delenv("ASR_BACKEND", raising=False)
 
     transport = httpx.ASGITransport(app=create_app())
@@ -226,21 +222,22 @@ async def _test_config_lists_recommended_asr_backend_first(monkeypatch):
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["backends"][0] == config_routes.RECOMMENDED_ASR_BACKEND
-    assert payload["defaults"]["asr_backend"] == config_routes.RECOMMENDED_ASR_BACKEND
-    assert payload["recommended_asr_backend"] == config_routes.RECOMMENDED_ASR_BACKEND
-    assert payload["engine_defaults"]["asr_backend"] == config_routes.RECOMMENDED_ASR_BACKEND
+    # Only one ASR model ships; a backend choice must not resurface anywhere
+    # the browser could render a select from.
+    assert "backends" not in payload
+    assert "recommended_asr_backend" not in payload
+    assert "engine_defaults" not in payload
+    assert "asr_backend" not in payload["defaults"]
     assert "translation_batch_size" not in payload["defaults"]
     assert payload["defaults"]["translation_max_workers"] == 16
     assert "show_speaker" not in payload["defaults"]
-    assert set(payload["backends"]) == set(config_routes.BACKENDS)
+    assert payload["subtitle_modes"] == ["zh", "bilingual"]
 
 
 def _isolate_model_requirement_env(
     tmp_path,
     monkeypatch,
     *,
-    boundary_no_download: str = "0",
     cuda_status: dict | None = None,
 ) -> None:
     models_root = tmp_path / "models"
@@ -250,15 +247,8 @@ def _isolate_model_requirement_env(
     monkeypatch.setattr(config_routes.model_paths, "RESOURCE_ROOT", resource_root)
     monkeypatch.setattr(config_routes.model_paths, "BUNDLED_MODELS_ROOT", resource_root / "models")
     monkeypatch.setattr(config_routes.model_paths, "is_frozen", lambda: False)
-    env_values = {
-        "ASR_MODEL_ID": "",
-        "ASR_MODEL_PATH": "",
-        "SPEECH_BOUNDARY_JA_PTM": config_routes.RECOMMENDED_ASR_BACKEND,
-        "SPEECH_BOUNDARY_JA_MODEL_PATH": "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
-        "SPEECH_BOUNDARY_JA_NO_DOWNLOAD": boundary_no_download,
-    }
-    for key, value in env_values.items():
-        monkeypatch.setenv(key, value)
+    for key in ("ASR_BACKEND", "ASR_MODEL_ID", "ASR_MODEL_PATH"):
+        monkeypatch.setenv(key, "")
     monkeypatch.setattr(
         config_routes,
         "_cuda_environment_status",
@@ -273,39 +263,7 @@ def _isolate_model_requirement_env(
     )
 
 
-async def _test_model_requirements_for_17b_include_boundary(tmp_path, monkeypatch):
-    _isolate_model_requirement_env(tmp_path, monkeypatch)
-
-    transport = httpx.ASGITransport(app=create_app())
-    async with httpx.AsyncClient(
-        transport=transport,
-        base_url="http://test",
-    ) as client:
-        response = await client.get(
-            "/api/model-requirements",
-            params={"asr_backend": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"},
-        )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["missing_count"] == 1
-    assert payload["needs_download"] is True
-    assert payload["download_disabled"] is False
-    assert payload["checkpoint_missing_count"] == 1
-    assert len(payload["required_checkpoints"]) == 1
-    pending = payload["required_checkpoints"][0]
-    assert pending["roles"] == ["boundary_pipeline"]
-    assert pending["error"] == "pending_binary_scorer_audit"
-    assert pending["present"] is False
-    assert payload["pipeline_ready"] is False
-    by_role = {
-        tuple(item["roles"]): item["repo_id"]
-        for item in payload["required_models"]
-    }
-    assert by_role[("asr", "boundary_feature")] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
-
-
-async def _test_model_requirements_dedupe_default_asr_and_boundary(tmp_path, monkeypatch):
+async def _test_model_requirements_single_asr_model_present(tmp_path, monkeypatch):
     _isolate_model_requirement_env(tmp_path, monkeypatch)
     local_model = tmp_path / "models" / "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
     local_model.mkdir(parents=True)
@@ -317,50 +275,39 @@ async def _test_model_requirements_dedupe_default_asr_and_boundary(tmp_path, mon
         transport=transport,
         base_url="http://test",
     ) as client:
-        response = await client.get(
-            "/api/model-requirements",
-            params={"asr_backend": config_routes.RECOMMENDED_ASR_BACKEND},
-        )
+        response = await client.get("/api/model-requirements")
 
     assert response.status_code == 200
     payload = response.json()
+    assert "asr_backend" not in payload
+    assert "required_checkpoints" not in payload
+    assert "checkpoint_missing_count" not in payload
     assert len(payload["required_models"]) == 1
+    only = payload["required_models"][0]
+    assert only["repo_id"] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+    assert only["present"] is True
     assert payload["missing_count"] == 0
     assert payload["needs_download"] is False
-    merged = next(
-        item
-        for item in payload["required_models"]
-        if item["repo_id"] == config_routes.RECOMMENDED_ASR_BACKEND
-    )
-    assert set(merged["roles"]) == {"asr", "boundary_feature"}
-    assert merged["present"] is True
+    assert payload["all_present"] is True
+    assert payload["pipeline_ready"] is True
 
 
-async def _test_model_requirements_marks_disabled_boundary_download(tmp_path, monkeypatch):
-    _isolate_model_requirement_env(tmp_path, monkeypatch, boundary_no_download="1")
+async def _test_model_requirements_missing_model_needs_download(tmp_path, monkeypatch):
+    _isolate_model_requirement_env(tmp_path, monkeypatch)
 
     transport = httpx.ASGITransport(app=create_app())
     async with httpx.AsyncClient(
         transport=transport,
         base_url="http://test",
     ) as client:
-        response = await client.get(
-            "/api/model-requirements",
-            params={"asr_backend": "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"},
-        )
+        response = await client.get("/api/model-requirements")
 
     assert response.status_code == 200
     payload = response.json()
-    boundary = next(
-        item for item in payload["required_models"] if item["roles"] == ["boundary_feature"]
-    )
-    assert boundary["download_enabled"] is False
+    assert payload["missing_count"] == 1
     assert payload["needs_download"] is True
-    assert payload["download_disabled"] is True
-    assert payload["checkpoint_missing_count"] == 1
-    pending = payload["required_checkpoints"][0]
-    assert pending["roles"] == ["boundary_pipeline"]
-    assert pending["error"] == "pending_binary_retrain"
+    assert payload["download_disabled"] is False
+    assert payload["all_present"] is False
     assert payload["pipeline_ready"] is False
 
 
@@ -390,10 +337,7 @@ async def _test_model_requirements_includes_cuda_driver_warning(tmp_path, monkey
         transport=transport,
         base_url="http://test",
     ) as client:
-        response = await client.get(
-            "/api/model-requirements",
-            params={"asr_backend": config_routes.RECOMMENDED_ASR_BACKEND},
-        )
+        response = await client.get("/api/model-requirements")
 
     assert response.status_code == 200
     payload = response.json()

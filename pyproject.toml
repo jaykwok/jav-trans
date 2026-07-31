@@ -1,7 +1,7 @@
 [project]
 name = "jav-trans"
 version = "0.1.0"
-requires-python = ">=3.14"
+requires-python = ">3.14"
 dependencies = [
     "accelerate",
     "fastapi",
@@ -30,12 +30,20 @@ dev = [
     "scikit-learn",
 ]
 
+# torchaudio is deliberately absent, and cannot be added on this stack: neither
+# the cu130 nor the cu132 index publishes a cp314 wheel for it (cu132 stops at
+# torchaudio 2.2.0 / cp312). The cu128 index does have cp314 wheels, but they
+# link against torch 2.9.x/cu128 and would either downgrade torch or mismatch
+# the libtorch ABI. CTC forced alignment is therefore implemented in
+# `src/asr/alignment.py` and verified against exhaustive path enumeration in
+# `tests/test_asr_alignment_head.py`.
+
 [tool.uv.sources]
-torch = { index = "pytorch-cu132" }
+torch = { index = "pytorch-cu130" }
 
 [[tool.uv.index]]
-name = "pytorch-cu132"
-url = "https://download.pytorch.org/whl/cu132"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.pytest.ini_options]

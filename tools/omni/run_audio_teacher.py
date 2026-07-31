@@ -21,7 +21,7 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
+from tools.omni.openai_compat import (  # noqa: E402
     DEFAULT_API_KEY_ENV_CANDIDATES,
     DEFAULT_BASE_URL_ENV_CANDIDATES,
     GEMINI_THINKING_LEVELS,

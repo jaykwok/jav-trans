@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 import main
-from helpers import ASR_06B_BACKEND, ASR_17B_BACKEND, make_job_context
+from helpers import ASR_17B_BACKEND, make_job_context
 from pipeline import audio as pipeline_audio
 
 
@@ -16,11 +16,13 @@ def test_asr_stage_env_restored_when_transcribe_raises(monkeypatch, tmp_path):
         video_path,
         output_dir,
         temp_root,
-        asr_backend=ASR_17B_BACKEND,
         skip_translation=True,
         keep_temp_files=True,
     )
-    monkeypatch.setenv("ASR_BACKEND", ASR_06B_BACKEND)
+    # ASR_BACKEND is a deployment setting since the job-level choice was
+    # dropped; the job must pass it through unchanged and must not unset it
+    # after a failure.
+    monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
     monkeypatch.setenv("ASR_CONTEXT", "process context")
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(
@@ -63,5 +65,5 @@ def test_asr_stage_env_restored_when_transcribe_raises(monkeypatch, tmp_path):
             job_id=ctx.job_id,
         )
 
-    assert main.os.environ["ASR_BACKEND"] == ASR_06B_BACKEND
+    assert main.os.environ["ASR_BACKEND"] == ASR_17B_BACKEND
     assert main.os.environ["ASR_CONTEXT"] == "process context"

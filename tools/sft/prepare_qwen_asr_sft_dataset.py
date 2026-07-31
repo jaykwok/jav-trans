@@ -19,7 +19,10 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from boundary.ja import sample_hf_audio_16k_mono, stable_hf_audio_id  # noqa: E402
+from audio.hf_datasets import (  # noqa: E402
+    sample_hf_audio_16k_mono,
+    stable_hf_audio_id,
+)
 
 
 ASR_DATASET = "litagin/Galgame_Speech_ASR_16kHz"

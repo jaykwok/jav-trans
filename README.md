@@ -1,8 +1,8 @@
 # jav-trans
 
-jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工具。它把视频处理成日文字幕、中文字幕或中日双语字幕，并把音频准备、语音岛检测、内部切分、Pre-ASR CueQC、Qwen ASR、字幕时间轴、LLM 翻译和质量报告串成一条本地优先的流水线。
+jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工具。它把视频处理成日文字幕、中文字幕或中日双语字幕，并把音频准备、切分、Qwen ASR、CTC 强制对齐、字幕时间轴、LLM 翻译和质量报告串成一条本地优先的流水线。
 
-项目目标：本地完成视频、音频、边界切分、ASR 和字幕时间轴重计算；LLM 只负责翻译、术语一致和口吻连贯，不负责脑补剧情或修正 ASR 误听。
+项目目标：本地完成视频、音频、切分、ASR 和字幕时间轴重计算；LLM 只负责翻译、术语一致和口吻连贯，不负责脑补剧情或修正 ASR 误听。
 
 致谢：[WhisperJAV](https://github.com/a63n/WhisperJAV) 为本项目早期路线提供了重要参考。
 
@@ -16,28 +16,25 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 ---
 
-## 项目背景
+## 设计原则
 
-本项目的边界系统不是单一 VAD，而是先检测连续人声包络，再逐层完成事件隔离、语义路由和首尾裁边，最终生成适合字幕和 ASR 的 speech-core chunk。
+本项目在 ASR 之前**不做任何丢弃式判断**。音频只被切开，不被筛选：切点由 ASR encoder 上的一个 CTC 对齐头给出的 blank 游程决定，输出精确铺满整个文件，每一秒都会进入解码器。
 
-当前设计把职责拆开：
+这条原则来自代价不对称：**丢错不可逆，留错可过滤**。判断放在有文本之后。
 
-- Vocal-envelope Scorer v12 只检测连续的人类发声事件包络：对白、耳语、呻吟、喘息、吸呼气、哭笑、咳嗽、亲吻/唾液/口腔声、歌唱和远处人声都属于 `vocal_candidate`。确认没有人类发声的静音、环境/BGM、机械、衣物/床体/水声和纯肉体撞击/拍打声属于 `non_vocal_candidate`；无法确认是否叠有人类发声或边界不可靠时标为训练忽略的 `unsure`。它不判断语义，也不按句切分。
-- Boundary Proposal 只提供高召回候选断点；Acoustic Split v4 学习 `cut/continue`，负责把包络内独立事件隔离成 provisional sub-islands。
-- Pre-ASR CueQC v13 对 provisional sub-island 做 `keep/drop` 二分类 argmax 路由；teacher/data 层可以保留 `unsure`，但模型不会输出它。
-- Inner Edge Refiner v2 对 CueQC 保留的 sub-island 做逐帧二分类 argmax，裁成送入 ASR 的 acoustic semantic core。
-- Outer Edge Refiner v3 已删除（2026-07-26 决策）：其职责与 Scorer 高召回包络 / CueQC 路由 / Inner 尾部裁边重叠，且从未训练部署；边界质量由 Scorer v12 训练目标直接承担，不再依赖中间修补层。决策记录见 `docs/design/20260726_scorer-v12-remove-outer-refiner.md`。
-- 字幕 layout 只处理显示规则，不反向修改 ASR chunk 语义。
+当前职责划分：
 
-这样做是为了避免一个模型同时承担“找语音、切句、删噪声、修边界、做字幕排版”。设计演进、实验记录、失败路线和更新记录都放在 [docs/HISTORY.md](docs/HISTORY.md)。
+- **切分**只决定边界落在哪里。切点由对齐头的停顿给出；没有配对齐头时退化为定长切分。切错只是边界变差，永远丢不了词。
+- **ASR 解码**输出日文文本。
+- **CTC 强制对齐**把文本逐字对回音频，产出真实字级时间戳与对齐分数。
+- **后置闸**（`src/asr/postgate.py`）只对已有文本**打标不删除**：失控重复、不可能的语速、与邻块重复等。标记随字幕下发，由下游决定是否过滤。
+- **字幕 layout** 只处理显示规则，不反向修改 ASR chunk 语义。
+
+设计演进、实验记录和失败路线见 [docs/HISTORY.md](docs/HISTORY.md)。
 
 ---
 
 ## 快速开始
-
-本仓库和 GitHub Releases 仅维护源码、测试、必要 checkpoint、release notes 与版本说明。打包器、打包配置和二进制发布产物不进入远端仓库。
-
-### 源码运行
 
 推荐环境：
 
@@ -74,7 +71,7 @@ uv venv
 uv sync
 ```
 
-Qwen3-ASR 原生支持要求 `transformers>=5.13.0`（由 `requirements.txt` 安装）。
+Qwen3-ASR 原生支持要求 `transformers>=5.13.0`（由 `uv sync` 按 `pyproject.toml` 安装）。`pyproject.toml` 同时把 `torch` 钉到 `pytorch-cu132` 索引，请勿改用 `pip install` 逐个装依赖——那样会从 PyPI 取到 CPU 版 torch。
 
 启动网页控制台：
 
@@ -83,11 +80,11 @@ $env:PYTHONIOENCODING="utf-8"
 uv run --no-sync python launcher.py
 ```
 
-默认地址为 `http://127.0.0.1:17321`。首次运行可以没有 `.env`；打开页面后在“翻译设置”面板填写 API Key、Base URL、模型和目标语言，保存或开始任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、后端、显存预算等研究项会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，可在“识别设置”里填写代理协议、地址和端口。
+默认地址为 `http://127.0.0.1:17321`。首次运行可以没有 `.env`；打开页面后在“翻译设置”面板填写 API Key、Base URL、模型和目标语言，保存或开始任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、显存预算等运行参数会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，可在“识别设置”里填写代理协议、地址和端口。
 
-**翻译后端支持**：通过 `TRANSLATION_BACKEND` 选择 OpenAI 兼容 API（`openai`）或进程内 Transformers 模型（`local`）。OpenAI 后端支持 Chat 与 Responses；本地后端复用单个模型并串行推理。生产环境部署本地大模型时，推荐启动 vLLM/SGLang 等 OpenAI 兼容服务后使用 `openai` 后端。详细配置和扩展指南见 [翻译后端架构文档](docs/translation-backend-architecture.md)。
+**翻译后端支持**：通过 `TRANSLATION_BACKEND` 选择 OpenAI 兼容 API（`openai`）或进程内 Transformers 模型（`local`）。OpenAI 后端支持 Chat 与 Responses；本地后端复用单个模型并串行推理，界面预设提供 Qwen3 4B / 8B / 14B 三档。生产环境部署本地大模型时，推荐启动 vLLM/SGLang 等 OpenAI 兼容服务后使用 `openai` 后端。详细配置和扩展指南见 [翻译后端架构文档](docs/translation-backend-architecture.md)。
 
-Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而不是浏览器本身。完整 SpeechBoundary-JA / ASR smoke 应确认日志中出现 `cuda_available=True`、`device=cuda:0` 或 `actual_device=cuda`。
+Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而不是浏览器本身。完整 ASR smoke 应确认日志中出现 `cuda_available=True`、`device=cuda:0` 或 `actual_device=cuda`。
 Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 
 ---
@@ -96,13 +93,13 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 
 1. 打开网页控制台。
 2. 选择视频文件。
-3. 选择字幕模式、ASR 后端和翻译设置。
+3. 选择字幕模式和翻译设置。
 4. 选中的视频会立即进入右侧“待开始”列表；确认后点击“开始任务”。
 5. 在输出目录查看 SRT、质量报告和日志。
 
-任务正常完成后会保留可复用的 Boundary cache；从右侧任务列表删除已结束任务时，会同时清理该视频的全部 Boundary cache 变体、未完成的 ASR checkpoint 和任务临时目录。运行中的任务第一次删除只执行取消，进入“已取消”后再次删除才会清理缓存。
+从右侧任务列表删除已结束任务时，会清理该视频未完成的 ASR checkpoint 和任务临时目录。运行中的任务第一次删除只执行取消，进入“已取消”后再次删除才会清理缓存。
 
-勾选“不翻译（仅日文字幕）”时，流水线仍会执行边界规划、可选 Pre-ASR CueQC、ASR 和 Boundary chunk 字幕时间轴生成，但跳过 LLM 翻译，最终输出 `<视频名>.ja.srt`。这是验证本地边界 / ASR / 字幕时间轴链路的推荐 smoke 模式。
+勾选“不翻译（仅日文字幕）”时，流水线仍会执行切分、ASR 和字幕时间轴生成，但跳过 LLM 翻译，最终输出 `<视频名>.ja.srt`。这是验证本地切分 / ASR / 字幕时间轴链路的推荐 smoke 模式。
 
 ---
 
@@ -112,87 +109,70 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 视频输入
   -> 任务上下文 / 配置解析
   -> 音频抽取与标准化
-  -> Shared Qwen feature extraction
-     - Qwen ASR repo 对应的 frozen PTM/encoder frame features
-     - MFCC / timing numeric features
-  -> Vocal-envelope Scorer v12（1.7B，按 broad human-vocal 标签完全随机初始化，registry 仍为空）
-     - 主臂：raw PTM2048 -> checkpoint 内 Linear(2048->2048)+GELU
-     - 与 normalized MFCC40 拼接后 Linear(2088->256)
-     - valid-prefix bidirectional Mamba2(hidden=256)
-     - 训练臂：Dense Span + exact DP（主）/ linear-chain CRF（对照）/ frame argmax-CE（fragmentation baseline）；Query-Mask 与 argmax-structured 不再训练
-     - vocal_candidate / non_vocal_candidate 二分类；teacher/canonical unsure=-100 不参与训练
-  -> Boundary Proposal（高召回候选断点，不直接决定最终 cut）
-  -> 按 ASR repo 进入互不混用的边界链
-     - 1.7B：Acoustic Split v4 binary argmax
-       -> provisional sub-islands
-       -> Pre-ASR CueQC v13 binary argmax
-       -> Inner Edge Refiner v2 binary acoustic core
-       -> chunk packing / boundary-cache
-     - 0.6B：空 registry placeholder 保持不动，暂不训练或修改
-     - drop 的 chunk 不导出 wav、不进入 ASR
+  -> 切分（asr.pregate.cut_at_pauses）
+     - ASR encoder 前向 -> CTC 对齐头 -> 每帧 blank 后验
+     - 连续 blank 游程即停顿，切点落在停顿中央
+     - 输出精确铺满 [0, 总时长]，相邻块共边，不丢任何音频
+     - 未配置 ASR_ALIGNMENT_HEAD_PATH 时退化为定长切分
   -> ASR wav chunk export
   -> Qwen ASR text transcription
-  -> Boundary chunk subtitle timing
-     - ASR 文本负责字幕文本
-     - acoustic timeline 来自 source absolute boundary
+  -> CTC 强制对齐（asr.alignment）
+     - 复用同一个 encoder 再跑一次前向（RTF 0.00069，约为一次解码的 0.56%）
+     - 逐字时间戳 + 对齐分数
+     - 起点/终点按对齐头自己判为 blank 的帧向外走，修正 CTC 尖峰造成的跨度内缩
+  -> 后置闸（asr.postgate）
+     - 失控重复 / 语速不可能 / 与邻块重复 等只打标，不删除
+     - 标记随 chunk 下发到 segment，由下游决定是否过滤
   -> Subtitle Layout v2
      - acoustic/display 双时间轴
      - 20-frame 最小显示时间（固定 `24000/1001` 基准）
      - 2-frame 最小间隔（固定 `24000/1001` 基准）
      - 7s 最大显示 soft guard
-     - 长 cue 先按 ASR 文本断句，再吸附 weak cut，没有 weak cut 才比例估算
   -> 可选 LLM 翻译
   -> SRT / bilingual JSON / quality report / logs
 ```
 
 关键约束：
 
-- Scorer v12 只决定是否存在连续人类发声事件，不负责语义 drop 或句内切点；Proposal 只能附加非绑定候选，最终 cut 由 Split 决定。
+- **ASR 之前不做丢弃式判断。** 切分只决定边界，输出铺满整个文件。
 - 内部 cut 是一个共享绝对时间戳，不允许左右 chunk 各自修边。
 - `20 / (24000/1001)` 是字幕最短显示和 micro chunk 风险线，不是 runtime duration-only drop 阈值。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
-- Runtime 不使用具体词黑名单或时长启发式删除短促人声；是否进入 ASR 由 Pre-ASR CueQC 模型标签决定。
-- Scorer v12 的各 decoder、Split v4、CueQC v13 与 Inner v2 都不读取 runtime threshold，不使用 hysteresis、固定时长、NMS、规则 merge 或 fallback。旧 Scorer 只保留为离线失败证据，v10/v11 checkpoint 和 canonical 不能 warm-start 或转换成 v12。
-- Boundary 阶段按 Scorer → Proposal → Split → CueQC → Inner 串行加载和释放模型；Inner 只对 CueQC argmax keep 的 provisional sub-islands 推理，且只能裁首尾、不能挖内部空洞。Boundary cache 把 provisional chunk JSON 与同一内容签名的 raw PTM/MFCC sidecar 分开保存，缓存命中无需重复提取特征。allocated/reserved/shared VRAM 只写运行诊断，不参与功能判断；显式 CUDA 请求不可用时直接报错，不回退 CPU，任何超过 telemetry noise floor 的 shared VRAM spill 都是 soft OOM。
-- 1.7B production registry 在 v12 数值与人工 gate 完成前保持为空；Outer Refiner v3 已删除，不进入生产链。
-- 0.6B Boundary registry 当前为空；选择该档会在模型加载前明确报告 `pending_binary_retrain`。
+- Runtime 不使用具体词黑名单或时长启发式删除短促人声。
+- 字幕行的起止**不取单个首字或末字**：18% 的行至少有一个字被接缝旁的音频拽走 >400ms，边界必须用稳健分位数。
+- 后置闸的 `min_alignment_score` 保持关闭：放行组与丢弃组的分数分布重叠，且两组都是真实内容，没有一组是幻听，未标定的阈值会静默删掉三分之一输出。
+- 对齐头**默认不启用**，必须显式设置 `ASR_ALIGNMENT_HEAD_PATH`。checkpoint 缺失或损坏只 warn 一次并降级为比例时间轴，不会让转写失败。
+- allocated/reserved/shared VRAM 只写运行诊断，不参与功能判断；显式 CUDA 请求不可用时直接报错，不回退 CPU。
 
 ---
 
 ## 模型架构
 
-当前只开发和审计 1.7B Boundary 链；0.6B 仅保留空 registry placeholder：
+ASR 只有一个 repo：`jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`，不提供更小的低显存档。
 
-- `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`：默认高质量档。
-- `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`：仅保留 ASR repo 与空 Boundary registry placeholder；全链重训留作未来 backlog，本轮不训练、不修改。
+除 ASR 外**只有一个可训练组件**：CTC 对齐头。它是 ASR encoder 上的一个薄头，encoder 全程冻结。
 
-Scorer v12 主容量合同为逐帧 raw PTM2048→trainable Linear(2048→2048)+GELU，与 normalized MFCC40 拼接后再经 Linear(2088→256) 输入双向 Mamba2(hidden=256)。PTM2048 只是冻结特征提取结果；所有 v12 adapter、时序主干和 decoder 都从 seed=`117` 完全随机初始化。当前训练臂固定为 Dense Span + exact DP（主，structured hinge + 0.5 dense frame CE）、linear-chain CRF（对照，sequence NLL + 0.5 run-balanced emission CE）与 frame argmax-CE（fragmentation baseline）；训练与 runtime 不加入阈值或规则平滑，test 只在 val 选出前两名后运行。完整 decoder/loss/选优方案见 `docs/design/20260726_scorer-v12-decoder-loss-training-plan.md`。
+```text
+ASR encoder 输出 2048 维 @13fps（76.9 ms/帧）
+  -> LayerNorm
+  -> Conv1d(2048->512, 上采样 x2)   # 38.46 ms/帧
+  -> 若干层小 encoder
+  -> Linear(-> 字表 + blank)
+```
 
-所有小模型统一放在：
+- **上采样 x2 不是可选项**：日语语速 6~8 mora/s，13fps 下每 mora 仅 1.6~2.2 帧，而 CTC 每个输出 token 至少要一帧。
+- **CTC 目标是「字」不是 kana**：`pyopenjtalk` 在本技术栈装不上，且汉字读音经 g2p 会引入噪声。
+- **训练数据是白送的** `(音频, ASR 文本)` 配对：ASR 转写自己的音频，输出即目标。
+- **同一份输出有两个读法**：与文本对齐得到时间轴，blank 游程用来选切点。两个读法都不丢音频。
+
+`forced_align` 在 `src/asr/alignment.py` 内自己实现，不依赖 `torchaudio`：本项目 Python 3.14，torch 所在索引上没有匹配的 torchaudio wheel，为一个算子拉 CUDA wheel 有扰动现有 torch 构建的实际风险。正确性用**穷举所有合法 CTC 路径**的参照实现验证（`tests/test_asr_alignment_head.py`），对着定义验而不是对着别人的实现验。
+
+checkpoint 放在：
 
 ```text
 src/checkpoints/
-├── jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf/
 └── jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/
 ```
-
-1.7B 的目标 Boundary pipeline 统一使用合同 `boundary_acoustic_binary_v12`：Scorer v12 → Proposal → Acoustic Split v4 → provisional sub-islands → CueQC v13 → Inner v2 acoustic core → Chunk/ASR。Outer Refiner v3 已删除，不再作为组件或 A/B 保留。模型缺失、repo 不匹配、合同不兼容或选择 0.6B 都会直接报错，不提供规则 fallback 或静默迁移。
-
-当前训练数据状态：主线 Gemini 3.6 Flash Medium 以一次完整 source 三态调用输出 `vocal_candidate / non_vocal_candidate / unsure` 连续全覆盖；请求固定 `max_tokens=8192 / MM:SS.mmm`，不发送 temperature/top-p/top-k。职责恢复为 broad human-vocal 后，旧 v11 语义标签、旧人工“去呻吟”审计、旧 voice-only pilot/calibration 和对应 checkpoint 均不能作为当前真值。冻结的 source/core/video partition、WAV、音频/帧 SHA 与严格匹配的 raw PTM2048/MFCC40 可以复用；新的 broad-vocal calibration 尚未冻结，production registry 仍为空。紧凑固定规则 Prompt 和 adaptive rolling Prompt 都只作为 held-out A/B 证据，`training_manifest_allowed=false`。主线完整 source 继续使用严格 `MM:SS.mmm`；adaptive 窗口最多 20 秒，允许 10ms 数字局部坐标，但所有相邻 span 共用同一个切点并按 vocal-safe 方向量化到 Scorer 的 20ms 帧。该 A/B 当前显示 adaptive Teacher 明显更碎，人工 gate 尚未完成，不能进入 canonical。详细合同与选优顺序见 [Scorer v12 structured-decoder training plan](docs/audits/20260725_scorer-v12-structured-decoder-training-plan.md) 和 [adaptive partition/time-grid A/B](docs/audits/20260726_scorer-v12-adaptive-partition-time-grid-ab-v1.md)，旧路线只作为失败证据保存在 [docs/HISTORY.md](docs/HISTORY.md)。
-
-Split v4 当前唯一合法训练数据合同是
-`acoustic_split_v4_sequence_dataset_summary_v1`：raw PTM2048 + MFCC40（frame
-width 2088）、当前 candidate scalar schema、固定 `train/val/test` source
-partition，并绑定 Scorer/Proposal/Outer 三个 checkpoint SHA、音频/特征/dataset
-sidecar SHA 和 `boundary_acoustic_binary_v12`。Outer 删除后该合同将改绑
-Scorer v12 输出（`post_candidate_island_scorer_v12`）并用最终 Scorer v12
-重新编译特征重训（见设计文档）；改绑完成前旧数据只作审计。`compile_joint_boundary_preasr_dataset.py`
-与 `merge_semantic_split_datasets.py` 会拒绝旧 row-wise、rehydrate、audit-only
-或缺 summary 的输入；trainer 还会拒绝 CUDA 不可用、非有限值和空监督 batch。
-当前 Runtime 尚未真正实现 `SEMANTIC_SPLIT_FEATURE_EXPORT_PATH` 的 candidate
-feature/metadata 导出，因此准备器会明确 fail-closed；任何 pending 产物都不能
-被标成 training-ready。完整代码审计见
-[20260723 full-code-audit-v2](docs/audits/20260723_full-code-audit-v2.md)。
 
 ---
 
@@ -203,85 +183,45 @@ feature/metadata 导出，因此准备器会明确 fail-closed；任何 pending 
 - `API_KEY`
 - `OPENAI_COMPATIBILITY_BASE_URL`
 - `LLM_MODEL_NAME`
-
-离线音频多模态 Teacher 使用三个隔离配置：`~/.config/omni/qwen`、
-`~/.config/omni/openrouter` 与 `~/.config/omni/gemini`。CLI 只接受
-`--env-file qwen|openrouter|gemini` 这些已知 profile，不接受任意文件名静默
-猜测协议。Qwen/OpenRouter 使用各自的兼容 API adapter；`gemini` 专指 Google
-AI Studio 原生 Interactions API，不再作为 OpenRouter Gemini 的别名。
-OpenRouter 常用键为 `OMNI_MODEL/OMNI_API_KEY/OMNI_BASE_URL`；原生 Gemini
-使用 `GEMINI_MODEL=gemini-3.6-flash`（可省略）与
-`GEMINI_API_KEY=KEY_1,KEY_2`。逗号分隔 Key 去重后只增加配额轮换槽，不增加到
-同等数量的并发：原生 provider 全局最多 2 worker，Scorer adaptive rolling
-Teacher 默认 1 worker 串行。每个 Key 按 5 RPM / 250k TPM / 20 RPD 限速（Google AI Studio 官方单 Key 限额的保守估计；若通过第三方 API 网关访问，实际限速以网关全局配置为准）。，并用最近 24
-小时真实请求时间做保守的 20 RPD 滚动账本；每个真正发出的请求（包括错误响应）
-都在发送前计入。Google 的真实免费层日界线仍待观察：东八区 16:00 只作为状态
-中的 advisory 观察点，绝不会据此清空请求历史或自动放行；明确的 daily-429 会为
-该 Key 持久化至少 24 小时冷却。
-
-状态原子保存在同目录 `gemini.quota.json`，其中只有 Key 的 SHA-256 指纹，不含
-Key 值；每个指纹记录最近 60 秒 RPM/TPM 事件、最近 24 小时 RPD 请求、首次/最近
-请求时间、下一释放时间、普通 429 冷却、daily-429 时间及其 RPD 冷却。进程重启
-后继续读取；新增、删除或重排 Key 依靠指纹稳定匹配。达到本地滚动预算会主动切
-到下一槽位，远端 HTTP 429 也会切换槽位。通用批处理 `--workers=0` 解析为 provider
-上限 2；可用 `--workers 1` 强制串行，但不能请求高于 provider 上限的并发。Google
-实际按 project 而不是 Key 计费/限流，因此多个 Key 只有属于不同 project 时才可能
-提供多份独立额度。
-OpenRouter 上的 Gemini 数据标注请求默认使用 `reasoning.effort=medium`、默认
-`max_tokens=8192` 和 `input_audio_raw`，默认不设置 `reasoning.exclude`
-（需要隐藏思考文本时用 `--exclude-reasoning`）；`high` 只用于显式受控
-A/B，不作为 canonical 数据标注默认值。Qwen 使用
-`enable_thinking/thinking_budget`、默认 `max_tokens=2048` 和
-`input_audio`。Qwen 与 OpenRouter 均不显式发送 temperature、top-p 或
-top-k。原生 Gemini 使用 `POST /v1beta/interactions`、内联音频、
-`thinking_level=medium`、`max_output_tokens=8192`、结构化 JSON 输出且
-`store=false`，同样不发送 temperature、top-p 或 top-k。旧 v3/v4 固定日界线
-账本会保守迁移到 v5 的滚动 24 小时状态，不会因 schema 升级恢复预算。现役完整
-source Teacher 生成时间坐标时统一使用 `omni_audio_timestamp_mmss_mmm_v1`：wire 字段为严格字符串
-`start_ts/end_ts/time_ts`（`MM:SS.mmm`），旧数字秒响应直接拒绝；本地严格
-解析后，训练与审计 manifest 内部仍可保存数值 `start_s/end_s/time_s`。唯一隔离
-例外是 Scorer adaptive A/B 的最多 20 秒局部窗口：其 wire 使用严格 10ms 数字坐标，
-随后由共享 quantizer 一次性映射为 vocal-safe 的 20ms Scorer 帧；该例外不能用于
-其它 Teacher，也不能绕过主线 `MM:SS.mmm` 合同。
 - 代理协议 / 地址 / 端口（可选，用于模型下载和 HTTP 请求）
 
-ASR 显存自适应默认值已经内置。当前完整工作流固定使用 `1.7B`；batch 或显存预算可通过“参数调优”里的环境变量覆盖，或手动编辑首次保存后生成的 `.env`。
+ASR 显存自适应默认值已经内置。batch 或显存预算可通过“参数调优”里的环境变量覆盖，或手动编辑首次保存后生成的 `.env`。
 
 默认配置：
 
 ```env
 ASR_BACKEND=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf
 ASR_BATCH_SIZE=auto
-ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4
+ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4
 ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto
 ASR_STAGE_WORKER_VRAM_RATIO=0.95
-ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=4096,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144
+ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144
 ASR_STAGE_WORKER_RAM_RATIO=0.95
 ASR_STAGE_WORKER_HEARTBEAT_S=10
 ASR_STAGE_WORKER_OOM_RETRY_LIMIT=6
 GPU_BATCH_PROFILE_ENABLED=1
 GPU_BATCH_PROFILE_GROWTH_THRESHOLD=0.80
-SPEECH_BOUNDARY_JA_WINDOW_S=20
-SPEECH_BOUNDARY_JA_OVERLAP_S=4
-ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES=auto
-PRE_ASR_CUEQC_ENABLED=1
+ASR_CHUNK_TARGET_S=20.0
+ASR_CHUNK_MAX_S=30.0
+ASR_CHUNK_MIN_S=2.0
+ASR_CHUNK_MIN_PAUSE_S=0.6
 ```
 
-ASR stage 固定由统一 GPU worker 持有 CUDA：Boundary/PTM feature extraction、Pre-ASR CueQC、ASR 和对齐都在同一个 GPU owner 进程里顺序执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM、CUDA 状态异常或超过 `ASR_STAGE_WORKER_VRAM_BUDGET_MB` 时会杀掉 worker，不会把 Web 主进程一起带崩。
+ASR stage 固定由统一 GPU worker 持有 CUDA：切分用的 encoder 前向、ASR 解码和 CTC 对齐都在同一个 GPU owner 进程里顺序执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM、CUDA 状态异常或超过 `ASR_STAGE_WORKER_VRAM_BUDGET_MB` 时会杀掉 worker，不会把 Web 主进程一起带崩。
 
 `ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 约为 `7779MiB`。当前 1.7B 完整推理链要求至少 `6144MiB` 物理 dedicated VRAM，并在模型加载前检查；shared VRAM 不计入可用预算，任何正的基线增量都立即视为 soft OOM，显式放大的 worker budget 和 CPU fallback 都不能绕过。监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
 
 GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长心跳。字幕 cue plan 会单独记录 timeline normalize、两轮 anchor-aware DP、polish 和 finalize 进度。
 
-Boundary cache 只使用序列化合同 ID `boundary_acoustic_binary_v12` 判断结构兼容性；整数 pipeline/cache version 已删除。cache 签名仍包含 repo-bound 模型内容摘要和运行配置，合同 ID 或模型内容不一致都会直接 miss。
+对齐后的 segment 会按内容签名缓存。签名包含 ASR backend、字幕选项与参与结果的运行配置；只改输出路径一类不影响内容的设置不会让缓存失效。
 
-`ASR_BATCH_SIZE=auto` 以 5600MB 下的 repo 默认表为基线，按显存预算比例放缩初始 batch。ASR text batch 与 Acoustic Split candidate batch 发生 GPU OOM 时会重启 worker、降低对应 batch 并从 cache/checkpoint 续跑；CueQC v13 按完整 planned-island group 与 padded-chunk 预算分批，不拆单个 group。RAM OOM 直接停止，不伪装成可由 GPU batch 修复的问题。
+`ASR_BATCH_SIZE=auto` 以 5600MB 下的 repo 默认表为基线，按显存预算比例放缩初始 batch。ASR text batch 发生 GPU OOM 时会重启 worker、降低 batch 并从 checkpoint 续跑。切分阶段逐个编码固定 30 秒窗口，没有可降的 batch，在那里 OOM 会直接停止而不是假装重试。RAM OOM 同样直接停止，不伪装成可由 GPU batch 修复的问题。
 
-auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理配置跨任务学习。v2 profile 记录已验证安全 batch 与 OOM 不安全上界：阶段 peak allocated 低于预算 `80%` 时，在两者之间二分探测；尚无 OOM 上界时则向当前阶段上限折半推进，OOM 后本次任务仍先减半恢复。当前覆盖 ASR chunk batch 与 Semantic Split 独立候选 batch。CueQC v13 另按 whole planned-island group 和 padded-chunk 预算分批，单个 group 的完整序列不拆分；显式数字 batch 不参与 profile 学习，Speech scorer/PTM 的 20 秒时序窗口也不改变模型可见上下文。
+auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理配置跨任务学习。v2 profile 记录已验证安全 batch 与 OOM 不安全上界：阶段 peak allocated 低于预算 `80%` 时，在两者之间二分探测；尚无 OOM 上界时则向当前阶段上限折半推进，OOM 后本次任务仍先减半恢复。当前只覆盖 ASR chunk batch；显式数字 batch 不参与 profile 学习。
 
-推理需要 ASR / SpeechBoundary-JA frozen feature Hugging Face 模型，以及与当前 repo id 匹配的本地 checkpoint。源码运行时如果本地没有 Hugging Face 模型，会按需下载到 `models/`。registry 缺失、覆盖映射未命中当前 repo id、文件不存在、schema 不匹配或 metadata 不匹配都会 fail-fast。
+推理只需要 ASR Hugging Face 模型本身；同一份权重会被请求两次，一次用于解码，一次用于对齐头读取的 encoder 特征。源码运行时如果本地没有模型，会按需下载到 `models/`。对齐头是唯一的本地 checkpoint，由 `ASR_ALIGNMENT_HEAD_PATH` 显式指定，**未配置时不报错**，切分退化为定长、字幕时间轴退化为按字数比例摊开。
 
-训练时生成的 CUDA feature cache、synthetic WAV、sequence JSONL、tensor cache 和 `datasets/train/...` 产物都不是运行依赖，不随源码或 Windows release 打包。
+训练时生成的 CUDA feature cache、synthetic WAV、sequence JSONL、tensor cache 和 `datasets/train/...` 产物都不是运行依赖，不随源码分发。
 
 ---
 
@@ -289,7 +229,7 @@ auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理�
 
 - ASR 文本会做 Unicode NFKC、空白归一、换行折叠和展示安全处理。
 - Qwen3-ASR runtime 始终使用 Transformers 官方 `apply_transcription_request(audio=..., language=...)` 路径，不提供演员名 / 人名 context 提示分支。
-- 字幕时间轴来自 Boundary chunk；ASR 输出文本只负责显示，不驱动默认切分。
+- 字幕时间轴来自 CTC 强制对齐的逐字时间戳；对齐头未配置时退化为按字数比例摊开。
 - LLM 翻译前会先固定 cue plan，翻译不会重排时间轴。
 
 ---
@@ -300,7 +240,6 @@ auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理�
 - `models/`：Hugging Face 模型缓存。
 - `tmp/jobs/<job_id>/`：Web / pipeline 单次任务临时目录；`JOB_TEMP_DIR` 默认是 `./tmp/jobs`。
 - `tmp/chunks/`：ASR wav chunk 和 crash-resume checkpoint 的一次性运行目录。
-- `tmp/cache/boundary/`：SpeechBoundary-JA frame score 到 Boundary Refiner 输出的 boundary-cache。
 - `tmp/cache/torch/`、`tmp/cache/hf/`：torch / Hugging Face 运行缓存。
 - `tmp/log/<job_id>/`：默认启用的本地诊断目录；包含 `.run.log` 和持久化 `.timings.json`。
 - `datasets/`：本地训练、验证、测试数据归档，默认 ignored；不进入 GitHub 源码仓库。
@@ -315,7 +254,7 @@ auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理�
 
 审计导航会显示每个审计产物的生成时间，优先使用 summary 时间，其次使用目录名前缀，便于区分多轮审计页。审计服务支持音频 Range seek 和导航页删除 API。直接打开 HTML 可以浏览页面，但删除按钮不能真正移动本地审计目录。
 
-成功运行后默认删除一次性 job 临时目录；保留可复用缓存，例如 `models/`、`tmp/cache/boundary/` 和 Web 状态。
+成功运行后默认删除一次性 job 临时目录；保留可复用缓存，例如 `models/`、`tmp/cache/` 和 Web 状态。
 
 ---
 
@@ -352,11 +291,11 @@ model_param_device=cuda:*
 ASR_BATCH_SIZE=2
 ```
 
-0.6B Boundary registry 当前保持空 placeholder，不能用于完整工作流；全链重训留作未来 backlog。
+只有 1.7B 一档，没有更小的模型可切换。降 batch 之后仍然 OOM 就只能关掉其他占用 GPU 的程序；本程序不会改用 CPU 继续推理。
 
 ### 长任务怎么排查
 
-运行日志默认写入 `tmp/log/<job_id>/`。`.run.log` 便于查错，`.timings.json` 记录音频准备、Boundary/Pre-ASR/ASR、翻译、写出等阶段耗时和显存快照；Web 完成任务后也会把这两个文件列在“其他文件”里。反馈问题时请保留 `.run.log`、`.timings.json`、质量报告和对应 SRT。
+运行日志默认写入 `tmp/log/<job_id>/`。`.run.log` 便于查错，`.timings.json` 记录音频准备、切分、ASR、字幕时间轴、翻译、写出等阶段耗时和显存快照；Web 完成任务后也会把这两个文件列在“其他文件”里。反馈问题时请保留 `.run.log`、`.timings.json`、质量报告和对应 SRT。
 
 ---
 
@@ -367,20 +306,18 @@ ASR_BATCH_SIZE=2
 - `src/main.py`：主流程编排。
 - `src/core/`：配置和任务上下文。
 - `src/pipeline/`：音频、缓存、输出、质量报告和阶段日志。
-- `src/asr/`：ASR、Boundary 字幕时间轴分配、Pre-ASR CueQC 和转写流程。
-- `src/boundary/`：Boundary Refiner checkpoint loader、edge-sequence Mamba2 adapter、core planner 和 boundary-cache。
-- `src/boundary/ja/`：SpeechBoundary-JA scorer、PTM/MFCC feature cache schema、训练数据 manifest 和 frame-score 训练工具。
+- `src/asr/`：ASR 转写、切分（`pregate.py`）、CTC 对齐头（`alignment.py`）、字幕时间轴（`subtitle_timing.py`）与后置闸（`postgate.py`）。
 - `src/llm/`：翻译 prompt、cache、glossary、API patch 和 translator。
 - `src/subtitles/`：SRT writer、字幕选项和字幕 QC。
 - `src/web/`：FastAPI 接口和静态前端。
-- `tools/`：训练、字幕审计和 workflow smoke 工具。
+- `tools/`：对齐头训练、审计页、离线 Teacher、ASR SFT 和 workflow smoke 工具。
 
 常用测试：
 
 ```powershell
 $env:PYTHONIOENCODING='utf-8'
 uv run pytest tests/test_config.py tests/web/test_jobs_api.py tests/test_asr_backend_dispatch.py
-uv run pytest tests/test_boundary_cache.py tests/test_semantic_boundary_runtime.py tests/test_chunk_packer.py tests/test_pipeline_chunk_config_runtime.py
+uv run pytest tests/test_asr_alignment_head.py tests/test_asr_pregate.py tests/test_asr_postgate.py tests/test_pipeline_chunking.py tests/test_subtitle_timing_aligned.py
 uv run pytest tests/test_translation_cache.py tests/test_translator_prompt.py tests/test_quality_report_output.py
 ```
 
@@ -398,31 +335,21 @@ uv run python -m <module> --help
 常用入口：
 
 - `tools.workflows.run_full_workflow`：命令行完整工作流 smoke。
-- `tools.web.smoke.start_server` / `submit_job` / `poll_job` / `summarize_job`：Web 服务 smoke 和任务汇总。
-- `tools.audits.audit_nav` / `serve_audits.ps1`：审计页导航与 Windows 本地服务。
-- `tools.audits.review_page_core` / `audit_prompt`：人工审计页共享 Core（`MM:SS.mmm` 区间显示与播放器、状态、完成度、保存 API）与可复用提示配置；任务特有布局、证据和完备 verdict 组合由 Adapter 提供。设计合同见 [Human Audit Page Core](docs/audits/20260723_human-audit-page-core-v1.md)。
-- `tools.omni.timestamp_contract`：现役完整 source 区间 Teacher 的严格 `MM:SS.mmm` wire schema、格式化、解析和 source-bound 校验；不提供数字秒兼容或时间猜测。Scorer adaptive A/B 的隔离 10ms 局部时间合同由其 Adapter 校验，不能外溢到其它 Teacher。
-- `tools.omni.run_audio_teacher` / `tools.omni.audio_teacher_batch`：音频 Teacher Core；统一处理 `--prompt/--prompt-file`、`--folder/--file/--manifest`、provider-safe 并发、进度、续跑和主线程串行化落盘，不直接生成训练真值。
-- `tools.omni.audio_teacher_transport`：Qwen、OpenRouter、Google AI Studio 三个 provider Adapter 的唯一分派入口；请求与响应协议互不冒充。
-- `tools.omni.gemini_native` / `tools.omni.inspect_gemini_quota`：Google AI Studio 原生 Interactions 音频 Adapter 与无请求状态入口；实现内联音频、结构化输出、思考/usage 证据、provider 并发上限 2、每槽位 5 RPM / 250k TPM / 保守滚动 24h 的 20 RPD、daily-429 冷却、脱敏状态账本与多 Key 轮换。东八区 16:00 只作 advisory 观察，不释放额度。`uv run python -m tools.omni.inspect_gemini_quota` 不发送 API 请求，只刷新并显示脱敏状态。
-- `tools.boundary.ja.build_vocal_envelope_scorer_v12_pilot_manifest` / `build_vocal_envelope_scorer_v12_full_manifest`：从冻结 source/partition 只重用身份并重新校验音频 SHA、时长、采样和 frame geometry；不继承 v11 标签、span 或 ASR 文本。
-- `tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni` / `vocal_envelope_scorer_v12_calibration` / `compile_vocal_envelope_scorer_v12_canonical`：Scorer v12 broad-vocal 单调用三态 Teacher、人工校准合同与严格 canonical compiler；当前 calibration hash 为空，未重新人工批准前 fail-closed。
-- `tools.boundary.ja.label_vocal_envelope_scorer_v12_compact_ab` / `tools.audits.generate_vocal_envelope_scorer_v12_prompt_ab_html`：Scorer adaptive complete-partition 隔离实验 Adapter 与 broad-v3 单页 A/B 审计 Adapter；每窗最多 20s、局部坐标严格 10ms、共享边界 vocal-safe 量化到 20ms frame，默认串行；所有输出固定 `training_manifest_allowed=false`，不能进入主线 canonical。
-- `tools.boundary.ja.train_vocal_envelope_scorer_v12`：完全随机初始化的 v12 训练器，支持 argmax structured、CRF、Query-Mask 与 Dense Span decoder，持续写入原子 `progress.json`。
-- `tools.audits.generate_candidate_island_dual_evidence_review`：Scorer Protect×Remove 与人工 full-source truth 的三轴 bridge-gap Adapter。
-- `tools.audits.generate_vocal_envelope_scorer_v12_teacher_audit_html`：Scorer v12 三态 Teacher 审计 Adapter；可筛选 train/val/test，并仅在 full evidence 与固定人工批准 pilot 的音频、帧和区间完全一致时跳过已审 calibration source，保存结果始终绑定当前 full manifest/preaudit SHA。
-- `tools.audits.record_vocal_envelope_scorer_v12_approval`：仅在用户明确完成整页审听并统一批准时，把 Scorer v12 审计页的三轴全通过裁决按 source/preaudit SHA 原子写成 `manual_verdicts.jsonl`；不会自动判断或绕过人工 gate。
-- `tools.audits.generate_candidate_island_dual_evidence_ab_review`：在两个已规范化 Scorer dual-evidence review 上复用同一 Core 的 High/Medium A/B Adapter；比较人工真语音保留、outside precision、监督覆盖与逐帧差异。
-- `tools.boundary.ja.select_candidate_island_scorer_v11_mixed_source_manifest` / `compile_candidate_island_scorer_v11_mixed_dual_evidence`：固定一 source/一 video 的真实 mixed-source Teacher manifest，并把独立 Protect/Remove 证据严格编译为 inside/outside/unsure canonical；不使用补集或标签继承。
-- `tools.boundary.ja.audit_candidate_island_scorer_v11_supervision_distribution`：Scorer v11 canonical 的逐 source 标签拓扑与真实 train↔held-out mixed 监督分布审计；只输出诊断证据，不生成训练标签。
-- `tools.audits.score_candidate_island_scorer_v11_checkpoint` / `generate_candidate_island_scorer_v11_prediction_audit_html`：按完整 source 聚合 Scorer checkpoint，单列 teacher all-outside source、outside event、continuity 与精确 residual，并生成可播放/可保存裁决的 prediction Adapter。
-- `tools.audits.generate_pre_asr_v13_false_drop_audit_html`：CueQC v13 false-drop Adapter。
-- `tools.audits.generate_split_v4_missing_cut_candidate_audit_html` / `generate_acoustic_split_canonical_candidate_audit_html`：Split v4 missing-cut 与 canonical candidate Adapter。现役/退役清单见 [人工审计 Adapter inventory](docs/audits/20260723_human-audit-adapter-inventory-v1.md)。
-- `tools.datasets.label_joint_boundary_preasr_with_omni`：实时 Omni 小规模标注。
-- `tools.datasets.batch_joint_boundary_preasr_with_omni`：Omni Batch 全量标注。
 - `tools.workflows.promote_torch_checkpoint`：晋升生产 checkpoint。
-
-其余训练、数据集和审计工具直接通过 `uv run python -m <module> --help` 查看；实验流程与指标放在 [docs/HISTORY.md](docs/HISTORY.md)。
+- `tools.web.smoke.start_server` / `submit_job` / `poll_job` / `summarize_job`：Web 服务 smoke 和任务汇总。
+- `tools.align.*`：CTC 对齐头训练链——`build_alignment_features`（encoder 特征抽取）、`build_real_alignment_manifest` / `build_real_alignment_lines`（真实数据 manifest）、`train_ctc_aligner`（训练）、`evaluate_alignment_geometry` / `evaluate_pregate_loss` / `measure_pregate_dropped_audio`（几何与切分评估）。
+- `tools.audits.audit_nav` / `serve_audits.ps1`：审计页导航与 Windows 本地服务。
+- `tools.audits.review_page_core` / `audit_prompt` / `binary_clip_audit`：人工审计页共享 Core（`MM:SS.mmm` 区间显示与播放器、状态、完成度、保存 API）与可复用提示配置；任务特有布局与 verdict 组合由 Adapter 提供。设计合同见 [Human Audit Page Core](docs/audits/20260723_human-audit-page-core-v1.md)。
+- `tools.audits.select_alignment_onset_audit` / `generate_alignment_onset_audit_html` / `evaluate_alignment_onset_audit`：对齐头起止点人工审计的抽样、页面生成与统计。
+- `tools.audits.generate_subtitle_ab_compare_audit_html`：两版字幕的 A/B 对照审计页。
+- `tools.datasets.label_drop_spans_words` / `apply_drop_span_relabels` / `cut_long_drop_span_clips`：drop-span 逐词 Teacher 标注、复核回写与长片段切分。
+- `tools.audits.build_word_definition_calibration` / `evaluate_word_teacher_calibration`：逐词 Teacher 的「什么算词」校准集与一致性评估。
+- `tools.omni.run_audio_teacher` / `audio_teacher_batch`：离线音频 Teacher Core；统一处理 `--prompt/--prompt-file`、`--folder/--file/--manifest`、provider-safe 并发、进度、续跑和主线程串行化落盘。
+- `tools.omni.audio_teacher_transport`：Qwen、OpenRouter、Google AI Studio 三个 provider Adapter 的唯一分派入口；`--env-file qwen|openrouter|gemini` 只接受这三个已知 profile（`~/.config/omni/` 下的隔离配置），请求与响应协议互不冒充。
+- `tools.omni.gemini_native` / `inspect_gemini_quota`：Google AI Studio 原生 Interactions 音频 Adapter；内联音频、结构化输出、多 Key 轮换与保守的本地滚动配额账本（多 Key 只增加配额轮换槽，不增加并发；`inspect_gemini_quota` 不发请求，只显示脱敏状态）。
+- `tools.omni.timestamp_contract`：Teacher 时间坐标的严格 `MM:SS.mmm` wire schema、格式化、解析和 source-bound 校验；不提供数字秒兼容或时间猜测。
+- `tools.sft.*`：Qwen3-ASR SFT 自训链路——数据集准备、云端训练资产与训练脚本；线上 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf` 即该链路的发布产物。
+- `tools.asr.convert_qwen3_asr_to_hf`：把 Qwen3-ASR 权重转换为 HF 布局。
 
 命令行完整工作流 smoke：
 
@@ -430,10 +357,4 @@ uv run python -m <module> --help
 uv run python -m tools.workflows.run_full_workflow --video video/<your-video>.mp4 --task-name 20260617_191654_cli-smoke --label smoke
 ```
 
-训练、诊断、实验记录和动态计划不在 README 展开；见 [docs/HISTORY.md](docs/HISTORY.md)。
-
----
-
-## 更新记录
-
-更新记录、实验路线、踩坑笔记和后续计划见 [docs/HISTORY.md](docs/HISTORY.md)。
+训练细节、实验记录和路线演变不在 README 展开；见 [docs/HISTORY.md](docs/HISTORY.md)。

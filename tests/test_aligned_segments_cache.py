@@ -41,7 +41,7 @@ def test_aligned_cache_signature_uses_full_subtitle_options(
         keep_temp_files=True,
     )
     _configure(monkeypatch)
-    monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
+    monkeypatch.setenv("ASR_CHUNK_MIN_PAUSE_S", "0.6")
 
     expected = main.aligned_cache_expectations_for_ctx(
         ctx,
@@ -51,7 +51,7 @@ def test_aligned_cache_signature_uses_full_subtitle_options(
     assert "ASR_STAGE_WORKER_MODE" not in expected["asr_stage_config"]
     assert "ASR_WORKER_MODE" not in expected["asr_stage_config"]
     assert "ASR_BATCH_SIZE" not in expected["asr_stage_config"]
-    assert expected["asr_stage_config"]["BOUNDARY_FEATURE_FRAME_HOP_S"] == "0.02"
+    assert expected["asr_stage_config"]["ASR_CHUNK_MIN_PAUSE_S"] == "0.6"
     assert "BOUNDARY_FRAME_HOP_S" not in expected["asr_stage_config"]
     assert expected["subtitle"]["timeline_mode"] == "alignment"
     assert "video_fps" not in expected["subtitle"]
@@ -103,12 +103,6 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
             ["mock asr"],
             {
                 "transcript_chunks": [{"text": "こんにちは"}],
-                "pre_asr_candidates": [
-                    {
-                        "sample_id": "preasr-clip-chunk00000",
-                        "features": {"x": 1.0},
-                    }
-                ],
                 "stage_timings": {},
             },
         )
@@ -134,16 +128,12 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
     assert payload["segments"] == [{"start": 0.0, "end": 1.0, "text": "こんにちは"}]
     assert payload["asr_log"] == ["mock asr"]
     assert "transcript_chunks" not in payload["asr_details"]
-    assert "pre_asr_candidates" not in payload["asr_details"]
     assert payload["asr_details"]["transcript_chunk_count"] == 1
-    assert payload["asr_details"]["pre_asr_candidate_count"] == 1
     transcript = json.loads((temp_root / "clip" / "clip.transcript.json").read_text(encoding="utf-8"))
     assert transcript["chunks"] == [{"text": "こんにちは"}]
     timings = json.loads((temp_root / "clip" / "clip.timings.json").read_text(encoding="utf-8"))
     assert "transcript_chunks" not in timings["asr_details"]
-    assert "pre_asr_candidates" not in timings["asr_details"]
     assert timings["asr_details"]["transcript_chunk_count"] == 1
-    assert timings["asr_details"]["pre_asr_candidate_count"] == 1
     _assert_no_project_absolute_path(aligned_path.read_text(encoding="utf-8"))
 
 

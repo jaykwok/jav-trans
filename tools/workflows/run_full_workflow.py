@@ -22,7 +22,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from asr.backends.qwen import (
     DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO,
-    qwen_asr_default_model_path,
+    active_qwen_asr_model_id,
 )
 from core.config import load_config
 
@@ -31,7 +31,10 @@ DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV = ",".join(
     f"{repo_id}={batch_size}"
     for repo_id, batch_size in DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO.items()
 )
-DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "candidate-island-v11-pending-audit"
+# What produced the chunk boundaries. The five-model acoustic chain this used to
+# name was retired on 2026-07-31; chunking now reads blank runs from the CTC
+# alignment head, and falls back to fixed-length cuts when no head is bound.
+DEFAULT_CHUNKING_SOURCE = "unknown"
 
 
 @dataclass(frozen=True)
@@ -70,21 +73,21 @@ def peak_cuda_reserved_mb(snapshots: list[dict[str, Any]]) -> float | None:
     return round(max(values), 1) if values else None
 
 
-def speech_boundary_operating_point(results: list[dict[str, Any]]) -> str:
+def chunking_source(results: list[dict[str, Any]]) -> str:
+    """Which path actually cut the audio, read back from the run rather than assumed.
+
+    `alignment_head_blank_runs` and the two fixed-length fallbacks produce the
+    same chunk shape, so a report that assumed one of them would hide a head
+    that failed to load.
+    """
     for result in results:
         signature = result.get("boundary_signature") or {}
         if not isinstance(signature, dict):
             continue
-        scorer = signature.get("scorer_checkpoint")
-        if isinstance(scorer, dict):
-            metadata = scorer.get("metadata") or {}
-            if isinstance(metadata, dict) and metadata.get("operating_point"):
-                return str(metadata["operating_point"])
-            if scorer.get("schema"):
-                return str(scorer["schema"])
-        if signature.get("operating_point"):
-            return str(signature["operating_point"])
-    return DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT
+        chunking = signature.get("chunking")
+        if isinstance(chunking, dict) and chunking.get("source"):
+            return str(chunking["source"])
+    return DEFAULT_CHUNKING_SOURCE
 
 
 def project_path(value: str | Path) -> Path:
@@ -110,7 +113,7 @@ def project_rel(value: str | Path | None) -> str:
 
 
 def make_paths(task_name: str) -> RunPaths:
-    root = PROJECT_ROOT / "agents" / "temp" / "speech-boundary-ja" / timestamped_label(task_name)
+    root = PROJECT_ROOT / "agents" / "temp" / "full-workflow" / timestamped_label(task_name)
     return RunPaths(
         root=root,
         jobs=root / "jobs",
@@ -182,8 +185,6 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ.pop("ASR_STAGE_WORKER_MODE", None)
     os.environ.pop("ASR_WORKER_MODE", None)
     os.environ.pop("ASR_WORKER_MODE_BY_REPO", None)
-    os.environ["ASR_BACKEND"] = args.asr_backend
-    os.environ["ASR_BOUNDARY_BACKEND"] = "speech_boundary_ja"
     os.environ["ASR_MODEL_PATH"] = project_path_value(args.asr_model_path)
     os.environ["ASR_MODEL_ID"] = ""
     os.environ["ASR_DTYPE"] = args.asr_dtype
@@ -195,55 +196,7 @@ def configure_env(args: argparse.Namespace) -> None:
     )
     os.environ["TRANSCRIPTION_TIMEOUT_S"] = str(args.transcription_timeout_s)
     os.environ["ASR_MAX_NEW_TOKENS"] = str(args.asr_max_new_tokens)
-    if args.boundary_feature_frame_hop_s is not None:
-        os.environ["BOUNDARY_FEATURE_FRAME_HOP_S"] = str(args.boundary_feature_frame_hop_s)
-    if args.outer_edge_refiner_model_path_by_repo.strip():
-        os.environ["OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO"] = (
-            args.outer_edge_refiner_model_path_by_repo
-        )
-    else:
-        os.environ.pop("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", None)
-    if args.semantic_split_model_path_by_repo.strip():
-        os.environ["SEMANTIC_SPLIT_MODEL_PATH_BY_REPO"] = (
-            args.semantic_split_model_path_by_repo
-        )
-    else:
-        os.environ.pop("SEMANTIC_SPLIT_MODEL_PATH_BY_REPO", None)
-    os.environ["OUTER_EDGE_REFINER_DEVICE"] = args.outer_edge_refiner_device
-    os.environ["SEMANTIC_SPLIT_DEVICE"] = args.semantic_split_device
-    os.environ["PRE_ASR_CUEQC_ENABLED"] = "1" if args.pre_asr_cueqc_enabled else "0"
-    if args.pre_asr_cueqc_model_path_by_repo.strip():
-        os.environ["PRE_ASR_CUEQC_MODEL_PATH_BY_REPO"] = args.pre_asr_cueqc_model_path_by_repo
-    else:
-        os.environ.pop("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", None)
-    os.environ["PRE_ASR_CUEQC_DEVICE"] = args.pre_asr_cueqc_device
     os.environ["KEEP_ASR_CHUNKS"] = "1" if args.keep_asr_chunks else "0"
-    os.environ["BOUNDARY_CACHE_ENABLED"] = "1" if args.boundary_cache else "0"
-    for legacy_proposal_control in (
-        "SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE",
-        "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE",
-        "SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S",
-        "SPEECH_BOUNDARY_JA_SPLIT_NMS_S",
-        "SPEECH_BOUNDARY_JA_SPLIT_SNAP_S",
-        "SPEECH_BOUNDARY_JA_MIN_SPLIT_SEGMENT_S",
-    ):
-        os.environ.pop(legacy_proposal_control, None)
-    os.environ["SPEECH_BOUNDARY_JA_PTM"] = args.speech_boundary_ptm
-    if str(args.speech_boundary_model_path or "").strip():
-        os.environ["SPEECH_BOUNDARY_JA_MODEL_PATH"] = project_path_value(args.speech_boundary_model_path)
-    else:
-        os.environ.pop("SPEECH_BOUNDARY_JA_MODEL_PATH", None)
-    os.environ["SPEECH_BOUNDARY_JA_DEVICE"] = args.speech_boundary_device
-    os.environ["SPEECH_BOUNDARY_JA_DTYPE"] = args.speech_boundary_dtype
-    if args.speech_boundary_scorer_checkpoint_by_repo.strip():
-        os.environ["SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO"] = (
-            args.speech_boundary_scorer_checkpoint_by_repo
-        )
-    else:
-        os.environ.pop("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", None)
-    os.environ["SPEECH_BOUNDARY_JA_SCORER_DEVICE"] = args.speech_boundary_scorer_device
-    os.environ["SPEECH_BOUNDARY_JA_WINDOW_S"] = str(args.speech_boundary_window_s)
-    os.environ["SPEECH_BOUNDARY_JA_OVERLAP_S"] = str(args.speech_boundary_overlap_s)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
@@ -254,9 +207,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
     job_id = sanitize_job_id(f"{video.stem}_{safe_label(args.label)}")
     job_temp_dir = paths.jobs / job_id
     advanced = {
-        "ASR_BACKEND": args.asr_backend,
-        "ASR_BOUNDARY_BACKEND": "speech_boundary_ja",
-        "ASR_MODEL_PATH": project_path_value(args.asr_model_path),
         "TRANSCRIPTION_TIMEOUT_S": str(args.transcription_timeout_s),
         "ASR_MAX_NEW_TOKENS": str(args.asr_max_new_tokens),
         "ASR_BATCH_SIZE": args.asr_batch_size,
@@ -264,42 +214,14 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
             "ASR_BATCH_SIZE_BY_REPO",
             DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV,
         ),
-        "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO": os.getenv(
-            "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", ""
-        ),
-        "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO": os.getenv(
-            "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO", ""
-        ),
-        "OUTER_EDGE_REFINER_DEVICE": os.getenv("OUTER_EDGE_REFINER_DEVICE", "auto"),
-        "SEMANTIC_SPLIT_DEVICE": os.getenv("SEMANTIC_SPLIT_DEVICE", "auto"),
-        "PRE_ASR_CUEQC_ENABLED": "1" if args.pre_asr_cueqc_enabled else "0",
-        "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": os.getenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", ""),
-        "PRE_ASR_CUEQC_DEVICE": os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"),
         "QUALITY_REPORT_ENABLED": "1",
         "QUALITY_REPORT_DIR": str(paths.root / "quality_reports"),
         "QC_HARD_FAIL": "0",
         "RUN_LOG_ENABLED": "1",
         "RUN_LOG_DIR": str(paths.run_logs),
-        "BOUNDARY_CACHE_ENABLED": "1" if args.boundary_cache else "0",
-        "BOUNDARY_CACHE_DIR": str(paths.root / "boundary-cache"),
-        "SPEECH_BOUNDARY_JA_PTM": args.speech_boundary_ptm,
-        "SPEECH_BOUNDARY_JA_MODEL_PATH": project_path_value(args.speech_boundary_model_path),
-        "SPEECH_BOUNDARY_JA_DEVICE": args.speech_boundary_device,
-        "SPEECH_BOUNDARY_JA_DTYPE": args.speech_boundary_dtype,
-        "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO": os.getenv(
-            "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
-            "",
-        ),
-        "SPEECH_BOUNDARY_JA_SCORER_DEVICE": os.getenv(
-            "SPEECH_BOUNDARY_JA_SCORER_DEVICE",
-            "auto",
-        ),
-        "SPEECH_BOUNDARY_JA_WINDOW_S": str(args.speech_boundary_window_s),
-        "SPEECH_BOUNDARY_JA_OVERLAP_S": str(args.speech_boundary_overlap_s),
         "KEEP_ASR_CHUNKS": "1" if args.keep_asr_chunks else "0",
     }
     spec = SimpleNamespace(
-        asr_backend=args.asr_backend,
         subtitle_mode=args.subtitle_mode,
         skip_translation=not args.translate,
         output_dir=str(paths.generated / job_id),
@@ -314,8 +236,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "xhigh"),
         advanced=advanced,
     )
-    if args.boundary_feature_frame_hop_s is not None:
-        advanced["BOUNDARY_FEATURE_FRAME_HOP_S"] = str(args.boundary_feature_frame_hop_s)
     ctx = JobContext.from_spec(
         spec,
         job_id=job_id,
@@ -332,8 +252,7 @@ def run_video(args: argparse.Namespace, paths: RunPaths, video: Path) -> dict[st
     ctx = build_context(args=args, paths=paths, video=video)
     print(
         f"=== START {video.name} label={args.label} "
-        "boundary=speech_boundary_ja scorer=v11-pending-audit "
-        f"asr={args.asr_backend} ===",
+        f"asr={active_qwen_asr_model_id()} ===",
         flush=True,
     )
     artifacts = pipeline_main.run_asr_alignment(str(video), ctx=ctx, job_id=ctx.job_id)
@@ -410,40 +329,24 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
     payload = {
         "task": args.task_name,
         "label": args.label,
-        "asr_backend": args.asr_backend,
+        "asr_model_id": active_qwen_asr_model_id(),
         "asr_model_path": project_rel(project_path_value(args.asr_model_path)),
-        "boundary_backend": "speech_boundary_ja",
-        "speech_boundary_operating_point": speech_boundary_operating_point(results),
-        "speech_boundary_decision_mode": "two_logit_softmax_argmax",
-        "speech_boundary_runtime_threshold": None,
-        "speech_boundary_split_strategy": "acoustic_proposal_then_semantic_split",
-        "speech_boundary_scorer_checkpoint_by_repo": args.speech_boundary_scorer_checkpoint_by_repo,
         "asr_batch_size": args.asr_batch_size,
-        "pre_asr_cueqc_enabled": bool(args.pre_asr_cueqc_enabled),
-        "boundary_planner": {
-            "feature_frame_hop_s": args.boundary_feature_frame_hop_s,
-            "order": [
-                "speech_island_scorer",
-                "outer_edge_refiner_v3",
-                "acoustic_split_v4",
-                "pre_asr_cueqc_v13",
-                "inner_edge_refiner_v2",
-            ],
-        },
+        "chunking_source": chunking_source(results),
+        "alignment_head_path": os.getenv("ASR_ALIGNMENT_HEAD_PATH", ""),
         "translate": bool(args.translate),
         "results": results,
     }
     paths.summary_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     lines = [
-        "# SpeechBoundary-JA Full Workflow",
+        "# Full Workflow",
         "",
-        f"- ASR: `{args.asr_backend}`",
-        "- Subtitle timing: `boundary chunk timeline`",
+        f"- ASR: `{active_qwen_asr_model_id()}`",
+        "- Subtitle timing: `CTC forced alignment` (falls back to proportional "
+        "when no alignment head is bound)",
         f"- ASR model: `{project_rel(project_path_value(args.asr_model_path)) or 'auto'}`",
-        "- Boundary: `speech_boundary_ja` candidate-island v11, "
-        "two-logit softmax argmax; production checkpoint pending audit",
-        f"- Pre-ASR CueQC: `{'on' if args.pre_asr_cueqc_enabled else 'off'}`",
+        f"- Chunking: `{chunking_source(results)}`",
         f"- Translation: `{'on' if args.translate else 'off'}`",
         f"- Runtime root: `{project_rel(paths.root)}`",
         "",
@@ -469,15 +372,12 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     load_config()
     parser = argparse.ArgumentParser(
-        description="Run project full workflow with SpeechBoundary-JA repo-id scorer, Boundary Refiner, and Qwen3-ASR."
+        description="Run the project's full workflow: chunking, Qwen3-ASR, CTC "
+        "alignment, and optional translation."
     )
     parser.add_argument("--video", action="append", required=True, help="Video path or stem. Repeatable.")
     parser.add_argument("--task-name", default="full-workflow-qwen200k")
-    parser.add_argument("--label", default="speech_boundary_ja_qwen200k")
-    parser.add_argument(
-        "--asr-backend",
-        default=os.getenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"),
-    )
+    parser.add_argument("--label", default="full_workflow")
     parser.add_argument(
         "--asr-model-path",
         default=os.getenv("ASR_MODEL_PATH", ""),
@@ -491,85 +391,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--translate", action="store_true", help="Run LLM translation too. Default outputs Japanese SRT.")
     parser.add_argument("--target-lang", default=os.getenv("TARGET_LANG", "简体中文"))
     parser.add_argument("--translation-max-workers", type=int, default=1)
-    parser.add_argument(
-        "--boundary-feature-frame-hop-s",
-        dest="boundary_feature_frame_hop_s",
-        type=float,
-        default=None,
-        help=(
-            "Override Boundary feature/score grid hop in seconds. This is not video FPS; "
-            "subtitle frame timing uses a fixed 24000/1001 base, independent of source FPS."
-        ),
-    )
-    parser.add_argument(
-        "--outer-edge-refiner-model-path-by-repo",
-        default=os.getenv("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", ""),
-        help="Optional repo-id checkpoint map for the repo-bound Outer Edge Refiner.",
-    )
-    parser.add_argument(
-        "--semantic-split-model-path-by-repo",
-        default=os.getenv("SEMANTIC_SPLIT_MODEL_PATH_BY_REPO", ""),
-        help="Optional repo-id checkpoint map for Acoustic Split v4.",
-    )
-    parser.add_argument(
-        "--pre-asr-cueqc-enabled",
-        action=argparse.BooleanOptionalAction,
-        default=_env_bool("PRE_ASR_CUEQC_ENABLED", False),
-        help="Run the current repo-bound binary Pre-ASR CueQC before ASR export.",
-    )
-    parser.add_argument(
-        "--pre-asr-cueqc-model-path-by-repo",
-        default=os.getenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", ""),
-        help="Optional repo-id checkpoint map for the repo-bound Pre-ASR CueQC checkpoint.",
-    )
-    parser.add_argument("--pre-asr-cueqc-device", default=os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"))
-    parser.add_argument(
-        "--outer-edge-refiner-device",
-        default=os.getenv("OUTER_EDGE_REFINER_DEVICE", "auto"),
-    )
-    parser.add_argument(
-        "--semantic-split-device",
-        default=os.getenv("SEMANTIC_SPLIT_DEVICE", "auto"),
-    )
     parser.add_argument("--keep-asr-chunks", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--boundary-cache", action=argparse.BooleanOptionalAction, default=_env_bool("BOUNDARY_CACHE_ENABLED", True))
-    parser.add_argument(
-        "--speech-boundary-ptm",
-        dest="speech_boundary_ptm",
-        default=os.getenv("SPEECH_BOUNDARY_JA_PTM", ""),
-    )
-    parser.add_argument(
-        "--speech-boundary-model-path",
-        dest="speech_boundary_model_path",
-        default=os.getenv("SPEECH_BOUNDARY_JA_MODEL_PATH", ""),
-    )
-    parser.add_argument("--speech-boundary-device", dest="speech_boundary_device", default=os.getenv("SPEECH_BOUNDARY_JA_DEVICE", "auto"))
-    parser.add_argument("--speech-boundary-dtype", dest="speech_boundary_dtype", default=os.getenv("SPEECH_BOUNDARY_JA_DTYPE", "bfloat16"))
-    parser.add_argument(
-        "--speech-boundary-scorer-checkpoint-by-repo",
-        dest="speech_boundary_scorer_checkpoint_by_repo",
-        default=os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", ""),
-        help=(
-            "Optional repo-id scorer map: '<repo_id>=<candidate_island_scorer_v11.pt>'"
-            "[,<repo_id>=...]'. Empty uses the registered repo-id scorer when available."
-        ),
-    )
-    parser.add_argument(
-        "--speech-boundary-scorer-device",
-        dest="speech_boundary_scorer_device",
-        default=os.getenv("SPEECH_BOUNDARY_JA_SCORER_DEVICE", "auto"),
-    )
-    parser.add_argument("--speech-boundary-window-s", dest="speech_boundary_window_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", 20.0))
-    parser.add_argument("--speech-boundary-overlap-s", dest="speech_boundary_overlap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", 4.0))
     args = parser.parse_args(argv)
-    if not str(args.speech_boundary_ptm or "").strip():
-        args.speech_boundary_ptm = args.asr_backend
-    if not str(args.speech_boundary_model_path or "").strip():
-        args.speech_boundary_model_path = qwen_asr_default_model_path(args.speech_boundary_ptm)
-    if args.speech_boundary_window_s <= 0:
-        parser.error("--speech-boundary-window-s must be positive")
-    if args.speech_boundary_overlap_s < 0 or args.speech_boundary_overlap_s >= args.speech_boundary_window_s:
-        parser.error("--speech-boundary-overlap-s must be non-negative and smaller than window")
     return args
 
 

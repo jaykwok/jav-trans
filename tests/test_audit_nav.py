@@ -179,17 +179,90 @@ def test_audit_index_defaults_to_mtime_descending(tmp_path: Path):
     assert index.index('href="new-review/index.html"') < index.index('href="old-review/index.html"')
 
 
-def test_audit_index_uses_directory_timestamp_as_generated_time(tmp_path: Path):
+def test_directory_label_never_overrides_the_real_generation_time(tmp_path: Path):
+    """The prefix is a batch label, not a clock.
+
+    It is picked by hand under the project's naming convention and in practice
+    is a round number: pages stamped `_150000`, `_160000`, `_170000`, `_120000`
+    were really written at 16:40, 17:54, 07:46 and 09:12. It also never moves
+    when a page is rebuilt, so one regenerated page kept advertising the
+    previous day and the nav implied it lacked a fix it had.
+    """
+    import os
+    import time
+
     audit_root = tmp_path / "agents" / "audits"
     index_html = _write_text(
         audit_root / "20260629_200000_review" / "index.html",
         "<!doctype html><title>review</title>",
     )
+    stamp = time.mktime(time.strptime("2026-07-02 11:22:33", "%Y-%m-%d %H:%M:%S"))
+    for path in (index_html, index_html.parent):
+        os.utime(path, (stamp, stamp))
 
     write_audit_index(audit_root=audit_root, latest_html=index_html, latest_title="Review")
 
     index = (audit_root / "index.html").read_text(encoding="utf-8")
-    assert "生成：2026-06-29 20:00:00" in index
+    assert "生成：2026-07-02 11:22:33" in index
+    assert "2026-06-29 20:00:00" not in index
+
+
+def test_a_recorded_generated_at_outranks_the_file_time(tmp_path: Path):
+    """Written by the generator, so it survives a copy that resets mtimes."""
+    import os
+    import time
+
+    audit_root = tmp_path / "agents" / "audits"
+    index_html = _write_text(
+        audit_root / "20260629_200000_review" / "index.html",
+        "<!doctype html><title>review</title>",
+    )
+    (index_html.parent / "summary.json").write_text(
+        json.dumps({"title": "R", "generated_at": "2026-06-29T20:34:56+08:00"}),
+        encoding="utf-8",
+    )
+    stamp = time.mktime(time.strptime("2026-07-02 11:22:33", "%Y-%m-%d %H:%M:%S"))
+    for path in (index_html, index_html.parent):
+        os.utime(path, (stamp, stamp))
+
+    write_audit_index(audit_root=audit_root, latest_html=index_html, latest_title="R")
+
+    index = (audit_root / "index.html").read_text(encoding="utf-8")
+    assert "2026-07-02 11:22:33" not in index
+
+
+def test_saving_verdicts_later_does_not_move_the_generation_time(tmp_path: Path):
+    """Ordering wants the newest touch anywhere in the folder; this label wants
+    when the page was built. Dropping `manual_verdicts.jsonl` in afterwards must
+    not push it forward."""
+    import os
+    import time
+
+    audit_root = tmp_path / "agents" / "audits"
+    index_html = _write_text(
+        audit_root / "20260629_200000_review" / "index.html",
+        "<!doctype html><title>review</title>",
+    )
+    built = time.mktime(time.strptime("2026-07-02 11:22:33", "%Y-%m-%d %H:%M:%S"))
+    os.utime(index_html, (built, built))
+    verdicts = index_html.parent / "manual_verdicts.jsonl"
+    verdicts.write_text("{}\n", encoding="utf-8")
+    later = time.mktime(time.strptime("2026-07-03 19:00:00", "%Y-%m-%d %H:%M:%S"))
+    os.utime(verdicts, (later, later))
+    os.utime(index_html.parent, (later, later))
+
+    write_audit_index(audit_root=audit_root, latest_html=index_html, latest_title="R")
+
+    index = (audit_root / "index.html").read_text(encoding="utf-8")
+    assert "生成：2026-07-02 11:22:33" in index
+    assert "2026-07-03 19:00:00" not in index
+
+
+def test_generators_record_a_timestamp_the_nav_can_read_back(tmp_path: Path):
+    """Producer and reader share one definition, so the format cannot drift."""
+    from tools.audits.audit_nav import _summary_generated_time, audit_generated_at
+
+    assert _summary_generated_time({"generated_at": audit_generated_at()})
 
 
 def test_audit_index_converts_aware_summary_time_to_local_time(tmp_path: Path):

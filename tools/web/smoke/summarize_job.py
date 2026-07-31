@@ -21,10 +21,16 @@ def _load_timings(job_dir: Path) -> tuple[Path | None, dict[str, Any]]:
     return path, read_json(path)
 
 
-def _pre_asr_cueqc_summary(asr_details: dict[str, Any]) -> dict[str, Any]:
+def _postgate_summary(asr_details: dict[str, Any]) -> dict[str, Any]:
+    """What the post-gate marked, which is the only gate left in the run.
+
+    This used to read `asr_details.pre_asr_cueqc`, a key nothing has written
+    since the pre-ASR chain was retired on 2026-07-31 - so the smoke summary
+    reported blanks and looked like a job that simply had no drops.
+    """
     report = (
-        asr_details.get("pre_asr_cueqc")
-        if isinstance(asr_details.get("pre_asr_cueqc"), dict)
+        asr_details.get("postgate")
+        if isinstance(asr_details.get("postgate"), dict)
         else {}
     )
     chunks = (
@@ -33,18 +39,18 @@ def _pre_asr_cueqc_summary(asr_details: dict[str, Any]) -> dict[str, Any]:
         else []
     )
     return {
-        "source": "asr_details.pre_asr_cueqc",
-        "enabled": report.get("enabled"),
-        "candidate_count": report.get("candidate_count"),
-        "keep_count": report.get("keep_count"),
-        "drop_count": report.get("drop_count"),
+        "source": "asr_details.postgate",
+        "schema": report.get("schema"),
+        "reviewed": report.get("reviewed"),
+        "flagged": report.get("flagged"),
+        "flags": report.get("flags") or {},
         "transcript_chunks": len(chunks),
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Summarize Web smoke artifacts and Pre-ASR CueQC decisions."
+        description="Summarize Web smoke artifacts and post-gate findings."
     )
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--job-dir", default="")
@@ -56,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     timings_path, timings = _load_timings(job_dir)
     asr_details = timings.get("asr_details") if isinstance(timings.get("asr_details"), dict) else {}
-    cueqc_summary = _pre_asr_cueqc_summary(asr_details)
+    postgate_summary = _postgate_summary(asr_details)
     summary = {
         "job_id": args.job_id,
         "job_dir": str(job_dir),
@@ -64,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": "artifacts_found" if timings_path else "timings_missing",
         "counts": timings.get("counts", {}),
         "stage_timings": timings.get("stage_timings", {}),
-        "pre_asr_cueqc": cueqc_summary,
+        "postgate": postgate_summary,
     }
     write_json(run_dir / "job_summary.json", summary)
     markdown = [
@@ -74,12 +80,11 @@ def main(argv: list[str] | None = None) -> int:
         f"- job_dir: `{job_dir}`",
         f"- timings: `{timings_path}`" if timings_path else "- timings: missing",
         f"- counts: `{summary['counts']}`",
-        f"- Pre-ASR CueQC enabled: `{cueqc_summary.get('enabled', '')}`",
-        f"- Pre-ASR CueQC candidates/keep/drop: "
-        f"`{cueqc_summary.get('candidate_count', '')}/"
-        f"{cueqc_summary.get('keep_count', '')}/"
-        f"{cueqc_summary.get('drop_count', '')}`",
-        f"- transcript_chunks: `{cueqc_summary['transcript_chunks']}`",
+        f"- post-gate reviewed/flagged: "
+        f"`{postgate_summary.get('reviewed', '')}/"
+        f"{postgate_summary.get('flagged', '')}` (flags are marks, not drops)",
+        f"- post-gate flags: `{postgate_summary.get('flags', {})}`",
+        f"- transcript_chunks: `{postgate_summary['transcript_chunks']}`",
         "",
     ]
     (run_dir / "job_summary.md").write_text("\n".join(markdown), encoding="utf-8")

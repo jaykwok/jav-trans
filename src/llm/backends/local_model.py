@@ -200,10 +200,15 @@ class LocalModelBackend(BaseTranslationBackend):
                 except Exception:
                     return False
 
+        # `enable_thinking=False` lands in the chat template's Jinja context;
+        # Qwen3-style templates read it and skip the <think> prelude, which
+        # would otherwise dominate generation time. Templates that don't use
+        # the variable ignore it.
         prompt = self._tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=False,
         )
         inputs = self._tokenizer(prompt, return_tensors="pt")
         input_length = int(inputs["input_ids"].shape[1])

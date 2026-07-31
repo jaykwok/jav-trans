@@ -20,7 +20,7 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-from boundary.gpu_safety import (  # noqa: E402
+from utils.gpu_safety import (  # noqa: E402
     DEFAULT_HOST_MEMORY_RATIO,
     HostMemoryExceeded,
     HostMemoryGuard,

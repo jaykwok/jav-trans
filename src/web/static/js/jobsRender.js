@@ -18,11 +18,7 @@ const STAGE_LABEL = {
   cancelled:           '已取消',
   audio_prepare:       '音频提取',
   asr_alignment:       'ASR 转写 & 字幕时间轴',
-  boundary_cache:      '边界缓存',
-  speech_island_scorer:'语音岛检测',
-  outer_edge_refiner:  '外边界精修',
-  semantic_split_model:'语义切分判断',
-  pre_asr_cueqc:       'Pre-ASR CueQC',
+  audio_chunking:      '音频切分',
   audio_chunk_export:  '导出 ASR 音频块',
   asr_text_transcribe: 'ASR 文本转写',
   subtitle_timing:     '字幕时间轴',
@@ -33,20 +29,29 @@ const STAGE_LABEL = {
 };
 
 const PROGRESS_PCT = { queued: 0, asr: 20, translating: 60, writing: 90, done: 100, failed: 100, cancelled: 0 };
+// Rebalanced on 2026-07-31: the five boundary stages that used to fill 3->38%
+// no longer run, and chunking now costs one encoder pass instead of five models.
 const STAGE_PCT = {
   audio_prepare: 3,
-  boundary_cache: 7,
-  speech_island_scorer: 11,
-  outer_edge_refiner: 16,
-  semantic_split_model: 21,
-  pre_asr_cueqc: 33,
-  audio_chunk_export: 38,
-  asr_text_transcribe: 43,
-  subtitle_timing: 64,
+  audio_chunking: 8,
+  audio_chunk_export: 14,
+  asr_text_transcribe: 20,
+  subtitle_timing: 55,
   translation_context: 72,
   translation: 76,
   write_output: 97,
 };
+
+const STAGE_ORDER = Object.keys(STAGE_PCT);
+
+// How much of the bar a stage owns: the gap to whatever comes next, minus a
+// point so an in-progress stage never reaches its successor's mark.
+function stageSpan(stage) {
+  const index = STAGE_ORDER.indexOf(stage);
+  if (index < 0) return 0;
+  const next = index + 1 < STAGE_ORDER.length ? STAGE_PCT[STAGE_ORDER[index + 1]] : 100;
+  return Math.max(0, next - STAGE_PCT[stage] - 1);
+}
 
 function clampPct(value) {
   const n = Number(value);
@@ -101,12 +106,14 @@ export function renderJobs() {
     let pct = STAGE_PCT[activeStage] ?? PROGRESS_PCT[job.status] ?? 0;
     if (job.status === 'done') {
       pct = 100;
-    } else if (activeStage === 'translation' && translatedRatio != null) {
-      pct = Math.round(76 + translatedRatio * 19);
-    } else if (activeStage === 'asr_text_transcribe' && itemRatio != null) {
-      pct = Math.round(43 + itemRatio * 20);
-    } else if (itemRatio != null && STAGE_PCT[activeStage] != null) {
-      pct = Math.round(STAGE_PCT[activeStage] + itemRatio * 4);
+    } else {
+      // Interpolate within the stage's own share of the bar, read from the
+      // table rather than repeated as literals - the old code hardcoded the
+      // 43..63 and 76..95 spans, so re-weighting a stage silently desynced them.
+      const ratio = activeStage === 'translation' ? translatedRatio : itemRatio;
+      if (ratio != null && STAGE_PCT[activeStage] != null) {
+        pct = Math.round(STAGE_PCT[activeStage] + ratio * stageSpan(activeStage));
+      }
     }
     pct = clampPct(pct);
     const fillClass = job.status === 'done' ? ' done' : job.status === 'failed' ? ' error' : '';
@@ -126,7 +133,7 @@ export function renderJobs() {
       ? `<button class="btn-sm btn-retry" data-retry="${escHtml(id)}" title="${
           translationRetry
             ? '优先复用已完成的 ASR 产物，仅重试翻译/写出'
-            : '重新进入 ASR 前置链，并复用仍然有效的边界与 ASR 缓存'
+            : '重新运行 ASR 转写与字幕时间轴，复用仍然有效的缓存'
         }">↺ ${translationRetry ? '重试翻译' : '重试'}</button>`
       : '';
 

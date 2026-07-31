@@ -280,7 +280,7 @@ def _sample_asr_artifacts(job: JobState, temp_dir: Path, output_dir: Path):
         asr_log=["mock asr"],
         audio_cached=True,
         device="cpu",
-        backend_label=job.spec.asr_backend,
+        backend_label="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
         video_duration_s=None,
         pipeline_started=0.0,
         job_id=job.id,
@@ -418,8 +418,10 @@ def test_remove_finished_job_deletes_job_temp_dir(tmp_path, monkeypatch):
     asyncio.run(_test_remove_finished_job_deletes_job_temp_dir(tmp_path, monkeypatch))
 
 
-def test_remove_finished_job_deletes_video_boundary_caches(tmp_path, monkeypatch):
-    asyncio.run(_test_remove_finished_job_deletes_video_boundary_caches(tmp_path, monkeypatch))
+def test_remove_finished_job_leaves_retired_boundary_cache_alone(tmp_path, monkeypatch):
+    asyncio.run(
+        _test_remove_finished_job_leaves_retired_boundary_cache_alone(tmp_path, monkeypatch)
+    )
 
 
 async def _test_remove_finished_job_deletes_job_temp_dir(tmp_path, monkeypatch):
@@ -447,17 +449,19 @@ async def _test_remove_finished_job_deletes_job_temp_dir(tmp_path, monkeypatch):
     await _reset_pm_state()
 
 
-async def _test_remove_finished_job_deletes_video_boundary_caches(tmp_path, monkeypatch):
+async def _test_remove_finished_job_leaves_retired_boundary_cache_alone(tmp_path, monkeypatch):
+    # Job removal used to purge `tmp/cache/boundary/`. The chain that wrote that
+    # cache was retired on 2026-07-31, so the purge deleted files nothing
+    # produces. Re-introducing it would mean deleting a directory whose current
+    # meaning is unknown, so pin that job removal no longer reaches in there.
     monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
     monkeypatch.setattr(pm, "_job_temp_dir", lambda job_id: str(tmp_path / "jobs" / job_id))
     monkeypatch.setattr(pm, "get_audio_cache_key", lambda _path: "abcdef12")
     cache_root = tmp_path / "boundary-cache"
     cache_root.mkdir()
     monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(cache_root))
-    matching = cache_root / "abcdef12.runtime.json"
-    unrelated = cache_root / "12345678.runtime.json"
-    matching.write_text("{}", encoding="utf-8")
-    unrelated.write_text("{}", encoding="utf-8")
+    stale = cache_root / "abcdef12.runtime.json"
+    stale.write_text("{}", encoding="utf-8")
     await _reset_pm_state()
 
     job = JobState(
@@ -475,8 +479,9 @@ async def _test_remove_finished_job_deletes_video_boundary_caches(tmp_path, monk
         pm._write_jobs_unlocked()
 
     assert await pm.remove_job(job.id)
-    assert not matching.exists()
-    assert unrelated.exists()
+    assert not temp_dir.exists()
+    assert stale.exists()
+    assert not hasattr(pm, "delete_for_audio_cache_key")
     await _reset_pm_state()
 
 

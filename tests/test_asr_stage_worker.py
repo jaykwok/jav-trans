@@ -108,7 +108,7 @@ def test_physical_ram_ratio_is_hard_oom(monkeypatch):
     with pytest.raises(RuntimeError, match="Physical RAM budget exceeded"):
         asr_pipeline._enforce_vram_budget_from_snapshot(
             {
-                "stage": "pre_asr_cueqc",
+                "stage": "asr_batch",
                 "shared_vram_mb": 0.0,
                 "physical_ram_used_mb": 15201.0,
                 "physical_ram_budget_mb": 15200.0,
@@ -176,7 +176,6 @@ def test_auto_vram_budget_and_batch_scale_from_physical_memory(monkeypatch):
 @pytest.mark.parametrize(
     ("backend", "minimum_mb"),
     [
-        ("jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf", 4096),
         ("jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf", 6144),
     ],
 )
@@ -193,7 +192,6 @@ def test_repo_physical_vram_floor_accepts_exact_minimum(backend, minimum_mb):
 @pytest.mark.parametrize(
     ("backend", "minimum_mb"),
     [
-        ("jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf", 4096),
         ("jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf", 6144),
     ],
 )
@@ -267,35 +265,49 @@ def test_explicit_vram_budget_sets_worker_allocator_fraction(monkeypatch):
     assert allocator_calls[0][1] == 0
 
 
-def test_boundary_oom_does_not_change_temporal_window():
-    env = {
-        "ASR_BATCH_SIZE": "4",
-        "SPEECH_BOUNDARY_JA_WINDOW_S": "20",
-    }
+def test_chunking_oom_is_not_answered_by_lowering_the_asr_batch():
+    """OOM in chunking must stop, not shrink an unrelated knob.
+
+    Chunking encodes fixed 30-second windows one at a time; halving
+    `ASR_BATCH_SIZE` would change nothing about the stage that ran out of
+    memory, so the retry would fail identically while looking like progress.
+    """
+    env = {"ASR_BATCH_SIZE": "4"}
     exc = gpu_worker.GpuWorkerError(
         "oom",
         "CUDA out of memory",
-        stage="speech_island_scorer",
+        stage="audio_chunking",
         runtime_tuning={"asr_batch_size": 4},
     )
 
     assert gpu_worker._oom_downshift(env, exc) is None
-    assert env["SPEECH_BOUNDARY_JA_WINDOW_S"] == "20"
+    assert env["ASR_BATCH_SIZE"] == "4"
 
 
-def test_terminal_oom_guidance_marks_06b_as_unsupported():
+def test_chunking_oom_is_recognised_from_the_stage_message():
+    assert gpu_worker._oom_stage_from_message("切分 0/1") == "audio_chunking"
+    assert gpu_worker._oom_stage_from_message("音频切块 3/9...") == "audio_chunking"
+    for retired in ("语音岛检测 1/1", "Pre-ASR CueQC 1/1", "外边界精修 1/1"):
+        assert gpu_worker._oom_stage_from_message(retired) == ""
+
+
+def test_terminal_oom_guidance_offers_no_smaller_model():
+    # The 0.6B tier was dropped on 2026-07-31. Telling the user to switch
+    # to a model that no longer ships would send them chasing a fix that
+    # does not exist.
     detail = gpu_worker._terminal_oom_detail(
         env={
-            "ASR_BACKEND": "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf",
-            "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "4096",
+            "ASR_BACKEND": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+            "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "6144",
         },
         detail="CUDA out of memory",
         batch_size=1,
         retry_records=[],
     )
 
-    assert "0.6B 最低显存档" in detail
-    assert "当前硬件/可用显存下无法运行" in detail
+    assert "0.6B" not in detail
+    assert "只有 1.7B 一档" in detail
+    assert "当前硬件/可用显存下仍然不行" in detail
     assert "不会改用 CPU 或缩短时序窗口" in detail
 
 
@@ -554,5 +566,5 @@ def test_stage_worker_stops_with_low_vram_guidance_when_batch_one_oom(
     assert killed["count"] == 3
     assert "ASR_BATCH_SIZE 已降到 1" in exc_info.value.detail
     assert "任务已停止" in exc_info.value.detail
-    assert "0.6B" in exc_info.value.detail
-    assert "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf" in exc_info.value.detail
+    assert "0.6B" not in exc_info.value.detail
+    assert "只有 1.7B 一档" in exc_info.value.detail

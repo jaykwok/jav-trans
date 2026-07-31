@@ -12,7 +12,6 @@ from asr.backends.registry import (
     current_asr_worker_mode,
 )
 from asr.backends.qwen import active_qwen_asr_model_id
-from asr.pre_asr_cueqc import runtime_signature as pre_asr_cueqc_runtime_signature
 
 
 _LAST_BOUNDARY_SIGNATURE: dict = {}
@@ -159,7 +158,6 @@ def _get_asr_runtime_signature(
             "asr_max_new_tokens": _env_text("ASR_MAX_NEW_TOKENS", "128"),
             "asr_repetition_penalty": _env_text("ASR_REPETITION_PENALTY", "1.05"),
         },
-        "pre_asr_cueqc": pre_asr_cueqc_runtime_signature(),
         "boundary": _jsonable(boundary_signature) if isinstance(boundary_signature, dict) else {},
     }
 

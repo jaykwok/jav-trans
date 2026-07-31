@@ -153,20 +153,49 @@ def _summary_generated_time(summary: Mapping[str, Any]) -> str:
     return ""
 
 
+def audit_generated_at() -> str:
+    """Timestamp for a generator to record in its summary.
+
+    Written by the producer and read by `_summary_generated_time`, so the two
+    ends share one definition and the format cannot drift apart.
+    """
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
 def _entry_generated_time(
     index_path: Path,
     summary: Mapping[str, Any],
     *,
     mtime: float | None = None,
 ) -> str:
+    """When the page was made, in descending order of trustworthiness.
+
+    The directory-name prefix used to outrank the file's own mtime, and it is
+    the least reliable of the three. It is a batch label from the project's
+    naming convention, chosen by hand and in practice a round number - pages
+    stamped `_150000`, `_160000`, `_170000` and `_120000` were really written at
+    16:40, 17:54, 07:46 and 09:12. Worse, it never changes when a page is
+    regenerated: one page still advertised the previous day's label after being
+    rebuilt to pick up a playback fix, so the nav implied it lacked the fix.
+
+    It stays as a last resort, because a wrong time beats no time when a page
+    has neither a summary nor a stattable file, but it can no longer override a
+    real one.
+    """
     summary_time = _summary_generated_time(summary)
     if summary_time:
         return summary_time
-    dir_time = _timestamp_from_text(index_path.parent.name)
-    if dir_time:
-        return dir_time
-    stat_time = _audit_entry_mtime(index_path) if mtime is None else mtime
-    return _format_datetime(datetime.fromtimestamp(stat_time))
+    # The page's own mtime, not `_audit_entry_mtime`. That helper maxes over the
+    # whole directory, which is what ordering by recent activity wants but not
+    # what this label says: saving `manual_verdicts.jsonl` into the folder would
+    # push the reported generation time forward hours after the page was built.
+    try:
+        return _format_datetime(datetime.fromtimestamp(index_path.stat().st_mtime))
+    except OSError:
+        pass
+    if mtime is not None:
+        return _format_datetime(datetime.fromtimestamp(mtime))
+    return _timestamp_from_text(index_path.parent.name)
 
 
 def _audit_entry_mtime(index_path: Path) -> float:

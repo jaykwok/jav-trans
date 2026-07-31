@@ -1,93 +1,23 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
-from utils.runtime_paths import resource_path, runtime_path
-
-QWEN_ASR_06B_REPO_ID = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
+# The 0.6B low-VRAM tier was dropped on 2026-07-31: it is not maintained, the
+# alignment head is only trained against the 1.7B encoder, and an unmaintained
+# second tier costs a per-repo dimension on every setting and registry here.
 QWEN_ASR_17B_REPO_ID = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
 QWEN_ASR_REPO_ID = QWEN_ASR_17B_REPO_ID
 
 DEFAULT_QWEN_ASR_BACKEND = QWEN_ASR_REPO_ID
 QWEN_ASR_BACKEND_REPOS: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: QWEN_ASR_06B_REPO_ID,
     QWEN_ASR_17B_REPO_ID: QWEN_ASR_17B_REPO_ID,
 }
-SMALL_MODEL_CHECKPOINT_ROOT = Path("src/checkpoints")
-
-
-def repo_checkpoint_path(repo_id: str, model_name: str, version: str) -> str:
-    repo_tag = repo_id.replace("/", "-")
-    filename = f"{model_name}_{version}.{repo_tag}.pt"
-    return (SMALL_MODEL_CHECKPOINT_ROOT / repo_tag / filename).as_posix()
-
 
 DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO: dict[str, int] = {
-    QWEN_ASR_06B_REPO_ID: 12,
     QWEN_ASR_17B_REPO_ID: 4,
 }
 DEFAULT_QWEN_ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO: dict[str, int] = {
-    QWEN_ASR_06B_REPO_ID: 4096,
     QWEN_ASR_17B_REPO_ID: 6144,
-}
-DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: "",
-    QWEN_ASR_17B_REPO_ID: "",
-}
-DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: "",
-    QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
-        QWEN_ASR_17B_REPO_ID, "semantic_split_model", "v4"
-    ),
-}
-DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
-    # 0.6B intentionally has no Inner checkpoint until it is retrained against
-    # the binary acoustic-core contract. An empty value is the explicit
-    # registry placeholder; runtime must not borrow the 1.7B artifact.
-    QWEN_ASR_06B_REPO_ID: "",
-    QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
-        QWEN_ASR_17B_REPO_ID, "inner_edge_refiner", "v2"
-    ),
-}
-DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: "",
-    QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
-        QWEN_ASR_17B_REPO_ID, "pre_asr_cueqc", "v13"
-    ),
-}
-BOUNDARY_PIPELINE_STATUS_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: "pending_binary_retrain",
-    # Report the first unavailable stage in the active 1.7B chain.  Outer v3
-    # is also pending, but Scorer v11 must be audited/trained/promoted before
-    # the workflow can reach it.
-    QWEN_ASR_17B_REPO_ID: "pending_binary_scorer_audit",
-}
-
-
-def require_boundary_pipeline_ready(repo_id: str | None = None) -> str:
-    selected = qwen_asr_repo_id(repo_id or current_qwen_asr_backend())
-    status = BOUNDARY_PIPELINE_STATUS_BY_REPO[selected]
-    if status != "ready":
-        raise RuntimeError(
-            f"Boundary pipeline for ASR repo {selected!r} is {status}; "
-            "the complete repo-bound Boundary chain is not available"
-        )
-    return selected
-# Scorer v11 has not been promoted.  Retired v8/v9/v10 checkpoints remain
-# addressable by explicit paths for offline audits, but must never appear as
-# the active repo default.
-DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: "",
-    QWEN_ASR_17B_REPO_ID: "",
-}
-# Learned boundary-proposal candidate source for the 1.7B Split v4 chain.
-# The 0.6B entry stays empty until its complete binary chain is retrained.
-DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: "",
-    QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
-        QWEN_ASR_17B_REPO_ID, "boundary_proposal_scorer", "v1"
-    ),
 }
 
 
@@ -117,102 +47,6 @@ def qwen_asr_repo_tag(repo_id: str | None = None) -> str:
 
 def qwen_asr_default_model_path(repo_id: str | None = None) -> str:
     return f"models/{qwen_asr_repo_tag(repo_id)}"
-
-
-def repo_path_mapping(raw: str) -> dict[str, str]:
-    mapping: dict[str, str] = {}
-    for item in (raw or "").split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if "=" not in item:
-            raise ValueError(
-                "Invalid repo path mapping entry "
-                f"{item!r}; expected '<repo_id>=<path>'"
-            )
-        repo_id, path = item.split("=", 1)
-        repo_id = repo_id.strip()
-        path = path.strip()
-        if not repo_id or not path:
-            raise ValueError(
-                "Invalid repo path mapping entry "
-                f"{item!r}; repo id and path are required"
-            )
-        mapping[repo_id] = path
-    return mapping
-
-
-def checkpoint_path_for_repo_env(
-    *,
-    repo_id: str | None,
-    mapping_env: str,
-    default_mapping: dict[str, str] | None = None,
-    required: bool = True,
-) -> str:
-    selected_repo = qwen_asr_repo_id((repo_id or current_qwen_asr_backend()).strip())
-    raw = os.getenv(mapping_env, "").strip()
-    if raw.lower() in {"auto", "default"}:
-        mapping = dict(default_mapping or {})
-    elif raw:
-        try:
-            mapping = repo_path_mapping(raw)
-        except ValueError as exc:
-            raise RuntimeError(f"{mapping_env} is malformed: {exc}") from exc
-    else:
-        mapping = dict(default_mapping or {})
-    if not mapping:
-        if not required:
-            return ""
-        raise RuntimeError(
-            f"{mapping_env} is required. Set an explicit repo-id mapping like "
-            f"{selected_repo}=path/to/checkpoint.pt"
-        )
-    path = mapping.get(selected_repo, "").strip()
-    if not path:
-        if not required:
-            return ""
-        raise RuntimeError(
-            f"{mapping_env} has no checkpoint for ASR repo {selected_repo!r}. "
-            "Add a '<repo_id>=<checkpoint_path>' entry for the selected ASR backend."
-        )
-    expanded_path = Path(path).expanduser()
-    candidate_paths = [runtime_path(expanded_path)]
-    if not expanded_path.is_absolute():
-        resource_candidate = resource_path(expanded_path)
-        if resource_candidate != candidate_paths[0]:
-            candidate_paths.append(resource_candidate)
-    for checkpoint_path in candidate_paths:
-        if checkpoint_path.exists() and checkpoint_path.is_file():
-            return str(checkpoint_path)
-    checked = ", ".join(str(candidate) for candidate in candidate_paths)
-    if not checked:
-        checked = str(runtime_path(expanded_path))
-    raise FileNotFoundError(
-        f"{mapping_env} checkpoint for ASR repo {selected_repo!r} does not exist: "
-        f"{path} (checked: {checked})"
-    )
-
-
-def validate_checkpoint_repo_id(
-    actual_repo_id: str | None,
-    expected_repo_id: str | None,
-    *,
-    checkpoint_kind: str,
-    metadata_key: str,
-) -> str:
-    expected = qwen_asr_repo_id((expected_repo_id or current_qwen_asr_backend()).strip())
-    actual = str(actual_repo_id or "").strip()
-    if not actual:
-        raise ValueError(
-            f"{checkpoint_kind} checkpoint missing {metadata_key}; "
-            "repo-id binding cannot be verified"
-        )
-    if actual != expected:
-        raise ValueError(
-            f"{checkpoint_kind} checkpoint {metadata_key}={actual!r} does not match "
-            f"selected repo {expected!r}"
-        )
-    return actual
 
 
 def active_qwen_asr_model_id() -> str:

@@ -14,7 +14,11 @@ from asr.backends.qwen import (
     current_qwen_asr_backend,
     qwen_asr_default_batch_size,
 )
-from asr.subtitle_timing import build_boundary_word_timestamps
+from asr.alignment import AlignmentHead
+from asr.subtitle_timing import (
+    build_aligned_word_timestamps,
+    build_boundary_word_timestamps,
+)
 from asr.text_normalize import normalize_display_text, strip_text_punctuation
 
 logger = logging.getLogger(__name__)
@@ -318,6 +322,10 @@ class LocalAsrBackend:
         # VRAM. See _join_zombie_worker.
         self._zombie_future = None
         self._zombie_executor = None
+        # Loaded lazily on first use and only when ASR_ALIGNMENT_HEAD_PATH is
+        # set. `False` means "not looked at yet"; `None` means "looked, absent",
+        # which stops a missing checkpoint from being re-probed per chunk.
+        self._alignment_head: AlignmentHead | None | bool = False
 
     def load(self, on_stage: Callable[[str], None] | None = None) -> None:
         from transformers import AutoModelForMultimodalLM, AutoProcessor
@@ -646,11 +654,23 @@ class LocalAsrBackend:
         log: list[str],
     ) -> tuple[dict, list[str]]:
         log.append("Subtitle timing: boundary_chunk_timeline")
-        word_dicts, alignment_mode, timing_meta = build_boundary_word_timestamps(
-            master_text or raw_master_text,
-            timing_start,
-            timing_end,
-        )
+        text = master_text or raw_master_text
+        aligned = self._align_characters(normalized_path, text, log)
+        if aligned:
+            char_spans, acoustic_extent = aligned
+            word_dicts, alignment_mode, timing_meta = build_aligned_word_timestamps(
+                text,
+                char_spans,
+                timing_start,
+                timing_end,
+                acoustic_extent,
+            )
+        else:
+            word_dicts, alignment_mode, timing_meta = build_boundary_word_timestamps(
+                text,
+                timing_start,
+                timing_end,
+            )
         return self._build_finalize_output(
             word_dicts=normalize_word_dicts(word_dicts),
             master_text=master_text,
@@ -662,6 +682,87 @@ class LocalAsrBackend:
             timing_meta=timing_meta,
             timing_window_source=timing_window_source,
         )
+
+    def _resolve_alignment_head(self, log: list[str]) -> AlignmentHead | None:
+        if self._alignment_head is not False:
+            return self._alignment_head or None
+        try:
+            self._alignment_head = AlignmentHead.from_env()
+        except Exception as error:  # noqa: BLE001
+            # A bad checkpoint must not take the transcription down with it;
+            # synthetic timing is a working fallback, and the log says why.
+            logger.warning("alignment head unavailable: %s", error)
+            log.append(f"Subtitle timing: alignment head unavailable ({error})")
+            self._alignment_head = None
+        return self._alignment_head or None
+
+    def _align_characters(
+        self,
+        normalized_path: str,
+        text: str,
+        log: list[str],
+    ) -> tuple[list, tuple[float, float]] | None:
+        """Character times for `text`, measured off this chunk's own audio.
+
+        Returns the spans together with the utterance's acoustic extent, which
+        is a different measurement off the same tensor: the spans say where each
+        character is, the extent says where the sound starts and stops. Line
+        edges need the second one - see `alignment.speech_extent`.
+
+        Runs the encoder a second time on this chunk rather than reusing the
+        forward from `generate`. That is affordable precisely because of the
+        asymmetry the redesign rests on - encoder RTF is 0.00069 against 0.12273
+        for decode, so a whole extra encoder pass costs about half a percent of
+        the decode that just happened.
+        """
+        head = self._resolve_alignment_head(log)
+        if head is None or not (text or "").strip():
+            return None
+        try:
+            import numpy as np
+            import torch
+
+            from asr.qwen_native import (
+                move_processor_inputs,
+                prepare_transcription_inputs,
+            )
+            from audio.loading import load_audio_16k_mono
+            from asr.encoder_features import qwen3_asr_audio_output_lengths
+
+            if self.model is None or self.processor is None:
+                return None
+            audio, rate = load_audio_16k_mono(normalized_path)
+            if rate != 16000:
+                return None
+            inputs = prepare_transcription_inputs(
+                self.processor,
+                audio=[np.asarray(audio, dtype=np.float32)],
+                language=ASR_LANGUAGE,
+            )
+            moved = move_processor_inputs(inputs, device=self.device, dtype=self.dtype)
+            with torch.inference_mode():
+                features = self.model.get_audio_features(
+                    input_features=moved["input_features"],
+                    input_features_mask=moved["input_features_mask"],
+                ).pooler_output
+            frames = int(
+                qwen3_asr_audio_output_lengths(
+                    moved["input_features_mask"].sum(dim=1)
+                )[0]
+            )
+            aligned = head.align_extent(
+                features[:frames].detach().float().cpu().numpy(), text
+            )
+            if not aligned:
+                log.append("Subtitle timing: alignment declined, using proportional")
+                return None
+            spans, extent_start, extent_end = aligned
+            log.append(f"Subtitle timing: aligned {len(spans)} characters")
+            return spans, (extent_start, extent_end)
+        except Exception as error:  # noqa: BLE001
+            logger.warning("character alignment failed: %s", error)
+            log.append(f"Subtitle timing: alignment failed ({error})")
+            return None
 
     def _alignment_window_for_text_result(
         self,
@@ -712,6 +813,11 @@ class LocalAsrBackend:
             "alignment_mode": alignment_mode,
             "duration": duration,
             "language": detected_language,
+            # Carried out rather than only logged: `alignment_score` in here is
+            # the post-gate's one signal for text the acoustics do not support,
+            # and it is only measurable at this point, where the characters were
+            # aligned against this chunk's own audio.
+            "timing_meta": dict(timing_meta or {}),
         }, log
 
     def finalize_text_results(

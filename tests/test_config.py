@@ -122,32 +122,38 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_VRAM_BUDGET_MB"] == "auto"
     assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_VRAM_RATIO"] == "0.95"
     minimum_vram_table = config.DEFAULT_SETTINGS["ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO"]
-    assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=4096" in minimum_vram_table
     assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144" in minimum_vram_table
+    # The 0.6B tier was dropped on 2026-07-31; a leftover row would
+    # advertise a model that no longer ships.
+    assert "0.6B" not in minimum_vram_table
     assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_HEARTBEAT_S"] == "10"
     assert config.DEFAULT_SETTINGS["ASR_BATCH_SIZE"] == "auto"
-    assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
     assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
+    assert "0.6B" not in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
     assert "ASR_WORKER_MODE_BY_REPO" not in config.DEFAULT_SETTINGS
-    assert config.DEFAULT_SETTINGS["SPEECH_BOUNDARY_JA_WINDOW_S"] == "20.0"
-    assert config.DEFAULT_SETTINGS["SPEECH_BOUNDARY_JA_OVERLAP_S"] == "4.0"
-    assert "BOUNDARY_REFINER_MODEL_PATH_BY_REPO" not in config.DEFAULT_SETTINGS
-    assert "CUEQC_MODEL_PATH_BY_REPO" not in config.DEFAULT_SETTINGS
-    assert "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO" in config.DEFAULT_SETTINGS
-    for mapping in (
-        qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
-        qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
-        qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
-        qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
+    assert config.DEFAULT_SETTINGS["ASR_CHUNK_TARGET_S"] == "20.0"
+    assert config.DEFAULT_SETTINGS["ASR_CHUNK_MAX_S"] == "30.0"
+    assert config.DEFAULT_SETTINGS["ASR_CHUNK_MIN_PAUSE_S"] == "0.6"
+    # The retired chain must not leave settings behind: an advertised knob that
+    # nothing reads is worse than a missing one, because it looks adjustable.
+    for retired in (
+        "ASR_BOUNDARY_BACKEND",
+        "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        "CUEQC_MODEL_PATH_BY_REPO",
+        "SPEECH_BOUNDARY_JA_WINDOW_S",
+        "SPEECH_BOUNDARY_JA_OVERLAP_S",
+        "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
+        "OUTER_EDGE_REFINER_DEVICE",
+        "SEMANTIC_SPLIT_DEVICE",
+        "INNER_EDGE_REFINER_DEVICE",
+        "ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES",
+        "BOUNDARY_CACHE_ENABLED",
+        "BOUNDARY_CACHE_DIR",
+        "BOUNDARY_FEATURE_FRAME_HOP_S",
+        "PRE_ASR_CUEQC_ENABLED",
     ):
-        assert set(mapping) == {
-            qwen.QWEN_ASR_06B_REPO_ID,
-            qwen.QWEN_ASR_17B_REPO_ID,
-        }
-    assert set(qwen.DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO) == {
-        qwen.QWEN_ASR_06B_REPO_ID,
-        qwen.QWEN_ASR_17B_REPO_ID
-    }
+        assert retired not in config.DEFAULT_SETTINGS
+    assert not hasattr(qwen, "QWEN_ASR_06B_REPO_ID")
     assert "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT" not in config.DEFAULT_SETTINGS
     assert not any(key.startswith("ALIGN") for key in config.DEFAULT_SETTINGS)
     assert "BOUNDARY_REFINER_ENABLED" not in config.DEFAULT_SETTINGS
@@ -168,48 +174,26 @@ def test_default_model_download_root_is_project_models():
     assert "CUEQC_EXPORT_CANDIDATES_PATH" not in config.DEFAULT_SETTINGS
     assert "CUEQC_EXPORT_CANDIDATES_APPEND" not in config.DEFAULT_SETTINGS
     assert "CUEQC_SHADOW_EMBED_CANDIDATES" not in config.DEFAULT_SETTINGS
-    assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_ENABLED"] == "1"
     assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
 
 
-def test_boundary_registry_keeps_06b_and_17b_pending_placeholders() -> None:
-    assert set(qwen.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO) == {
-        qwen.QWEN_ASR_06B_REPO_ID,
-        qwen.QWEN_ASR_17B_REPO_ID,
-    }
-    assert "semantic_split_model_v4." in qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO[
-        qwen.QWEN_ASR_17B_REPO_ID
-    ]
-    assert "pre_asr_cueqc_v13." in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO[
-        qwen.QWEN_ASR_17B_REPO_ID
-    ]
-    assert qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO[
-        qwen.QWEN_ASR_17B_REPO_ID
-    ] == ""
-    assert qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO[
-        qwen.QWEN_ASR_17B_REPO_ID
-    ] == ""
-    assert qwen.BOUNDARY_PIPELINE_STATUS_BY_REPO[qwen.QWEN_ASR_06B_REPO_ID] == (
-        "pending_binary_retrain"
-    )
-    assert qwen.BOUNDARY_PIPELINE_STATUS_BY_REPO[qwen.QWEN_ASR_17B_REPO_ID] == (
-        "pending_binary_scorer_audit"
-    )
-    active_mappings = (
-        qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
-        qwen.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO,
-        qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
-        qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
-        qwen.DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
-        qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
-    )
-    for mapping in active_mappings:
-        assert mapping[qwen.QWEN_ASR_06B_REPO_ID] == ""
-    for mapping in active_mappings:
-        for repo_id, path in mapping.items():
-            if not path:
-                continue
-            assert path.startswith(f"src/checkpoints/{qwen.qwen_asr_repo_tag(repo_id)}/")
+def test_boundary_registries_are_gone_after_retirement() -> None:
+    """The chain was retired on 2026-07-31 and its tools left with it.
+
+    The empty per-repo registries were kept briefly for the offline tools, but
+    those tools moved to agents/rm/ too - so the registries and the machinery
+    that resolved through them must not exist at all.
+    """
+    for name in (
+        "DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO",
+        "DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO",
+        "DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO",
+        "DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO",
+        "DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO",
+        "DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO",
+        "BOUNDARY_PIPELINE_STATUS_BY_REPO",
+    ):
+        assert not hasattr(qwen, name), name
 
 
 def test_job_context_defaults_runtime_logs_from_config(monkeypatch, tmp_path):
@@ -240,7 +224,7 @@ def test_job_context_defaults_runtime_logs_from_config(monkeypatch, tmp_path):
 def test_asr_chunk_min_duration_removed_from_active_config_surface():
     active_files = (
         "src/asr/chunking.py",
-        "src/boundary/cache.py",
+        "src/asr/pregate.py",
         "src/core/config.py",
         "src/main.py",
         "README.md",
@@ -291,41 +275,17 @@ def test_subtitle_max_duration_clamp_removed_from_active_config_surface():
         assert "max_duration" not in text
 
 
-def test_pre_asr_cueqc_old_versions_removed_from_active_runtime_surface():
-    active_files = (
+def test_pre_asr_cueqc_modules_are_retired():
+    # The pre-ASR CueQC gate and its training tools moved to agents/rm/ on
+    # 2026-07-31; a resurrected module path would mean an accidental restore.
+    for relative_path in (
         "src/asr/pre_asr_cueqc.py",
-        "src/asr/backends/qwen.py",
-        "src/core/config.py",
-        "README.md",
-        "tools/workflows/run_full_workflow.py",
-        "tools/asr/cueqc/pre_asr_feature_compiler.py",
-        "tools/asr/cueqc/pre_asr_binary_trainer.py",
-    )
-    retired_tokens = (
-        "cueqc_pre_asr_mamba_v6",
-        "cueqc_pre_asr_mamba_v8",
-        "cueqc_pre_asr_mamba_v9",
-        "pre_asr_cueqc_features_v2",
-        "pre_asr_cueqc_features_v4",
-        "pre_asr_cueqc_features_v5",
-        "compile_pre_asr_v6",
-        "compile_pre_asr_v8",
-        "compile_pre_asr_v9",
-        "train_pre_asr_v6",
-        "train_pre_asr_v8",
-        "train_pre_asr_v9",
-        "export_pre_asr_v6",
-        "export_pre_asr_v8",
-        "export_pre_asr_v9",
-        "Pre-ASR CueQC v6",
-        "Pre-ASR CueQC v8",
-        "Pre-ASR CueQC v9",
-    )
-    for relative_path in active_files:
-        text = (ROOT / relative_path).read_text(encoding="utf-8")
-        for token in retired_tokens:
-            assert token not in text
-    assert qwen.QWEN_ASR_17B_REPO_ID in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO
+        "tools/asr/cueqc",
+        "src/boundary",
+        "src/audio/chunk_packer.py",
+        "tools/boundary",
+    ):
+        assert not (ROOT / relative_path).exists(), relative_path
 
 
 def test_asr_after_cueqc_removed_from_active_runtime_surface():

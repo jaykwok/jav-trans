@@ -8,16 +8,12 @@ from pipeline.artifacts import (
 )
 
 
-def test_translation_resume_snapshot_drops_large_pre_asr_features(tmp_path):
+def test_translation_resume_snapshot_keeps_asr_details(tmp_path):
     artifacts = AsrArtifacts(
         segments=[],
         audio_path=str(tmp_path / "audio.wav"),
         job_temp_dir=str(tmp_path),
         asr_details={
-            "pre_asr_candidates": [
-                {"pre_asr_ptm_pooled_features": [0.1] * 4096},
-                {"pre_asr_ptm_pooled_features": [0.2] * 4096},
-            ],
             "transcript_chunks": [{"text": "ok"}],
         },
         aligned_segments_path=str(tmp_path / "aligned.json"),
@@ -46,10 +42,10 @@ def test_translation_resume_snapshot_drops_large_pre_asr_features(tmp_path):
 
     payload = serialize_asr_artifacts(artifacts)
 
-    assert "pre_asr_candidates" not in payload["asr_details"]
-    assert payload["asr_details"]["pre_asr_candidate_count"] == 2
     assert payload["asr_details"]["transcript_chunks"] == [{"text": "ok"}]
-    assert "pre_asr_candidates" in artifacts.asr_details
+    # The snapshot copies asr_details verbatim; the pre-ASR candidate
+    # compaction was dropped with the chain that produced those candidates.
+    assert "pre_asr_candidate_count" not in payload["asr_details"]
 
 
 def test_snapshot_only_resolves_declared_path_fields(tmp_path, monkeypatch):

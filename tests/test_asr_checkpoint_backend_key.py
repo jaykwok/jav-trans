@@ -5,7 +5,7 @@ import importlib
 import numpy as np
 import pytest
 
-from helpers import ASR_06B_BACKEND, ASR_17B_BACKEND
+from helpers import ASR_17B_BACKEND
 
 
 def _checkpoint_name(
@@ -21,17 +21,6 @@ def _checkpoint_name(
     return asr._get_asr_checkpoint_path("sample.wav").name
 
 
-def test_checkpoint_key_rejects_pending_06b_boundary_repo(monkeypatch):
-    with pytest.raises(RuntimeError, match="has no checkpoint"):
-        _checkpoint_name(
-            monkeypatch,
-            asr_backend=ASR_06B_BACKEND,
-        )
-
-    assert _checkpoint_name(
-        monkeypatch,
-        asr_backend=ASR_17B_BACKEND,
-    ).startswith("asr_checkpoint_")
 
 
 def test_checkpoint_key_changes_with_asr_model_id_override(monkeypatch):
@@ -40,7 +29,7 @@ def test_checkpoint_key_changes_with_asr_model_id_override(monkeypatch):
         asr_backend=ASR_17B_BACKEND,
     )
 
-    monkeypatch.setenv("ASR_MODEL_ID", ASR_06B_BACKEND)
+    monkeypatch.setenv("ASR_MODEL_ID", f"{ASR_17B_BACKEND}-local-tune")
     tuned_key = _checkpoint_name(
         monkeypatch,
         asr_backend=ASR_17B_BACKEND,

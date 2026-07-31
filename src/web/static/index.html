@@ -54,14 +54,10 @@
         </label>
       </div>
 
-      <!-- Recognition settings -->
+      <!-- Model / environment readiness -->
       <div class="panel">
-        <div class="panel-title">🎯 识别设置</div>
+        <div class="panel-title">🎯 运行环境</div>
         <div class="form-grid">
-          <label class="field">
-            <span>ASR 后端</span>
-            <select id="r-backend"></select>
-          </label>
           <div id="model-requirements-notice" class="model-requirements-notice" hidden></div>
         </div>
       </div>
@@ -135,7 +131,7 @@
             <label class="field">
               <span>环境变量覆盖（每行 KEY=VALUE，优先级高于 .env）</span>
               <textarea id="t-env-override" rows="3"
-                placeholder="SPEECH_BOUNDARY_JA_SCORER_DEVICE=auto&#10;OUTER_EDGE_REFINER_DEVICE=auto"></textarea>
+                placeholder="ASR_ALIGNMENT_HEAD_PATH=./src/checkpoints/ctc_aligner.pt&#10;ASR_CHUNK_TARGET_S=20"></textarea>
             </label>
             <button class="btn btn-outline" id="btn-save-custom" type="button">保存自定义设置</button>
           </div>
@@ -207,16 +203,16 @@
                 <span>本地模型</span>
                 <select id="local-model-preset">
                   <option value="">-- 选择推荐模型 --</option>
-                  <option value="Tencent-Hunyuan/Hunyuan-Large">腾讯混元 Large (389B)</option>
-                  <option value="Qwen/Qwen2.5-72B-Instruct">通义千问 2.5 (72B)</option>
-                  <option value="Qwen/Qwen2.5-32B-Instruct">通义千问 2.5 (32B)</option>
+                  <option value="Qwen/Qwen3-4B">Qwen3 4B（约 9GB 显存）</option>
+                  <option value="Qwen/Qwen3-8B">Qwen3 8B（约 17GB 显存）</option>
+                  <option value="Qwen/Qwen3-14B">Qwen3 14B（约 30GB 显存）</option>
                   <option value="custom">自定义模型路径</option>
                 </select>
               </label>
 
               <label class="field" id="local-model-path-field" style="display:none">
                 <span>模型路径或 HuggingFace ID</span>
-                <input type="text" id="local-model-path" placeholder="例：D:\models\hunyuan 或 Qwen/Qwen2.5-72B-Instruct">
+                <input type="text" id="local-model-path" placeholder="例：D:\models\qwen3-8b 或 Qwen/Qwen3-8B">
               </label>
 
               <label class="field">
@@ -238,9 +234,9 @@
               </div>
 
               <p class="field-hint">
-                选择推荐模型后，首次使用会自动下载到当前 Hugging Face 缓存目录。
-                混元 Large 需要约 800GB 显存（多卡或量化），千问 72B 需要约 150GB 显存。
-                建议使用代理加速下载。
+                模型以 bf16 精度加载，显存不够会自动溢出到内存（速度明显下降）。
+                本地翻译与 ASR 共用同一块 GPU；显存紧张时选更小的模型或 CPU。
+                首次使用会自动下载到当前 Hugging Face 缓存目录，建议使用代理加速。
               </p>
             </div>
 
