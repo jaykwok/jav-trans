@@ -100,11 +100,13 @@ def list_backends() -> list[str]:
 
 
 def _register_builtin_backends() -> None:
+    from llm.backends.llamacpp_server import LlamaCppServerBackend
     from llm.backends.local_model import LocalModelBackend
     from llm.backends.openai_compat import OpenAICompatBackend
 
     register_backend("openai", OpenAICompatBackend)
     register_backend("local", LocalModelBackend)
+    register_backend("llamacpp", LlamaCppServerBackend)
 
 
 _register_builtin_backends()

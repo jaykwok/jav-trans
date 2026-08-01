@@ -23,7 +23,6 @@ from pipeline.artifacts import (
 )
 from pipeline.aligned_cache import try_load_aligned_segments
 from pipeline.audio import get_audio_cache_key
-from pipeline.cleanup import cleanup_asr_checkpoints
 from pipeline.ids import sanitize_job_id
 import main as pipeline_main
 from main import run_asr_alignment, run_translation_and_write
@@ -243,18 +242,6 @@ def _remove_job_temp_dir(job_id: str) -> None:
         return
     if path.is_dir():
         shutil.rmtree(path, ignore_errors=True)
-
-
-def _remove_job_caches(job: JobState) -> None:
-    # The boundary cache this used to purge was retired on 2026-07-31 together
-    # with the acoustic chain that wrote it; nothing produces those files now.
-    chunk_root = Path(
-        os.getenv("ASR_CHUNK_ROOT", PROJECT_ROOT / "tmp" / "chunks")
-    ).resolve()
-    cleanup_asr_checkpoints(
-        Path(_job_temp_dir(job.id)),
-        chunk_root.parent,
-    )
 
 
 def _translation_cache_path(job_id: str) -> str:
@@ -622,7 +609,6 @@ async def remove_job(job_id: str) -> bool:
             removed_job = job
 
     if removed_job is not None:
-        _remove_job_caches(removed_job)
         _remove_job_temp_dir(removed_job.id)
         return True
 
@@ -644,7 +630,6 @@ async def remove_finished_jobs() -> int:
         if removed_jobs:
             _write_jobs_unlocked()
     for job in removed_jobs:
-        _remove_job_caches(job)
         _remove_job_temp_dir(job.id)
     return len(removed_jobs)
 
@@ -668,7 +653,6 @@ async def evict_old_jobs(max_age_hours: int = 48) -> int:
         if removed_jobs:
             _write_jobs_unlocked()
     for job in removed_jobs:
-        _remove_job_caches(job)
         _remove_job_temp_dir(job.id)
     return len(removed_jobs)
 

@@ -1499,7 +1499,7 @@ class _GpuWorkerClient:
                 if on_stage is not None:
                     on_stage(
                         "GPU worker OOM; restarting worker and resuming from "
-                        f"cache/checkpoint with {setting} "
+                        f"ASR result cache with {setting} "
                         f"{previous_value:g}->{next_value:g}"
                     )
                 continue

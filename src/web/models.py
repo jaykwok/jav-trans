@@ -17,7 +17,7 @@ def normalize_llm_api_format(value: str | None) -> str:
 def normalize_llm_reasoning_effort(value: str | None) -> str:
     """Clamp an LLM reasoning effort to the supported set; default 'medium'."""
     normalized = (value or "medium").strip().lower()
-    return normalized if normalized in {"medium", "xhigh"} else "medium"
+    return normalized if normalized in {"minimal", "medium", "xhigh"} else "medium"
 
 
 class JobSpec(BaseModel):
@@ -32,7 +32,7 @@ class JobSpec(BaseModel):
     target_lang: str | None = Field(default=None, max_length=64)
     translation_glossary: str | None = Field(default=None, max_length=20000)
     llm_api_format: Literal["chat", "responses"] | None = None
-    llm_reasoning_effort: Literal["medium", "xhigh"] | None = None
+    llm_reasoning_effort: Literal["minimal", "medium", "xhigh"] | None = None
     keep_temp_files: bool = False
     resume_from_job_id: str = Field(default="", max_length=128)
     advanced: dict[str, str] = Field(default_factory=dict, max_length=100)
@@ -67,13 +67,17 @@ class SettingsRead(BaseModel):
     proxy_port: int | None = None
     translation_glossary: str = ""
     llm_api_format: Literal["chat", "responses"] = "chat"
-    llm_reasoning_effort: Literal["medium", "xhigh"] = "medium"
+    llm_reasoning_effort: Literal["minimal", "medium", "xhigh"] = "medium"
     target_lang: str = "简体中文"
-    translation_backend: Literal["openai", "local"] = "openai"
+    translation_backend: Literal["openai", "local", "llamacpp"] = "openai"
     local_model_path: str = ""
     local_model_device: Literal["cuda", "cpu"] = "cuda"
     local_model_max_length: int = 32768
     local_model_auto_download: bool = True
+    llamacpp_server_path: str = ""
+    llamacpp_model_repo: str = ""
+    llamacpp_model_file: str = ""
+    llamacpp_gguf_path: str = ""
 
 
 class SettingsUpdate(BaseModel):
@@ -85,10 +89,14 @@ class SettingsUpdate(BaseModel):
     proxy_port: int | None = Field(default=None, ge=1, le=65535)
     translation_glossary: str | None = None
     llm_api_format: Literal["chat", "responses"] | None = None
-    llm_reasoning_effort: Literal["medium", "xhigh"] | None = None
+    llm_reasoning_effort: Literal["minimal", "medium", "xhigh"] | None = None
     target_lang: str | None = None
-    translation_backend: Literal["openai", "local"] | None = None
+    translation_backend: Literal["openai", "local", "llamacpp"] | None = None
     local_model_path: str | None = None
     local_model_device: Literal["cuda", "cpu"] | None = None
     local_model_max_length: int | None = Field(default=None, ge=512, le=1000000)
     local_model_auto_download: bool | None = None
+    llamacpp_server_path: str | None = None
+    llamacpp_model_repo: str | None = None
+    llamacpp_model_file: str | None = None
+    llamacpp_gguf_path: str | None = None

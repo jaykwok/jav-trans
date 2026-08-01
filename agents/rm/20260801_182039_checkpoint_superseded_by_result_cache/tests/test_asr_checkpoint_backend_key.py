@@ -105,3 +105,45 @@ def test_checkpoint_excludes_quarantined_results():
     # persists, so quarantined chunks get re-transcribed on resume instead of
     # being silently restored as empty completed results.
     assert set(filtered.keys()) == {0}
+
+
+class _FakeTextBackend:
+    request_batch_size = 2
+
+    def transcribe_texts(self, audio_paths, on_stage=None):
+        return [
+            {"text": "テスト", "raw_text": "テスト", "duration": 1.0, "language": "Japanese"}
+            for _ in audio_paths
+        ]
+
+
+def test_completed_transcription_keeps_checkpoint_until_stage_cleanup(
+    monkeypatch, tmp_path
+):
+    """完成 258/258 后 VRAM 检查或对齐仍可能失败并重启 worker；
+    checkpoint 必须活到整个阶段成功，由 _cleanup_asr_checkpoint 收尾删除。"""
+    monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
+    monkeypatch.setenv("ASR_CHECKPOINT_INTERVAL", "1")
+    from asr import transcribe
+
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"")
+    chunks = [
+        {"index": i, "start": float(i), "end": float(i) + 1.0, "path": str(wav),
+         "source_audio_path": str(tmp_path / "src.wav")}
+        for i in range(3)
+    ]
+    monkeypatch.setattr(transcribe, "_get_wav_duration", lambda _p: 1.0, raising=False)
+
+    results, _ = transcribe._transcribe_asr_chunks_text_only(
+        _FakeTextBackend(), chunks, "ASR 文本转写"
+    )
+    assert len(results) == 3
+
+    source = transcribe._get_asr_checkpoint_source(chunks, "ASR 文本转写")
+    checkpoint_path = transcribe._get_asr_checkpoint_path(source)
+    assert checkpoint_path.exists(), "转写完成不得删除 checkpoint"
+
+    # 阶段成功后的收尾删除
+    transcribe._cleanup_asr_checkpoint(chunks, "ASR 文本转写")
+    assert not checkpoint_path.exists()

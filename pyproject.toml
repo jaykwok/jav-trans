@@ -18,6 +18,7 @@ dependencies = [
     "scipy",
     "soundfile",
     "torch>=2.13.0",
+    "torchcodec",
     "transformers>=5.13.0",
     "uvicorn[standard]",
     "xxhash",

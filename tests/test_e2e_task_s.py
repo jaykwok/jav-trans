@@ -94,11 +94,7 @@ def _load_cache(path: Path) -> dict:
 
 
 def _cleanup_job_temp(job_temp_dir: Path) -> None:
-    chunk_root = main.asr_module.current_asr_chunk_root()
-    cleanup_job_temp(
-        str(job_temp_dir),
-        checkpoint_root=chunk_root.resolve().parent,
-    )
+    cleanup_job_temp(str(job_temp_dir))
 
 
 def test_s1_skip_translation_writes_japanese_srt_without_translator(monkeypatch, tmp_path):

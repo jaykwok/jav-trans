@@ -11,11 +11,7 @@ from helpers import make_job_context, run_pipeline
 
 
 def _cleanup_job_temp(job_temp_dir: Path) -> None:
-    chunk_root = main.asr_module.current_asr_chunk_root()
-    cleanup_job_temp(
-        str(job_temp_dir),
-        checkpoint_root=chunk_root.resolve().parent,
-    )
+    cleanup_job_temp(str(job_temp_dir))
 
 
 def _segments(count: int = 5) -> list[dict]:
@@ -117,7 +113,7 @@ def _patch_pipeline(
     return ctx
 
 
-def test_cleanup_removes_translation_cache_and_matching_asr_checkpoint(monkeypatch, tmp_path):
+def test_cleanup_removes_translation_cache_and_job_temp(monkeypatch, tmp_path):
     job_dir = tmp_path / "jobs" / "clip"
     job_dir.mkdir(parents=True)
     (job_dir / "clip.transcript.json").write_text("{}", encoding="utf-8")
@@ -133,21 +129,15 @@ def test_cleanup_removes_translation_cache_and_matching_asr_checkpoint(monkeypat
     cache_memory_path.write_text("", encoding="utf-8")
     glossary_cache_path = tmp_path / "translation_global_glossary.abc123.json"
     glossary_cache_path.write_text("{}", encoding="utf-8")
-    checkpoint_root = tmp_path / "asr_root"
-    checkpoint_root.mkdir()
-    matching_checkpoint = checkpoint_root / "asr_checkpoint_match.json"
-    matching_checkpoint.write_text(
-        json.dumps({"audio_path": f"{audio_path}|mock_text_stage"}),
-        encoding="utf-8",
-    )
-    unrelated_checkpoint = checkpoint_root / "asr_checkpoint_other.json"
-    unrelated_checkpoint.write_text(
-        json.dumps({"audio_path": "other/job/audio.wav|mock_text_stage"}),
-        encoding="utf-8",
-    )
+    # The cross-job ASR result cache must survive job cleanup: that is the
+    # whole point of content addressing.
+    asr_cache_root = tmp_path / "asr_cache"
+    asr_cache_entry = asr_cache_root / "abcdef123456" / ("0" * 64 + ".json")
+    asr_cache_entry.parent.mkdir(parents=True)
+    asr_cache_entry.write_text("{}", encoding="utf-8")
 
     monkeypatch.setenv("TRANSLATION_CACHE_PATH", str(cache_path))
-    monkeypatch.setenv("ASR_CHUNK_ROOT", str(checkpoint_root / "chunks"))
+    monkeypatch.setenv("ASR_RESULT_CACHE_ROOT", str(asr_cache_root))
 
     _cleanup_job_temp(job_dir)
 
@@ -155,8 +145,7 @@ def test_cleanup_removes_translation_cache_and_matching_asr_checkpoint(monkeypat
     assert not cache_jsonl_path.exists()
     assert not cache_memory_path.exists()
     assert not glossary_cache_path.exists()
-    assert not matching_checkpoint.exists()
-    assert unrelated_checkpoint.exists()
+    assert asr_cache_entry.exists()
     assert not audio_path.exists()
 
 
@@ -195,12 +184,6 @@ def test_translation_crash_resume_and_success_cleanup(monkeypatch, tmp_path, cap
     job_dir = job_temp_root / "sample-j_60s"
     wav_files = list(job_dir.rglob("*.wav"))
     assert wav_files
-    checkpoint_path = tmp_path / "asr_root" / "asr_checkpoint_resume.json"
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint_path.write_text(
-        json.dumps({"audio_path": f"{wav_files[0]}|mock_text_stage"}),
-        encoding="utf-8",
-    )
 
     chat_calls.clear()
     monkeypatch.delenv("_TEST_CRASH_TRANSLATION_BATCH", raising=False)
@@ -215,7 +198,6 @@ def test_translation_crash_resume_and_success_cleanup(monkeypatch, tmp_path, cap
     assert srt_path.exists()
     assert srt_path.read_text(encoding="utf-8").count("-->") == 5
     assert not cache_path.exists()
-    assert not checkpoint_path.exists()
     assert not list(job_dir.rglob("*.wav")) if job_dir.exists() else True
 
 

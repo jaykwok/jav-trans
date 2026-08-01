@@ -1,8 +1,8 @@
 import json
 
 from llm import translator
-def test_prompt_version_is_v29():
-    assert translator.PROMPT_VERSION == "v2.9"
+def test_prompt_version_is_v31():
+    assert translator.PROMPT_VERSION == "v3.1"
 
 
 def test_system_prompt_no_male_prefix_example():

@@ -275,8 +275,10 @@ def test_timing_polish_preserves_natural_pause():
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
 
-    assert prepared[0]["end"] == pytest.approx(1.2)
-    assert prepared[1]["start"] - prepared[0]["end"] == pytest.approx(0.6)
+    # Linger stops at next_start - short_gap_collapse_s, keeping a visible
+    # half-second pause; the 0.5s acoustic-shift cap no longer binds first.
+    assert prepared[0]["end"] == pytest.approx(1.3)
+    assert prepared[1]["start"] - prepared[0]["end"] == pytest.approx(0.5)
 
 
 def test_timing_polish_disabled_keeps_existing_alignment_end():
@@ -586,3 +588,31 @@ def test_write_bilingual_srt_does_not_emit_acoustic_prefix(tmp_path):
 
     content = path.read_text(encoding="utf-8")
     assert "过来" in content
+
+
+def test_unsplittable_long_block_display_clamped_to_seven_seconds():
+    # A near-textless 30s span (long moan) gives the split DP no usable break
+    # positions; the display window must still respect the 7s ceiling while the
+    # acoustic span survives as provenance.
+    blocks = [{"start": 0.0, "end": 30.0, "ja_text": "んっ", "zh_text": "嗯"}]
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=SubtitleOptions())
+
+    assert len(prepared) == 1
+    cue = prepared[0]
+    assert cue["display_end"] - cue["display_start"] == pytest.approx(7.0)
+    assert cue["display_clamped_to_max"] is True
+    assert cue["acoustic_end"] == pytest.approx(30.0)
+    assert cue["duration_violation"] is False
+
+
+def test_splittable_long_block_is_not_clamped():
+    text = "今日は本当にいい天気ですね。散歩に行きましょう。公園でお弁当を食べたいです。"
+    blocks = [{"start": 0.0, "end": 20.0, "ja_text": text, "zh_text": text}]
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=SubtitleOptions())
+
+    assert len(prepared) >= 2
+    for cue in prepared:
+        assert cue["display_end"] - cue["display_start"] <= 7.0 + 1e-6
+        assert cue["display_clamped_to_max"] is False

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from subtitles.options import SubtitleOptions
+from subtitles.zh_style import normalize_zh_subtitle_text, wrap_zh_subtitle_text
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,16 @@ def _wrap_subtitle_text(
         for line in lines
         for wrapped in [_wrap_subtitle_line(line.strip(), options.line_max_chars)]
         if wrapped.strip()
+    )
+
+
+def _render_zh_subtitle_text(text: str, *, options: SubtitleOptions) -> str:
+    """Netflix CHS TTSG presentation pass: normalize punctuation, wrap ≤2 lines."""
+    normalized = normalize_zh_subtitle_text(text)
+    return wrap_zh_subtitle_text(
+        normalized,
+        line_max_units=float(options.line_max_chars),
+        ascii_alnum_weight=options.ascii_char_weight,
     )
 
 
@@ -813,6 +824,14 @@ def _finalize_layout_fields(
         display_end = max(display_start, _safe_float(item.get("end"), display_start))
         acoustic_start = _safe_float(item.get("acoustic_start"), display_start)
         acoustic_end = max(acoustic_start, _safe_float(item.get("acoustic_end"), display_end))
+        # Hard 7s ceiling. The two DP passes split everything splittable; what
+        # reaches this point unsplit (single-character moans over a 30s span)
+        # gets its display window clamped while the acoustic span stays intact
+        # as provenance.
+        item["display_clamped_to_max"] = False
+        if max_display_s > 0.0 and display_end - display_start > max_display_s:
+            display_end = display_start + max_display_s
+            item["display_clamped_to_max"] = True
         item["start"] = display_start
         item["end"] = display_end
         item["display_start"] = display_start
@@ -940,10 +959,10 @@ def write_srt(
             start_str = format_timestamp(start)
             end_str   = format_timestamp(end)
             zh_text = str(block.get("zh_text", "")).strip()
-            if not zh_text:
+            wrapped = _render_zh_subtitle_text(zh_text, options=options)
+            if not wrapped:
                 logger.warning("Empty translated subtitle at index %s; using placeholder", idx)
-                zh_text = "「未翻译」"
-            wrapped = _wrap_subtitle_text(zh_text, options=options)
+                wrapped = "「未翻译」"
             f.write(f"{idx}\n{start_str} --> {end_str}\n{wrapped}\n\n")
     return blocks
 
@@ -970,11 +989,13 @@ def write_bilingual_srt(
             start_str = format_timestamp(start)
             end_str   = format_timestamp(end)
             ja_line = _wrap_subtitle_text(block.get("ja_text", ""), options=options)
-            zh_text = str(block.get("zh_text", "")).strip()
-            if not zh_text:
+            zh_line = _render_zh_subtitle_text(
+                str(block.get("zh_text", "")).strip(),
+                options=options,
+            )
+            if not zh_line:
                 logger.warning("Empty translated subtitle at index %s; using placeholder", idx)
-                zh_text = "「未翻译」"
-            zh_line = _wrap_subtitle_text(zh_text, options=options)
+                zh_line = "「未翻译」"
             content = "\n".join(
                 line for line in (ja_line + "\n" + zh_line).split("\n") if line.strip()
             )

@@ -33,7 +33,9 @@ def test_subtitle_options_defaults_are_conservative():
     assert options.frame_min_duration_s == pytest.approx(20 / BASE_FPS)
     assert options.timing_polish_enabled is True
     assert options.short_gap_collapse_s == 0.5
-    assert options.linger_s == 0.45
+    assert options.linger_s == 0.5
+    assert options.line_max_chars == 16
+    assert options.max_display_shift_from_acoustic_end_s == 0.5
 
 
 def test_write_srt_ignores_speaker_metadata(tmp_path):
@@ -73,7 +75,7 @@ def test_prepare_srt_blocks_timeline_mode_is_per_options(monkeypatch, tmp_path):
     )
 
     content = path.read_text(encoding="utf-8")
-    assert "00:00:00,000 --> 00:00:01,284" in content
+    assert "00:00:00,000 --> 00:00:01,334" in content
 
 
 def test_prepare_bilingual_keeps_adjacent_cues_separate(tmp_path):

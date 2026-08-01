@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from asr import chunking, local_backend, pipeline, transcribe
+from asr import chunking, local_backend, pipeline, result_cache, transcribe
 
 
 def test_chunk_settings_refresh_between_calls(monkeypatch, tmp_path):
@@ -20,21 +20,17 @@ def test_chunk_settings_refresh_between_calls(monkeypatch, tmp_path):
 
 
 def test_transcribe_settings_refresh_between_calls(monkeypatch):
-    monkeypatch.setenv("ASR_CHECKPOINT_INTERVAL", "7")
-    monkeypatch.setenv("ASR_CHECKPOINT_ENABLED", "0")
+    monkeypatch.setenv("ASR_RESULT_CACHE_ENABLED", "0")
     monkeypatch.setenv("ASR_INVALID_SEGMENT_DURATION", "0.2")
     monkeypatch.setenv("ASR_MIN_REPAIRED_SEGMENT_DURATION", "0.8")
-    assert transcribe._asr_checkpoint_interval() == 7
-    assert not transcribe._asr_checkpoint_enabled()
+    assert not result_cache.result_cache_enabled()
     assert transcribe._asr_invalid_segment_duration_s() == 0.2
     assert transcribe._asr_min_repaired_segment_duration_s() == 0.8
 
-    monkeypatch.setenv("ASR_CHECKPOINT_INTERVAL", "11")
-    monkeypatch.setenv("ASR_CHECKPOINT_ENABLED", "1")
+    monkeypatch.setenv("ASR_RESULT_CACHE_ENABLED", "1")
     monkeypatch.setenv("ASR_INVALID_SEGMENT_DURATION", "0.05")
     monkeypatch.setenv("ASR_MIN_REPAIRED_SEGMENT_DURATION", "0.5")
-    assert transcribe._asr_checkpoint_interval() == 11
-    assert transcribe._asr_checkpoint_enabled()
+    assert result_cache.result_cache_enabled()
     assert transcribe._asr_invalid_segment_duration_s() == 0.05
     assert transcribe._asr_min_repaired_segment_duration_s() == 0.5
 

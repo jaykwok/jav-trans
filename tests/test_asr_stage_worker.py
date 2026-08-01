@@ -34,21 +34,23 @@ def test_vram_budget_enforced_on_allocated_not_reserved(monkeypatch):
         )
 
 
-def test_shared_vram_spill_is_soft_oom(monkeypatch):
+def test_shared_vram_jitter_below_tolerance_is_not_spill(monkeypatch):
     monkeypatch.setenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "5600")
-    with pytest.raises(RuntimeError, match="shared VRAM spill"):
-        asr_pipeline._enforce_vram_budget_from_snapshot(
-            {
-                "stage": "split_done",
-                "shared_vram_mb": 0.001,
-                "physical_ram_used_mb": 1000.0,
-                "physical_ram_budget_mb": 15000.0,
-                "max_allocated_mb": 4800.0,
-            }
-        )
+    # The PDH counter jitters by a few MB from driver staging buffers; a 4MB
+    # delta once killed a fully finished transcription pass three times in a
+    # row. Growth below the tolerance must NOT raise.
+    asr_pipeline._enforce_vram_budget_from_snapshot(
+        {
+            "stage": "asr_text_transcribe_done",
+            "shared_vram_mb": 4.0,
+            "physical_ram_used_mb": 1000.0,
+            "physical_ram_budget_mb": 15000.0,
+            "max_allocated_mb": 4800.0,
+        }
+    )
 
 
-def test_shared_vram_any_positive_spill_is_soft_oom(monkeypatch):
+def test_shared_vram_growth_above_tolerance_is_soft_oom(monkeypatch):
     monkeypatch.setenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "5600")
     base = {
         "stage": "split_done",
@@ -59,7 +61,22 @@ def test_shared_vram_any_positive_spill_is_soft_oom(monkeypatch):
     }
     with pytest.raises(RuntimeError, match="shared VRAM spill"):
         asr_pipeline._enforce_vram_budget_from_snapshot(
-            {**base, "shared_vram_mb": 0.001}
+            {**base, "shared_vram_mb": 65.0}
+        )
+
+
+def test_shared_vram_spill_tolerance_env_override(monkeypatch):
+    monkeypatch.setenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "5600")
+    monkeypatch.setenv("ASR_SHARED_VRAM_SPILL_TOLERANCE_MB", "0")
+    with pytest.raises(RuntimeError, match="shared VRAM spill"):
+        asr_pipeline._enforce_vram_budget_from_snapshot(
+            {
+                "stage": "split_done",
+                "shared_vram_mb": 0.001,
+                "physical_ram_used_mb": 1000.0,
+                "physical_ram_budget_mb": 15000.0,
+                "max_allocated_mb": 4800.0,
+            }
         )
 
 

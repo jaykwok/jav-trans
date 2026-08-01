@@ -72,6 +72,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_STAGE_WORKER_VRAM_RATIO": "0.95",
     "ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144",
     "ASR_STAGE_WORKER_RAM_RATIO": "0.95",
+    # The Windows PDH shared-VRAM counter jitters by a few MB even when the
+    # allocator is hard-capped and cannot spill; only growth beyond this
+    # tolerance counts as a real WDDM spill.
+    "ASR_SHARED_VRAM_SPILL_TOLERANCE_MB": "64",
     "ASR_STAGE_WORKER_HEARTBEAT_S": "10",
     # Cross-job auto-batch learning. Successful jobs below the utilization
     # threshold probe between the safe batch and current upper bound; OOM
@@ -163,11 +167,39 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Auto-download model from HuggingFace if not present locally
     "LOCAL_MODEL_AUTO_DOWNLOAD": "1",
 
+    # --- llama.cpp GGUF Settings (when TRANSLATION_BACKEND=llamacpp) ---
+    # Runs Sakura/GalTransl and other quantized GGUF models through a managed
+    # local llama-server process (official prebuilt CUDA binaries; OpenAI
+    # protocol on 127.0.0.1). Empty server path means "find llama-server on
+    # PATH" (winget install llama.cpp).
+    "LLAMACPP_SERVER_PATH": "",
+    # Default model: GalTransl 7B v3.7 Q6_K -- the galgame-specialized JA->ZH
+    # tier the model card recommends for 8GB GPUs (~6.3GB file, CC-BY-NC-SA).
+    "LLAMACPP_MODEL_REPO": "SakuraLLM/Sakura-GalTransl-7B-v3.7",
+    "LLAMACPP_MODEL_FILE": "Sakura-Galtransl-7B-v3.7.gguf",
+    # Explicit local GGUF path wins over repo+file download.
+    "LLAMACPP_GGUF_PATH": "",
+    # Context per server slot; total server context is CTX_SIZE * PARALLEL.
+    "LLAMACPP_CTX_SIZE": "8192",
+    "LLAMACPP_N_GPU_LAYERS": "999",
+    "LLAMACPP_PARALLEL": "4",
+    "LLAMACPP_STARTUP_TIMEOUT_S": "300",
+    # Sakura line-oriented prompt profile: auto | sakura | json. auto switches
+    # on exactly when the configured model is a Sakura/GalTransl variant.
+    "TRANSLATION_PROMPT_PROFILE": "auto",
+    "SAKURA_BATCH_SIZE": "8",
+    "SAKURA_WORKERS": "4",
+    "SAKURA_HISTORY_LINES": "8",
+
     # --- Output & Cache ---
     # Root directory for per-video temporary files.
     "JOB_TEMP_DIR": "./tmp/jobs",
-    # Root directory for transient ASR wav chunks and crash-resume checkpoints.
+    # Root directory for transient ASR wav chunks.
     "ASR_CHUNK_ROOT": "./tmp/chunks",
+    # Cross-job content-addressed ASR result cache (survives job cleanup);
+    # set ASR_RESULT_CACHE_ENABLED=0 to disable reads and writes.
+    "ASR_RESULT_CACHE_ROOT": "./tmp/asr_cache",
+    "ASR_RESULT_CACHE_ENABLED": "1",
     # 1 writes per-job run logs and persistent timing sidecars under RUN_LOG_DIR.
     "RUN_LOG_ENABLED": "1",
     # Persistent diagnostics root. Runtime creates one subdirectory per job id.

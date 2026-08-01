@@ -153,6 +153,23 @@ export async function loadSettings() {
       if (autoDownload) autoDownload.checked = s.local_model_auto_download;
     }
 
+    // llama.cpp (Sakura / GGUF) backend fields
+    const lcPreset = $('llamacpp-model-preset');
+    if (lcPreset) {
+      if (s.llamacpp_gguf_path) {
+        lcPreset.value = 'custom';
+        const pathField = $('llamacpp-gguf-path-field');
+        if (pathField) pathField.style.display = '';
+        const pathInput = $('llamacpp-gguf-path');
+        if (pathInput) pathInput.value = s.llamacpp_gguf_path;
+      } else if (s.llamacpp_model_repo && s.llamacpp_model_file) {
+        const key = `${s.llamacpp_model_repo}|${s.llamacpp_model_file}`;
+        if ([...lcPreset.options].some(opt => opt.value === key)) lcPreset.value = key;
+      }
+    }
+    const lcServer = $('llamacpp-server-path');
+    if (lcServer && s.llamacpp_server_path) lcServer.value = s.llamacpp_server_path;
+
     const proxyProtocol = $('proxy-protocol');
     if (proxyProtocol) proxyProtocol.value = s.proxy_protocol || 'http';
     const proxyHost = $('proxy-host');
@@ -225,6 +242,19 @@ export function readTranslationSettingsFromForm() {
     body.local_model_device = $('local-model-device')?.value || 'cuda';
     body.local_model_max_length = parseInt($('local-model-max-length')?.value || '32768', 10);
     body.local_model_auto_download = !!$('local-model-auto-download')?.checked;
+  }
+
+  if (backend === 'llamacpp') {
+    const preset = $('llamacpp-model-preset')?.value || '';
+    if (preset === 'custom') {
+      body.llamacpp_gguf_path = $('llamacpp-gguf-path')?.value?.trim() || '';
+    } else if (preset.includes('|')) {
+      const [repo, file] = preset.split('|');
+      body.llamacpp_model_repo = repo;
+      body.llamacpp_model_file = file;
+      body.llamacpp_gguf_path = '';
+    }
+    body.llamacpp_server_path = $('llamacpp-server-path')?.value?.trim() || '';
   }
 
   return body;
@@ -436,8 +466,10 @@ export function installSettingsPanel() {
   $('translation-backend')?.addEventListener('change', () => {
     const backend = $('translation-backend').value;
     const openaiFields = $('openai-backend-fields');
+    const llamacppFields = $('llamacpp-backend-fields');
     const localFields = $('local-backend-fields');
     if (openaiFields) openaiFields.style.display = backend === 'openai' ? '' : 'none';
+    if (llamacppFields) llamacppFields.style.display = backend === 'llamacpp' ? '' : 'none';
     if (localFields) localFields.style.display = backend === 'local' ? '' : 'none';
   });
 
@@ -445,6 +477,13 @@ export function installSettingsPanel() {
   $('local-model-preset')?.addEventListener('change', () => {
     const preset = $('local-model-preset').value;
     const pathField = $('local-model-path-field');
+    if (pathField) pathField.style.display = preset === 'custom' ? '' : 'none';
+  });
+
+  // llama.cpp GGUF preset switcher
+  $('llamacpp-model-preset')?.addEventListener('change', () => {
+    const preset = $('llamacpp-model-preset').value;
+    const pathField = $('llamacpp-gguf-path-field');
     if (pathField) pathField.style.display = preset === 'custom' ? '' : 'none';
   });
 

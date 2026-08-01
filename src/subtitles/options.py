@@ -32,14 +32,14 @@ class SubtitleOptions:
     timeline_mode: str = "alignment"
     bilingual_secondary_weight: float = 0.4
     ascii_char_weight: float = 0.55
-    line_max_chars: int = 25
+    line_max_chars: int = 16
     timing_polish_enabled: bool = True
     short_gap_collapse_s: float = 0.5
-    linger_s: float = 0.45
+    linger_s: float = 0.5
     weak_cut_snap_short_s: float = 0.25
     weak_cut_snap_normal_s: float = 0.40
     weak_cut_snap_long_s: float = 0.60
-    max_display_shift_from_acoustic_end_s: float = 0.20
+    max_display_shift_from_acoustic_end_s: float = 0.5
 
     @property
     def frame_duration_s(self) -> float:
@@ -82,13 +82,13 @@ class SubtitleOptions:
                 os.getenv("SUBTITLE_BILINGUAL_SECONDARY_WEIGHT", "0.4")
             ),
             ascii_char_weight=float(os.getenv("SUBTITLE_ASCII_CHAR_WEIGHT", "0.55")),
-            line_max_chars=max(0, int(os.getenv("SRT_LINE_MAX_CHARS", "25"))),
+            line_max_chars=max(0, int(os.getenv("SRT_LINE_MAX_CHARS", "16"))),
             timing_polish_enabled=_env_bool("SUBTITLE_TIMING_POLISH_ENABLED", True),
             short_gap_collapse_s=max(
                 0.0,
                 float(os.getenv("SUBTITLE_SHORT_GAP_COLLAPSE_S", "0.5")),
             ),
-            linger_s=max(0.0, float(os.getenv("SUBTITLE_LINGER_S", "0.45"))),
+            linger_s=max(0.0, float(os.getenv("SUBTITLE_LINGER_S", "0.5"))),
             weak_cut_snap_short_s=max(
                 0.0,
                 float(os.getenv("SUBTITLE_WEAK_CUT_SNAP_SHORT_S", "0.25")),
@@ -103,7 +103,7 @@ class SubtitleOptions:
             ),
             max_display_shift_from_acoustic_end_s=max(
                 0.0,
-                float(os.getenv("SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_END_S", "0.20")),
+                float(os.getenv("SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_END_S", "0.5")),
             ),
         )
 

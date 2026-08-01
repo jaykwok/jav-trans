@@ -1,4 +1,4 @@
-from llm import translator
+from llm import profiles, translator
 def _segments() -> list[dict]:
     return [
         {"start": 0.0, "end": 1.0, "text": "いい"},
@@ -47,7 +47,7 @@ def test_translation_cache_key_changes_with_target_lang():
 def test_translation_cache_key_changes_with_prompt_version(monkeypatch):
     first = translator._translation_cache_key(0, _segments(), glossary="健太（男主）")
 
-    monkeypatch.setattr(translator, "PROMPT_VERSION", "v-test-next")
+    monkeypatch.setattr(profiles.get_profile("json"), "version", "v-test-next")
     second = translator._translation_cache_key(0, _segments(), glossary="健太（男主）")
 
     assert first != second
@@ -140,7 +140,7 @@ def test_translation_memory_key_changes_with_character_reference():
 def test_translation_memory_key_changes_with_prompt_version(monkeypatch):
     first = translator._translation_memory_key("いい", glossary="", target_lang="简体中文")
 
-    monkeypatch.setattr(translator, "PROMPT_VERSION", "v-test-next")
+    monkeypatch.setattr(profiles.get_profile("json"), "version", "v-test-next")
     second = translator._translation_memory_key("いい", glossary="", target_lang="简体中文")
 
     assert first != second

@@ -435,7 +435,7 @@ async def get_settings() -> SettingsRead:
     )
     target_lang = _runtime_or_env_or_setting("TARGET_LANG", "简体中文")
     translation_backend = _runtime_or_env_or_setting("TRANSLATION_BACKEND", "openai")
-    if translation_backend not in {"openai", "local"}:
+    if translation_backend not in {"openai", "local", "llamacpp"}:
         translation_backend = "openai"
     local_model_path = _runtime_or_env_or_setting("LOCAL_MODEL_PATH", "")
     local_model_device = _runtime_or_env_or_setting("LOCAL_MODEL_DEVICE", "cuda")
@@ -449,6 +449,10 @@ async def get_settings() -> SettingsRead:
         local_model_max_length = 32768
     local_model_max_length = max(512, min(1_000_000, local_model_max_length))
     local_model_auto_download = _truthy(_runtime_or_env_or_setting("LOCAL_MODEL_AUTO_DOWNLOAD", "1"))
+    llamacpp_server_path = _runtime_or_env_or_setting("LLAMACPP_SERVER_PATH", "")
+    llamacpp_model_repo = _runtime_or_env_or_setting("LLAMACPP_MODEL_REPO", "")
+    llamacpp_model_file = _runtime_or_env_or_setting("LLAMACPP_MODEL_FILE", "")
+    llamacpp_gguf_path = _runtime_or_env_or_setting("LLAMACPP_GGUF_PATH", "")
 
     return SettingsRead(
         api_key_set=bool(api_key),
@@ -467,6 +471,10 @@ async def get_settings() -> SettingsRead:
         local_model_device=local_model_device,
         local_model_max_length=local_model_max_length,
         local_model_auto_download=local_model_auto_download,
+        llamacpp_server_path=llamacpp_server_path,
+        llamacpp_model_repo=llamacpp_model_repo,
+        llamacpp_model_file=llamacpp_model_file,
+        llamacpp_gguf_path=llamacpp_gguf_path,
     )
 
 
@@ -474,6 +482,7 @@ async def get_settings() -> SettingsRead:
 async def post_settings(update: SettingsUpdate) -> dict:
     changes: dict[str, str] = {}
     reset_local_translation_backend = False
+    reset_llamacpp_translation_backend = False
     if update.api_key is not None:
         changes["API_KEY"] = update.api_key
         os.environ["API_KEY"] = update.api_key
@@ -493,10 +502,10 @@ async def post_settings(update: SettingsUpdate) -> dict:
         changes["LLM_API_FORMAT"] = update.llm_api_format
         os.environ["LLM_API_FORMAT"] = update.llm_api_format
     if update.llm_reasoning_effort is not None:
-        if update.llm_reasoning_effort not in {"medium", "xhigh"}:
+        if update.llm_reasoning_effort not in {"minimal", "medium", "xhigh"}:
             raise HTTPException(
                 status_code=422,
-                detail="llm_reasoning_effort must be one of: medium, xhigh",
+                detail="llm_reasoning_effort must be one of: minimal, medium, xhigh",
             )
         changes["LLM_REASONING_EFFORT"] = update.llm_reasoning_effort
         os.environ["LLM_REASONING_EFFORT"] = update.llm_reasoning_effort
@@ -504,14 +513,15 @@ async def post_settings(update: SettingsUpdate) -> dict:
         changes["TARGET_LANG"] = update.target_lang
         os.environ["TARGET_LANG"] = update.target_lang
     if update.translation_backend is not None:
-        if update.translation_backend not in {"openai", "local"}:
+        if update.translation_backend not in {"openai", "local", "llamacpp"}:
             raise HTTPException(
                 status_code=422,
-                detail="translation_backend must be one of: openai, local",
+                detail="translation_backend must be one of: openai, local, llamacpp",
             )
         changes["TRANSLATION_BACKEND"] = update.translation_backend
         os.environ["TRANSLATION_BACKEND"] = update.translation_backend
         reset_local_translation_backend = update.translation_backend != "local"
+        reset_llamacpp_translation_backend = update.translation_backend != "llamacpp"
     if update.local_model_path is not None:
         changes["LOCAL_MODEL_PATH"] = update.local_model_path
         os.environ["LOCAL_MODEL_PATH"] = update.local_model_path
@@ -532,15 +542,31 @@ async def post_settings(update: SettingsUpdate) -> dict:
         changes["LOCAL_MODEL_AUTO_DOWNLOAD"] = "1" if update.local_model_auto_download else "0"
         os.environ["LOCAL_MODEL_AUTO_DOWNLOAD"] = "1" if update.local_model_auto_download else "0"
         reset_local_translation_backend = True
+    for field_name, env_key in (
+        ("llamacpp_server_path", "LLAMACPP_SERVER_PATH"),
+        ("llamacpp_model_repo", "LLAMACPP_MODEL_REPO"),
+        ("llamacpp_model_file", "LLAMACPP_MODEL_FILE"),
+        ("llamacpp_gguf_path", "LLAMACPP_GGUF_PATH"),
+    ):
+        value = getattr(update, field_name)
+        if value is not None:
+            changes[env_key] = value
+            os.environ[env_key] = value
+            # A running llama-server keeps the old GGUF loaded; drop it so the
+            # next translation spawns with the new configuration.
+            reset_llamacpp_translation_backend = True
     if changes:
         _clear_saved_hf_mirror_if_present(changes)
         _update_env_file(changes)
-    if reset_local_translation_backend:
+    if reset_local_translation_backend or reset_llamacpp_translation_backend:
         from llm.backends import reset_backend
 
         # Releasing a model may wait for an active generate() call. Keep that
         # wait off the FastAPI event loop so SSE and cancellation stay alive.
-        await asyncio.to_thread(reset_backend, "local")
+        if reset_local_translation_backend:
+            await asyncio.to_thread(reset_backend, "local")
+        if reset_llamacpp_translation_backend:
+            await asyncio.to_thread(reset_backend, "llamacpp")
     return {"ok": True}
 
 

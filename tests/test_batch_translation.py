@@ -83,7 +83,7 @@ def test_env_int_clamped_bounds_and_fallback(monkeypatch):
     assert translator._env_int_clamped("TRANSLATION_BATCH_SIZE", 64, 8, 400) == 64
 
 
-def test_translate_segments_single_request_when_below_threshold(monkeypatch):
+def test_translate_segments_single_batch_below_threshold(monkeypatch):
     calls: list[int] = []
 
     def fake_chat(messages, expected_count=0, on_progress=None, **_kwargs):
@@ -105,7 +105,7 @@ def test_translate_segments_single_request_when_below_threshold(monkeypatch):
     assert len(zh_texts) == 60
     assert zh_texts[0] == "zh-0"
     assert zh_texts[-1] == "zh-59"
-    assert timings[0]["mode"] == "single_request_full_context"
+    assert timings[0]["mode"] == "batched_full_context"
 
 
 def test_translate_segments_uses_task_character_reference(monkeypatch):
@@ -309,7 +309,7 @@ def test_translate_segments_uses_task_api_format(monkeypatch):
     assert calls == ["responses"]
     assert retry_events == []
     assert zh_texts == ["zh-0"]
-    assert timings[0]["mode"] == "single_request_full_context"
+    assert timings[0]["mode"] == "batched_full_context"
 
 
 def test_aggregated_progress_callback(monkeypatch):

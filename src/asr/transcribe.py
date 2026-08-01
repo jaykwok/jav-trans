@@ -1,20 +1,19 @@
+import json
 import logging
 import os
 import re
 import time
 import uuid
+from pathlib import Path
 from typing import Callable
 
 from asr.backends.base import BaseAsrBackend
 from asr.alignment_quality import classify_alignment_quality
-from asr.checkpoint import (
-    _checkpointable_text_results,
-    _delete_path_for_cleanup,
-    _get_asr_checkpoint_path,
-    _get_asr_checkpoint_source,
+from asr import chunking as _chunking_module
+from asr import result_cache as _result_cache_module
+from asr.result_cache import (
+    _cacheable_text_results,
     _is_timed_out_result,
-    _load_asr_checkpoint,
-    _save_asr_checkpoint,
 )
 from asr.local_backend import LocalAsrBackend
 
@@ -30,19 +29,6 @@ def _emit_progress(on_stage: Callable[[str], None] | None, message: str) -> None
 _TRIVIAL_SEGMENT = re.compile(
     r"^[。！？…、\s,.!?・「」（）【】；：\-—–]+$"
 )
-
-
-def _asr_checkpoint_enabled() -> bool:
-    return os.getenv("ASR_CHECKPOINT_ENABLED", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
-
-
-def _asr_checkpoint_interval() -> int:
-    return max(1, int(os.getenv("ASR_CHECKPOINT_INTERVAL", "50")))
 
 
 def _asr_invalid_segment_duration_s() -> float:
@@ -241,42 +227,24 @@ def _transcribe_asr_chunks_text_only(
         return [], {"text_transcribe_s": 0.0}
 
     request_batch_size = max(1, int(getattr(backend, "request_batch_size", 1)))
-    checkpoint_source = _get_asr_checkpoint_source(chunks, text_stage_label)
-    checkpoint_path = _get_asr_checkpoint_path(checkpoint_source)
-    run_id = uuid.uuid4().hex[:8]
-    text_results_by_index = _load_asr_checkpoint(
-        checkpoint_path,
-        checkpoint_source,
-        chunks,
-        run_id=run_id,
-    )
+    # Content-addressed prefill: any chunk whose audio+model identity was
+    # transcribed before — this run, a crashed run, or a different job over the
+    # same source — comes straight from the cache.
+    text_results_by_index: dict[int, dict] = {}
+    for chunk in chunks:
+        cached = _result_cache_module.lookup(chunk["path"])
+        if cached is None:
+            continue
+        text_results_by_index[int(chunk["index"])] = _result_cache_module.restore_text_result(
+            chunk,
+            cached,
+        )
     if text_results_by_index and on_stage:
-        on_stage(f"ASR checkpoint 恢复 {len(text_results_by_index)}/{len(chunks)} 个块")
+        on_stage(f"ASR 缓存命中 {len(text_results_by_index)}/{len(chunks)} 个块")
 
-    processed_since_checkpoint = 0
-    completed = False
-    final_checkpoint_saved = False
     text_started = time.perf_counter()
 
-    def _save_progress_checkpoint() -> None:
-        nonlocal processed_since_checkpoint
-        if processed_since_checkpoint < _asr_checkpoint_interval():
-            return
-        _save_asr_checkpoint(
-            checkpoint_path,
-            checkpoint_source,
-            chunks,
-            _checkpointable_text_results(text_results_by_index),
-            run_id=run_id,
-        )
-        processed_since_checkpoint = 0
-        if on_stage:
-            on_stage(
-                f"ASR checkpoint 已保存 {len(text_results_by_index)}/{len(chunks)} 个块"
-            )
-
     def _store_text_results(batch_chunks: list[dict], batch_text_results: list[dict]) -> None:
-        nonlocal processed_since_checkpoint
         if len(batch_text_results) != len(batch_chunks):
             raise RuntimeError(
                 "ASR batch result count mismatch: "
@@ -286,85 +254,57 @@ def _transcribe_asr_chunks_text_only(
             )
         for chunk, text_result in zip(batch_chunks, batch_text_results):
             text_results_by_index[int(chunk["index"])] = text_result
-        processed_since_checkpoint += len(batch_text_results)
-        _save_progress_checkpoint()
+            # Per-chunk files land immediately, so a crash resumes for free.
+            _result_cache_module.store(chunk["path"], text_result)
 
     def _transcribe_batch(batch_chunks: list[dict]) -> list[dict]:
         audio_paths = [chunk["path"] for chunk in batch_chunks]
         return backend.transcribe_texts(audio_paths, on_stage=on_stage)
 
-    try:
-        for batch_start in range(0, len(chunks), request_batch_size):
-            batch_chunks = chunks[batch_start : batch_start + request_batch_size]
-            pending_chunks = [
-                chunk
-                for chunk in batch_chunks
-                if int(chunk["index"]) not in text_results_by_index
-            ]
-            batch_end = batch_start + len(batch_chunks)
-            batch_number = batch_start // request_batch_size + 1
-            batch_started = time.perf_counter()
-            _emit_progress(
-                on_stage,
-                (
-                    f"{text_stage_label} {batch_end}/{len(chunks)} "
-                    f"batch={batch_number} size={len(pending_chunks)} start"
-                ),
-            )
-            if not pending_chunks:
-                continue
-
-            batch_text_results = _transcribe_batch(pending_chunks)
-            _enforce_vram_budget(
-                f"{text_stage_label}_batch_{batch_number}",
-                on_stage,
-            )
-            _store_text_results(pending_chunks, batch_text_results)
-            batch_elapsed = time.perf_counter() - batch_started
-            _emit_progress(
-                on_stage,
-                (
-                    f"{text_stage_label} {len(text_results_by_index)}/{len(chunks)} "
-                    f"batch={batch_number} size={len(batch_text_results)} done "
-                    f"elapsed={batch_elapsed:.2f}s "
-                    f"sec_per_chunk={batch_elapsed / max(len(batch_text_results), 1):.3f}"
-                ),
-            )
-
-        timeout_count = sum(
-            1 for result in text_results_by_index.values() if _is_timed_out_result(result)
+    for batch_start in range(0, len(chunks), request_batch_size):
+        batch_chunks = chunks[batch_start : batch_start + request_batch_size]
+        pending_chunks = [
+            chunk
+            for chunk in batch_chunks
+            if int(chunk["index"]) not in text_results_by_index
+        ]
+        batch_end = batch_start + len(batch_chunks)
+        batch_number = batch_start // request_batch_size + 1
+        batch_started = time.perf_counter()
+        _emit_progress(
+            on_stage,
+            (
+                f"{text_stage_label} {batch_end}/{len(chunks)} "
+                f"batch={batch_number} size={len(pending_chunks)} start"
+            ),
         )
-        checkpointable_results = _checkpointable_text_results(text_results_by_index)
-        completed = len(checkpointable_results) >= len(chunks)
-        if timeout_count:
-            if on_stage:
-                on_stage(
-                    f"[WARN] 本轮 {timeout_count} 个块超时跳过，已从 checkpoint 中排除，下次续跑将重试"
-                )
-            _save_asr_checkpoint(
-                checkpoint_path,
-                checkpoint_source,
-                chunks,
-                checkpointable_results,
-                run_id=run_id,
-            )
-            final_checkpoint_saved = True
-        if completed:
-            _delete_path_for_cleanup(checkpoint_path)
-    finally:
-        if (
-            _asr_checkpoint_enabled()
-            and not completed
-            and not final_checkpoint_saved
-            and processed_since_checkpoint > 0
-        ):
-            _save_asr_checkpoint(
-                checkpoint_path,
-                checkpoint_source,
-                chunks,
-                _checkpointable_text_results(text_results_by_index),
-                run_id=run_id,
-            )
+        if not pending_chunks:
+            continue
+
+        batch_text_results = _transcribe_batch(pending_chunks)
+        _enforce_vram_budget(
+            f"{text_stage_label}_batch_{batch_number}",
+            on_stage,
+        )
+        _store_text_results(pending_chunks, batch_text_results)
+        batch_elapsed = time.perf_counter() - batch_started
+        _emit_progress(
+            on_stage,
+            (
+                f"{text_stage_label} {len(text_results_by_index)}/{len(chunks)} "
+                f"batch={batch_number} size={len(batch_text_results)} done "
+                f"elapsed={batch_elapsed:.2f}s "
+                f"sec_per_chunk={batch_elapsed / max(len(batch_text_results), 1):.3f}"
+            ),
+        )
+
+    timeout_count = sum(
+        1 for result in text_results_by_index.values() if _is_timed_out_result(result)
+    )
+    if timeout_count and on_stage:
+        on_stage(
+            f"[WARN] 本轮 {timeout_count} 个块超时跳过，未写入结果缓存，下次续跑将重试"
+        )
 
     text_results = [
         text_results_by_index[int(chunk["index"])]
@@ -374,6 +314,77 @@ def _transcribe_asr_chunks_text_only(
 
     text_elapsed = time.perf_counter() - text_started
     return text_results, {"text_transcribe_s": text_elapsed}
+
+
+def _delete_path_for_cleanup(path: Path) -> None:
+    if not path.exists():
+        return
+
+    try:
+        if path.is_dir():
+            import shutil
+
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def aggregate_timeout_fragments(job_id: str) -> Path | None:
+    normalized_job_id = re.sub(r"[^0-9A-Za-z._-]+", "_", (job_id or "").strip())
+    normalized_job_id = normalized_job_id.strip("._-")
+    if not normalized_job_id:
+        return None
+
+    out_dir = _chunking_module.current_asr_chunk_root().parent / "asr_timeouts"
+    if not out_dir.exists() or not out_dir.is_dir():
+        return None
+
+    fragments: list[Path] = []
+    for path in out_dir.glob("timeouts_*.json"):
+        if path.name.startswith("timeouts_summary_"):
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        candidates = {
+            str(payload.get("job_id") or ""),
+            str(payload.get("video_name") or ""),
+            str(payload.get("video_stem") or ""),
+            str(payload.get("source_job_id") or ""),
+        }
+        audio_path = str(payload.get("audio_path") or "")
+        if normalized_job_id in candidates or f"/{normalized_job_id}/" in audio_path.replace("\\", "/"):
+            fragments.append(path)
+
+    if not fragments:
+        return None
+
+    records: list[dict] = []
+    for path in sorted(fragments, key=lambda item: item.name):
+        try:
+            records.append(json.loads(path.read_text(encoding="utf-8")))
+        except Exception as exc:
+            records.append({"source_file": path.name, "parse_error": repr(exc)})
+
+    summary_path = out_dir / f"timeouts_summary_{normalized_job_id}.json"
+    tmp_path = summary_path.with_name(f"{summary_path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    payload = {
+        "job_id": normalized_job_id,
+        "count": len(records),
+        "fragments": [path.name for path in sorted(fragments, key=lambda item: item.name)],
+        "records": records,
+    }
+    with open(tmp_path, "w", encoding="utf-8") as writer:
+        json.dump(payload, writer, ensure_ascii=False, indent=2)
+    tmp_path.replace(summary_path)
+
+    for path in fragments:
+        _delete_path_for_cleanup(path)
+
+    return summary_path
 
 
 def _is_empty_segment_text_result(text_result: dict) -> bool:

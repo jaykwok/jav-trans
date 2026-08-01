@@ -9,8 +9,8 @@ from typing import Any, Callable
 
 import numpy as np
 
-from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
+from asr import result_cache as _result_cache_module
 from asr import transcribe as _transcribe_module
 from asr.alignment import AlignmentHead, blank_runs
 from asr.cueqc import build_candidate as build_cueqc_candidate
@@ -21,7 +21,7 @@ from pipeline import memory_safety as _memory_safety_module
 
 _registry_module = importlib.reload(_registry_module)
 _chunking_module = importlib.reload(_chunking_module)
-_checkpoint_module = importlib.reload(_checkpoint_module)
+_result_cache_module = importlib.reload(_result_cache_module)
 _transcribe_module = importlib.reload(_transcribe_module)
 
 # Call-time backend resolution: reads ASR_BACKEND env at each call so a
@@ -95,10 +95,9 @@ def _env_int(name: str, default: str) -> int:
 get_backend_label = _registry_module.get_backend_label
 _resolve_asr_backend = _registry_module._resolve_asr_backend
 _create_asr_backend = _registry_module._create_asr_backend
-_is_timed_out_result = _checkpoint_module._is_timed_out_result
-_checkpointable_text_results = _checkpoint_module._checkpointable_text_results
-_delete_path_for_cleanup = _checkpoint_module._delete_path_for_cleanup
-_get_asr_checkpoint_source = _checkpoint_module._get_asr_checkpoint_source
+_is_timed_out_result = _result_cache_module._is_timed_out_result
+_checkpointable_text_results = _result_cache_module._cacheable_text_results
+_delete_path_for_cleanup = _transcribe_module._delete_path_for_cleanup
 
 _get_wav_duration = _chunking_module._get_wav_duration
 _extract_wav_chunks = _chunking_module._extract_wav_chunks
@@ -122,73 +121,38 @@ _repair_postprocessed_segment_windows = _transcribe_module._repair_postprocessed
 _group_words_to_segments = _transcribe_module._group_words_to_segments
 
 
-def _sync_checkpoint_state() -> None:
-    _checkpoint_module._LAST_BOUNDARY_SIGNATURE = _LAST_BOUNDARY_SIGNATURE
-
-
 def _get_asr_runtime_signature(last_boundary_signature: dict | None = None) -> dict:
-    _sync_checkpoint_state()
-    return _checkpoint_module._get_asr_runtime_signature(
-        last_boundary_signature=_LAST_BOUNDARY_SIGNATURE if last_boundary_signature is None else last_boundary_signature,
+    """Model+decode identity plus chunking provenance, for job-level caches.
+
+    The cross-job result cache deliberately keys on less than this (audio
+    content replaces the boundary signature); this fuller signature remains the
+    key for caches whose values depend on chunk *placement*, e.g. the aligned
+    segments cache in main.py.
+    """
+    boundary_signature = (
+        _LAST_BOUNDARY_SIGNATURE
+        if last_boundary_signature is None
+        else last_boundary_signature
     )
-
-
-def _get_asr_checkpoint_path(audio_path: str) -> Path:
-    _sync_checkpoint_state()
-    return _checkpoint_module._get_asr_checkpoint_path(
-        audio_path,
-        last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
-        chunk_root=_chunking_module.current_asr_chunk_root(),
-    )
-
-
-def _chunk_checkpoint_signature(chunks: list[dict]) -> dict[str, dict[str, float | str]]:
-    _sync_checkpoint_state()
-    return _checkpoint_module._chunk_checkpoint_signature(
-        chunks,
-        last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
-    )
-
-
-def _load_asr_checkpoint(
-    checkpoint_path: Path,
-    checkpoint_source: str,
-    chunks: list[dict],
-    run_id: str | None = None,
-) -> dict[int, dict]:
-    _sync_checkpoint_state()
-    return _checkpoint_module._load_asr_checkpoint(
-        checkpoint_path,
-        checkpoint_source,
-        chunks,
-        run_id=run_id,
-        last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
-        checkpoint_enabled=_transcribe_module._asr_checkpoint_enabled(),
-    )
-
-
-def _save_asr_checkpoint(
-    checkpoint_path: Path,
-    checkpoint_source: str,
-    chunks: list[dict],
-    text_results_by_index: dict[int, dict],
-    run_id: str | None = None,
-) -> None:
-    _sync_checkpoint_state()
-    return _checkpoint_module._save_asr_checkpoint(
-        checkpoint_path,
-        checkpoint_source,
-        chunks,
-        text_results_by_index,
-        run_id=run_id,
-        last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
-        checkpoint_enabled=_transcribe_module._asr_checkpoint_enabled(),
-    )
+    model_signature = _result_cache_module.model_signature()
+    return {
+        "version": 9,
+        "backend": model_signature["backend"],
+        "worker_mode": _registry_module.current_asr_worker_mode(),
+        "timestamp": {
+            "source": "boundary_chunk_timeline",
+        },
+        "model": model_signature["model"],
+        "language": model_signature["language"],
+        "generation": model_signature["generation"],
+        "boundary": _result_cache_module._jsonable(boundary_signature)
+        if isinstance(boundary_signature, dict)
+        else {},
+    }
 
 
 def aggregate_timeout_fragments(job_id: str) -> Path | None:
-    _sync_checkpoint_state()
-    return _checkpoint_module.aggregate_timeout_fragments(job_id)
+    return _transcribe_module.aggregate_timeout_fragments(job_id)
 
 
 import logging as _logging
@@ -199,7 +163,6 @@ def _set_last_boundary_signature(signature: dict) -> None:
     global _LAST_BOUNDARY_SIGNATURE
     _LAST_BOUNDARY_SIGNATURE = dict(signature)
     _chunking_module._LAST_BOUNDARY_SIGNATURE = _LAST_BOUNDARY_SIGNATURE
-    _sync_checkpoint_state()
 
 
 def _json_payload(value: Any) -> Any:
@@ -493,17 +456,32 @@ def _vram_budget_mb() -> float:
         return 0.0
 
 
+def _shared_vram_spill_tolerance_mb() -> float:
+    # The Windows PDH "GPU Process Memory shared usage" counter jitters by a
+    # few MB from driver-side staging buffers even when the CUDA allocator is
+    # hard-capped by set_per_process_memory_fraction and cannot spill. A real
+    # WDDM spill moves hundreds of MB of tensor pages, so a small tolerance
+    # separates counter noise from actual spill. A 4MB jitter once killed a
+    # fully finished transcription pass three times in a row.
+    raw = os.getenv("ASR_SHARED_VRAM_SPILL_TOLERANCE_MB", "64").strip()
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 64.0
+
+
 def _enforce_vram_budget_from_snapshot(snapshot: dict) -> None:
     try:
         shared_vram_mb = float(snapshot.get("shared_vram_mb") or 0.0)
     except (TypeError, ValueError):
         shared_vram_mb = 0.0
-    if shared_vram_mb > 0.0:
+    if shared_vram_mb > _shared_vram_spill_tolerance_mb():
         raise RuntimeError(
             "GPU shared VRAM spill detected: "
             f"stage={snapshot.get('stage', '')} shared_vram_mb={shared_vram_mb:.3f} "
             f"raw_mb={snapshot.get('shared_vram_raw_mb', '')} "
-            f"baseline_mb={snapshot.get('shared_vram_baseline_mb', '')}"
+            f"baseline_mb={snapshot.get('shared_vram_baseline_mb', '')} "
+            f"tolerance_mb={_shared_vram_spill_tolerance_mb():.1f}"
         )
     try:
         physical_ram_used_mb = float(snapshot.get("physical_ram_used_mb"))
@@ -1072,6 +1050,9 @@ def _transcribe_and_align_local(
             elapsed_s=total_elapsed,
         )
         log.append(f"过滤后保留字幕: {len(segments)}")
+        # No stage-success cleanup here anymore: per-chunk results live in the
+        # cross-job content-addressed cache (asr.result_cache) and are meant to
+        # outlive the job so identical audio never pays the decode twice.
 
         details = _json_payload({
             "backend": get_backend_label(),

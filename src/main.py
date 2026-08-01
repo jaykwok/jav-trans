@@ -64,6 +64,7 @@ from asr import pipeline as asr_module
 from asr.manifest import build_asr_manifest
 from subtitles import writer as subtitle_module
 from subtitles.options import BASE_FPS
+from llm import backends as llm_backends
 from llm import translator as translator_module
 
 from rich.console import Console
@@ -161,6 +162,8 @@ _ASR_STAGE_CACHE_NEUTRAL_KEYS = {
     "GPU_BATCH_PROFILE_PATH",
     "ASR_CHUNK_ROOT",
     "KEEP_ASR_CHUNKS",
+    "ASR_RESULT_CACHE_ENABLED",
+    "ASR_RESULT_CACHE_ROOT",
     "TRANSCRIPTION_TIMEOUT_S",
 }
 
@@ -657,10 +660,6 @@ def _materialize_cached_file(source: str | Path, destination: str | Path) -> boo
     return True
 
 
-def _asr_checkpoint_root() -> Path:
-    return asr_module.current_asr_chunk_root().parent
-
-
 def _resolve_project_runtime_path(raw_path: str | Path) -> Path:
     path = Path(raw_path).expanduser()
     if not path.is_absolute():
@@ -669,14 +668,11 @@ def _resolve_project_runtime_path(raw_path: str | Path) -> Path:
 
 
 def _cleanup_pipeline_temp(job_temp_dir: str, audio_path: str, translation_cache_path: str = "") -> None:
-    cleanup_module.cleanup_asr_checkpoint_for_audio(
-        audio_path,
-        asr_module._get_asr_checkpoint_path,
-    )
+    # ASR results live in the cross-job content-addressed cache
+    # (asr.result_cache) and deliberately survive job cleanup.
     cleanup_module.cleanup_job_temp(
         job_temp_dir,
         translation_cache_path,
-        checkpoint_root=_asr_checkpoint_root(),
     )
     cleanup_module.cleanup_runtime_ephemeral_temp(
         job_temp_root=os.getenv("JOB_TEMP_DIR", "tmp/jobs") or "tmp/jobs",
@@ -1736,24 +1732,31 @@ def _run_translation_and_write_impl(
                     completed=int(evt.get("expected", len(translation_segments))),
                 )
 
-        (
-            zh_texts,
-            translation_request_timings,
-            translation_api_retry_events,
-        ) = translator_module.translate_segments(
-            translation_segments,
-            global_context=global_context,
-            target_lang=ctx.target_lang,
-            glossary=ctx.translation_glossary,
-            character_reference="",
-            max_workers=ctx.translation_max_workers,
-            reasoning_effort=ctx.llm_reasoning_effort,
-            api_format=ctx.llm_api_format,
-            cache_path=translation_cache_path,
-            on_batch_done=_on_translation_done,
-            on_progress=_on_translation_progress,
-            cancel_event=cancel_event,
-        )
+        try:
+            (
+                zh_texts,
+                translation_request_timings,
+                translation_api_retry_events,
+            ) = translator_module.translate_segments(
+                translation_segments,
+                global_context=global_context,
+                target_lang=ctx.target_lang,
+                glossary=ctx.translation_glossary,
+                character_reference="",
+                max_workers=ctx.translation_max_workers,
+                reasoning_effort=ctx.llm_reasoning_effort,
+                api_format=ctx.llm_api_format,
+                cache_path=translation_cache_path,
+                on_batch_done=_on_translation_done,
+                on_progress=_on_translation_progress,
+                cancel_event=cancel_event,
+            )
+        finally:
+            # The managed llama-server holds several GB of VRAM; the next video
+            # in this job starts with an ASR stage that needs it back. The
+            # server respawns lazily (mmap reload) on the next translation.
+            if llm_backends.selected_backend_name() == "llamacpp":
+                llm_backends.reset_backend("llamacpp")
         _raise_if_cancelled(cancel_event)
 
     srt_blocks = [

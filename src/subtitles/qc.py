@@ -1,6 +1,14 @@
 import os
 import re
 
+from subtitles.options import BASE_FPS
+from subtitles.zh_style import (
+    count_banned_punctuation,
+    normalize_zh_subtitle_text,
+    wrap_zh_subtitle_text,
+    zh_display_units,
+)
+
 
 def _env_float(key: str, default: float) -> float:
     try:
@@ -112,6 +120,126 @@ def _subtitle_duration_stats(segments: list[dict]) -> dict:
 
 _KANA_ONLY_RE = re.compile(r"^[ぁ-ゟァ-ヿ\s、。！？…ー～「」『』・\(\)（）]+$")
 _COMPACT_TEXT_RE = re.compile(r"\s+")
+
+# Netflix CHS TTSG hard limits the writer is expected to satisfy; QC measures
+# the rendered output (same normalize+wrap pass as write_srt) so a regression
+# in either layer shows up here.
+_SPEC_LINE_MAX_UNITS = 16.0
+_SPEC_MAX_LINES = 2
+_SPEC_MAX_ZH_CPS = 9.0
+_SPEC_MAX_DURATION_S = 7.0
+_SPEC_MIN_DURATION_S = 5.0 / 6.0
+_SPEC_MIN_GAP_S = 2.0 / BASE_FPS
+
+
+def _rendered_zh_lines(segment: dict) -> list[str]:
+    rendered = wrap_zh_subtitle_text(
+        normalize_zh_subtitle_text(str(segment.get("zh") or ""))
+    )
+    return [line for line in rendered.split("\n") if line]
+
+
+def _subtitle_spec_compliance_stats(segments: list[dict]) -> dict:
+    line_over_count = 0
+    lines_over_count = 0
+    banned_punct_count = 0
+    raw_banned_punct_count = 0
+    cps_over_count = 0
+    max_cps = 0.0
+    duration_over_count = 0
+    duration_under_count = 0
+    gap_under_count = 0
+    examples: list[dict] = []
+    windows: list[tuple[float, float]] = []
+
+    for index, segment in enumerate(segments):
+        try:
+            start = float(segment.get("start", 0.0))
+            end = float(segment.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        end = max(start, end)
+        duration = end - start
+        windows.append((start, end))
+
+        issues: list[str] = []
+        if duration > _SPEC_MAX_DURATION_S + 1e-6:
+            duration_over_count += 1
+            issues.append(f"duration>{_SPEC_MAX_DURATION_S:.0f}s")
+        if duration < _SPEC_MIN_DURATION_S - 1e-6:
+            duration_under_count += 1
+            issues.append("duration<5/6s")
+
+        lines = _rendered_zh_lines(segment)
+        raw_banned_punct_count += count_banned_punctuation(str(segment.get("zh") or ""))
+        if lines:
+            if len(lines) > _SPEC_MAX_LINES:
+                lines_over_count += 1
+                issues.append(f"lines={len(lines)}")
+            over_lines = sum(
+                1 for line in lines if zh_display_units(line) > _SPEC_LINE_MAX_UNITS + 1e-6
+            )
+            if over_lines:
+                line_over_count += over_lines
+                issues.append("line>16")
+            banned = count_banned_punctuation("\n".join(lines))
+            if banned:
+                banned_punct_count += banned
+                issues.append(f"banned_punct={banned}")
+            reading_units = zh_display_units(
+                "".join(lines).replace(" ", "")
+            )
+            cps = reading_units / max(duration, 0.001)
+            max_cps = max(max_cps, cps)
+            if cps > _SPEC_MAX_ZH_CPS + 1e-6:
+                cps_over_count += 1
+                issues.append(f"cps={cps:.1f}")
+
+        if issues and len(examples) < 20:
+            examples.append(
+                {
+                    "index": index,
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "issues": issues,
+                }
+            )
+
+    windows.sort()
+    for (_, previous_end), (next_start, _) in zip(windows, windows[1:]):
+        gap = next_start - previous_end
+        if 0.0 <= gap < _SPEC_MIN_GAP_S - 1e-6:
+            gap_under_count += 1
+
+    return {
+        "spec_zh_line_over_16_count": line_over_count,
+        "spec_zh_lines_over_2_count": lines_over_count,
+        "spec_zh_banned_punct_count": banned_punct_count,
+        "spec_zh_raw_banned_punct_count": raw_banned_punct_count,
+        "spec_zh_cps_over_9_count": cps_over_count,
+        "spec_zh_cps_max": round(max_cps, 3),
+        "spec_duration_over_7s_count": duration_over_count,
+        "spec_duration_under_min_count": duration_under_count,
+        "spec_gap_under_2frames_count": gap_under_count,
+        "spec_review_examples": examples,
+    }
+
+
+def _append_spec_warnings(warnings: list[str], spec_stats: dict) -> None:
+    thresholds = {
+        "spec_zh_line_over_16_count": "QC_MAX_SPEC_LINE_OVER",
+        "spec_zh_lines_over_2_count": "QC_MAX_SPEC_LINES_OVER",
+        "spec_zh_banned_punct_count": "QC_MAX_SPEC_BANNED_PUNCT",
+        "spec_zh_cps_over_9_count": "QC_MAX_SPEC_CPS_OVER",
+        "spec_duration_over_7s_count": "QC_MAX_SPEC_DURATION_OVER",
+        "spec_duration_under_min_count": "QC_MAX_SPEC_DURATION_UNDER",
+        "spec_gap_under_2frames_count": "QC_MAX_SPEC_GAP_UNDER",
+    }
+    for key, env_name in thresholds.items():
+        limit = _env_float(env_name, 0.0)
+        value = spec_stats.get(key, 0)
+        if value > limit:
+            warnings.append(f"{key}={value} > {env_name}={limit:.0f}")
 
 
 def _subtitle_text_units(segment: dict) -> int:
@@ -248,6 +376,7 @@ def compute_quality_report(
     overlap_stats = _subtitle_overlap_stats(segments)
     duration_stats = _subtitle_duration_stats(segments)
     density_stats = _subtitle_density_audit_stats(segments)
+    spec_stats = _subtitle_spec_compliance_stats(segments)
     alignment_issue_total = max(int(total_segments or 0), 0)
 
     n = len(segments)
@@ -275,6 +404,7 @@ def compute_quality_report(
             **overlap_stats,
             **duration_stats,
             **density_stats,
+            **spec_stats,
             "warnings": warnings,
         }
 
@@ -363,6 +493,7 @@ def compute_quality_report(
         asr_generation_error_count=asr_generation_error_count,
         asr_generation_overflow_count=asr_generation_overflow_count,
     )
+    _append_spec_warnings(warnings, spec_stats)
 
     report = {
         "empty_zh_ratio": empty_zh_ratio,
@@ -381,6 +512,7 @@ def compute_quality_report(
         **overlap_stats,
         **duration_stats,
         **density_stats,
+        **spec_stats,
         "warnings": warnings,
     }
     return report

@@ -1,14 +1,12 @@
 from pathlib import Path
 
 from pipeline.cleanup import cleanup_job_temp, cleanup_runtime_ephemeral_temp
-from asr import pipeline as asr
 
 
 def _cleanup_job_temp(job_temp_dir: Path, translation_cache_path: str = "") -> None:
     cleanup_job_temp(
         str(job_temp_dir),
         translation_cache_path,
-        checkpoint_root=asr.current_asr_chunk_root().parent,
     )
 def test_cleanup_job_temp_removes_wav_json_and_keeps_srt(tmp_path):
     job_dir = tmp_path / "job"

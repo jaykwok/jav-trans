@@ -71,7 +71,7 @@ uv venv
 uv sync
 ```
 
-Qwen3-ASR 原生支持要求 `transformers>=5.13.0`（由 `uv sync` 按 `pyproject.toml` 安装）。`pyproject.toml` 同时把 `torch` 钉到 `pytorch-cu132` 索引，请勿改用 `pip install` 逐个装依赖——那样会从 PyPI 取到 CPU 版 torch。
+Qwen3-ASR 原生支持要求 `transformers>=5.13.0`（由 `uv sync` 按 `pyproject.toml` 安装）。`pyproject.toml` 同时把 `torch` 钉到 `pytorch-cu130` 索引，请勿改用 `pip install` 逐个装依赖——那样会从 PyPI 取到 CPU 版 torch。
 
 启动网页控制台：
 
@@ -82,7 +82,7 @@ uv run --no-sync python launcher.py
 
 默认地址为 `http://127.0.0.1:17321`。首次运行可以没有 `.env`；打开页面后在“翻译设置”面板填写 API Key、Base URL、模型和目标语言，保存或开始任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、显存预算等运行参数会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，可在“识别设置”里填写代理协议、地址和端口。
 
-**翻译后端支持**：通过 `TRANSLATION_BACKEND` 选择 OpenAI 兼容 API（`openai`）或进程内 Transformers 模型（`local`）。OpenAI 后端支持 Chat 与 Responses；本地后端复用单个模型并串行推理，界面预设提供 Qwen3 4B / 8B / 14B 三档。生产环境部署本地大模型时，推荐启动 vLLM/SGLang 等 OpenAI 兼容服务后使用 `openai` 后端。详细配置和扩展指南见 [翻译后端架构文档](docs/translation-backend-architecture.md)。
+**翻译后端支持**：通过 `TRANSLATION_BACKEND` 选择三种后端。`openai`——OpenAI 兼容 API（支持 Chat 与 Responses）。`llamacpp`——**本地翻译推荐**：程序托管官方 llama-server 运行 GGUF 量化模型，预设为 galgame 特调的 Sakura-GalTransl 系列（7B Q6_K 约 6.3GB，官方 8G 显存档；另有 6G 档 IQ4_XS 与 14B 档），需先 `winget install llama.cpp` 或从 GitHub Releases 下载 CUDA 包并在设置里填路径；Sakura 系模型会自动切换到其官方行式翻译模板（术语表 + 历史上文），其许可为 CC-BY-NC-SA 4.0 禁止商用；翻译开始时临时释放 ASR 显存、切回 ASR 时自动重载。`local`——进程内 Transformers（bf16，不支持 GGUF；量化需求请用 `llamacpp`）。详细配置和扩展指南见 [翻译后端架构文档](docs/translation-backend-architecture.md)。
 
 Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而不是浏览器本身。完整 ASR smoke 应确认日志中出现 `cuda_available=True`、`device=cuda:0` 或 `actual_device=cuda`。
 Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
@@ -97,7 +97,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 4. 选中的视频会立即进入右侧“待开始”列表；确认后点击“开始任务”。
 5. 在输出目录查看 SRT、质量报告和日志。
 
-从右侧任务列表删除已结束任务时，会清理该视频未完成的 ASR checkpoint 和任务临时目录。运行中的任务第一次删除只执行取消，进入“已取消”后再次删除才会清理缓存。
+从右侧任务列表删除已结束任务时，会清理任务临时目录；跨任务的 ASR 结果缓存（`tmp/asr_cache/`）按设计保留，不随任务删除。运行中的任务第一次删除只执行取消，进入“已取消”后再次删除才会清理临时目录。
 
 勾选“不翻译（仅日文字幕）”时，流水线仍会执行切分、ASR 和字幕时间轴生成，但跳过 LLM 翻译，最终输出 `<视频名>.ja.srt`。这是验证本地切分 / ASR / 字幕时间轴链路的推荐 smoke 模式。
 
@@ -215,7 +215,9 @@ GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长�
 
 对齐后的 segment 会按内容签名缓存。签名包含 ASR backend、字幕选项与参与结果的运行配置；只改输出路径一类不影响内容的设置不会让缓存失效。
 
-`ASR_BATCH_SIZE=auto` 以 5600MB 下的 repo 默认表为基线，按显存预算比例放缩初始 batch。ASR text batch 发生 GPU OOM 时会重启 worker、降低 batch 并从 checkpoint 续跑。切分阶段逐个编码固定 30 秒窗口，没有可降的 batch，在那里 OOM 会直接停止而不是假装重试。RAM OOM 同样直接停止，不伪装成可由 GPU batch 修复的问题。
+每个 ASR chunk 的转写结果另有一层跨任务的内容寻址缓存（`tmp/asr_cache/<模型签名>/<音频sha256>.json`）：键为 chunk 音频 PCM 内容加模型与解码参数，与路径、chunk 序号和任务无关。同一部片重跑、崩溃续跑、甚至不同任务里字节相同的 chunk 都直接命中，整段跳过 encoder+decoder。超时与隔离结果不会入缓存；`ASR_RESULT_CACHE_ENABLED=0` 可关闭，`ASR_RESULT_CACHE_ROOT` 改位置。该缓存取代了旧的 per-job crash-resume checkpoint。
+
+`ASR_BATCH_SIZE=auto` 以 5600MB 下的 repo 默认表为基线，按显存预算比例放缩初始 batch。ASR text batch 发生 GPU OOM 时会重启 worker、降低 batch 并从结果缓存续跑。切分阶段逐个编码固定 30 秒窗口，没有可降的 batch，在那里 OOM 会直接停止而不是假装重试。RAM OOM 同样直接停止，不伪装成可由 GPU batch 修复的问题。
 
 auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理配置跨任务学习。v2 profile 记录已验证安全 batch 与 OOM 不安全上界：阶段 peak allocated 低于预算 `80%` 时，在两者之间二分探测；尚无 OOM 上界时则向当前阶段上限折半推进，OOM 后本次任务仍先减半恢复。当前只覆盖 ASR chunk batch；显式数字 batch 不参与 profile 学习。
 
@@ -231,6 +233,7 @@ auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理�
 - Qwen3-ASR runtime 始终使用 Transformers 官方 `apply_transcription_request(audio=..., language=...)` 路径，不提供演员名 / 人名 context 提示分支。
 - 字幕时间轴来自 CTC 强制对齐的逐字时间戳；对齐头未配置时退化为按字数比例摊开。
 - LLM 翻译前会先固定 cue plan，翻译不会重排时间轴。
+- 最终中文输出遵循 Netflix Chinese (Simplified) TTSG：每行 ≤16 全角单位、最多 2 行（下宽金字塔）、时长 5/6s–7s、2 帧最小间隔、语音结束后出点约 +0.5s；不用逗号句号（句中停顿为单个空格）、省略号为单个 U+2026、全角？！且不连用、半角数字、无斜体。标点归一化与折行在 `src/subtitles/zh_style.py` 的写盘层完成，翻译缓存保留 LLM 原文；质量报告以 `spec_*` 指标核查全部硬指标。`SRT_LINE_MAX_CHARS` 默认 16。
 
 ---
 
@@ -239,7 +242,8 @@ auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理�
 - `video/<视频名>/`：正式字幕、质量报告和人工质检报告。
 - `models/`：Hugging Face 模型缓存。
 - `tmp/jobs/<job_id>/`：Web / pipeline 单次任务临时目录；`JOB_TEMP_DIR` 默认是 `./tmp/jobs`。
-- `tmp/chunks/`：ASR wav chunk 和 crash-resume checkpoint 的一次性运行目录。
+- `tmp/chunks/`：ASR wav chunk 的一次性运行目录。
+- `tmp/asr_cache/`：跨任务 ASR 结果缓存；按内容寻址，任务删除时保留。
 - `tmp/cache/torch/`、`tmp/cache/hf/`：torch / Hugging Face 运行缓存。
 - `tmp/log/<job_id>/`：默认启用的本地诊断目录；包含 `.run.log` 和持久化 `.timings.json`。
 - `datasets/`：本地训练、验证、测试数据归档，默认 ignored；不进入 GitHub 源码仓库。
@@ -307,7 +311,7 @@ ASR_BATCH_SIZE=2
 - `src/core/`：配置和任务上下文。
 - `src/pipeline/`：音频、缓存、输出、质量报告和阶段日志。
 - `src/asr/`：ASR 转写、切分（`pregate.py`）、CTC 对齐头（`alignment.py`）、字幕时间轴（`subtitle_timing.py`）与后置闸（`postgate.py`）。
-- `src/llm/`：翻译 prompt、cache、glossary、API patch 和 translator。
+- `src/llm/`：翻译侧三层——`backends/`（transport）、`profiles/`（各模型家族 prompt 合同）、`engine.py`（唯一编排循环），`translator.py` 是门面；另有 prompt、cache、glossary、修复批与术语预抽取。
 - `src/subtitles/`：SRT writer、字幕选项和字幕 QC。
 - `src/web/`：FastAPI 接口和静态前端。
 - `tools/`：对齐头训练、审计页、离线 Teacher、ASR SFT 和 workflow smoke 工具。

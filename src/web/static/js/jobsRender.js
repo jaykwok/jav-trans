@@ -83,6 +83,24 @@ export function renderJobs() {
     if (!visibleIds.has(el.dataset.id)) el.remove();
   });
 
+  // Re-appending an already-attached card restarts all of its CSS animations
+  // (card-in entrance, progress flow/sheen), which showed up as a whole-card
+  // blink on every poll. Cards are only (re)inserted when their order actually
+  // changes, and innerHTML is only rewritten when the content differs.
+  let prevCard = null;
+  const placeCard = card => {
+    const misplaced =
+      card.parentNode !== jobArea ||
+      (prevCard
+        ? card.previousElementSibling !== prevCard
+        : card.previousElementSibling?.classList?.contains('job-card'));
+    if (misplaced) {
+      const ref = prevCard ? prevCard.nextSibling : jobArea.querySelector('.job-card');
+      jobArea.insertBefore(card, ref === card ? card.nextSibling : ref);
+    }
+    prevCard = card;
+  };
+
   ids.forEach(id => {
     const job = state.jobs[id];
     let card = jobArea.querySelector(`.job-card[data-id="${id}"]`);
@@ -175,9 +193,9 @@ export function renderJobs() {
       : '';
 
     const dl = job._download;
-    let progressSection = `<div class="progress-bar"><div class="progress-fill${fillClass}" style="width:${pct}%"></div></div>`;
+    const dlPct = dl ? clampPct(dl.pct ?? 0) : 0;
+    let progressSection = `<div class="progress-bar"><div class="progress-fill${fillClass}"></div></div>`;
     if (dl) {
-      const dlPct = clampPct(dl.pct ?? 0);
       const fname = dl.file ? dl.file.split(/[\\/]/).pop().replace(/\.(safetensors|bin|pt|gguf)$/, '') : '模型';
       const downloadedMb = dl.sizeMb ? Math.round(dlPct / 100 * dl.sizeMb) : null;
       const sizeStr = downloadedMb != null && dl.sizeMb ? `${downloadedMb}/${dl.sizeMb}MB` : '';
@@ -188,11 +206,11 @@ export function renderJobs() {
           <span class="dl-label">↓ ${escHtml(fname)}</span>
           <span class="dl-info">${escHtml(info)}</span>
         </div>
-        <div class="dl-bar"><div class="dl-bar-fill" style="width:${dlPct}%"></div></div>`;
+        <div class="dl-bar"><div class="dl-bar-fill"></div></div>`;
     }
     const title = jobTitle(job);
 
-    card.innerHTML = `
+    const html = `
       <div class="job-header">
         <span class="job-title" title="${escHtml(title)}">${escHtml(title)}</span>
         <span class="badge badge-${escHtml(job.status)}">${escHtml(STATUS_LABEL[job.status] ?? job.status)}</span>
@@ -209,8 +227,18 @@ export function renderJobs() {
         ${CLEARABLE.has(job.status) ? `<button class="btn-sm btn-remove" data-remove="${escHtml(id)}" title="从列表删除">✕ 删除</button>` : ''}
       </div>
       ${errorMsg}`;
+    if (card._html !== html) {
+      card.innerHTML = html;
+      card._html = html;
+    }
+    // Bar widths go through style so a pct-only change never rewrites the DOM
+    // (rewriting restarts the flow/sheen animations mid-loop).
+    const fill = card.querySelector('.progress-fill');
+    if (fill) fill.style.width = `${pct}%`;
+    const dlFill = card.querySelector('.dl-bar-fill');
+    if (dlFill) dlFill.style.width = `${dlPct}%`;
     // Keep the visual order aligned with the API's FIFO job order.
-    jobArea.appendChild(card);
+    placeCard(card);
   });
 
   pendingFiles.forEach(file => {
@@ -221,7 +249,7 @@ export function renderJobs() {
       card.dataset.id = file.pendingId;
     }
     const title = file.name || file.path || file.pendingId;
-    card.innerHTML = `
+    const html = `
       <div class="job-header">
         <span class="job-title" title="${escHtml(file.path || title)}">${escHtml(title)}</span>
         <span class="badge badge-pending">${STATUS_LABEL.pending}</span>
@@ -231,7 +259,11 @@ export function renderJobs() {
         <span class="job-stage">等待点击“开始任务”</span>
         <button class="btn-sm btn-remove" data-remove-pending="${escHtml(file.pendingId)}" title="移出待开始列表">✕ 删除</button>
       </div>`;
-    jobArea.appendChild(card);
+    if (card._html !== html) {
+      card.innerHTML = html;
+      card._html = html;
+    }
+    placeCard(card);
   });
 }
 

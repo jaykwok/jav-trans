@@ -191,3 +191,45 @@ def test_subtitle_density_below_4cps_not_marked():
     assert report["subtitle_density_over_4cps_count"] == 0
     assert report["subtitle_density_max_ja_cps"] == pytest.approx(3.0)
 
+
+
+def test_spec_compliance_flags_violations():
+    segs = [
+        # banned punctuation + cps: 22 reading units in 1s
+        _seg("ア", "这是一句故意塞满很多字的中文字幕，它明显超速了。", 0.0, 1.0),
+        # duration over 7s
+        _seg("イ", "太长了", 10.0, 18.0),
+        # duration under 5/6s, and gap to the next cue below two frames
+        _seg("ウ", "太短", 20.0, 20.5),
+        _seg("エ", "紧跟", 20.51, 22.0),
+    ]
+    report = compute_quality_report(segs, 60.0, [], 0, 4)
+
+    # Rendered output is normalized, so banned marks survive only in raw zh.
+    assert report["spec_zh_banned_punct_count"] == 0
+    assert report["spec_zh_raw_banned_punct_count"] > 0
+    assert report["spec_zh_cps_over_9_count"] >= 1
+    assert report["spec_zh_cps_max"] > 9.0
+    assert report["spec_duration_over_7s_count"] == 1
+    assert report["spec_duration_under_min_count"] == 1
+    assert report["spec_gap_under_2frames_count"] == 1
+    assert any("spec_zh_cps_over_9_count" in w for w in report["warnings"])
+    assert any("spec_duration_over_7s_count" in w for w in report["warnings"])
+    assert report["spec_review_examples"]
+
+
+def test_spec_compliance_clean_output_has_no_spec_warnings():
+    segs = [
+        _seg("ア", "你好 今天天气不错", 0.0, 2.0),
+        _seg("イ", "我们出去走走吧", 3.0, 5.0),
+    ]
+    report = compute_quality_report(segs, 60.0, [], 0, 2)
+
+    assert report["spec_zh_line_over_16_count"] == 0
+    assert report["spec_zh_lines_over_2_count"] == 0
+    assert report["spec_zh_banned_punct_count"] == 0
+    assert report["spec_zh_cps_over_9_count"] == 0
+    assert report["spec_duration_over_7s_count"] == 0
+    assert report["spec_duration_under_min_count"] == 0
+    assert report["spec_gap_under_2frames_count"] == 0
+    assert not [w for w in report["warnings"] if w.startswith("spec_")]

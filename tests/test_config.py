@@ -240,7 +240,7 @@ def test_asr_sliding_text_context_removed_from_active_config_surface():
         "src/asr/transcribe.py",
         "src/asr/local_backend.py",
         "src/asr/backends/base.py",
-        "src/asr/checkpoint.py",
+        "src/asr/result_cache.py",
         "src/asr/pipeline.py",
         "src/core/config.py",
         "src/main.py",
@@ -291,7 +291,7 @@ def test_pre_asr_cueqc_modules_are_retired():
 def test_asr_after_cueqc_removed_from_active_runtime_surface():
     active_files = (
         "src/asr/pipeline.py",
-        "src/asr/checkpoint.py",
+        "src/asr/result_cache.py",
         "src/core/config.py",
         "tools/workflows/run_full_workflow.py",
         "tools/web/smoke/submit_job.py",

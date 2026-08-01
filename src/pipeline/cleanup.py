@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
-from typing import Callable
 
 
 def unlink_for_cleanup(path: Path) -> None:
@@ -41,40 +39,12 @@ def cleanup_translation_cache(cache_path: str = "") -> None:
             unlink_for_cleanup(glossary_path)
 
 
-def cleanup_asr_checkpoints(job_temp_dir: Path, checkpoint_root: Path) -> None:
-    job_marker = str(job_temp_dir.resolve()).replace("\\", "/").lower()
-    for checkpoint_path in checkpoint_root.glob("asr_checkpoint_*.json"):
-        try:
-            payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-            checkpoint_source = str(payload.get("audio_path", ""))
-        except Exception:
-            checkpoint_source = ""
-        normalized_source = checkpoint_source.replace("\\", "/").lower()
-        if job_marker and job_marker in normalized_source:
-            unlink_for_cleanup(checkpoint_path)
-
-
-def cleanup_asr_checkpoint_for_audio(
-    audio_path: str,
-    get_checkpoint_path: Callable[[str], str | Path],
-) -> None:
-    try:
-        checkpoint_path = Path(get_checkpoint_path(audio_path))
-    except Exception as exc:
-        print(f"[WARN] cleanup failed to resolve ASR checkpoint: {exc}", file=sys.stderr)
-        return
-    unlink_for_cleanup(checkpoint_path)
-
-
 def cleanup_job_temp(
     job_temp_dir: str,
     translation_cache_path: str = "",
-    *,
-    checkpoint_root: Path,
 ) -> None:
     root = Path(job_temp_dir)
     cleanup_translation_cache(translation_cache_path)
-    cleanup_asr_checkpoints(root, checkpoint_root)
 
     if not root.exists() or not root.is_dir():
         return
