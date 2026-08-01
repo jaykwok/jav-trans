@@ -233,7 +233,7 @@ def test_native_profile_accepts_two_comma_separated_keys(tmp_path: Path) -> None
 def test_native_profile_caps_concurrency_below_key_count(tmp_path: Path) -> None:
     env_file = tmp_path / "gemini"
     env_file.write_text(
-        "GEMINI_API_KEY=key-one,key-two,key-three,key-four\n"
+        "GEMINI_API_KEY=key-one,key-two,key-three,key-four,key-five,key-six\n"
         "GEMINI_MODEL=gemini-3.6-flash\n",
         encoding="utf-8",
     )
@@ -241,8 +241,16 @@ def test_native_profile_caps_concurrency_below_key_count(tmp_path: Path) -> None
         profile="gemini",
         env_file=env_file,
     )
-    assert transport.api_key_count == 4
-    assert transport.max_concurrency == 2
+    assert transport.api_key_count == 6
+    # The provider cap was deliberately raised 2 -> 4 in 68e7a9e; the contract
+    # is that concurrency stays at the cap once keys outnumber it, so rotation
+    # always has a ready key.
+    assert (
+        transport.max_concurrency
+        == GoogleAIStudioAudioTeacherTransport.PROVIDER_CONCURRENCY_CAP
+        == 4
+    )
+    assert transport.max_concurrency < transport.api_key_count
 
 
 def test_native_rpd_budget_rotates_proactively_and_persists(tmp_path: Path) -> None:
