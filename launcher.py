@@ -52,7 +52,7 @@ _SMOKE_IMPORTS = "--smoke-imports" in sys.argv
 def _webview_icon_arg() -> str | None:
     return str(_APP_ICON_PATH) if _APP_ICON_PATH.exists() else None
 
-PORT = int(os.getenv("JAV_TRANS_PORT", "17321"))
+PORT = int(os.getenv("JAV_TRANS_PORT", "1234"))
 EVENTS_PORT = int(os.getenv("JAV_TRANS_EVENTS_PORT", "17322"))
 
 # Globs inside tmp/ that are always safe to remove (one-time run artifacts).
