@@ -4,6 +4,8 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 项目目标：本地完成视频、音频、切分、ASR 和字幕时间轴重计算；LLM 只负责翻译、术语一致和口吻连贯，不负责脑补剧情或修正 ASR 误听。
 
+**翻译可以完全本地运行**：除 OpenAI 兼容 API 外，内置 llama.cpp 后端托管 GGUF 量化模型（预设 galgame 特调的 Sakura-GalTransl，7B Q6_K 适配 8G 显存），以及进程内 Transformers 后端。选本地后端时整条流水线不出网。详见下方「翻译后端支持」。
+
 致谢：[WhisperJAV](https://github.com/a63n/WhisperJAV) 为本项目早期路线提供了重要参考。
 
 ---
@@ -12,7 +14,7 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 ![网页控制台主界面](docs/images/ui-web-console.png)
 
-任务提交、实时阶段进度、显存/耗时监控和质量报告都在本地网页控制台完成。更多截图放在 `docs/images/`。
+任务提交、翻译后端选择（API / 本地 GGUF / 本地 Transformers）、实时阶段进度、显存与耗时监控、质量报告都在本地网页控制台完成。更多截图放在 `docs/images/`。
 
 ---
 
