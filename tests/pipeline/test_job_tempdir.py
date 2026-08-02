@@ -1,0 +1,393 @@
+import json
+from pathlib import Path
+
+import main
+from pipeline import audio as pipeline_audio
+from helpers import make_job_context, run_pipeline
+
+
+def _assert_no_project_absolute_path(text: str) -> None:
+    assert main.PROJECT_ROOT.resolve().as_posix() not in text.replace("\\", "/")
+
+
+def test_job_tempdir_groups_temp_outputs_and_keeps_srt_at_output_root(monkeypatch, tmp_path):
+    output_dir = tmp_path / "out"
+    temp_root = tmp_path / "jobs"
+    seen_audio_path = {}
+
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"fake-video")
+    ctx = make_job_context(
+        video_path,
+        output_dir,
+        temp_root,
+        skip_translation=True,
+        keep_temp_files=True,
+    )
+    monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
+
+    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+        seen_audio_path["path"] = out_path
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"")
+
+    def fake_transcribe_and_align(
+        audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        assert device == "auto"
+        assert env_overrides is not None
+        assert job_id
+        assert cancel_requested is not None
+        assert Path(audio_path).parent == temp_root / "sample" / "audio"
+        return (
+            [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+            ["mock asr"],
+            {"transcript_chunks": [], "stage_timings": {}},
+        )
+
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
+    monkeypatch.setattr(
+        main.translator_module,
+        "translate_segments",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("translation should be skipped")
+        ),
+    )
+
+    run_pipeline(video_path, ctx)
+
+    job_dir = temp_root / "sample"
+    assert Path(seen_audio_path["path"]).is_file()
+    assert (output_dir / "sample.ja.srt").is_file()
+    assert not (job_dir / "sample.ja.srt").exists()
+
+    for suffix in (
+        "asr_manifest.json",
+        "transcript.json",
+        "aligned_segments.json",
+        "bilingual.json",
+        "timings.json",
+    ):
+        assert (job_dir / f"sample.{suffix}").is_file()
+        assert not (output_dir / f"sample.{suffix}").exists()
+
+    timings = json.loads((job_dir / "sample.timings.json").read_text(encoding="utf-8"))
+    assert timings["job_id"] == "sample"
+    assert Path(timings["job_temp_dir"]) == job_dir.relative_to(main.PROJECT_ROOT)
+    assert Path(timings["outputs"]["srt"]) == (output_dir / "sample.ja.srt").relative_to(main.PROJECT_ROOT)
+    assert timings["outputs"]["run_log"] is None
+    _assert_no_project_absolute_path((job_dir / "sample.timings.json").read_text(encoding="utf-8"))
+    _assert_no_project_absolute_path((job_dir / "sample.aligned_segments.json").read_text(encoding="utf-8"))
+    _assert_no_project_absolute_path((job_dir / "sample.asr_manifest.json").read_text(encoding="utf-8"))
+
+
+def test_resume_materializes_cache_into_current_job_directory(monkeypatch, tmp_path):
+    output_dir = tmp_path / "out"
+    temp_root = tmp_path / "jobs"
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"fake-video")
+    ctx = make_job_context(
+        video_path,
+        output_dir,
+        temp_root,
+        job_id="new-job",
+        skip_translation=True,
+        keep_temp_files=True,
+    )
+    old_dir = temp_root / "old-job"
+    cache_key = pipeline_audio.get_audio_cache_key(str(video_path))
+    old_audio = old_dir / "audio" / f"sample.{cache_key}.wav"
+    old_audio.parent.mkdir(parents=True)
+    old_audio.write_bytes(b"cached-audio")
+    old_aligned = old_dir / "sample.aligned_segments.json"
+    old_aligned.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(main.audio_module, "probe_video_duration_s", lambda _path: 1.0)
+    monkeypatch.setattr(
+        main.aligned_cache_module,
+        "try_load_aligned_segments",
+        lambda path, *_args: {
+            "segments": [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+            "asr_details": {"transcript_chunks": []},
+            "asr_log": ["cached"],
+        }
+        if Path(path) == old_aligned
+        else None,
+    )
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("valid resume cache must skip ASR")
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_audio,
+        "extract_audio",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached audio must be materialized")
+        ),
+    )
+
+    artifacts = main.run_asr_alignment(
+        str(video_path),
+        ctx=ctx,
+        job_id=ctx.job_id,
+        cache_job_id="old-job",
+    )
+
+    new_dir = temp_root / "new-job"
+    assert Path(artifacts.job_temp_dir) == new_dir.resolve()
+    assert Path(artifacts.audio_path).read_bytes() == b"cached-audio"
+    assert Path(artifacts.aligned_segments_path).parent == new_dir.resolve()
+    assert Path(artifacts.aligned_segments_path).is_file()
+    assert old_audio.is_file()
+    assert old_aligned.is_file()
+
+
+def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
+    output_dir = tmp_path / "out"
+    temp_root = tmp_path / "jobs"
+    log_dir = tmp_path / "logs"
+
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"fake-video")
+    ctx = make_job_context(
+        video_path,
+        output_dir,
+        temp_root,
+        skip_translation=True,
+        keep_temp_files=True,
+        run_log_enabled=True,
+        run_log_dir=log_dir,
+    )
+    monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
+
+    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"")
+
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        assert device == "auto"
+        assert env_overrides is not None
+        assert job_id
+        assert cancel_requested is not None
+        if on_stage:
+            on_stage("ASR mock")
+        return (
+            [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+            ["mock asr"],
+            {"transcript_chunks": [], "stage_timings": {}},
+        )
+
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
+    monkeypatch.setattr(
+        main.translator_module,
+        "translate_segments",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("translation should be skipped")
+        ),
+    )
+
+    artifacts = main.run_asr_alignment(
+        str(video_path),
+        ctx=ctx,
+        job_id=ctx.job_id,
+    )
+    logger = artifacts.logger
+    assert logger is not None
+    output_paths = main.run_translation_and_write(
+        str(video_path),
+        artifacts,
+        ctx=ctx,
+        job_id=ctx.job_id,
+    )
+    assert artifacts.logger is None
+    assert not logger.handlers
+    assert getattr(main.events._thread_local, "run_logger", None) is not logger
+
+    timings = json.loads(
+        (temp_root / "sample" / "sample.timings.json").read_text(encoding="utf-8")
+    )
+    run_log = Path(timings["outputs"]["run_log"])
+    run_log_path = run_log if run_log.is_absolute() else main.PROJECT_ROOT / run_log
+    assert run_log_path.parent == log_dir / "sample"
+    assert run_log_path.is_file()
+    content = run_log_path.read_text(encoding="utf-8")
+    assert "run_start" in content
+    assert "stage_start audio_prepare" in content
+    assert "run_done" in content
+    _assert_no_project_absolute_path(content)
+
+    timings_log = Path(timings["outputs"]["timings_log"])
+    timings_log_path = (
+        timings_log if timings_log.is_absolute() else main.PROJECT_ROOT / timings_log
+    )
+    assert timings_log_path.parent == log_dir / "sample"
+    assert timings_log_path.is_file()
+    assert json.loads(timings_log_path.read_text(encoding="utf-8"))["job_id"] == "sample"
+    assert str(run_log_path) in output_paths
+    assert str(timings_log_path) in output_paths
+
+
+def test_run_log_filename_components_are_bounded():
+    component = main._run_log_component(
+        "匿名样片 A_" + "speech-boundary-v3-grok-hysteresis_" * 4,
+        max_chars=48,
+    )
+
+    assert len(component) <= 48
+    assert component.startswith("匿名样片 A_")
+    assert "-" in component
+
+
+def test_run_log_filename_does_not_repeat_long_job_id(tmp_path):
+    ctx = make_job_context(
+        tmp_path / "sample.mp4",
+        tmp_path / "out",
+        tmp_path / "jobs",
+        run_log_enabled=True,
+        run_log_dir=tmp_path / ("nested-" * 12),
+    )
+    job_id = "匿名样片 C_" + "joint-trained-validation_" * 5
+    backend = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+
+    logger, log_path = main._setup_run_logger(job_id, backend, ctx)
+    try:
+        assert main._run_log_component(job_id, max_chars=48) not in log_path.name
+        assert log_path.is_file()
+    finally:
+        main._close_run_logger(logger)
+
+
+def test_successful_run_cleans_job_temp_by_default(monkeypatch, tmp_path):
+    output_dir = tmp_path / "out"
+    temp_root = tmp_path / "jobs"
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"fake-video")
+
+    ctx = make_job_context(
+        video_path,
+        output_dir,
+        temp_root,
+        skip_translation=True,
+        keep_temp_files=False,
+    )
+    monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
+
+    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"")
+
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        assert device == "auto"
+        assert env_overrides is not None
+        assert job_id
+        assert cancel_requested is not None
+        return (
+            [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+            [],
+            {"transcript_chunks": [], "stage_timings": {}},
+        )
+
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
+
+    run_pipeline(video_path, ctx)
+
+    assert (output_dir / "sample.ja.srt").is_file()
+    assert not (temp_root / "sample").exists()
+
+
+def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
+    output_dir = tmp_path / "out"
+    temp_root = tmp_path / "jobs"
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"fake-video")
+    monkeypatch.setenv("ASR_CHUNK_MIN_PAUSE_S", "0.6")
+    original_asr_batch_size = main.os.environ.get("ASR_BATCH_SIZE")
+    ctx = make_job_context(
+        video_path,
+        output_dir,
+        temp_root,
+        skip_translation=True,
+        keep_temp_files=True,
+        advanced={
+            "ASR_CHUNK_MIN_PAUSE_S": "0.9",
+            "ASR_BATCH_SIZE": "12",
+        },
+    )
+    monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
+
+    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"")
+
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        assert device == "auto"
+        assert env_overrides["ASR_CHUNK_MIN_PAUSE_S"] == "0.9"
+        assert env_overrides["ASR_BATCH_SIZE"] == "12"
+        assert job_id
+        assert cancel_requested is not None
+        return (
+            [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+            [],
+            {"transcript_chunks": [], "stage_timings": {}},
+        )
+
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
+
+    run_pipeline(video_path, ctx)
+
+    assert main.os.environ["ASR_CHUNK_MIN_PAUSE_S"] == "0.6"
+    assert main.os.environ.get("ASR_BATCH_SIZE") == original_asr_batch_size
+

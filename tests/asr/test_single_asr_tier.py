@@ -18,7 +18,7 @@ from core import config
 
 import web as _web_package
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 _SRC_WEB = ROOT / "src" / "web"
 if str(_SRC_WEB) not in _web_package.__path__:
     _web_package.__path__.append(str(_SRC_WEB))

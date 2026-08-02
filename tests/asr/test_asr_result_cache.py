@@ -331,7 +331,7 @@ def test_align_results_second_pass_served_from_finalize_cache(monkeypatch, tmp_p
     _setup_cache_env(monkeypatch, tmp_path)
     _setup_head_env(monkeypatch, tmp_path)
     from asr import transcribe
-    from tests.test_alignment_head_wiring import _LifecycleBackend
+    from tests.asr.test_alignment_head_wiring import _LifecycleBackend
 
     wav = tmp_path / "chunk_0000.wav"
     _write_wav(wav, value=7)

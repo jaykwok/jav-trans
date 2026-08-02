@@ -2,7 +2,7 @@ from pathlib import Path
 
 from asr import pipeline as asr
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_word_group_does_not_cross_source_chunk_boundary():

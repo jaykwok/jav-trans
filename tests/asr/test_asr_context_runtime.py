@@ -5,7 +5,7 @@ from asr import transcribe
 from asr.qwen_native import prepare_transcription_inputs
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_asr_context_chunk_helper_removed():
