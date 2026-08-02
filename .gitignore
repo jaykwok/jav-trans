@@ -55,11 +55,15 @@ video/
 models/*
 !models/README.md
 
-# Build/package outputs
+# Build/package outputs. `packaging/` is deliberately NOT here: it holds the
+# Windows build recipe (build_windows.ps1, archive_release.ps1, the PyInstaller
+# spec, prepare_default_model.py), which is source, not output. It was ignored
+# until 2026-08-02, which meant a fresh clone of a Windows-distributed tool had
+# no way to produce a build. `*.spec` is scoped to the repo root so PyInstaller's
+# generated specs stay ignored while packaging/jav-trans-web.spec is tracked.
 build/
 dist/
-packaging/
-*.spec
+/*.spec
 *.7z
 *.7z.*
 *.zip

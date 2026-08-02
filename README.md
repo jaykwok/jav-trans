@@ -212,7 +212,7 @@ ASR_CHUNK_MIN_PAUSE_S=0.6
 
 ASR stage 固定由统一 GPU worker 持有 CUDA：切分用的 encoder 前向、ASR 解码和 CTC 对齐都在同一个 GPU owner 进程里顺序执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM、CUDA 状态异常或超过 `ASR_STAGE_WORKER_VRAM_BUDGET_MB` 时会杀掉 worker，不会把 Web 主进程一起带崩。
 
-`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 约为 `7779MiB`。当前 1.7B 完整推理链要求至少 `6144MiB` 物理 dedicated VRAM，并在模型加载前检查；shared VRAM 不计入可用预算，任何正的基线增量都立即视为 soft OOM，显式放大的 worker budget 和 CPU fallback 都不能绕过。监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
+`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 约为 `7779MiB`。**推荐 8GB 及以上**：1.7B 权重约 3.4GB 常驻，实测 8GB 卡在 batch 8 / 20 秒块下峰值 `5692MiB`（预算 `7778MiB`），这是当前默认配置的标定点。`ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO` 的 `6144MiB` 是**硬下限**而不是推荐值——低于它直接拒绝启动，等于它则必须靠 auto batch 自己降到 4~6 才跑得动，余量很小。检查在模型加载前完成；shared VRAM 不计入可用预算，任何正的基线增量都立即视为 soft OOM，显式放大的 worker budget 和 CPU fallback 都不能绕过。监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
 
 GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长心跳。字幕 cue plan 会单独记录 timeline normalize、两轮 anchor-aware DP、polish 和 finalize 进度。
 
@@ -294,7 +294,11 @@ model_param_device=cuda:*
 
 ### 显存不足
 
-默认配置已按 6GB 级显存目标设置（见上文「默认配置」）。如果仍然 OOM，先降低当前模型 batch：
+默认配置已按 **8GB 级显存**目标设置（见上文「默认配置」），硬下限是 `6144MiB`。
+
+先让 auto batch 自己收敛：`ASR_BATCH_SIZE=auto` 会按 GPU、显存预算、模型和 chunk 时长学习安全 batch，OOM 一次就记下上界并二分回退，profile 跨任务保存在 `tmp/cache/gpu_batch_profiles.json`。8GB 和 16GB 卡各自学各自的，不共用。
+
+只有在 auto 反复 OOM 时才手动钉值——显式数字会关掉学习：
 
 ```env
 ASR_BATCH_SIZE=2
