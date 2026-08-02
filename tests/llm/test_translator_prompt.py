@@ -1,8 +1,10 @@
 import json
 
 from llm import translator
-def test_prompt_version_is_v31():
-    assert translator.PROMPT_VERSION == "v3.1"
+def test_prompt_version_is_current():
+    """The cache key is `id@version`, so this constant is what decides whether a
+    prompt change reaches anyone who already has a cache."""
+    assert translator.PROMPT_VERSION == "v3.2"
 
 
 def test_system_prompt_no_male_prefix_example():

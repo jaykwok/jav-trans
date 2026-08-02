@@ -766,6 +766,11 @@ def _prepare_translation_cues(
         item["ja_text"] = ja_text
         item["zh_text"] = str(item.get("zh_text") or ja_text)
         item["words"] = list(item.get("words") or [])
+        # Normalized here rather than left absent so every cue answers the
+        # question, and the prompt layer can serialize a fact instead of an
+        # inference from a missing key.
+        item["continues_from_previous"] = bool(item.get("continues_from_previous"))
+        item["continues_into_next"] = bool(item.get("continues_into_next"))
         if "source_segment_ids" not in item:
             item["source_segment_ids"] = [cue_id]
         normalized.append(item)

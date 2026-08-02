@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import sys
 import wave
 from pathlib import Path
@@ -14,11 +13,18 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
-def _reload_pipeline(monkeypatch, tmp_path: Path):
+def _pipeline(monkeypatch, tmp_path: Path):
+    """Point the chunk root at a scratch directory and hand back the stage.
+
+    This used to `importlib.reload` the module to make the new environment take
+    effect. Every setting it reads is read inside a function, so the reload only
+    forked the module's function objects away from the ones `asr.chunking` and
+    `asr.transcribe` still held - patching one then had no effect on the other.
+    """
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
     from asr import pipeline as asr
 
-    return importlib.reload(asr)
+    return asr
 
 
 def _write_wav(path: Path, seconds: float, sample_rate: int = 8000) -> None:
@@ -31,7 +37,7 @@ def _write_wav(path: Path, seconds: float, sample_rate: int = 8000) -> None:
 
 
 def test_asr_text_transcribe_passes_only_audio_paths(monkeypatch, tmp_path):
-    asr = _reload_pipeline(monkeypatch, tmp_path)
+    asr = _pipeline(monkeypatch, tmp_path)
     source = tmp_path / "source.wav"
     _write_wav(source, 2.0)
 
@@ -73,7 +79,7 @@ def test_asr_text_transcribe_passes_only_audio_paths(monkeypatch, tmp_path):
 
 
 def test_asr_text_transcribe_rejects_short_batch_results(monkeypatch, tmp_path):
-    asr = _reload_pipeline(monkeypatch, tmp_path)
+    asr = _pipeline(monkeypatch, tmp_path)
     source = tmp_path / "source.wav"
     _write_wav(source, 2.0)
     chunks = [

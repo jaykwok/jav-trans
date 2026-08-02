@@ -16,6 +16,7 @@ from asr.backends.qwen import (
     qwen_asr_default_batch_size,
 )
 from asr.alignment import AlignmentHead
+from asr.decode_guard import build_stopping_criteria
 from asr.subtitle_timing import (
     build_aligned_word_timestamps,
     build_boundary_word_timestamps,
@@ -632,10 +633,16 @@ class LocalAsrBackend:
                 device=self.device,
                 dtype=self.dtype,
             )
+            # A sequence stuck in a repetition loop never emits EOS, and
+            # `generate` runs until every sequence is done - so one runaway
+            # chunk makes the whole batch pay for `max_new_tokens` steps. See
+            # asr.decode_guard for the measurement.
+            stopping_criteria = build_stopping_criteria(int(moved["input_ids"].shape[1]))
             generated_ids = self.model.generate(
                 **moved,
                 max_new_tokens=_asr_max_new_tokens(),
                 do_sample=False,
+                **({"stopping_criteria": stopping_criteria} if stopping_criteria else {}),
             )
             generated_suffix = generated_ids[:, moved["input_ids"].shape[1] :]
             decoded = self.processor.batch_decode(
@@ -912,7 +919,13 @@ class LocalAsrBackend:
 
         # Batched only when there is a head to feed; without one nothing below
         # touches the GPU and encoding would be pure waste.
-        batch_size = max(1, _env_int("ASR_ALIGN_BATCH_SIZE", "8"))
+        #
+        # Same encoder call and the same VRAM curve as the blank-run pass in
+        # asr.pipeline, which was measured to cliff 65x when peak use reaches
+        # 7.26 GiB on an 8 GiB card. Here it matters more, not less: this runs
+        # right after decoding, so the allocator is already holding fragmented
+        # blocks. 4 is where the speed-up has saturated anyway.
+        batch_size = max(1, _env_int("ASR_ALIGN_BATCH_SIZE", "4"))
         head_available = (
             self._resolve_alignment_head([]) is not None
             and self.model is not None

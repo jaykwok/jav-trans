@@ -111,6 +111,49 @@ class TestDegradation:
         assert sum(end - begin for begin, end in spans) == pytest.approx(95.0)
 
 
+class TestSpansDigest:
+    """Counts alone do not identify a set of cuts.
+
+    Caches keyed on the boundary signature hold word timings measured against
+    the exact chunk boundaries. Encoding the blank-run pass at a different batch
+    size was measured to move the run count by ±3 out of ~215 - so different
+    geometry can and sometimes does carry the same counts, and reusing timings
+    across it would put words on the wrong side of a cut.
+    """
+
+    def test_different_cuts_produce_different_digests(self) -> None:
+        assert asr._spans_digest([(0.0, 10.0), (10.0, 20.0)]) != asr._spans_digest(
+            [(0.0, 11.0), (11.0, 20.0)]
+        )
+
+    def test_the_same_cuts_produce_the_same_digest(self) -> None:
+        spans = [(0.0, 10.0), (10.0, 20.5)]
+        assert asr._spans_digest(spans) == asr._spans_digest(list(spans))
+
+    def test_the_same_count_with_different_geometry_still_differs(self) -> None:
+        """The exact case the count-only signature could not see."""
+        assert asr._spans_digest([(0.0, 5.0), (5.0, 9.0)]) != asr._spans_digest(
+            [(0.0, 4.0), (4.0, 9.0)]
+        )
+
+    def test_sub_millisecond_noise_does_not_invalidate_a_cache(self) -> None:
+        """Float noise below a millisecond cannot move a subtitle, and an exact
+        digest would throw away good cached timings over it."""
+        assert asr._spans_digest([(0.0, 10.0)]) == asr._spans_digest([(0.0, 10.00004)])
+
+    def test_the_signature_carries_it(
+        self, audio: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("ASR_ALIGNMENT_HEAD_PATH", raising=False)
+        spans = asr._build_processing_spans(str(audio))
+        signature = asr._LAST_BOUNDARY_SIGNATURE["chunking"]
+        assert signature["spans_sha256"] == asr._spans_digest(spans)
+
+    def test_the_runtime_signature_version_moved_with_it(self) -> None:
+        """Adding a key changes cache identity; the version says so out loud."""
+        assert asr._get_asr_runtime_signature()["version"] == 10
+
+
 class TestRetirement:
     def test_the_dead_chain_is_gone_from_the_transcription_path(self) -> None:
         """Named individually so a partial revert cannot pass silently."""

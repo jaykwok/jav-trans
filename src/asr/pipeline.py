@@ -1,7 +1,7 @@
-import importlib
 from collections import Counter
 import gc
 import hashlib
+import logging
 import os
 import time
 from pathlib import Path
@@ -9,34 +9,35 @@ from typing import Any, Callable
 
 import numpy as np
 
-from asr import chunking as _chunking_module
-from asr import result_cache as _result_cache_module
-from asr import transcribe as _transcribe_module
+from asr import chunking, result_cache, transcribe
 from asr.alignment import AlignmentHead, alignment_head_configured, blank_runs
+from asr.backends import registry
+from asr.chunking import (
+    CHUNK_CUT_SCHEMA,
+    _extract_wav_chunks,
+    _get_wav_duration,
+    cut_at_pauses,
+)
 from asr.cue_features import build_candidate as build_cue_candidate
 from asr.postgate import POSTGATE_SCHEMA, review_all as postgate_review_all
-from asr.chunking import CHUNK_CUT_SCHEMA, cut_at_pauses
-from asr.backends import registry as _registry_module
-from pipeline import memory_safety as _memory_safety_module
+from asr.transcribe import (
+    _align_TRANSCRIPTION_results,
+    _alignment_outcome_for_chunk,
+    _build_transcript_chunks,
+    _delete_path_for_cleanup,
+    _group_words_to_segments,
+    _postprocess_segments,
+    _transcribe_asr_chunks_text_only,
+    _with_alignment_window,
+)
+from asr.backends.registry import get_backend_label, _resolve_asr_backend
+from pipeline import memory_safety
 
-_registry_module = importlib.reload(_registry_module)
-_chunking_module = importlib.reload(_chunking_module)
-_result_cache_module = importlib.reload(_result_cache_module)
-_transcribe_module = importlib.reload(_transcribe_module)
-
-# Call-time backend resolution: reads ASR_BACKEND env at each call so a
-# persistent worker serves jobs with different backends without reloading.
-_current_asr_backend = _registry_module.current_asr_backend
-_QWEN_BACKENDS = _registry_module._QWEN_BACKENDS
-_VALID_ASR_BACKENDS = _registry_module._VALID_ASR_BACKENDS
-
-_LAST_BOUNDARY_SIGNATURE: dict = _chunking_module._LAST_BOUNDARY_SIGNATURE
 _JSON_PAYLOAD_INLINE_ARRAY_LIMIT = 4096
 
 # Audio is encoded in pieces of this length when looking for pauses; it is the
 # window the ASR encoder is happiest with, not a property of the chunking.
 _FEATURE_CHUNK_S = 30.0
-ASR_LANGUAGE_FOR_CHUNKING = os.getenv("ASR_LANGUAGE", "Japanese").strip() or "Japanese"
 
 
 def _load_asr_model_for_features() -> tuple[Any, Any]:
@@ -80,7 +81,9 @@ def _release_feature_model_vram() -> None:
 
 
 def current_asr_chunk_root() -> Path:
-    return _chunking_module.current_asr_chunk_root()
+    """Where chunk WAVs go. Forwarded because `main.py` asks the ASR stage for
+    it, and the stage - not the chunker - is what main.py depends on."""
+    return chunking.current_asr_chunk_root()
 
 
 def _env_bool(name: str, default: str) -> bool:
@@ -95,41 +98,35 @@ def _env_int(name: str, default: str) -> int:
     return int(float(os.getenv(name, default)))
 
 
+def _asr_language_for_chunking() -> str:
+    """Read at call time like every other setting in this stage.
+
+    It was a module-level constant, which made it the one value a persistent
+    worker could not pick up between jobs - and the only remaining excuse for
+    reloading this module to refresh the environment.
+    """
+    return os.getenv("ASR_LANGUAGE", "Japanese").strip() or "Japanese"
 
 
+# Where the last chunking pass recorded how it cut the audio. Owned here because
+# this is the only module that both writes and reads it; the chunker itself is
+# stateless and takes its geometry as arguments.
+_LAST_BOUNDARY_SIGNATURE: dict = {}
 
 
+def _set_last_boundary_signature(signature: dict) -> None:
+    global _LAST_BOUNDARY_SIGNATURE
+    _LAST_BOUNDARY_SIGNATURE = dict(signature)
 
 
+def _spans_digest(spans: list[tuple[float, float]]) -> str:
+    """Identity of a set of cuts, to millisecond resolution.
 
-
-get_backend_label = _registry_module.get_backend_label
-_resolve_asr_backend = _registry_module._resolve_asr_backend
-_create_asr_backend = _registry_module._create_asr_backend
-_is_timed_out_result = _result_cache_module._is_timed_out_result
-_checkpointable_text_results = _result_cache_module._cacheable_text_results
-_delete_path_for_cleanup = _transcribe_module._delete_path_for_cleanup
-
-_get_wav_duration = _chunking_module._get_wav_duration
-_extract_wav_chunks = _chunking_module._extract_wav_chunks
-_chunk_duration = _chunking_module._chunk_duration
-
-ASRWorkerSystemError = _transcribe_module.ASRWorkerSystemError
-_strip_punctuation = _transcribe_module._strip_punctuation
-_collapse_repeated_noise = _transcribe_module._collapse_repeated_noise
-_is_low_value_text = _transcribe_module._is_low_value_text
-_clean_segment_text = _transcribe_module._clean_segment_text
-_with_alignment_window = _transcribe_module._with_alignment_window
-_alignment_outcome_for_chunk = _transcribe_module._alignment_outcome_for_chunk
-_transcribe_asr_chunks_text_only = _transcribe_module._transcribe_asr_chunks_text_only
-_is_empty_segment_text_result = _transcribe_module._is_empty_segment_text_result
-_empty_alignment_placeholder = _transcribe_module._empty_alignment_placeholder
-_empty_segments_quarantine_placeholder = _transcribe_module._empty_segments_quarantine_placeholder
-_align_TRANSCRIPTION_results = _transcribe_module._align_TRANSCRIPTION_results
-_build_transcript_chunks = _transcribe_module._build_transcript_chunks
-_postprocess_segments = _transcribe_module._postprocess_segments
-_repair_postprocessed_segment_windows = _transcribe_module._repair_postprocessed_segment_windows
-_group_words_to_segments = _transcribe_module._group_words_to_segments
+    Rounded rather than exact because float noise below a millisecond cannot
+    move a subtitle, and an exact digest would invalidate caches over it.
+    """
+    joined = ";".join(f"{begin:.3f}-{end:.3f}" for begin, end in spans)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
 
 
 def _get_asr_runtime_signature(last_boundary_signature: dict | None = None) -> dict:
@@ -145,35 +142,32 @@ def _get_asr_runtime_signature(last_boundary_signature: dict | None = None) -> d
         if last_boundary_signature is None
         else last_boundary_signature
     )
-    model_signature = _result_cache_module.model_signature()
+    model_signature = result_cache.model_signature()
     return {
-        "version": 9,
+        # 10: the chunking signature gained `spans_sha256`, so caches keyed on
+        # this can no longer be served across a change in cut geometry.
+        "version": 10,
         "backend": model_signature["backend"],
-        "worker_mode": _registry_module.current_asr_worker_mode(),
+        "worker_mode": registry.current_asr_worker_mode(),
         "timestamp": {
             "source": "boundary_chunk_timeline",
         },
         "model": model_signature["model"],
         "language": model_signature["language"],
         "generation": model_signature["generation"],
-        "boundary": _result_cache_module._jsonable(boundary_signature)
+        "boundary": result_cache._jsonable(boundary_signature)
         if isinstance(boundary_signature, dict)
         else {},
     }
 
 
 def aggregate_timeout_fragments(job_id: str) -> Path | None:
-    return _transcribe_module.aggregate_timeout_fragments(job_id)
+    """Forwarded because the web layer collects timeout diagnostics from the ASR
+    stage, and should not have to know which file inside it does the writing."""
+    return transcribe.aggregate_timeout_fragments(job_id)
 
 
-import logging as _logging
-_pipeline_logger = _logging.getLogger(__name__)
-
-
-def _set_last_boundary_signature(signature: dict) -> None:
-    global _LAST_BOUNDARY_SIGNATURE
-    _LAST_BOUNDARY_SIGNATURE = dict(signature)
-    _chunking_module._LAST_BOUNDARY_SIGNATURE = _LAST_BOUNDARY_SIGNATURE
+_pipeline_logger = logging.getLogger(__name__)
 
 
 def _json_payload(value: Any) -> Any:
@@ -257,18 +251,29 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
         # processor pads it to a full window anyway, so it only costs encoder time.
         windows = [piece for piece in windows if len(piece) >= 8000]
 
-        # Batched, because this is a pure encoder pass and the encoder is
-        # compute-bound: one window at a time left the GPU idle between kernel
-        # launches and cost 20.06s on a 2h09m file (258 windows, ~78ms each).
-        # The windows are fixed-length by construction, so batching adds no
-        # padding waste. Batch size follows the decode stage's budget rather than
-        # a constant of its own - the same weights are resident either way.
-        batch_size = max(1, _env_int("ASR_FEATURE_BATCH_SIZE", "8"))
+        # Batched because this is a pure encoder pass; the windows are
+        # fixed-length by construction, so batching adds no padding waste.
+        #
+        # Measured on an RTX 4060 Ti (8 GiB), 80 windows from 40 minutes of
+        # audio, timing this loop alone with the model already resident:
+        #
+        #   batch  1 -> 2.93 s (36.6 ms/window), peak 4.02 GiB
+        #   batch  4 -> 2.14 s (27.5 ms/window), peak 4.67 GiB
+        #   batch  8 -> 2.11 s (26.4 ms/window), peak 5.54 GiB
+        #   batch 16 -> 136.99 s (1712 ms/window), peak 7.26 GiB
+        #
+        # So the win is 1.37x and it is spent by batch 4; 8 buys 0.03 s for
+        # another 0.87 GiB. Batch 16 is not a slow batch, it is a **65x cliff**:
+        # 7.26 GiB on an 8 GiB card spills into WDDM shared memory and every
+        # access crosses PCIe. The default is 4 to keep that cliff two doublings
+        # away rather than one, because free VRAM is not ours alone - a browser
+        # on the same GPU moves it.
+        batch_size = max(1, _env_int("ASR_FEATURE_BATCH_SIZE", "4"))
         pieces = []
         for start in range(0, len(windows), batch_size):
             group = windows[start : start + batch_size]
             inputs = prepare_transcription_inputs(
-                processor, audio=group, language=ASR_LANGUAGE_FOR_CHUNKING
+                processor, audio=group, language=_asr_language_for_chunking()
             )
             moved = move_processor_inputs(
                 inputs, device=model.device, dtype=model.dtype
@@ -357,6 +362,13 @@ def _build_processing_spans(
                 "pause_count": len(runs),
                 "chunk_count": len(spans),
                 "duration_s": round(duration_s, 3),
+                # The cuts themselves, not just how many there are. Caches keyed
+                # on this signature hold word timings measured against these
+                # exact boundaries, and counts alone can match across different
+                # geometry: encoding the blank-run pass at a different batch
+                # size was measured to move the run count by ±3 out of ~215 -
+                # different cuts, and once in a while the same count.
+                "spans_sha256": _spans_digest(spans),
                 **{key: cfg[key] for key in sorted(cfg)},
             }
         }
@@ -429,7 +441,7 @@ def _cuda_memory_snapshot(stage: str, *, elapsed_s: float | None = None) -> dict
         snapshot["cuda_available"] = bool(torch.cuda.is_available())
         if not torch.cuda.is_available():
             snapshot.update(
-                _memory_safety_module.runtime_memory_snapshot(
+                memory_safety.runtime_memory_snapshot(
                     require_shared_vram=False,
                 )
             )
@@ -452,7 +464,7 @@ def _cuda_memory_snapshot(stage: str, *, elapsed_s: float | None = None) -> dict
     except Exception as exc:  # noqa: BLE001 - diagnostics must not break ASR
         snapshot["error"] = f"{type(exc).__name__}: {exc}"
     snapshot.update(
-        _memory_safety_module.runtime_memory_snapshot(
+        memory_safety.runtime_memory_snapshot(
             require_shared_vram=bool(snapshot.get("cuda_available")),
         )
     )
@@ -1180,7 +1192,7 @@ def _transcribe_and_align_local(
         if (
             chunk_dir is not None
             and chunk_dir.exists()
-            and not _chunking_module.keep_asr_chunks()
+            and not chunking.keep_asr_chunks()
         ):
             _delete_path_for_cleanup(chunk_dir)
 

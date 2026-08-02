@@ -549,7 +549,7 @@ def _chat_with_reasoning(
             **chat_kwargs,
         )
     except RetryableTranslationFormatError as exc:
-        if effective_effort != "xhigh" or not _is_stream_interrupted_error(exc):
+        if effective_effort != "max" or not _is_stream_interrupted_error(exc):
             raise
         _record_api_retry_event(exc, 0, 0.0, note="fallback_reasoning_effort_medium")
         fallback_kwargs = dict(chat_kwargs)
@@ -576,7 +576,38 @@ def _split_into_batches(segments: list[dict], batch_size: int) -> list[list[dict
     return [segments[index : index + batch_size] for index in range(0, len(segments), batch_size)]
 
 
+# Batches each worker should get. 1 fills the pool but does no balancing at all
+# - the wall time becomes whatever the single slowest batch takes. Higher values
+# balance better but multiply requests, and every request re-sends the full-film
+# JSON prefix and pays time-to-first-token before producing anything.
+_TARGET_BATCHES_PER_WORKER = 2
+_MIN_AUTO_BATCH_SIZE = 4
+
+
 def _auto_translation_batch_size(segment_count: int, max_workers: int) -> int:
+    """Batch size that keeps the worker pool busy without shredding requests.
+
+    `TRANSLATION_BATCH_SIZE` alone ignores how many workers there are, and on
+    short films that leaves most of them idle: 613 cues at the configured 64 is
+    ten batches for a sixteen-worker pool, so six workers never receive one.
+
+    Simulated on seven real cue lists over a swept per-request overhead F, as
+    worst-case regret against the best fixed size for each film:
+
+        overhead F     0     30     60    120    240
+        1 per worker  77%    52%    42%    34%    26%
+        2 per worker  13%     9%     7%     7%    16%
+        4 per worker   5%     9%    18%    34%    71%
+        fixed 64      86%    67%    56%    42%    36%
+
+    F was then measured against the live API, and it turns out not to be one
+    number: reasoning is a per-request cost that does not scale with the batch,
+    so F is ~65s per request with thinking on and ~0.05s with it off - the two
+    ends of that sweep, both reachable by flipping one setting. Two per worker
+    is the only column that is fine at both ends, which is what a default has to
+    be when the user owns the switch. The cap is still the configured size, so
+    this only ever makes batches smaller.
+    """
     count = max(0, int(segment_count))
     if count <= 0:
         return 0
@@ -586,7 +617,14 @@ def _auto_translation_batch_size(segment_count: int, max_workers: int) -> int:
         except ValueError:
             local_batch_size = 16
         return min(count, max(1, min(64, local_batch_size)))
-    return min(count, TRANSLATION_BATCH_SIZE)
+    workers = max(1, int(max_workers))
+    if workers == 1:
+        # Nothing to balance. Splitting here would only pay the per-request
+        # overhead twice for work that runs back to back either way.
+        return min(count, TRANSLATION_BATCH_SIZE)
+    target_batches = workers * _TARGET_BATCHES_PER_WORKER
+    balanced = -(-count // target_batches)  # ceil
+    return min(count, TRANSLATION_BATCH_SIZE, max(_MIN_AUTO_BATCH_SIZE, balanced))
 
 
 _serialize_segments = prompt_module._serialize_segments

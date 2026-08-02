@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import wave
 from pathlib import Path
 
@@ -14,12 +13,10 @@ def _write_wav(path: Path, *, duration_s: float = 1.0, sample_rate: int = 16000)
 
 
 def test_chunk_export_keeps_any_nonzero_clamped_span(monkeypatch, tmp_path):
-    monkeypatch.setenv("ASR_CHUNK_MIN_DURATION_S", "9.0")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
 
     from asr import chunking
 
-    chunking = importlib.reload(chunking)
     audio = tmp_path / "source.wav"
     _write_wav(audio, duration_s=1.0)
 

@@ -19,6 +19,24 @@ def test_chunk_settings_refresh_between_calls(monkeypatch, tmp_path):
     assert chunking.keep_asr_chunks()
 
 
+def test_asr_language_refreshes_between_calls(monkeypatch):
+    """It was a module-level constant read once at import.
+
+    That made it the only ASR setting a persistent worker could not pick up
+    between jobs, and the last standing excuse for reloading `asr.pipeline` to
+    refresh the environment - a reload that forked the module's function objects
+    away from the submodules it shares them with.
+    """
+    monkeypatch.setenv("ASR_LANGUAGE", "Japanese")
+    assert pipeline._asr_language_for_chunking() == "Japanese"
+
+    monkeypatch.setenv("ASR_LANGUAGE", "English")
+    assert pipeline._asr_language_for_chunking() == "English"
+
+    monkeypatch.setenv("ASR_LANGUAGE", "   ")
+    assert pipeline._asr_language_for_chunking() == "Japanese"
+
+
 def test_transcribe_settings_refresh_between_calls(monkeypatch):
     monkeypatch.setenv("ASR_RESULT_CACHE_ENABLED", "0")
     monkeypatch.setenv("ASR_INVALID_SEGMENT_DURATION", "0.2")

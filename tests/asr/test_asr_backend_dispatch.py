@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 from pathlib import Path
 
 import pytest
@@ -9,14 +8,21 @@ from asr.backends.base import BaseAsrBackend
 from helpers import ASR_17B_BACKEND, RETIRED_06B_BACKEND
 
 
-def _reload_asr(monkeypatch, *, backend: str):
+def _asr(monkeypatch, *, backend: str):
+    """Select the backend and hand back the stage.
+
+    No reload: `ASR_BACKEND` is read inside `_resolve_asr_backend`, which is the
+    property that lets one persistent worker serve jobs with different backends.
+    Reloading here would have hidden a regression in exactly that property.
+    """
     monkeypatch.setenv("ASR_BACKEND", backend)
     from asr import pipeline as asr
-    return importlib.reload(asr)
+
+    return asr
 
 
 def test_qwen3_asr_repo_backend_dispatch_uses_gpu_worker_local_backend(monkeypatch):
-    asr = _reload_asr(monkeypatch, backend=ASR_17B_BACKEND)
+    asr = _asr(monkeypatch, backend=ASR_17B_BACKEND)
     backend = asr._resolve_asr_backend("cpu")
 
     assert type(backend).__name__ == "LocalAsrBackend"
@@ -27,7 +33,7 @@ def test_qwen3_asr_repo_backend_dispatch_uses_gpu_worker_local_backend(monkeypat
 
 def test_legacy_asr_worker_mode_env_is_ignored(monkeypatch):
     monkeypatch.setenv("ASR_WORKER_MODE", "subprocess")
-    asr = _reload_asr(monkeypatch, backend=ASR_17B_BACKEND)
+    asr = _asr(monkeypatch, backend=ASR_17B_BACKEND)
     backend = asr._resolve_asr_backend("cpu")
 
     assert isinstance(backend, BaseAsrBackend)
@@ -39,10 +45,7 @@ def test_legacy_asr_worker_mode_env_is_ignored(monkeypatch):
 def test_qwen3_asr_default_runtime_mode_is_gpu_worker(monkeypatch):
     monkeypatch.delenv("ASR_WORKER_MODE", raising=False)
     monkeypatch.delenv("ASR_WORKER_MODE_BY_REPO", raising=False)
-    from asr import pipeline as asr
-
-    monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
-    asr = importlib.reload(asr)
+    asr = _asr(monkeypatch, backend=ASR_17B_BACKEND)
     backend_17b = asr._resolve_asr_backend("cpu")
     assert backend_17b.is_subprocess is False
     assert asr.get_backend_label() == ASR_17B_BACKEND
@@ -52,14 +55,14 @@ def test_retired_06b_backend_is_rejected(monkeypatch):
     # A stale `.env` from before 2026-07-31 still names the 0.6B repo.
     # Failing loudly beats silently transcribing with a model the user
     # did not pick, and beats a KeyError deep inside a batch-size lookup.
-    asr = _reload_asr(monkeypatch, backend=RETIRED_06B_BACKEND)
+    asr = _asr(monkeypatch, backend=RETIRED_06B_BACKEND)
 
     with pytest.raises(ValueError, match="Unsupported ASR_BACKEND"):
         asr._resolve_asr_backend("cpu")
 
 
 def test_invalid_asr_backend_is_rejected(monkeypatch):
-    asr = _reload_asr(monkeypatch, backend="unknown_backend")
+    asr = _asr(monkeypatch, backend="unknown_backend")
 
     try:
         asr._resolve_asr_backend("cpu")
@@ -71,7 +74,7 @@ def test_invalid_asr_backend_is_rejected(monkeypatch):
 
 def test_internal_asr_backend_names_are_rejected(monkeypatch):
     invalid_name = "local" + "_asr"
-    asr = _reload_asr(monkeypatch, backend=invalid_name)
+    asr = _asr(monkeypatch, backend=invalid_name)
 
     try:
         asr._resolve_asr_backend("cpu")
@@ -83,7 +86,7 @@ def test_internal_asr_backend_names_are_rejected(monkeypatch):
 
 
 def test_short_qwen_backend_aliases_are_rejected(monkeypatch):
-    asr = _reload_asr(monkeypatch, backend="qwen3-asr-1.7b")
+    asr = _asr(monkeypatch, backend="qwen3-asr-1.7b")
 
     try:
         asr._resolve_asr_backend("cpu")
@@ -96,7 +99,7 @@ def test_short_qwen_backend_aliases_are_rejected(monkeypatch):
 
 def test_legacy_non_hf_repo_id_is_rejected(monkeypatch):
     legacy_repo = ASR_17B_BACKEND.removesuffix("-hf")
-    asr = _reload_asr(monkeypatch, backend=legacy_repo)
+    asr = _asr(monkeypatch, backend=legacy_repo)
 
     with pytest.raises(ValueError, match="Unsupported ASR_BACKEND"):
         asr._resolve_asr_backend("cpu")

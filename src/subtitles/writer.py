@@ -745,6 +745,23 @@ def _split_long_display_block(
         )
         item["subtitle_layout_split"] = "max_display_duration"
         item["subtitle_layout_split_source"] = split_source
+        # Which side of this piece is the middle of a sentence. The translator
+        # sees cues one at a time and will otherwise close each fragment off as
+        # a complete sentence; these two flags are what tells it not to.
+        #
+        # Written relative to the parent rather than to this pass, because
+        # `_split_long_display_blocks` runs twice and a piece can be split
+        # again: the first piece inherits whatever the parent said about its
+        # left edge, the last inherits its right edge, and every internal edge
+        # is a continuation by construction.
+        item["continues_from_previous"] = (
+            bool(block.get("continues_from_previous")) if index == 0 else True
+        )
+        item["continues_into_next"] = (
+            bool(block.get("continues_into_next"))
+            if index == len(boundaries) - 2
+            else True
+        )
         item["layout_engine"] = options.layout_engine
         item["layout_version"] = "subtitle_layout_v2"
         item["timing_model"] = options.timing_model

@@ -4,7 +4,11 @@ import re
 from llm.glossary import normalize_glossary_text
 
 
-PROMPT_VERSION = "v3.1"
+# v3.2: cues carry `cont_prev`/`cont_next` when the display-duration split cut a
+# sentence in half, and the system prompt says what to do with them. Bumped
+# because the cache key is `id@version` - translations produced without the
+# markers are the exact ones this change exists to replace.
+PROMPT_VERSION = "v3.2"
 _LEADING_ROLE_LABEL_RE = re.compile(
     r"^\s*(?:男|女|男性|女性|男优|女优|スタッフ|撮影者|カメラマン|"
     r"[A-Za-z][A-Za-z ._-]{0,20})\s*[：:]\s*"
@@ -39,15 +43,21 @@ def _serialize_segments(
         end = _safe_float(seg.get("end"))
         ja_text = _normalize_source_text(seg.get("text", ""))
         item_id = explicit_ids[idx] if explicit_ids is not None else start_index + idx
-        payload.append(
-            {
-                "id": item_id,
-                "start": round(start, 3),
-                "end": round(end, 3),
-                "duration_sec": round(max(0.0, end - start), 3),
-                "ja": ja_text,
-            }
-        )
+        item = {
+            "id": item_id,
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "duration_sec": round(max(0.0, end - start), 3),
+            "ja": ja_text,
+        }
+        # Emitted only when true. Most cues are whole utterances, and a pair of
+        # `false` on every line would cost prompt tokens on every batch of every
+        # film to say nothing.
+        if seg.get("continues_from_previous"):
+            item["cont_prev"] = True
+        if seg.get("continues_into_next"):
+            item["cont_next"] = True
+        payload.append(item)
     if compact:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -73,7 +83,11 @@ _SYSTEM_PROMPT_FULL = (
     "6. {name_homophone}\n"
     "7. 全片上下文只用于翻译连贯、指代判断、口吻一致和术语一致；不要修改、补全或纠正日文原文。\n"
     "8. 每条输入必须单独翻译，不能合并、拆分、漏译、调换顺序。\n"
-    "9. 只输出合法 JSON，不要 Markdown、不要解释、不要额外字段；思考过程不要写进最终 content。"
+    "9. 带 cont_prev / cont_next 的条目是同一句话被字幕时长切开后的片段："
+    "cont_prev 表示它接着上一条没说完的话，cont_next 表示这句话在下一条继续。"
+    "这类片段按上下文译成能前后衔接的半句，各自都不要补成完整句子，也不要在片段结尾加收句的标点；"
+    "没有这两个标记的条目就是完整的一句，照常翻译。\n"
+    "10. 只输出合法 JSON，不要 Markdown、不要解释、不要额外字段；思考过程不要写进最终 content。"
     '最终 content 必须是完整 JSON 对象，形如 {{"translations":[{{"id":0,"text":"..."}}]}}，条数严格匹配本次任务，且不能为空。\n\n'
     "风格示例（仅示范语气与用词，不是本次待译内容）：\n"
     "気持ちいい… → 好舒服…\n"
@@ -92,6 +106,7 @@ _SYSTEM_PROMPT_COMPACT = (
     "保持人名罗马音；汉字人名也要按日语读音罗马音化，不输出中文汉字名；"
     "不用逗号句号，停顿用空格；省略号单个…；全角？！且不连用；"
     "每条独立翻译，不合并、不漏译、不调序。"
+    "带 cont_prev/cont_next 的是同一句被切开的片段，译成能衔接的半句，不要各自补成完整句。"
     '只输出合法 JSON：{{"translations":[{{"id":0,"text":"..."}}]}}。'
 )
 

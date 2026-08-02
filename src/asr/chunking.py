@@ -6,9 +6,6 @@ from pathlib import Path
 from typing import Callable
 
 
-_LAST_BOUNDARY_SIGNATURE: dict = {}
-
-
 def current_asr_chunk_root() -> Path:
     return Path(os.getenv("ASR_CHUNK_ROOT", Path("tmp") / "chunks")).resolve()
 

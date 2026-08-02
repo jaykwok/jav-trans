@@ -47,20 +47,52 @@ def test_split_into_batches():
     assert len(translator._split_into_batches(_segments(450), 200)) == 3
 
 
-def test_auto_translation_batch_size_is_worker_independent():
-    # 0 segments -> no batch; otherwise min(count, TRANSLATION_BATCH_SIZE),
-    # independent of worker count. Derive expectations from the module constant
-    # so a local .env override of TRANSLATION_BATCH_SIZE doesn't break the test.
+def test_auto_translation_batch_size_fills_the_worker_pool():
+    """The batch size now answers to the pool, because ignoring it left workers
+    with nothing to do.
+
+    613 cues at the configured 64 is ten batches for a sixteen-worker pool - six
+    workers never receive one, and no scheduling fixes a round that is mostly
+    empty. The rule aims for two batches per worker: one fills the pool but
+    balances nothing, four multiplies requests that each re-send the full-film
+    prefix. Expectations are derived from the module constant so a local
+    TRANSLATION_BATCH_SIZE override does not break the test.
+    """
     cap = translator.TRANSLATION_BATCH_SIZE
     assert 8 <= cap <= 400
     assert translator._auto_translation_batch_size(0, 4) == 0
-    assert translator._auto_translation_batch_size(5, 4) == 5
-    assert translator._auto_translation_batch_size(cap + 100, 1) == cap
-    assert translator._auto_translation_batch_size(cap + 100, 16) == cap
-    # Worker count must not change the batch size.
+
+    # Short film, wide pool: shrink so every worker gets work.
+    assert translator._auto_translation_batch_size(cap + 100, 16) == -(
+        -(cap + 100) // 32
+    )
+
+    # It never grows past the configured cap, however long the film is.
+    assert translator._auto_translation_batch_size(100_000, 16) == cap
+
+
+def test_auto_translation_batch_size_leaves_long_films_alone():
+    """Where the pool is already saturated, the rule must not fire - the extra
+    requests would be paid for nothing."""
+    cap = translator.TRANSLATION_BATCH_SIZE
     assert translator._auto_translation_batch_size(
         5000, 1
     ) == translator._auto_translation_batch_size(5000, 32)
+    assert translator._auto_translation_batch_size(5000, 32) == cap
+
+
+def test_auto_translation_batch_size_does_not_split_for_one_worker():
+    """With a single worker there is nothing to balance, so a smaller batch buys
+    nothing and pays time-to-first-token an extra time."""
+    cap = translator.TRANSLATION_BATCH_SIZE
+    assert translator._auto_translation_batch_size(cap + 100, 1) == cap
+    assert translator._auto_translation_batch_size(60, 1) == 60
+
+
+def test_auto_translation_batch_size_has_a_floor():
+    """A handful of cues must not become one request per cue."""
+    assert translator._auto_translation_batch_size(10, 16) == 4
+    assert translator._auto_translation_batch_size(3, 16) == 3
 
 
 def test_env_float_falls_back_on_bad_value(monkeypatch):

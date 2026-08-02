@@ -36,6 +36,34 @@ def _split_into_batches(segments: list[dict], batch_size: int) -> list[list[dict
     ]
 
 
+def _batch_cost(batch_segments: list[dict]) -> int:
+    """Rough cost of a batch: how much Japanese it has to translate.
+
+    Latency here is dominated by output tokens, and output length tracks source
+    length closely enough to rank batches by. Nothing depends on this being
+    accurate - it only decides who starts first.
+    """
+    return sum(len(str(seg.get("text", ""))) for seg in batch_segments)
+
+
+def _submission_order(
+    pending_batches: list[tuple[int, list[dict]]],
+) -> list[tuple[int, list[dict]]]:
+    """Longest batch first.
+
+    Batches are id-addressed and independent, so the order they run in is free -
+    but the order they *start* in decides the makespan. Submitted in index
+    order, the largest batch can be the last one picked up, and the whole
+    translation then ends one full large batch after the pool went idle.
+    Longest-processing-time-first is the standard fix and is within 4/3 of
+    optimal for identical workers; here the batches are far from equal, because
+    a batch of twelve long lines and a batch of twelve grunts both count twelve.
+    """
+    return sorted(
+        pending_batches, key=lambda item: (-_batch_cost(item[1]), item[0])
+    )
+
+
 def _make_aggregated_progress_callback(
     num_batches: int,
     expected_total: int,
@@ -916,7 +944,7 @@ def run_batched(
             }
             futures = {
                 executor.submit(run_batch, batch_index, batch): batch_index
-                for batch_index, batch in pending_batches
+                for batch_index, batch in _submission_order(pending_batches)
             }
             try:
                 remaining = set(futures)
