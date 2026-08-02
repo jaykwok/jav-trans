@@ -37,7 +37,7 @@ def _pythonpath_with_src(env: dict[str, str]) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Start the JAVTrans Web server for smoke tests.")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=1234)
+    parser.add_argument("--port", type=int, default=8888)
     parser.add_argument("--events-port", default="17322")
     parser.add_argument("--run-dir", default="", help="Defaults to agents/temp/YYYYMMDD_HHMMSS_web-smoke-server")
     parser.add_argument("--startup-timeout", type=float, default=30.0)

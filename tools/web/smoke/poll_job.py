@@ -17,7 +17,7 @@ def _resolve_job_id(args: argparse.Namespace) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Poll a Web API job and persist latest state.")
-    parser.add_argument("--base-url", default="http://127.0.0.1:1234")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8888")
     parser.add_argument("--job-id", default="")
     parser.add_argument("--job-id-file", default="")
     parser.add_argument("--run-dir", default="", help="Defaults to agents/temp/YYYYMMDD_HHMMSS_web-smoke-poll")

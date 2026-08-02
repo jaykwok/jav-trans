@@ -217,7 +217,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Internal TCP port used by the web console to receive StageEvent lines.
     "JAV_TRANS_EVENTS_PORT": "17322",
     # Web console HTTP port used by launcher.py.
-    "JAV_TRANS_PORT": "1234",
+    "JAV_TRANS_PORT": "8888",
 
     # --- Audio ---
     # 1 applies dynamic normalization before ASR.
