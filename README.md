@@ -141,10 +141,10 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - `20 / (24000/1001)` 是字幕最短显示和 micro chunk 风险线，不是 runtime duration-only drop 阈值。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声。
-- 字幕行的起止**不取单个首字或末字**：18% 的行至少有一个字被接缝旁的音频拽走 >400ms，边界必须用稳健分位数。
-- 超长 cue 的**拆分点取对齐头量出的词间静音**（≥0.12s 才算间隙，≥0.60s 视为完整停顿，切点落在静音中央），文本切点取该静音之后那个词的真实起点，因此时间与文本来自同一次测量。只有 `ctc_forced_alignment` 的词参与：比例时间戳只是字数比例的另一种写法，用它当声学证据会把猜测标成测量。没有真实停顿可用时如实退回按字数比例切分。
-- 后置闸的 `min_alignment_score` 保持关闭：放行组与丢弃组的分数分布重叠，且两组都是真实内容，没有一组是幻听，未标定的阈值会静默删掉三分之一输出。
-- 对齐头**默认启用**：`ASR_ALIGNMENT_HEAD_PATH` 默认指向 HF 上的 `ctc_aligner.pt`（galgame Phase 1 头，clean speech 上 containment 98.75%、逐字偏移中位 1.9ms；真实 JAV 上的起点精度已由 110 条盲听审计裁决——故意错切的 150ms/400ms 探针都能被听出来，而对齐起点与「提前半秒、不可能被切」的对照组分不开，即没有 150ms 量级的系统性滞后）。把该值置空可回退到定长切分 + 比例时间轴。checkpoint 缺失、下载失败或损坏都只 warn 一次并降级，不会让转写失败。
+- 字幕行的起止**不取单个首字或末字**，用稳健分位数。
+- 超长 cue 的**拆分点取对齐头量出的词间静音**（≥0.12s 才算间隙，≥0.60s 视为完整停顿，切点落在静音中央），文本切点取该静音之后那个词的真实起点。只有 `ctc_forced_alignment` 的词参与；没有真实停顿可用时退回按字数比例切分。
+- 后置闸的 `min_alignment_score` 保持关闭，因为该阈值尚未标定。
+- 对齐头**默认启用**：`ASR_ALIGNMENT_HEAD_PATH` 默认指向 HF 上的 `ctc_aligner.pt`。置空可回退到定长切分 + 比例时间轴。checkpoint 缺失、下载失败或损坏都只 warn 一次并降级，不会让转写失败。
 - allocated/reserved/shared VRAM 只写运行诊断，不参与功能判断；显式 CUDA 请求不可用时直接报错，不回退 CPU。
 
 ---
@@ -163,23 +163,23 @@ ASR encoder 输出 2048 维 @13fps（76.9 ms/帧）
   -> Linear(-> 字表 + blank)
 ```
 
-- **上采样 x2 不是可选项**：日语语速 6~8 mora/s，13fps 下每 mora 仅 1.6~2.2 帧，而 CTC 每个输出 token 至少要一帧。
-- **CTC 目标是「字」不是 kana**：`pyopenjtalk` 在本技术栈装不上，且汉字读音经 g2p 会引入噪声。
-- **训练数据是白送的** `(音频, ASR 文本)` 配对：ASR 转写自己的音频，输出即目标。
+- **上采样 x2 不是可选项**：CTC 每个输出 token 至少要一帧，而日语语速在 13fps 下每 mora 仅 1.6~2.2 帧。
+- **CTC 目标是「字」不是 kana**，因此不需要 g2p 依赖。
+- **训练数据是** `(音频, ASR 文本)` 配对：ASR 转写自己的音频，输出即目标。
 - **同一份输出有两个读法**：与文本对齐得到时间轴，blank 游程用来选切点。两个读法都不丢音频。
 
-`forced_align` 在 `src/asr/alignment.py` 内自己实现，不依赖 `torchaudio`：本项目 Python 3.14，torch 所在索引上没有匹配的 torchaudio wheel，为一个算子拉 CUDA wheel 有扰动现有 torch 构建的实际风险。正确性用**穷举所有合法 CTC 路径**的参照实现验证（`tests/asr/test_asr_alignment_head.py`），对着定义验而不是对着别人的实现验。
+`forced_align` 在 `src/asr/alignment.py` 内自己实现，不依赖 `torchaudio`（本项目 Python 3.14，torch 所在索引上没有匹配的 torchaudio wheel）。正确性由穷举所有合法 CTC 路径的参照实现验证（`tests/asr/test_asr_alignment_head.py`）。
 
-对齐头跟 ASR 权重一起发在 HF 上，不进本仓库：它是 encoder 专属的（换 encoder 就作废），放在它所属的 encoder 旁边才不会两边漂移，而且 14.7MB 的二进制每迭代一次就给 git 历史加一份全量副本。`ASR_ALIGNMENT_HEAD_PATH` 因此接受两种写法：
+对齐头跟 ASR 权重一起发在 HF 上，不进本仓库：它是 encoder 专属的，换 encoder 即作废。`ASR_ALIGNMENT_HEAD_PATH` 接受两种写法：
 
 ```text
 hf:<repo>@<commit sha>#<文件名>   # 默认；首次运行下载进 HF 缓存，之后离线
 ./path/to/ctc_aligner.pt          # 本地文件，覆盖默认值
 ```
 
-默认值**钉死 commit sha 而不是 `main`**：跟着分支走意味着某天重训一版头，所有人的字幕时间轴会一起变，而运行日志里不会有任何一行提到这件事。换头是显式改配置的动作。
+默认值**钉死 commit sha 而不是 `main`**，换头是显式改配置的动作。
 
-首次运行下载到 **`models/ctc_aligner.pt`**（14.7MB，与 ASR 权重同目录，走项目代理设置），之后完全离线；打包版直接内置在同一位置，不下载。同名的 `models/ctc_aligner.pt.revision` 记录这份文件是哪个 sha——改了默认 sha 会重新下载，而不是继续用同名的旧头。`ctc_aligner.pt` 的字节内容还参与 ASR finalize 缓存的签名，所以换头会自动让旧的对齐结果失效，不会拿旧时间轴冒充新头的输出。
+首次运行下载到 **`models/ctc_aligner.pt`**（14.7MB，与 ASR 权重同目录，走项目代理设置），之后完全离线；打包版直接内置在同一位置，不下载。同名的 `models/ctc_aligner.pt.revision` 记录这份文件对应哪个 sha，改了默认 sha 会重新下载。`ctc_aligner.pt` 的字节内容参与 ASR finalize 缓存签名，换头会自动让旧的对齐结果失效。
 
 ---
 
@@ -216,23 +216,23 @@ ASR_CHUNK_MIN_PAUSE_S=0.6
 
 ASR stage 固定由统一 GPU worker 持有 CUDA：切分用的 encoder 前向、ASR 解码和 CTC 对齐都在同一个 GPU owner 进程里顺序执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM、CUDA 状态异常或超过 `ASR_STAGE_WORKER_VRAM_BUDGET_MB` 时会杀掉 worker，不会把 Web 主进程一起带崩。
 
-`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 约为 `7779MiB`。**推荐 8GB 及以上**：1.7B 权重约 3.4GB 常驻，实测 8GB 卡在 batch 8 / 20 秒块下峰值 `5692MiB`（预算 `7778MiB`），这是当前默认配置的标定点。`ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO` 的 `6144MiB` 是**硬下限**而不是推荐值——低于它直接拒绝启动，等于它则必须靠 auto batch 自己降到 4~6 才跑得动，余量很小。检查在模型加载前完成；shared VRAM 不计入可用预算，任何正的基线增量都立即视为 soft OOM，显式放大的 worker budget 和 CPU fallback 都不能绕过。监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
+`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 约为 `7779MiB`。**推荐 8GB 及以上**：1.7B 权重约 3.4GB 常驻，默认配置（batch 8 / 20 秒块）在 8GB 卡上峰值约 `5692MiB`。`ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO` 的 `6144MiB` 是**硬下限**而不是推荐值：低于它直接拒绝启动，等于它则需要 auto batch 降到 4~6 才能跑，余量很小。检查在模型加载前完成；shared VRAM 不计入可用预算，任何正的基线增量都立即视为 soft OOM，显式放大的 worker budget 和 CPU fallback 都不能绕过。监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
 
 GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长心跳。字幕 cue plan 会单独记录 timeline normalize、两轮 anchor-aware DP、polish 和 finalize 进度。
 
 对齐后的 segment 会按内容签名缓存。签名包含 ASR backend、字幕选项与参与结果的运行配置；只改输出路径一类不影响内容的设置不会让缓存失效。
 
-每个 ASR chunk 的转写结果另有一层跨任务的内容寻址缓存（`tmp/asr_cache/<模型签名>/<音频sha256>.json`）：键为 chunk 音频 PCM 内容加模型与解码参数，与路径、chunk 序号和任务无关。同一部片重跑、崩溃续跑、甚至不同任务里字节相同的 chunk 都直接命中，整段跳过 encoder+decoder。超时与隔离结果不会入缓存；`ASR_RESULT_CACHE_ENABLED=0` 可关闭，`ASR_RESULT_CACHE_ROOT` 改位置。该缓存取代了旧的 per-job crash-resume checkpoint。
+每个 ASR chunk 的转写结果另有一层跨任务的内容寻址缓存（`tmp/asr_cache/<模型签名>/<音频sha256>.json`）：键为 chunk 音频 PCM 内容加模型与解码参数，与路径、chunk 序号和任务无关。同一部片重跑、崩溃续跑、甚至不同任务里字节相同的 chunk 都直接命中，整段跳过 encoder+decoder。超时与隔离结果不会入缓存；`ASR_RESULT_CACHE_ENABLED=0` 可关闭，`ASR_RESULT_CACHE_ROOT` 改位置。
 
 `ASR_BATCH_SIZE=auto` 以 5600MB 下的 repo 默认表为基线，按显存预算比例放缩初始 batch。ASR text batch 发生 GPU OOM 时会重启 worker、降低 batch 并从结果缓存续跑。切分阶段逐个编码固定 30 秒窗口，没有可降的 batch，在那里 OOM 会直接停止而不是假装重试。RAM OOM 同样直接停止，不伪装成可由 GPU batch 修复的问题。
 
-auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、显存预算、模型、精度、attention 实现和 chunk 时长跨任务学习。v3 profile 记录已验证安全 batch 与 OOM 不安全上界：阶段 peak allocated 低于预算 `80%` 时，在两者之间二分探测；尚无 OOM 上界时则向当前阶段上限折半推进，OOM 后本次任务仍先减半恢复，同时把安全值压到不安全值以下。**chunk 时长进 profile 身份**是必需的：同一张卡上 30s chunk 的显存占用远高于 20s，两者共用一条 profile 会让长 chunk 反复撞 OOM。8G 与 16G 卡因此各自学各自的上限，不需要手动配置。当前只覆盖 ASR chunk batch；显式数字 batch 不参与 profile 学习。
+auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、显存预算、模型、精度、attention 实现和 chunk 时长跨任务学习。v3 profile 记录已验证安全 batch 与 OOM 不安全上界：阶段 peak allocated 低于预算 `80%` 时，在两者之间二分探测；尚无 OOM 上界时则向当前阶段上限折半推进，OOM 后本次任务仍先减半恢复，同时把安全值压到不安全值以下。chunk 时长是 profile 身份的一部分，因此不同显存和不同 chunk 几何各自学各自的上限，不需要手动配置。当前只覆盖 ASR chunk batch；显式数字 batch 不参与 profile 学习。
 
-推理只需要 ASR Hugging Face 模型本身；同一份权重会被加载两处，切分阶段短暂加载一次取 encoder 特征（算完即卸，与解码模型不同驻——8G 卡容不下两份），解码阶段再加载一次并一直用到对齐 pass 结束。**权重按需加载**：需要它的阶段自己加载，所以整片命中缓存的续跑完全不会加载模型。源码运行时如果本地没有模型，会按需下载到 `models/`。对齐头（14.7MB）默认从同一个 HF repo 按固定 commit sha 取，落在 `models/ctc_aligner.pt`；置空则**不报错**，切分退化为定长、字幕时间轴退化为按字数比例摊开。
+推理只需要 ASR Hugging Face 模型本身；同一份权重会被加载两处，切分阶段短暂加载一次取 encoder 特征（算完即卸，不与解码模型同驻），解码阶段再加载一次并一直用到对齐 pass 结束。**权重按需加载**：需要它的阶段自己加载，所以整片命中缓存的续跑完全不会加载模型。源码运行时如果本地没有模型，会按需下载到 `models/`。对齐头（14.7MB）默认从同一个 HF repo 按固定 commit sha 取，落在 `models/ctc_aligner.pt`；置空则**不报错**，切分退化为定长、字幕时间轴退化为按字数比例摊开。
 
 阶段耗时表的各行严格加总为总计。ASR 在独立的 GPU owner 进程里运行，进程启动、环境传递与结果回传单列为「ASR Worker 启动与传输」；未归入任何具名阶段的剩余时间落在「其他」。
 
-训练时生成的 CUDA feature cache、synthetic WAV、sequence JSONL、tensor cache 和 `datasets/train/...` 产物都不是运行依赖，不随源码分发。
+训练产物（CUDA feature cache、synthetic WAV、sequence JSONL、tensor cache、`datasets/train/...`）都不是运行依赖，不随源码分发。
 
 ---
 
