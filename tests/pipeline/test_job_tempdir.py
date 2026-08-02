@@ -256,12 +256,12 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
 
 def test_run_log_filename_components_are_bounded():
     component = main._run_log_component(
-        "匿名样片 A_" + "speech-boundary-v3-grok-hysteresis_" * 4,
+        "sample-a_" + "speech-boundary-v3-grok-hysteresis_" * 4,
         max_chars=48,
     )
 
     assert len(component) <= 48
-    assert component.startswith("匿名样片 A_")
+    assert component.startswith("sample-a_")
     assert "-" in component
 
 
@@ -273,7 +273,7 @@ def test_run_log_filename_does_not_repeat_long_job_id(tmp_path):
         run_log_enabled=True,
         run_log_dir=tmp_path / ("nested-" * 12),
     )
-    job_id = "匿名样片 C_" + "joint-trained-validation_" * 5
+    job_id = "sample-c_" + "joint-trained-validation_" * 5
     backend = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
 
     logger, log_path = main._setup_run_logger(job_id, backend, ctx)

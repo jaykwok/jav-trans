@@ -48,7 +48,7 @@ CueQC 与 Split candidate 都是单一、明确的二分类查询，因此单轴
 
 ### Subtitle A/B
 
-`generate_subtitle_ab_compare_audit_html.py` 是 sample-c/sample-a 最终 A/B 的现役可视化入口，后续需要补全人工 A/B Adapter，覆盖 empty、重复、遗漏、时间连续性和总体偏好；当前尚未保存人工 verdict，因此本轮只保留，不把播放器对照页误称为已迁移人工 gate。
+`generate_subtitle_ab_compare_audit_html.py` 是 匿名样片 C/A 最终 A/B 的现役可视化入口，后续需要补全人工 A/B Adapter，覆盖 empty、重复、遗漏、时间连续性和总体偏好；当前尚未保存人工 verdict，因此本轮只保留，不把播放器对照页误称为已迁移人工 gate。
 
 ## 暂不机械迁移的页面
 

@@ -72,4 +72,4 @@ Inner当前有效职责和结构保持不变。它只接收CueQC keep，输出�
 4. 用最终Proposal/Outer路线重编Split candidate-query schema和数据，跑neutral容量A/B。
 5. 用最终Split真实sub-island重编CueQC；若改变PTM adapter则新schema随机初始化重训。
 6. Inner真正移到CueQC keep后执行；按最终上游重跑gate，只有失败才扩容A/B。
-7. 最后完成full/batched等价、阶段释放、shared spill=0、sample-c/sample-a和full workflow smoke。
+7. 最后完成full/batched等价、阶段释放、shared spill=0、匿名样片 C/A和full workflow smoke。

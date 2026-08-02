@@ -23,19 +23,31 @@ SUMMARY_TIME_KEYS = (
     "exported_at",
     "timestamp",
 )
-ANON_LABELS = {
-    "匿名样片 A": "匿名样片 A",
-    "匿名样片 B": "匿名样片 B",
-    "匿名样片 C": "匿名样片 C",
-    "匿名样片 D": "匿名样片 D",
-    "匿名样片 E": "匿名样片 E",
-    "匿名样片 F": "匿名样片 F",
-    "匿名样片 G": "匿名样片 G",
-    "匿名样片 H": "匿名样片 H",
-    "匿名样片 I": "匿名样片 I",
-    "匿名样片 J": "匿名样片 J",
-    "匿名样片 K": "匿名样片 K",
-}
+# Real sample stem -> anonymous label, loaded from outside the repository.
+#
+# This table used to be a literal here, which defeated its own purpose: it maps
+# every "匿名样片 X" in the committed docs back to the stem it stands for, so
+# committing it de-anonymised everything it was supposed to protect. It lives in
+# agents/ now, which is gitignored. Missing file means no substitution - the
+# audit pages it feeds are generated under agents/audits/ and never committed,
+# so a local run showing real stems is the intended behaviour, not a leak.
+ANON_LABELS_PATH = Path(
+    os.getenv("AUDIT_ANON_LABELS_PATH", "").strip()
+    or (AUDIT_ROOT / "anon_labels.json")
+)
+
+
+def _load_anon_labels() -> dict[str, str]:
+    try:
+        payload = json.loads(ANON_LABELS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key): str(value) for key, value in payload.items() if key}
+
+
+ANON_LABELS = _load_anon_labels()
 
 
 def anonymize_display_text(value: str) -> str:

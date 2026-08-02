@@ -76,6 +76,6 @@ Scorer v11 当前职责 canonical 已闭合，但仍需针对新音频重新提�
 4. 用最终 Scorer→Proposal→Outer 输出生成 Split v4 candidate-query dataset；先 neutral baseline，再按固定数据做 loss/architecture A/B。
 5. 导出真实 provisional sub-islands，重新做 CueQC teacher/canonical/feature compile；fixed partition随机初始化重训 CueQC，不允许只 rebind旧 checkpoint。
 6. 只从新 CueQC argmax keep输出编译 Inner v2数据，随机初始化重训并做 start/end coverage最高95%数值 gate及人工 zero-clipping/zero-true-speech-deletion gate。
-7. 最后才运行 Scorer→Proposal→Outer→Split→CueQC→Inner 的 batch/full equivalence、VRAM lifecycle、sample-c/sample-a、OOM和完整 workflow smoke。
+7. 最后才运行 Scorer→Proposal→Outer→Split→CueQC→Inner 的 batch/full equivalence、VRAM lifecycle、匿名样片 C/A、OOM和完整 workflow smoke。
 
 在步骤1开始前，本轮不启动任何 GPU训练，也不修改任何生产 checkpoint或registry。
