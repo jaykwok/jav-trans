@@ -55,7 +55,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # 1.7B SFT encoder); clear this to fall back to proportional timing and
     # fixed-length chunks. Accuracy validated on clean speech; real-domain
     # onset accuracy still under audit.
-    "ASR_ALIGNMENT_HEAD_PATH": "./src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/ctc_aligner.pt",
+    # `hf:<repo>@<sha>#<file>` downloads once into the HF cache and is offline
+    # afterwards; a plain path still works as a local override. The sha is
+    # pinned deliberately - under a moving branch a retrained head would change
+    # every subtitle's timing with nothing in the run saying so.
+    "ASR_ALIGNMENT_HEAD_PATH": "hf:jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf@2d46a169b71232ff08800472c457fdc092084bdf#ctc_aligner.pt",
 
     # --- ASR Language & Generation ---
     # Source audio language hint passed to ASR.

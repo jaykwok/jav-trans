@@ -15,7 +15,7 @@ It bundles:
   `PATH`, or from `-FfmpegExe` / `-FfprobeExe`
 - `src/assets/images/icon.png` for the in-app header, drop zone image, and PNG favicon
 - `src/assets/images/icon.ico` for the pywebview native window icon and packaged executable icon
-- all repo-bound small models under `src/checkpoints/<repo-tag>/`
+- `models/ctc_aligner.pt`, the CTC alignment head
 - the bundled Hugging Face inference model directories:
   - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`
   - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`
@@ -41,9 +41,14 @@ For a small development build only, pass `-SkipModels`. That skips model
 preparation and leaves the Hugging Face model directories out of the PyInstaller
 package. Do not use `-SkipModels` for user-facing Windows builds.
 
-The PyInstaller spec treats `src/checkpoints/` as required data. It contains one
-directory per supported ASR repo and includes both active models and explicit
-offline replay checkpoints. Normal inference does not regenerate these files.
+The CTC alignment head is downloaded at build time from the same Hugging Face
+repo as the ASR weights, at the commit sha pinned in
+`DEFAULT_SETTINGS["ASR_ALIGNMENT_HEAD_PATH"]`, and placed at `models/ctc_aligner.pt`
+inside the package. The spec reads that default rather than hardcoding the sha,
+so the head the build ships is always the head a source checkout would download.
+The packaged app prefers this bundled copy over the Hub, so a first run without
+network still produces real word-level timing instead of falling back to
+proportional timestamps. `-SkipModels` skips it along with the ASR models.
 
 It does not bundle Microsoft Edge WebView2. Users still need the WebView2
 runtime, which is already present on most supported Windows systems. If the app

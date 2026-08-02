@@ -4,6 +4,7 @@ import os
 import shutil
 import importlib.util
 import fnmatch
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import (
@@ -67,6 +68,28 @@ def _ignored_inference_file(relative_path: str) -> bool:
         fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch(name, pattern)
         for pattern in INFERENCE_IGNORE_PATTERNS
     )
+
+
+def _alignment_head_source() -> str:
+    """Fetch the CTC alignment head the app will run, at the pinned revision.
+
+    Resolved from ASR_ALIGNMENT_HEAD_PATH's default rather than hardcoded here,
+    so the sha the build ships and the sha the source checkout downloads cannot
+    drift apart. Bundled because a packaged first run has no network guarantee,
+    and without the head the app silently falls back to proportional timing.
+    """
+    sys.path.insert(0, str(ROOT / "src"))
+    from asr.alignment import _parse_hf_reference
+    from core.config import DEFAULT_SETTINGS
+
+    reference = DEFAULT_SETTINGS["ASR_ALIGNMENT_HEAD_PATH"].strip()
+    if not reference.lower().startswith("hf:"):
+        return str(_require_path(reference, "CTC alignment head"))
+
+    from huggingface_hub import hf_hub_download
+
+    repo, revision, filename = _parse_hf_reference(reference)
+    return hf_hub_download(repo_id=repo, filename=filename, revision=revision or None)
 
 
 def _collect_inference_model_dir(path: str, dest: str, label: str) -> list[tuple[str, str]]:
@@ -161,10 +184,10 @@ datas += copy_metadata("torchcodec")
 datas += [
     (str(_require_path("src/web/static", "web static assets")), "src/web/static"),
     (str(_require_path("src/assets", "application assets")), "src/assets"),
-    (str(_require_path("src/checkpoints", "repo-bound small models")), "src/checkpoints"),
 ]
 
 if not _env_bool("JAV_TRANS_SKIP_MODELS"):
+    datas.append((_alignment_head_source(), "models"))
     datas += _collect_inference_model_dir(
         "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
         "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",

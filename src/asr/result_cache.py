@@ -268,7 +268,16 @@ def _alignment_head_digest() -> str | None:
     if not raw_path:
         return None
     try:
-        head_path = Path(raw_path).resolve()
+        # download=False: this runs before anyone has asked for the head, and a
+        # cache-key lookup is no place to start a network fetch. An uncached
+        # `hf:` reference yields "" and disables the finalize cache for that one
+        # call; the loader downloads it, and the next call keys off the file.
+        from asr.alignment import resolve_alignment_head_path
+
+        local_path = resolve_alignment_head_path(raw_path, download=False)
+        if not local_path:
+            return None
+        head_path = Path(local_path).resolve()
         stat = head_path.stat()
         cache_key = (str(head_path), stat.st_size, stat.st_mtime_ns)
         cached = _HEAD_DIGEST_CACHE.get(cache_key)

@@ -35,6 +35,7 @@ pre-decode gate the pipeline needs. So blank is index 0 and stays interpretable.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import json
 import math
 import unicodedata
@@ -398,6 +399,116 @@ def speech_extent(
 
 
 ALIGNMENT_HEAD_PATH_ENV = "ASR_ALIGNMENT_HEAD_PATH"
+ALIGNMENT_HEAD_HF_SCHEME = "hf:"
+ALIGNMENT_HEAD_DEFAULT_FILENAME = "ctc_aligner.pt"
+
+
+def _parse_hf_reference(reference: str) -> tuple[str, str, str]:
+    """`hf:<repo>@<revision>#<filename>` -> (repo, revision, filename).
+
+    `#` and `@` are the separators because a repo id contains `/` and a commit
+    sha contains neither, so the split stays unambiguous without quoting.
+    """
+    body = reference.strip()
+    if body.lower().startswith(ALIGNMENT_HEAD_HF_SCHEME):
+        body = body[len(ALIGNMENT_HEAD_HF_SCHEME) :].strip()
+    if "#" in body:
+        body, filename = body.rsplit("#", 1)
+    else:
+        filename = ALIGNMENT_HEAD_DEFAULT_FILENAME
+    if "@" in body:
+        repo, revision = body.rsplit("@", 1)
+    else:
+        repo, revision = body, ""
+    repo, filename, revision = repo.strip(" /"), filename.strip(), revision.strip()
+    if not repo or not filename:
+        raise ValueError(f"malformed alignment head reference: {reference!r}")
+    return repo, revision, filename
+
+
+def _bundled_head_path(filename: str) -> str:
+    """A copy shipped inside the packaged app, or "" when there is none.
+
+    The Windows build carries the head next to the ASR weights, because a first
+    run on a machine with no network must still produce measured timings rather
+    than silently falling back to proportional ones. Consulted only when frozen,
+    so a stray file in a source checkout's models/ cannot displace the pinned
+    revision without anyone noticing.
+    """
+    from utils.model_paths import BUNDLED_MODELS_ROOT
+    from utils.runtime_paths import is_frozen
+
+    if not is_frozen():
+        return ""
+    candidate = BUNDLED_MODELS_ROOT / filename
+    return str(candidate) if candidate.is_file() else ""
+
+
+def _revision_marker(head_path: Path) -> Path:
+    return head_path.with_name(head_path.name + ".revision")
+
+
+def _downloaded_head_path(filename: str, revision: str) -> str:
+    """The head already sitting in models/, if it is the revision we asked for.
+
+    It lives next to the ASR weights rather than in the Hub cache: the weights
+    are in models/, the packaged build ships the head at models/, and the Hub
+    cache root is tmp/, a directory whose name invites deletion. The sidecar
+    records which revision the file is, so re-pinning the default sha fetches
+    the new head instead of silently loading the old one under the same name.
+    """
+    from utils.model_paths import MODELS_ROOT
+
+    candidate = MODELS_ROOT / filename
+    if not candidate.is_file():
+        return ""
+    if not revision:
+        return str(candidate)
+    try:
+        recorded = _revision_marker(candidate).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return str(candidate) if recorded == revision else ""
+
+
+def resolve_alignment_head_path(reference: str, *, download: bool = True) -> str:
+    """Turn the configured reference into a local checkpoint path.
+
+    A plain path is returned untouched. `hf:...` resolves to `models/<file>`,
+    downloading it there once (honouring the project proxy settings) and staying
+    offline on every later run.
+
+    The default reference pins a commit sha rather than a branch. The head is
+    encoder-specific, and a moving `main` would let a retrained head change
+    every subtitle's timing with nothing in the run saying so.
+    """
+    reference = (reference or "").strip()
+    if not reference.lower().startswith(ALIGNMENT_HEAD_HF_SCHEME):
+        return reference
+
+    repo, revision, filename = _parse_hf_reference(reference)
+    for local in (_bundled_head_path(filename), _downloaded_head_path(filename, revision)):
+        if local:
+            return local
+    if not download:
+        return ""
+
+    from huggingface_hub import hf_hub_download
+
+    from utils.model_paths import MODELS_ROOT
+
+    MODELS_ROOT.mkdir(parents=True, exist_ok=True)
+    downloaded = hf_hub_download(
+        repo_id=repo,
+        filename=filename,
+        revision=revision or None,
+        local_dir=str(MODELS_ROOT),
+    )
+    if revision:
+        # Written after the file lands, so an interrupted download leaves no
+        # marker and the next run re-fetches rather than trusting a partial.
+        _revision_marker(Path(downloaded)).write_text(revision, encoding="utf-8")
+    return downloaded
 
 
 def alignment_head_configured() -> bool:
@@ -434,7 +545,8 @@ class AlignmentHead:
     def load(cls, checkpoint_path: str, *, device=None) -> "AlignmentHead":
         import torch
 
-        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        resolved_path = resolve_alignment_head_path(checkpoint_path)
+        payload = torch.load(resolved_path, map_location="cpu", weights_only=False)
         schema = str(payload.get("schema") or "")
         if schema != ALIGNMENT_MODEL_SCHEMA:
             raise ValueError(
