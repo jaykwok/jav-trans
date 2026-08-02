@@ -49,4 +49,4 @@ Split canonical teacher 人工 gate 保持 `cut / continue / unsure` 单轴合�
 
 该页使用 Core 的 `shouldSerialize`，只保存已选择 `cut/continue/unsure` 的条目。部分审计可以安全保存；evaluator 仍通过 missing ids 明确报告尚未完成的 gate，而不是把未审行当成非法 verdict。
 
-其余 Adapter 的迁移审计与阻塞项见 `docs/audits/20260723_human-audit-adapter-inventory-v1.md`。
+其余 Adapter 的迁移审计与阻塞项见 `docs/archive/audits/20260723_human-audit-adapter-inventory-v1.md`（该清单里的 CueQC / Split Adapter 已随 2026-07-31 边界链退役，仅存档）。
