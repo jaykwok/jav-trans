@@ -3,7 +3,18 @@ from __future__ import annotations
 import json
 import os
 import re
+from functools import lru_cache
 from pathlib import Path
+
+
+@lru_cache(maxsize=8)
+def _root_pattern(project_root_text: str) -> re.Pattern[str]:
+    return re.compile(re.escape(project_root_text) + r"/?", re.IGNORECASE)
+
+
+@lru_cache(maxsize=8)
+def _resolved_root_text(project_root: Path) -> str:
+    return project_root.resolve().as_posix()
 
 
 def project_relative(path: str | Path | None, *, project_root: Path) -> str | None:
@@ -12,10 +23,17 @@ def project_relative(path: str | Path | None, *, project_root: Path) -> str | No
     raw = str(path)
     if not raw:
         return raw
-    project_root_text = project_root.resolve().as_posix()
+    if "/" not in raw and "\\" not in raw:
+        # Not a path, so neither branch below can change it: the root pattern
+        # cannot match without a separator, and a separator-less string is never
+        # absolute. Returning early keeps subtitle text and word tokens - which
+        # are the overwhelming majority of strings in these payloads - off the
+        # filesystem. `Path.resolve()` is a syscall (~150us here), and paying it
+        # per string made write_output 37.7s on a 2h09m film.
+        return raw
+    project_root_text = _resolved_root_text(project_root)
     normalized = raw.replace("\\", "/")
-    root_pattern = re.compile(re.escape(project_root_text) + r"/?", re.IGNORECASE)
-    normalized = root_pattern.sub("", normalized)
+    normalized = _root_pattern(project_root_text).sub("", normalized)
     if normalized != raw.replace("\\", "/"):
         return normalized or "."
     candidate = Path(raw)
