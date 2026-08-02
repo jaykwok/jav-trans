@@ -1,25 +1,27 @@
-"""Which stretches of audio are worth decoding, read off the alignment head.
+"""The pre-gate that was rejected, kept so it can go on being measured.
 
-This is the gate reading of the same tensor `asr.alignment` uses for timing. A
-run of frames the head labels blank is a run with no character evidence in it,
-so it does not need the decoder - and the decoder is the entire cost of ASR
-(encoder RTF 0.00069 against 0.12273 for decode, a 178x asymmetry measured in
-Phase 0). Running the encoder over everything and the decoder over a third of it
-is what makes a pre-gate affordable without a separate acoustic model.
+This is the *first* reading of the alignment head's blank runs: treat a run of
+blank as audio with no words in it and skip the decoder for it. The appeal was
+real - decode is 178x the cost of the encoder forward, so gating would have cut
+most of the ASR bill.
 
-**The decisive property of this gate is that its errors are not symmetric.**
-Audio the gate drops is never transcribed, so a word lost here is lost for good;
-audio it keeps that turns out to be wordless costs some decode time and is
-filtered downstream by the post-gate, which is reversible. Every default below
-is therefore biased toward keeping: blank has to be sustained before it counts
-as a pause, short pauses inside an utterance are bridged rather than cut on, and
-each surviving region is padded outward. The project has already paid for the
-opposite mistake once - the retired pre-ASR chain dropped audio on acoustic
-evidence alone, and 55 real sources went with it.
+A 2026-07-31 measurement on real audio falsified it. The head separates
+lexically dense speech from vocalisation-dense audio, not speech from silence,
+so the stretches it calls blank routinely contain real lines embedded in
+moaning. Dropping them is unrecoverable: audio the gate skips is never
+transcribed, and a word lost here is lost for good. Production therefore uses
+the same signal only to choose cut points (`asr.chunking.cut_at_pauses`), where
+a mistake moves a boundary instead of deleting a line.
 
-Nothing here is learned and nothing here is tuned against its own output. The
-parameters are geometric, and the number that decides them is measured against
-human-audited spans by `tools/align/evaluate_pregate_loss.py`.
+It lives under tools/ rather than src/ because nothing in the runtime may import
+it, and it is **deliberately self-contained**: `_clamp_spans` and `_merge` are
+duplicated from `asr.chunking` rather than imported. A baseline that follows
+production refactors is not a baseline - the numbers
+`tools/align/evaluate_pregate_loss.py` reports would silently change meaning.
+
+Consumers: `evaluate_pregate_loss.py` (loss against human-audited spans) and
+`measure_pregate_dropped_audio.py` (how much real audio this would have thrown
+away).
 """
 from __future__ import annotations
 
@@ -145,89 +147,6 @@ def speech_regions(
             for index in range(pieces)
         )
     return split
-
-
-def cut_at_pauses(
-    blank_spans: list[tuple[float, float]],
-    total_s: float,
-    *,
-    target_s: float = 20.0,
-    max_s: float = 30.0,
-    min_s: float = 2.0,
-) -> list[tuple[float, float]]:
-    """Contiguous chunks covering ALL of the audio, cut inside pauses.
-
-    This is the second reading of the blank runs and the one that survived. The
-    gate above uses them to decide what *not* to decode, and a 2026-07-31
-    measurement falsified that on this domain: the head separates lexically
-    dense speech from vocalisation-dense audio rather than speech from silence,
-    so skipping the blank stretches lost real lines embedded in moaning.
-
-    Choosing *where to cut* has no such failure mode, because nothing is
-    dropped. The output tiles `[0, total_s]` exactly - adjacent chunks share an
-    edge and the last one ends at `total_s` - so a mistake here can only put a
-    boundary in a slightly worse place, never lose a word. That makes it safe to
-    use the very signal that was too weak to gate with.
-
-    Cuts land at the middle of a pause rather than its edge, which is where a
-    boundary does least damage to the words on either side.
-    """
-    total_s = max(0.0, float(total_s))
-    if total_s <= 0.0:
-        return []
-    if max_s <= 0.0 or target_s <= 0.0:
-        raise ValueError("target_s and max_s must be > 0")
-    if target_s > max_s:
-        raise ValueError("target_s must be <= max_s")
-    if total_s <= max_s:
-        return [(0.0, total_s)]
-
-    candidates = [
-        (begin + end) / 2.0
-        for begin, end in _clamp_spans(blank_spans, total_s)
-        if 0.0 < (begin + end) / 2.0 < total_s
-    ]
-
-    chunks: list[tuple[float, float]] = []
-    cursor = 0.0
-    while total_s - cursor > max_s:
-        window = [
-            point
-            for point in candidates
-            if cursor + min_s <= point <= cursor + max_s
-        ]
-        # Nearest to the target length, so chunks stay evenly sized instead of
-        # collapsing to the first pause after `min_s`.
-        cut = (
-            min(window, key=lambda point: abs(point - (cursor + target_s)))
-            if window
-            else cursor + max_s
-        )
-        chunks.append((cursor, cut))
-        cursor = cut
-    chunks.append((cursor, total_s))
-
-    if len(chunks) > 1 and chunks[-1][1] - chunks[-1][0] < min_s:
-        # A sliver at the end is not worth its own decode call, and merging it
-        # backwards keeps the tiling exact.
-        tail = chunks.pop()
-        chunks[-1] = (chunks[-1][0], tail[1])
-    return chunks
-
-
-def gate_audio(
-    log_probs,
-    total_s: float,
-    *,
-    upsample: int = 2,
-    config: PreGateConfig | None = None,
-) -> list[tuple[float, float]]:
-    """Regions worth decoding, straight from the head's per-frame posteriors."""
-    from asr.alignment import blank_runs
-
-    config = config or PreGateConfig()
-    runs = blank_runs(log_probs, upsample=upsample, min_seconds=config.min_blank_s)
-    return speech_regions(runs, total_s, config)
 
 
 def covered_seconds(

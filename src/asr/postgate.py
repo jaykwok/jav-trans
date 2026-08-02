@@ -8,7 +8,7 @@ before any text existed, and its mistakes were unrecoverable. Here the text is
 already in hand, the evidence is far stronger, and a wrong call costs a label
 rather than a line.
 
-The features come from `asr.cueqc`, which has been written and tested since the
+The features come from `asr.cue_features`, which has been written and tested since the
 old design but was never wired into anything. What it could not see is the one
 signal the alignment head adds: **text the acoustics do not support aligns
 badly**. A runaway decode or an invented phrase still reads as plausible
@@ -100,7 +100,7 @@ def review(
 ) -> dict[str, Any]:
     """Flags for one decoded cue. `kept` is always True by construction.
 
-    `candidate` is an `asr.cueqc.build_candidate` payload. `alignment_score` is
+    `candidate` is an `asr.cue_features.build_candidate` payload. `alignment_score` is
     the mean per-character forced-alignment score for the same cue, which
     `asr.subtitle_timing.build_aligned_word_timestamps` returns; passing None
     means the cue has no measured timing and the audio-support check is skipped

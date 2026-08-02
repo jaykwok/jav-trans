@@ -61,7 +61,7 @@ from asr.alignment import (  # noqa: E402
     AlignmentHead,
     blank_runs,
 )
-from asr.pregate import (  # noqa: E402
+from tools.align.pregate_reference import (  # noqa: E402
     PREGATE_SCHEMA,
     PreGateConfig,
     covered_seconds,

@@ -285,7 +285,7 @@ def test_removed_scorer_runtime_env_is_absent_from_active_surfaces():
         "SPEECH_BOUNDARY_JA_MIN_SEGMENT_S",
     )
     active_paths = [
-        run_full_workflow.PROJECT_ROOT / "src" / "asr" / "pregate.py",
+        run_full_workflow.PROJECT_ROOT / "src" / "asr" / "chunking.py",
         run_full_workflow.PROJECT_ROOT / "src" / "core" / "config.py",
         run_full_workflow.PROJECT_ROOT / "src" / "web" / "static" / "index.html",
         run_full_workflow.PROJECT_ROOT / "tools" / "workflows" / "run_full_workflow.py",
@@ -304,7 +304,7 @@ def test_removed_split_env_is_absent_from_current_and_legacy_runtime_files():
         "SPEECH_BOUNDARY_JA_SPLIT_TARGET_S",
     )
     checked_paths = [
-        run_full_workflow.PROJECT_ROOT / "src" / "asr" / "pregate.py",
+        run_full_workflow.PROJECT_ROOT / "src" / "asr" / "chunking.py",
         run_full_workflow.PROJECT_ROOT / "src" / "web" / "static" / "index.html",
         run_full_workflow.PROJECT_ROOT / "tools" / "workflows" / "run_full_workflow.py",
     ]

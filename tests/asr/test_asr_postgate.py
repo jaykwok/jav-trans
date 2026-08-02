@@ -20,7 +20,7 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
         sys.path.insert(0, str(root))
 
 from asr import postgate  # noqa: E402
-from asr.cueqc import build_candidate  # noqa: E402
+from asr.cue_features import build_candidate  # noqa: E402
 from asr.postgate import PostGateConfig, review, review_all  # noqa: E402
 
 

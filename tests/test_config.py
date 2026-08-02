@@ -224,7 +224,7 @@ def test_job_context_defaults_runtime_logs_from_config(monkeypatch, tmp_path):
 def test_asr_chunk_min_duration_removed_from_active_config_surface():
     active_files = (
         "src/asr/chunking.py",
-        "src/asr/pregate.py",
+        "src/asr/chunking.py",
         "src/core/config.py",
         "src/main.py",
         "README.md",

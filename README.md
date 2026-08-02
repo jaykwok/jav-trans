@@ -111,7 +111,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 视频输入
   -> 任务上下文 / 配置解析
   -> 音频抽取与标准化
-  -> 切分（asr.pregate.cut_at_pauses）
+  -> 切分（asr.chunking.cut_at_pauses）
      - ASR encoder 前向 -> CTC 对齐头 -> 每帧 blank 后验
      - 连续 blank 游程即停顿，切点落在停顿中央
      - 输出精确铺满 [0, 总时长]，相邻块共边，不丢任何音频
@@ -323,7 +323,7 @@ ASR_BATCH_SIZE=2
 - `src/main.py`：主流程编排。
 - `src/core/`：配置和任务上下文。
 - `src/pipeline/`：音频、缓存、输出、质量报告和阶段日志。
-- `src/asr/`：ASR 转写、切分（`pregate.py`）、CTC 对齐头（`alignment.py`）、字幕时间轴（`subtitle_timing.py`）与后置闸（`postgate.py`）。
+- `src/asr/`：ASR 转写、切分（`chunking.py`）、cue 特征（`cue_features.py`）、CTC 对齐头（`alignment.py`）、字幕时间轴（`subtitle_timing.py`）与后置闸（`postgate.py`）。
 - `src/llm/`：翻译侧三层——`backends/`（transport）、`profiles/`（各模型家族 prompt 合同）、`engine.py`（唯一编排循环），`translator.py` 是门面；另有 prompt、cache、glossary、修复批与术语预抽取。
 - `src/subtitles/`：SRT writer、字幕选项和字幕 QC。
 - `src/web/`：FastAPI 接口和静态前端。

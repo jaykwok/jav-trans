@@ -43,9 +43,9 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
         sys.path.insert(0, str(root))
 
 from asr.alignment import AlignmentHead, blank_runs, normalize_text  # noqa: E402
-from asr.cueqc import build_candidate  # noqa: E402
+from asr.cue_features import build_candidate  # noqa: E402
 from asr.postgate import PostGateConfig, review  # noqa: E402
-from asr.pregate import PreGateConfig, speech_regions  # noqa: E402
+from tools.align.pregate_reference import PreGateConfig, speech_regions  # noqa: E402
 from audio.loading import load_audio_16k_mono  # noqa: E402
 from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
 from asr.encoder_features import qwen3_asr_audio_output_lengths  # noqa: E402

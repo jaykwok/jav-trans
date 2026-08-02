@@ -18,10 +18,10 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-from asr.pregate import (  # noqa: E402
+from asr.chunking import cut_at_pauses  # noqa: E402
+from tools.align.pregate_reference import (  # noqa: E402
     PreGateConfig,
     covered_seconds,
-    cut_at_pauses,
     duration,
     speech_regions,
 )

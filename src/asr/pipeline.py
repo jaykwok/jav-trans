@@ -13,9 +13,9 @@ from asr import chunking as _chunking_module
 from asr import result_cache as _result_cache_module
 from asr import transcribe as _transcribe_module
 from asr.alignment import AlignmentHead, alignment_head_configured, blank_runs
-from asr.cueqc import build_candidate as build_cueqc_candidate
+from asr.cue_features import build_candidate as build_cue_candidate
 from asr.postgate import POSTGATE_SCHEMA, review_all as postgate_review_all
-from asr.pregate import PREGATE_SCHEMA, cut_at_pauses
+from asr.chunking import CHUNK_CUT_SCHEMA, cut_at_pauses
 from asr.backends import registry as _registry_module
 from pipeline import memory_safety as _memory_safety_module
 
@@ -333,7 +333,7 @@ def _build_processing_spans(
     a badly placed cut costs a worse boundary rather than a lost line. The
     stronger reading of the same signal - skipping the blank stretches entirely
     - was measured on 2026-07-31 and falsified: it dropped real lines embedded
-    in non-semantic vocalisation. See `asr.pregate`.
+    in non-semantic vocalisation. See `tools/align/pregate_reference.py`.
 
     With no head configured this degrades to fixed-length chunks, which is a
     placement change and not a correctness one.
@@ -352,7 +352,7 @@ def _build_processing_spans(
     _set_last_boundary_signature(
         {
             "chunking": {
-                "schema": PREGATE_SCHEMA,
+                "schema": CHUNK_CUT_SCHEMA,
                 "source": source,
                 "pause_count": len(runs),
                 "chunk_count": len(spans),
@@ -649,7 +649,7 @@ def _apply_postgate(
         scores.append(float(value) if isinstance(value, (int, float)) else None)
 
     candidates = [
-        build_cueqc_candidate(
+        build_cue_candidate(
             chunk=chunk,
             text_result=text_results[position],
             position=position,

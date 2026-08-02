@@ -1,3 +1,16 @@
+"""Per-cue features describing what a chunk's transcript looks like.
+
+Pure description, no verdict. Every function here answers "what does this text
+and its neighbourhood look like" - character counts, repeat runs, kana/kanji
+ratios, gaps to adjacent cues - and nothing here decides whether a cue is good.
+`asr.postgate` owns that, and owns it alone.
+
+The split is the point. This file was written as `cueqc.py`, feature extraction
+for a learned CueQC model that also held the decision. Both decision models are
+retired (`tests/test_config.py::test_pre_asr_cueqc_modules_are_retired` pins
+their paths as gone); the features outlived them because describing a cue turned
+out to be the durable half and judging it the fragile one.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -375,78 +388,3 @@ def build_candidate(
         "labels": {},
     }
 
-
-def build_candidates(
-    chunks: list[Mapping[str, Any]],
-    text_results: list[Mapping[str, Any]],
-    *,
-    audio_id: str = "",
-    video_id: str = "",
-) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
-    for position, (chunk, text_result) in enumerate(zip(chunks, text_results)):
-        candidates.append(
-            build_candidate(
-                chunk=chunk,
-                text_result=text_result,
-                position=position,
-                chunks=chunks,
-                text_results=text_results,
-                audio_id=audio_id,
-                video_id=video_id,
-            )
-        )
-    return candidates
-
-
-def numeric_feature_vector(candidate: Mapping[str, Any]) -> list[float]:
-    text_features_payload = (
-        candidate.get("text_features")
-        if isinstance(candidate.get("text_features"), Mapping)
-        else {}
-    )
-    adjacency = candidate.get("adjacency") if isinstance(candidate.get("adjacency"), Mapping) else {}
-    repeat = (
-        text_features_payload.get("repeat_profile")
-        if isinstance(text_features_payload.get("repeat_profile"), Mapping)
-        else {}
-    )
-
-    return [
-        _safe_float(candidate.get("duration_s")),
-        _safe_float(text_features_payload.get("char_count")),
-        _safe_float(text_features_payload.get("unique_chars")),
-        _safe_float(text_features_payload.get("unique_ratio")),
-        _safe_float(text_features_payload.get("kana_ratio")),
-        _safe_float(text_features_payload.get("kanji_ratio")),
-        _safe_float(text_features_payload.get("chars_per_sec")),
-        _safe_float(repeat.get("run")),
-        _safe_float(repeat.get("unit_len")),
-        _safe_float(repeat.get("ratio")),
-        _safe_float(adjacency.get("prev_gap_s"), 5.0),
-        _safe_float(adjacency.get("next_gap_s"), 5.0),
-        _safe_float(adjacency.get("same_text_run_length")),
-        1.0 if bool(text_features_payload.get("kana_only")) else 0.0,
-        1.0 if bool(text_features_payload.get("has_kanji")) else 0.0,
-        1.0 if bool(text_features_payload.get("has_latin_or_digit")) else 0.0,
-        _safe_float(text_features_payload.get("raw_char_count")),
-    ]
-
-
-def normalize_feature_matrix(rows: Iterable[Mapping[str, Any]]) -> list[list[float]]:
-    matrix = [numeric_feature_vector(row) for row in rows]
-    if not matrix:
-        return []
-    width = len(matrix[0])
-    means: list[float] = []
-    stds: list[float] = []
-    for col in range(width):
-        values = [row[col] for row in matrix]
-        mean = sum(values) / max(1, len(values))
-        variance = sum((value - mean) ** 2 for value in values) / max(1, len(values))
-        means.append(mean)
-        stds.append(math.sqrt(variance) or 1.0)
-    return [
-        [(row[col] - means[col]) / stds[col] for col in range(width)]
-        for row in matrix
-    ]
