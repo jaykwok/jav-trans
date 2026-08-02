@@ -248,14 +248,27 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
         clip = _np.asarray(audio, dtype=_np.float32)
         duration_s = len(clip) / 16000.0
 
-        pieces = []
         width = int(_FEATURE_CHUNK_S * 16000)
-        for offset in range(0, len(clip), width):
-            piece = _np.ascontiguousarray(clip[offset : offset + width])
-            if len(piece) < 8000:
-                continue
+        windows = [
+            _np.ascontiguousarray(clip[offset : offset + width])
+            for offset in range(0, len(clip), width)
+        ]
+        # Anything under half a second cannot carry a pause decision and the
+        # processor pads it to a full window anyway, so it only costs encoder time.
+        windows = [piece for piece in windows if len(piece) >= 8000]
+
+        # Batched, because this is a pure encoder pass and the encoder is
+        # compute-bound: one window at a time left the GPU idle between kernel
+        # launches and cost 20.06s on a 2h09m file (258 windows, ~78ms each).
+        # The windows are fixed-length by construction, so batching adds no
+        # padding waste. Batch size follows the decode stage's budget rather than
+        # a constant of its own - the same weights are resident either way.
+        batch_size = max(1, _env_int("ASR_FEATURE_BATCH_SIZE", "8"))
+        pieces = []
+        for start in range(0, len(windows), batch_size):
+            group = windows[start : start + batch_size]
             inputs = prepare_transcription_inputs(
-                processor, audio=[piece], language=ASR_LANGUAGE_FOR_CHUNKING
+                processor, audio=group, language=ASR_LANGUAGE_FOR_CHUNKING
             )
             moved = move_processor_inputs(
                 inputs, device=model.device, dtype=model.dtype
@@ -265,12 +278,19 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
                     input_features=moved["input_features"],
                     input_features_mask=moved["input_features_mask"],
                 ).pooler_output
-            frames = int(
-                qwen3_asr_audio_output_lengths(
+            lengths = [
+                int(value)
+                for value in qwen3_asr_audio_output_lengths(
                     moved["input_features_mask"].sum(dim=1)
-                )[0]
-            )
-            pieces.append(head.log_probs(features[:frames].detach().float().cpu().numpy()))
+                )
+            ]
+            # `pooler_output` concatenates the batch along the frame axis rather
+            # than returning [B, T, D]; each window's frames are its own slice.
+            hidden = features.detach().float().cpu().numpy()
+            offset = 0
+            for length in lengths:
+                pieces.append(head.log_probs(hidden[offset : offset + length]))
+                offset += length
         if not pieces:
             return [], duration_s, "fixed_length_no_features"
         # Concatenated before deriving runs: a pause straddling a feature-chunk

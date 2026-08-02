@@ -6,7 +6,7 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from utils.model_paths import resolve_model_spec
 from asr.backends.qwen import (
@@ -25,6 +25,13 @@ from asr.text_normalize import normalize_display_text, strip_text_punctuation
 logger = logging.getLogger(__name__)
 
 ASR_LANGUAGE = os.getenv("ASR_LANGUAGE", "Japanese").strip() or "Japanese"
+
+
+def _env_int(name: str, default: str) -> int:
+    try:
+        return int(float(os.getenv(name, default)))
+    except (TypeError, ValueError):
+        return int(float(default))
 
 
 def _resolve_asr_batch_size() -> int:
@@ -660,10 +667,13 @@ class LocalAsrBackend:
         timing_end: float,
         timing_window_source: str,
         log: list[str],
+        cached_features: Any = None,
     ) -> tuple[dict, list[str]]:
         log.append("Subtitle timing: boundary_chunk_timeline")
         text = master_text or raw_master_text
-        aligned = self._align_characters(normalized_path, text, log)
+        aligned = self._align_characters(
+            normalized_path, text, log, cached_features=cached_features
+        )
         if aligned:
             char_spans, acoustic_extent = aligned
             word_dicts, alignment_mode, timing_meta = build_aligned_word_timestamps(
@@ -709,6 +719,8 @@ class LocalAsrBackend:
         normalized_path: str,
         text: str,
         log: list[str],
+        *,
+        cached_features: Any = None,
     ) -> tuple[list, tuple[float, float]] | None:
         """Character times for `text`, measured off this chunk's own audio.
 
@@ -739,28 +751,33 @@ class LocalAsrBackend:
 
             if self.model is None or self.processor is None:
                 return None
-            audio, rate = load_audio_16k_mono(normalized_path)
-            if rate != 16000:
-                return None
-            inputs = prepare_transcription_inputs(
-                self.processor,
-                audio=[np.asarray(audio, dtype=np.float32)],
-                language=ASR_LANGUAGE,
-            )
-            moved = move_processor_inputs(inputs, device=self.device, dtype=self.dtype)
-            with torch.inference_mode():
-                features = self.model.get_audio_features(
-                    input_features=moved["input_features"],
-                    input_features_mask=moved["input_features_mask"],
-                ).pooler_output
-            frames = int(
-                qwen3_asr_audio_output_lengths(
-                    moved["input_features_mask"].sum(dim=1)
-                )[0]
-            )
-            aligned = head.align_extent(
-                features[:frames].detach().float().cpu().numpy(), text
-            )
+            if cached_features is not None:
+                # Already encoded with this chunk's siblings in one forward pass.
+                chunk_features = cached_features
+            else:
+                audio, rate = load_audio_16k_mono(normalized_path)
+                if rate != 16000:
+                    return None
+                inputs = prepare_transcription_inputs(
+                    self.processor,
+                    audio=[np.asarray(audio, dtype=np.float32)],
+                    language=ASR_LANGUAGE,
+                )
+                moved = move_processor_inputs(
+                    inputs, device=self.device, dtype=self.dtype
+                )
+                with torch.inference_mode():
+                    features = self.model.get_audio_features(
+                        input_features=moved["input_features"],
+                        input_features_mask=moved["input_features_mask"],
+                    ).pooler_output
+                frames = int(
+                    qwen3_asr_audio_output_lengths(
+                        moved["input_features_mask"].sum(dim=1)
+                    )[0]
+                )
+                chunk_features = features[:frames].detach().float().cpu().numpy()
+            aligned = head.align_extent(chunk_features, text)
             if not aligned:
                 log.append("Subtitle timing: alignment declined, using proportional")
                 return None
@@ -828,6 +845,63 @@ class LocalAsrBackend:
             "timing_meta": dict(timing_meta or {}),
         }, log
 
+    def _encode_chunk_features(self, paths: list[str]) -> dict[str, Any]:
+        """Encoder frames for several chunks in one forward pass.
+
+        The alignment pass used to encode one chunk at a time, re-reading the wav
+        and recomputing mel on the CPU for each - 37.76s over 384 chunks on a
+        2h09m file. The encoder is compute-bound, so the per-call overhead was
+        most of that. Returns `{path: frames}` and simply omits anything that
+        failed to load, because the caller already degrades to proportional
+        timing when a chunk has no features.
+        """
+        import numpy as np
+        import torch
+
+        from asr.qwen_native import move_processor_inputs, prepare_transcription_inputs
+        from audio.loading import load_audio_16k_mono
+        from asr.encoder_features import qwen3_asr_audio_output_lengths
+
+        loaded: list[tuple[str, Any]] = []
+        for path in paths:
+            try:
+                audio, rate = load_audio_16k_mono(path)
+            except Exception as error:  # noqa: BLE001
+                logger.warning("alignment audio load failed for %s: %s", path, error)
+                continue
+            if rate != 16000:
+                continue
+            loaded.append((path, np.asarray(audio, dtype=np.float32)))
+        if not loaded:
+            return {}
+
+        inputs = prepare_transcription_inputs(
+            self.processor,
+            audio=[audio for _, audio in loaded],
+            language=ASR_LANGUAGE,
+        )
+        moved = move_processor_inputs(inputs, device=self.device, dtype=self.dtype)
+        with torch.inference_mode():
+            features = self.model.get_audio_features(
+                input_features=moved["input_features"],
+                input_features_mask=moved["input_features_mask"],
+            ).pooler_output
+        lengths = [
+            int(value)
+            for value in qwen3_asr_audio_output_lengths(
+                moved["input_features_mask"].sum(dim=1)
+            )
+        ]
+        # `pooler_output` concatenates the batch along the frame axis, matching
+        # `encoder_features.Qwen3AsrEncoder.encode_batch`.
+        hidden = features.detach().float().cpu().numpy()
+        encoded: dict[str, Any] = {}
+        offset = 0
+        for (path, _), length in zip(loaded, lengths):
+            encoded[path] = hidden[offset : offset + length]
+            offset += length
+        return encoded
+
     def finalize_text_results(
         self,
         text_results: list[dict],
@@ -836,6 +910,42 @@ class LocalAsrBackend:
         if not text_results:
             return []
 
+        # Batched only when there is a head to feed; without one nothing below
+        # touches the GPU and encoding would be pure waste.
+        batch_size = max(1, _env_int("ASR_ALIGN_BATCH_SIZE", "8"))
+        head_available = (
+            self._resolve_alignment_head([]) is not None
+            and self.model is not None
+            and self.processor is not None
+        )
+
+        finalized: list[tuple[dict, list[str]]] = []
+        for group_start in range(0, len(text_results), batch_size):
+            group = text_results[group_start : group_start + batch_size]
+            feature_cache: dict[str, Any] = {}
+            if head_available:
+                alignable = [
+                    str(item["normalized_path"])
+                    for item in group
+                    if str(item.get("text", "")).strip()
+                ]
+                if alignable:
+                    try:
+                        feature_cache = self._encode_chunk_features(alignable)
+                    except Exception as error:  # noqa: BLE001
+                        # One bad batch must not lose the transcription; every
+                        # chunk below falls back to its own encode or to
+                        # proportional timing.
+                        logger.warning("batched chunk encode failed: %s", error)
+                        feature_cache = {}
+            finalized.extend(self._finalize_group(group, feature_cache))
+        return finalized
+
+    def _finalize_group(
+        self,
+        text_results: list[dict],
+        feature_cache: dict[str, Any],
+    ) -> list[tuple[dict, list[str]]]:
         finalized: list[tuple[dict, list[str]]] = []
         for text_result in text_results:
             log: list[str] = list(text_result.get("log", []))
@@ -873,6 +983,7 @@ class LocalAsrBackend:
                     timing_end=window_end,
                     timing_window_source=window_source,
                     log=log,
+                    cached_features=feature_cache.get(normalized_path),
                 )
             )
         return finalized
