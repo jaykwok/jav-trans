@@ -7,7 +7,7 @@ from typing import Any
 
 _MAX_TRANSLATION_WORKERS = 64
 
-from core.config import DEFAULT_SETTINGS
+from core.config import DEFAULT_SETTINGS, normalize_reasoning_effort
 
 
 def _flag(value: Any, default: bool = False) -> bool:
@@ -51,11 +51,7 @@ def _llm_api_format(value: str) -> str:
     return normalized if normalized in {"chat", "responses"} else "chat"
 
 
-def _llm_reasoning_effort(value: str) -> str:
-    normalized = (value or "medium").strip().lower()
-    if normalized in {"medium", "xhigh"}:
-        return normalized
-    return "medium"
+_llm_reasoning_effort = normalize_reasoning_effort
 
 
 @dataclass

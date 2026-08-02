@@ -313,10 +313,10 @@ def _chat_completions(
         ),
         "reasoning_effort": effective_effort,
         # Providers keyed on the extra_body convention (GLM/DashScope-style)
-        # ignore reasoning_effort; "minimal" must switch thinking off there too.
+        # ignore reasoning_effort; "none" must switch thinking off there too.
         "extra_body": {
             "thinking": {
-                "type": "disabled" if effective_effort == "minimal" else "enabled"
+                "type": "disabled" if effective_effort == "none" else "enabled"
             }
         },
         "stream_options": {"include_usage": True},
@@ -447,9 +447,7 @@ def _chat_responses(
         "model": model_name,
         "input": _build_responses_input(messages),
         "stream": True,
-        "reasoning": {
-            "effort": effective_reasoning_effort
-        },
+        "reasoning": {"effort": effective_reasoning_effort},
         "text": _responses_text_format(
             model_name,
             schema=response_schema,

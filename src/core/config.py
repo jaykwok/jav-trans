@@ -146,7 +146,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "LLM_MODEL_NAME": "deepseek-v4-flash",
     # OpenAI-compatible API surface for translation requests. Valid values: chat, responses.
     "LLM_API_FORMAT": "chat",
-    # Reasoning effort parameter for models that support it. Valid values: medium, xhigh.
+    # Thinking budget for models that support it. Valid values: none, medium, max.
     "LLM_REASONING_EFFORT": "medium",
     # Sampling temperature for translation. Higher = more colloquial/varied; the
     # JSON-format retry loop tolerates the extra variance. Read at import time; a
@@ -277,6 +277,25 @@ def _apply_values(values: dict[str, str], protected_keys: set[str]) -> None:
         os.environ[key] = value
 
 
+# The three thinking tiers, in one place because they used to live in three:
+# `llm.settings`, `web.models` and `core.job_context` each kept their own copy
+# and they drifted -- job_context's list was missing the no-thinking tier
+# entirely, so a job submitted with it silently ran at "medium" no matter what
+# the UI said.
+#
+# "none" is the off switch (not "minimal", which is the smallest *nonzero*
+# budget on OpenAI, Gemini and DeepSeek alike) and "max" is the top tier.
+REASONING_EFFORTS = ("none", "medium", "max")
+
+
+def normalize_reasoning_effort(value: str | None, fallback: str = "medium") -> str:
+    """Clamp a thinking tier to the supported set."""
+    normalized = (value or fallback or "medium").strip().lower()
+    if normalized in REASONING_EFFORTS:
+        return normalized
+    return fallback if fallback in REASONING_EFFORTS else "medium"
+
+
 _PROXY_ENV_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -285,7 +304,29 @@ _PROXY_ENV_KEYS = (
     "https_proxy",
     "all_proxy",
 )
+_NO_PROXY_ENV_KEYS = ("NO_PROXY", "no_proxy")
+# The llamacpp backend talks to a llama-server it started itself on 127.0.0.1,
+# and neither urllib nor httpx exempts loopback on its own (verified: with
+# HTTP_PROXY set, `proxy_bypass("127.0.0.1")` is False and httpx picks the proxy
+# transport for a 127.0.0.1 URL). Without this, configuring a proxy for model
+# downloads would send local translation requests to the proxy instead.
+_LOOPBACK_NO_PROXY = ("127.0.0.1", "localhost", "::1")
 _SUPPORTED_PROXY_PROTOCOLS = {"http", "https", "socks5"}
+
+
+def _no_proxy_value_with_loopback(existing: str) -> str:
+    """Add the loopback hosts to a NO_PROXY list, keeping what the user set."""
+
+    entries = [item.strip() for item in str(existing or "").split(",")]
+    entries = [item for item in entries if item]
+    if "*" in entries:
+        return ",".join(entries)
+    lowered = {item.lower() for item in entries}
+    for host in _LOOPBACK_NO_PROXY:
+        if host not in lowered:
+            entries.append(host)
+            lowered.add(host)
+    return ",".join(entries)
 
 
 def network_proxy_url_from_env() -> str:
@@ -308,6 +349,12 @@ def apply_network_proxy_environment(
     if proxy_url:
         for key in _PROXY_ENV_KEYS:
             os.environ[key] = proxy_url
+        existing_no_proxy = ""
+        for key in _NO_PROXY_ENV_KEYS:
+            existing_no_proxy = os.environ.get(key) or existing_no_proxy
+        merged = _no_proxy_value_with_loopback(existing_no_proxy)
+        for key in _NO_PROXY_ENV_KEYS:
+            os.environ[key] = merged
         return
     if clear_existing:
         for key in _PROXY_ENV_KEYS:

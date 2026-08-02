@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from core.config import normalize_reasoning_effort
+
 
 MAX_TRANSLATION_WORKERS = 64
 
@@ -14,10 +16,7 @@ def normalize_llm_api_format(value: str | None) -> str:
     return normalized if normalized in {"chat", "responses"} else "chat"
 
 
-def normalize_llm_reasoning_effort(value: str | None) -> str:
-    """Clamp an LLM reasoning effort to the supported set; default 'medium'."""
-    normalized = (value or "medium").strip().lower()
-    return normalized if normalized in {"minimal", "medium", "xhigh"} else "medium"
+normalize_llm_reasoning_effort = normalize_reasoning_effort
 
 
 class JobSpec(BaseModel):
@@ -32,7 +31,7 @@ class JobSpec(BaseModel):
     target_lang: str | None = Field(default=None, max_length=64)
     translation_glossary: str | None = Field(default=None, max_length=20000)
     llm_api_format: Literal["chat", "responses"] | None = None
-    llm_reasoning_effort: Literal["minimal", "medium", "xhigh"] | None = None
+    llm_reasoning_effort: Literal["none", "medium", "max"] | None = None
     keep_temp_files: bool = False
     resume_from_job_id: str = Field(default="", max_length=128)
     advanced: dict[str, str] = Field(default_factory=dict, max_length=100)
@@ -67,7 +66,7 @@ class SettingsRead(BaseModel):
     proxy_port: int | None = None
     translation_glossary: str = ""
     llm_api_format: Literal["chat", "responses"] = "chat"
-    llm_reasoning_effort: Literal["minimal", "medium", "xhigh"] = "medium"
+    llm_reasoning_effort: Literal["none", "medium", "max"] = "medium"
     target_lang: str = "简体中文"
     translation_backend: Literal["openai", "local", "llamacpp"] = "openai"
     local_model_path: str = ""
@@ -89,7 +88,7 @@ class SettingsUpdate(BaseModel):
     proxy_port: int | None = Field(default=None, ge=1, le=65535)
     translation_glossary: str | None = None
     llm_api_format: Literal["chat", "responses"] | None = None
-    llm_reasoning_effort: Literal["minimal", "medium", "xhigh"] | None = None
+    llm_reasoning_effort: Literal["none", "medium", "max"] | None = None
     target_lang: str | None = None
     translation_backend: Literal["openai", "local", "llamacpp"] | None = None
     local_model_path: str | None = None

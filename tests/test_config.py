@@ -337,3 +337,76 @@ def test_frozen_path_defaults_resolve_to_runtime_root(monkeypatch, tmp_path):
     assert os.environ["TORCH_HOME"] == str((tmp_path / "tmp" / "cache" / "torch").resolve())
     assert os.environ["JOB_TEMP_DIR"] == str((tmp_path / "tmp" / "jobs").resolve())
     assert os.environ["LLM_MODEL_NAME"] == "from_config"
+
+
+class TestProxyExemptsLoopback:
+    """A proxy is configured so model downloads can leave the machine. The
+    llamacpp backend, meanwhile, talks to a llama-server it started itself on
+    127.0.0.1 -- and neither urllib nor httpx exempts loopback on its own, so
+    without NO_PROXY the same setting that fixes downloads breaks local
+    translation.
+    """
+
+    @staticmethod
+    def _clear(monkeypatch):
+        for key in config._PROXY_ENV_KEYS + config._NO_PROXY_ENV_KEYS:
+            monkeypatch.delenv(key, raising=False)
+
+    def test_setting_a_proxy_exempts_loopback(self, monkeypatch):
+        self._clear(monkeypatch)
+        config.apply_network_proxy_environment("http://127.0.0.1:7890")
+        for key in config._NO_PROXY_ENV_KEYS:
+            entries = os.environ[key].split(",")
+            assert "127.0.0.1" in entries
+            assert "localhost" in entries
+            assert "::1" in entries
+
+    def test_urllib_and_httpx_agree_that_loopback_is_direct(self, monkeypatch):
+        """The two clients that actually reach the local server: `_health_ok`
+        uses urllib, the OpenAI SDK uses httpx."""
+        import urllib.request
+
+        import httpx
+
+        self._clear(monkeypatch)
+        config.apply_network_proxy_environment("http://127.0.0.1:7890")
+
+        assert urllib.request.proxy_bypass("127.0.0.1") is True
+        assert not urllib.request.proxy_bypass("huggingface.co")
+
+        client = httpx.Client(trust_env=True)
+        try:
+            local = client._transport_for_url(httpx.URL("http://127.0.0.1:8080/v1"))
+            remote = client._transport_for_url(httpx.URL("https://huggingface.co/x"))
+            assert getattr(local._pool, "_proxy_url", None) is None
+            assert getattr(remote._pool, "_proxy_url", None) is not None
+        finally:
+            client.close()
+
+    def test_a_user_supplied_no_proxy_is_kept(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("NO_PROXY", "internal.example,10.0.0.1")
+        config.apply_network_proxy_environment("http://127.0.0.1:7890")
+        entries = os.environ["NO_PROXY"].split(",")
+        assert entries[:2] == ["internal.example", "10.0.0.1"]
+        assert "127.0.0.1" in entries
+
+    def test_loopback_is_not_added_twice(self, monkeypatch):
+        self._clear(monkeypatch)
+        config.apply_network_proxy_environment("http://127.0.0.1:7890")
+        config.apply_network_proxy_environment("http://127.0.0.1:7890")
+        assert os.environ["NO_PROXY"].split(",").count("127.0.0.1") == 1
+
+    def test_a_wildcard_bypass_is_left_alone(self, monkeypatch):
+        """`*` already means "never proxy"; appending hosts to it would only
+        make the value harder to read."""
+        self._clear(monkeypatch)
+        monkeypatch.setenv("NO_PROXY", "*")
+        config.apply_network_proxy_environment("http://127.0.0.1:7890")
+        assert os.environ["NO_PROXY"] == "*"
+
+    def test_no_proxy_configured_touches_nothing(self, monkeypatch):
+        self._clear(monkeypatch)
+        config.apply_network_proxy_environment("")
+        assert "NO_PROXY" not in os.environ
+        assert "HTTP_PROXY" not in os.environ

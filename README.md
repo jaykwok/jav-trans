@@ -38,6 +38,19 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 ## 快速开始
 
+### 发布版（推荐给新用户）
+
+解压发布包，双击 `jav-trans-setup.exe`。它自带 FFmpeg Shared 和 uv，第一次运行会：
+
+1. 读取 PyTorch 官方源上的 torch 安装包测速，报出实测速度和预计耗时；太慢或连不上时可以在控制台填写本地代理，代理会写入 `.env`，之后下载 ASR 模型也复用同一份设置。
+2. 用 uv 同步依赖，控制台实时显示下载进度。安装后约占 3.3GB 磁盘。中断后重新双击即可续装。
+
+装完自动启动；之后每次双击同一个 exe 会跳过安装直接启动。ASR 模型（约 3.9GB）和 CTC 对齐头在第一次转录时按需下载到 `models/`。
+
+发布包不打包 PyTorch 和模型权重，因此需要解压到有 15GB 以上空闲空间、且不需要管理员权限的目录（`.venv`、`models/`、`tmp/` 都建在程序目录内）。可用参数：`--proxy <URL>` 指定代理，`--yes` 直连安装不询问，`--reinstall` 重装环境，`--install-only` 只装不启动。
+
+### 从源码运行
+
 推荐环境：
 
 - Windows 10/11。
@@ -192,6 +205,8 @@ hf:<repo>@<commit sha>#<文件名>   # 默认；首次运行下载进 HF 缓存�
 - `LLM_MODEL_NAME`
 - 代理协议 / 地址 / 端口（可选，用于模型下载和 HTTP 请求）
 
+“思考强度”三档 `none` / `medium` / `max`，默认 `medium`。**这一档是翻译耗时的主要变量**：实测同一批 16 条 cue，`medium` 用 45.07s、5,266 个输出 token，`none` 用 5.53s、262 个——因为思考占了输出 token 的 95%–98%，而墙钟基本等于输出 token 数除以生成速度。追求速度和成本就选 `none`，追求用词稳定就留 `medium`。（注意不要写 `minimal`：那个值在 OpenAI、Gemini、DeepSeek 上都只是“最小的非零思考预算”而不是关闭。）
+
 ASR 显存自适应默认值已经内置。batch 或显存预算可通过“参数调优”里的环境变量覆盖，或手动编辑首次保存后生成的 `.env`。
 
 默认配置：
@@ -283,7 +298,9 @@ PROXY_HOST=127.0.0.1
 PROXY_PORT=7890
 ```
 
-或提前把模型下载到 `models/` 对应目录。
+或提前把模型下载到 `models/` 对应目录。发布版安装器在首次运行时也会写同样的三个键，安装依赖和下载模型共用这一份代理。
+
+这一份设置覆盖所有出网请求：安装 PyTorch、下载 ASR 权重与对齐头、下载 Sakura/GGUF 翻译模型、调用远程 LLM API。本机回环（`127.0.0.1` / `localhost` / `::1`）自动豁免，所以填了代理不会影响本地 llama-server。唯一不经过代理的是 `llama-server.exe` 本身——它由 `winget install llama.cpp` 或 GitHub release 手动安装。
 
 ### CUDA 没有被使用
 

@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException
 from asr.backends.qwen import active_qwen_asr_model_id
 from core.config import (
     DEFAULT_SETTINGS,
+    REASONING_EFFORTS,
     apply_network_proxy_environment,
     load_config,
 )
@@ -505,10 +506,10 @@ async def post_settings(update: SettingsUpdate) -> dict:
         changes["LLM_API_FORMAT"] = update.llm_api_format
         os.environ["LLM_API_FORMAT"] = update.llm_api_format
     if update.llm_reasoning_effort is not None:
-        if update.llm_reasoning_effort not in {"minimal", "medium", "xhigh"}:
+        if update.llm_reasoning_effort not in REASONING_EFFORTS:
             raise HTTPException(
                 status_code=422,
-                detail="llm_reasoning_effort must be one of: minimal, medium, xhigh",
+                detail=f"llm_reasoning_effort must be one of: {', '.join(REASONING_EFFORTS)}",
             )
         changes["LLM_REASONING_EFFORT"] = update.llm_reasoning_effort
         os.environ["LLM_REASONING_EFFORT"] = update.llm_reasoning_effort

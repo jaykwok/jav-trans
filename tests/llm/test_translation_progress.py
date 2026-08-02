@@ -110,7 +110,7 @@ def test_chat_uses_openai_json_schema(monkeypatch):
     requests: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_MODEL_NAME", "gpt-5.5")
-    monkeypatch.setenv("LLM_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
     monkeypatch.setattr(
         openai_compat,
         "_create_chat_completion",
@@ -128,7 +128,7 @@ def test_chat_uses_openai_json_schema(monkeypatch):
     assert output == '{"translations":[{"id":0,"text":"甲"},{"id":1,"text":"乙"}]}'
     request = requests[0]
     assert request["stream"] is True
-    assert request["reasoning_effort"] == "xhigh"
+    assert request["reasoning_effort"] == "max"
     assert request["extra_body"] == {"thinking": {"type": "enabled"}}
     response_format = request["response_format"]
     assert response_format["type"] == "json_schema"
@@ -272,19 +272,19 @@ def test_chat_retries_without_stream_options_when_provider_rejects_usage(monkeyp
     assert "stream_options" not in requests[1]
 
 
-def test_xhigh_stream_protocol_error_falls_back_to_medium(monkeypatch):
+def test_max_stream_protocol_error_falls_back_to_medium(monkeypatch):
     requests: list[dict] = []
     retry_events: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_MODEL_NAME", "gpt-5.5")
-    monkeypatch.setenv("LLM_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
 
     class RemoteProtocolError(RuntimeError):
         pass
 
     def fake_create_chat_completion(request):
         requests.append(dict(request))
-        if request["reasoning_effort"] == "xhigh":
+        if request["reasoning_effort"] == "max":
             return _broken_stream(
                 RemoteProtocolError(
                     "peer closed connection without sending complete message body "
@@ -300,7 +300,7 @@ def test_xhigh_stream_protocol_error_falls_back_to_medium(monkeypatch):
         output = translator._chat_with_reasoning(
             [{"role": "user", "content": "json"}],
             expected_count=1,
-            reasoning_effort="xhigh",
+            reasoning_effort="max",
         )
     finally:
         if previous_retry_events is None:
@@ -309,7 +309,7 @@ def test_xhigh_stream_protocol_error_falls_back_to_medium(monkeypatch):
             translator._RETRY_CONTEXT.events = previous_retry_events
 
     assert output == '{"translations":[{"id":0,"text":"好"}]}'
-    assert [request["reasoning_effort"] for request in requests] == ["xhigh", "medium"]
+    assert [request["reasoning_effort"] for request in requests] == ["max", "medium"]
     assert retry_events
     assert retry_events[0]["note"] == "fallback_reasoning_effort_medium"
 
@@ -366,7 +366,7 @@ def test_grok_responses_uses_standard_openai_shape(monkeypatch):
     requests: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "responses")
     monkeypatch.setenv("LLM_MODEL_NAME", "grok-4.20-0309-non-reasoning")
-    monkeypatch.setenv("LLM_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
     monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://api.openai.example/v1")
 
     def fake_create_response(request):
@@ -393,7 +393,7 @@ def test_grok_responses_uses_standard_openai_shape(monkeypatch):
     assert request["stream"] is True
     assert request["input"][0]["role"] == "system"
     assert request["input"][0]["content"][0]["type"] == "input_text"
-    assert request["reasoning"] == {"effort": "xhigh"}
+    assert request["reasoning"] == {"effort": "max"}
     text_format = request["text"]["format"]
     assert text_format["type"] == "json_schema"
     assert text_format["name"] == "subtitle_translations"

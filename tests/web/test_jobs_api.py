@@ -496,7 +496,7 @@ async def _test_settings_translation_fields_update_runtime_env(monkeypatch):
     stale_env = {
         "TRANSLATION_GLOSSARY": "old glossary",
         "TARGET_LANG": "简体中文",
-        "LLM_REASONING_EFFORT": "xhigh",
+        "LLM_REASONING_EFFORT": "max",
     }
     monkeypatch.setattr(
         config_routes,

@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import os
 
-from core.config import load_config
+from core.config import (
+    REASONING_EFFORTS,
+    load_config,
+    normalize_reasoning_effort,
+)
 
 load_config()
 
@@ -76,11 +80,5 @@ def _llm_api_format(api_format: str | None = None) -> str:
     return _normalize_llm_api_format(value)
 
 
-_REASONING_EFFORTS = {"minimal", "medium", "xhigh"}
-
-
-def _normalize_reasoning_effort(value: str | None, fallback: str = "medium") -> str:
-    normalized = (value or fallback or "medium").strip().lower()
-    if normalized in _REASONING_EFFORTS:
-        return normalized
-    return fallback if fallback in _REASONING_EFFORTS else "medium"
+_REASONING_EFFORTS = set(REASONING_EFFORTS)
+_normalize_reasoning_effort = normalize_reasoning_effort
