@@ -140,8 +140,9 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声。
 - 字幕行的起止**不取单个首字或末字**：18% 的行至少有一个字被接缝旁的音频拽走 >400ms，边界必须用稳健分位数。
+- 超长 cue 的**拆分点取对齐头量出的词间静音**（≥0.12s 才算间隙，≥0.60s 视为完整停顿，切点落在静音中央），文本切点取该静音之后那个词的真实起点，因此时间与文本来自同一次测量。只有 `ctc_forced_alignment` 的词参与：比例时间戳只是字数比例的另一种写法，用它当声学证据会把猜测标成测量。没有真实停顿可用时如实退回按字数比例切分。
 - 后置闸的 `min_alignment_score` 保持关闭：放行组与丢弃组的分数分布重叠，且两组都是真实内容，没有一组是幻听，未标定的阈值会静默删掉三分之一输出。
-- 对齐头**默认不启用**，必须显式设置 `ASR_ALIGNMENT_HEAD_PATH`。checkpoint 缺失或损坏只 warn 一次并降级为比例时间轴，不会让转写失败。
+- 对齐头**默认启用**：`ASR_ALIGNMENT_HEAD_PATH` 默认指向 `src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/ctc_aligner.pt`（galgame Phase 1 头，clean speech 上 containment 98.75%、逐字偏移中位 1.9ms；真实 JAV 上的起点精度已由 110 条盲听审计裁决——故意错切的 150ms/400ms 探针都能被听出来，而对齐起点与「提前半秒、不可能被切」的对照组分不开，即没有 150ms 量级的系统性滞后）。把该值置空可回退到定长切分 + 比例时间轴。checkpoint 缺失或损坏只 warn 一次并降级，不会让转写失败。
 - allocated/reserved/shared VRAM 只写运行诊断，不参与功能判断；显式 CUDA 请求不可用时直接报错，不回退 CPU。
 
 ---
@@ -221,7 +222,9 @@ GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长�
 
 auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理配置跨任务学习。v2 profile 记录已验证安全 batch 与 OOM 不安全上界：阶段 peak allocated 低于预算 `80%` 时，在两者之间二分探测；尚无 OOM 上界时则向当前阶段上限折半推进，OOM 后本次任务仍先减半恢复。当前只覆盖 ASR chunk batch；显式数字 batch 不参与 profile 学习。
 
-推理只需要 ASR Hugging Face 模型本身；同一份权重会被请求两次，一次用于解码，一次用于对齐头读取的 encoder 特征。源码运行时如果本地没有模型，会按需下载到 `models/`。对齐头是唯一的本地 checkpoint，由 `ASR_ALIGNMENT_HEAD_PATH` 显式指定，**未配置时不报错**，切分退化为定长、字幕时间轴退化为按字数比例摊开。
+推理只需要 ASR Hugging Face 模型本身；同一份权重会被加载两处，切分阶段短暂加载一次取 encoder 特征（算完即卸，与解码模型不同驻——8G 卡容不下两份），解码阶段再加载一次并一直用到对齐 pass 结束。**权重按需加载**：需要它的阶段自己加载，所以整片命中缓存的续跑完全不会加载模型。源码运行时如果本地没有模型，会按需下载到 `models/`。对齐头是唯一的本地 checkpoint，默认由 `ASR_ALIGNMENT_HEAD_PATH` 指向仓库内置的 galgame 头；置空则**不报错**，切分退化为定长、字幕时间轴退化为按字数比例摊开。
+
+阶段耗时表的各行严格加总为总计。ASR 在独立的 GPU owner 进程里运行，进程启动、环境传递与结果回传单列为「ASR Worker 启动与传输」；未归入任何具名阶段的剩余时间落在「其他」。
 
 训练时生成的 CUDA feature cache、synthetic WAV、sequence JSONL、tensor cache 和 `datasets/train/...` 产物都不是运行依赖，不随源码分发。
 

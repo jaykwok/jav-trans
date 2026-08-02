@@ -616,3 +616,96 @@ def test_splittable_long_block_is_not_clamped():
     for cue in prepared:
         assert cue["display_end"] - cue["display_start"] <= 7.0 + 1e-6
         assert cue["display_clamped_to_max"] is False
+
+
+def _aligned_words(text: str, start: float, char_s: float) -> list[dict]:
+    words = []
+    cursor = start
+    for char in text:
+        words.append(
+            {
+                "word": char,
+                "start": cursor,
+                "end": cursor + char_s,
+                "timestamp_kind": "ctc_forced_alignment",
+            }
+        )
+        cursor += char_s
+    return words
+
+
+def test_long_cue_splits_at_measured_word_gap_not_mid_word():
+    # The failure this fixes: with no punctuation and two different speaking
+    # rates, a character-ratio split lands inside a word. The 0.8s silence
+    # between them is the only correct break, and only the measured word
+    # timings know where it is.
+    first = "あのちょっとだけ"
+    second = "まってくださいよおねがい"
+    words = _aligned_words(first, 0.0, 0.20)
+    gap_start = words[-1]["end"]
+    words += _aligned_words(second, gap_start + 0.8, 0.50)
+    block = {
+        "start": 0.0,
+        "end": words[-1]["end"],
+        "ja_text": first + second,
+        "zh_text": first + second,
+        "words": words,
+    }
+
+    prepared = subtitle.prepare_srt_blocks([block], options=SubtitleOptions())
+
+    assert len(prepared) == 2
+    assert prepared[0]["ja_text"] == first
+    assert prepared[1]["ja_text"] == second
+    # The cut sits inside the silence, not at either word's edge.
+    assert gap_start < prepared[1]["start"] <= gap_start + 0.8
+    assert prepared[0]["subtitle_layout_split_source"] == "word_gap_dp"
+    assert prepared[0]["text_break_type"] == "word_gap_boundary"
+
+
+def test_long_cue_split_ignores_synthetic_word_timings():
+    # Proportional timings are a restatement of the character ratio the DP
+    # already has. Treating them as measured evidence would launder a guess
+    # into an acoustic anchor.
+    first = "あのちょっとだけ"
+    second = "まってくださいよおねがい"
+    words = _aligned_words(first, 0.0, 0.20)
+    gap_start = words[-1]["end"]
+    words += _aligned_words(second, gap_start + 0.8, 0.50)
+    for word in words:
+        word["timestamp_kind"] = "synthetic_proportional"
+    block = {
+        "start": 0.0,
+        "end": words[-1]["end"],
+        "ja_text": first + second,
+        "zh_text": first + second,
+        "words": words,
+    }
+
+    prepared = subtitle.prepare_srt_blocks([block], options=SubtitleOptions())
+
+    assert all(
+        cue["subtitle_layout_split_source"] == "proportional_text_dp"
+        for cue in prepared
+    )
+
+
+def test_word_gap_anchors_ignore_within_word_spacing():
+    # Continuous speech has small inter-character gaps. Offering those as cut
+    # candidates would put the split back inside a word.
+    text = "きょうはいいてんきですね" * 2
+    words = _aligned_words(text, 0.0, 0.36)
+    for index, word in enumerate(words):
+        # 60ms of separation everywhere: real, but far below a pause.
+        word["end"] = word["start"] + 0.30
+    block = {
+        "start": 0.0,
+        "end": words[-1]["end"],
+        "ja_text": text,
+        "zh_text": text,
+        "words": words,
+    }
+
+    anchors = subtitle._word_gap_anchors(block, start=0.0, end=words[-1]["end"])
+
+    assert anchors == []

@@ -5,6 +5,7 @@ from datetime import datetime
 from io import StringIO
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 
 from core import events
@@ -218,3 +219,70 @@ def test_timing_summary_zeros_cached_asr_stages():
     )
 
     assert {row["seconds"] for row in rows if row["key"] in {"split_s", "asr_text_transcribe_s"}} == {0.0}
+
+
+def test_timing_summary_parts_add_up_to_total():
+    # Real runs never tiled the total: the ASR worker's startup and IPC, plus
+    # quality reporting and cleanup, sit between the listed stages, so the
+    # printed parts summed to noticeably less than the total right underneath.
+    rows = _timing_summary_rows(
+        {
+            "audio_prepare_s": 0.27,
+            "asr_alignment_total_s": 11.37,
+            "subtitle_cue_plan_s": 0.01,
+            "translation_context_s": 0.0,
+            "translation_s": 0.0,
+            "write_output_s": 0.28,
+            "pipeline_total_s": 15.0,
+        },
+        {
+            "stage_timings": {
+                "asr_alignment_total_s": 10.79,
+                "split_s": 5.58,
+                "asr_model_load_s": 2.26,
+                "asr_text_transcribe_s": 2.52,
+                "asr_model_unload_s": 0.0,
+                "alignment_s": 0.43,
+                "subtitle_segment_s": 0.0,
+            }
+        },
+    )
+
+    by_key = {row["key"]: row["seconds"] for row in rows}
+    parts = sum(value for key, value in by_key.items() if key != "pipeline_total_s")
+    assert parts == pytest.approx(by_key["pipeline_total_s"], abs=0.01)
+    # The out-of-process ASR window is attributed rather than left anonymous.
+    assert by_key["asr_worker_overhead_s"] == pytest.approx(0.58, abs=0.01)
+    assert by_key["other_s"] == pytest.approx(3.07, abs=0.01)
+    keys = [row["key"] for row in rows]
+    assert keys.index("asr_worker_overhead_s") < keys.index("split_s")
+    assert rows[-1]["key"] == "pipeline_total_s"
+
+
+def test_timing_summary_omits_residual_row_when_stages_tile_the_total():
+    rows = _timing_summary_rows(
+        {
+            "audio_prepare_s": 1.0,
+            "asr_alignment_total_s": 20.0,
+            "subtitle_cue_plan_s": 2.0,
+            "translation_context_s": 3.0,
+            "translation_s": 4.0,
+            "write_output_s": 5.0,
+            "pipeline_total_s": 35.0,
+        },
+        {
+            "stage_timings": {
+                "asr_alignment_total_s": 20.0,
+                "split_s": 6.0,
+                "asr_model_load_s": 1.0,
+                "asr_text_transcribe_s": 8.0,
+                "asr_model_unload_s": 1.0,
+                "alignment_s": 3.0,
+                "subtitle_segment_s": 1.0,
+            }
+        },
+    )
+
+    keys = {row["key"] for row in rows}
+    assert "other_s" not in keys
+    assert "asr_worker_overhead_s" not in keys

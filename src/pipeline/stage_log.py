@@ -29,6 +29,7 @@ _ASR_STAGE_MAP = {
 
 _TIMING_SUMMARY_ROWS = (
     ("音频准备", "audio_prepare_s", "pipeline"),
+    ("ASR Worker 启动与传输", "asr_worker_overhead_s", "derived"),
     ("静音分析与切块", "split_s", "asr"),
     ("ASR 模型加载", "asr_model_load_s", "asr"),
     ("ASR 文本转写", "asr_text_transcribe_s", "asr"),
@@ -39,8 +40,13 @@ _TIMING_SUMMARY_ROWS = (
     ("翻译上下文", "translation_context_s", "pipeline"),
     ("翻译", "translation_s", "pipeline"),
     ("输出写入", "write_output_s", "pipeline"),
+    ("其他", "other_s", "derived"),
     ("总计", "pipeline_total_s", "pipeline"),
 )
+
+# Below this a residual is measurement noise between stage boundaries, not a
+# stage anyone can act on, and printing it would only add a row of zeros.
+_TIMING_RESIDUAL_MIN_S = 0.05
 
 
 def _event_ts() -> str:
@@ -195,6 +201,9 @@ def _timing_summary_rows(stage_timings: dict, asr_details: dict) -> list[dict]:
     )
     rows: list[dict] = []
     for label, key, source in _TIMING_SUMMARY_ROWS:
+        if source == "derived":
+            # Filled in below, once the measured rows and the total are known.
+            continue
         if source == "asr":
             value = 0.0 if asr_skipped else asr_stage_timings.get(key)
         else:
@@ -202,6 +211,55 @@ def _timing_summary_rows(stage_timings: dict, asr_details: dict) -> list[dict]:
         if value is None:
             continue
         rows.append({"label": label, "key": key, "seconds": round(float(value), 2)})
+
+    def _insert_before(anchor_key: str, label: str, key: str, seconds: float) -> None:
+        entry = {"label": label, "key": key, "seconds": round(seconds, 2)}
+        position = next(
+            (index for index, row in enumerate(rows) if row["key"] == anchor_key),
+            len(rows),
+        )
+        rows.insert(position, entry)
+
+    # The ASR stage runs in a separate GPU-owning process. The pipeline's own
+    # measurement of that window is longer than the sum the worker reports from
+    # inside itself, and the difference - process startup, env handoff, moving
+    # results back - is real time that belonged in no row.
+    worker_window_s = stage_timings.get("asr_alignment_total_s")
+    worker_inner_s = asr_stage_timings.get("asr_alignment_total_s")
+    if not asr_skipped and worker_window_s is not None and worker_inner_s is not None:
+        overhead = float(worker_window_s) - float(worker_inner_s)
+        if overhead >= _TIMING_RESIDUAL_MIN_S:
+            label = next(
+                (
+                    row_label
+                    for row_label, row_key, _source in _TIMING_SUMMARY_ROWS
+                    if row_key == "asr_worker_overhead_s"
+                ),
+                "ASR Worker 启动与传输",
+            )
+            # Ahead of the stages it wraps, which is where it happens.
+            _insert_before("split_s", label, "asr_worker_overhead_s", overhead)
+
+    # The listed stages still do not tile the run: quality reporting, cleanup and
+    # the audio handoff sit between them. Without this row the table shows parts
+    # that visibly fail to add up to the total it prints right underneath, which
+    # reads as a broken measurement rather than unlisted work.
+    total_s = stage_timings.get("pipeline_total_s")
+    if total_s is not None:
+        measured = sum(
+            float(row["seconds"]) for row in rows if row["key"] != "pipeline_total_s"
+        )
+        residual = float(total_s) - measured
+        if residual >= _TIMING_RESIDUAL_MIN_S:
+            label = next(
+                (
+                    row_label
+                    for row_label, row_key, _source in _TIMING_SUMMARY_ROWS
+                    if row_key == "other_s"
+                ),
+                "其他",
+            )
+            _insert_before("pipeline_total_s", label, "other_s", residual)
     return rows
 
 

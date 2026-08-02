@@ -299,6 +299,7 @@ def _anchor_times(block: dict, *, start: float, end: float) -> list[dict]:
                     "strength": _safe_float(candidate.get("strength"), 0.0),
                 }
             )
+    anchors.extend(_word_gap_anchors(block, start=start, end=end))
     anchors.sort(
         key=lambda item: (
             float(item["time_s"]),
@@ -322,11 +323,121 @@ def _text_break_score(text: str, position: int) -> float:
     return 0.75
 
 
-def _candidate_text_positions_for_dp(text: str, *, split_count: int) -> list[int]:
+# A silence between two measured words has to be at least this long before it is
+# offered as a cue boundary. Below it the "gap" is the ordinary space between
+# syllables of continuous speech, and cutting there splits a word.
+WORD_GAP_MIN_S = 0.12
+
+# A gap this long is treated as a full pause and scored like a strong cut. Sized
+# to the chunker's own pause floor (ASR_CHUNK_MIN_PAUSE_S default 0.6s) so the
+# two readings of silence agree on what counts as a pause.
+WORD_GAP_STRONG_S = 0.60
+
+
+def _word_gap_anchors(block: dict, *, start: float, end: float) -> list[dict]:
+    """Cut candidates read off measured word timings.
+
+    The acoustic candidate channel (`primary_cut_candidates`/`weak_cut_candidates`)
+    was fed by the pre-ASR chain that was retired on 2026-07-31; nothing has
+    populated it since, so the "anchor-aware" DP has been running with an empty
+    anchor list and splitting long cues purely on character ratio - which lands
+    mid-word, because character count is not time.
+
+    With the alignment head on, every character has a measured extent, so the
+    silences between words are known directly. Only real gaps become anchors and
+    only aligned words are trusted: proportional timings are a restatement of the
+    character ratio the DP already has, and offering them as "acoustic" evidence
+    would launder a guess into an anchor.
+    """
+    words = [
+        word
+        for word in _timed_words(block)
+        if str(word.get("timestamp_kind") or "") == "ctc_forced_alignment"
+    ]
+    if len(words) < 2:
+        return []
+
+    anchors: list[dict] = []
+    for earlier, later in zip(words, words[1:]):
+        gap_start = float(earlier["end"])
+        gap_end = float(later["start"])
+        gap = gap_end - gap_start
+        if gap < WORD_GAP_MIN_S:
+            continue
+        # Middle of the silence: the same rule the chunker uses, and it keeps the
+        # cue off both the decay of the previous word and the onset of the next.
+        time_s = gap_start + gap / 2.0
+        if not start < time_s < end:
+            continue
+        strong = gap >= WORD_GAP_STRONG_S
+        anchors.append(
+            {
+                "time_s": time_s,
+                "anchor_type": "primary_cut" if strong else "weak_cut",
+                "score": round(gap, 4),
+                "prominence": 0.0,
+                "speech_valley": 0.0,
+                # Longer silence is a better place to cut; the DP reads this as a
+                # tie-break and as a small bonus, both monotone in gap length.
+                "strength": round(min(gap / WORD_GAP_STRONG_S, 1.0), 4),
+                "anchor_source": "word_gap",
+                # The word this silence ends at. Lets the DP pair the anchor with
+                # the exact character the word starts at instead of guessing the
+                # position back out of a ratio.
+                "next_word_start_s": gap_end,
+            }
+        )
+    return anchors
+
+
+def _word_boundary_text_positions(block: dict, text: str) -> dict[int, float]:
+    """Character offsets in `text` where a measured word starts, by time.
+
+    The DP picks a text position and a time independently and pays a penalty for
+    how far apart they are. Feeding it the positions that correspond to real word
+    starts is what lets the two agree: without them the only candidate positions
+    are punctuation, spaces, and evenly-spaced ratio guesses, and in Japanese —
+    no spaces, sparse punctuation in ASR output — that means the ratio guesses.
+    """
+    words = [
+        word
+        for word in _timed_words(block)
+        if str(word.get("timestamp_kind") or "") == "ctc_forced_alignment"
+    ]
+    if len(words) < 2:
+        return {}
+
+    positions: dict[int, float] = {}
+    cursor = 0
+    for index, word in enumerate(words):
+        token = str(word.get("word") or "")
+        if not token:
+            continue
+        found = text.find(token, cursor)
+        if found < 0:
+            # The cue text is not the concatenation of these words (translation,
+            # normalisation, an earlier split). Without a reliable mapping a
+            # position here would attach a real time to the wrong character.
+            continue
+        cursor = found + len(token)
+        if index == 0:
+            continue
+        if 0 < found < len(text):
+            positions[found] = float(word["start"])
+    return positions
+def _candidate_text_positions_for_dp(
+    text: str,
+    *,
+    split_count: int,
+    word_positions: dict[int, float] | None = None,
+) -> list[int]:
     raw = str(text or "")
     if len(raw) <= 1:
         return []
     positions = set(_candidate_text_boundaries(raw))
+    positions.update(
+        position for position in (word_positions or {}) if 0 < position < len(raw)
+    )
     for index in range(1, max(1, split_count) + 1):
         position = _fallback_text_position(raw, index / float(split_count + 1))
         if 0 < position < len(raw):
@@ -376,11 +487,23 @@ def _long_display_dp_plan(
         return None
     min_duration_s = _subtitle_min_duration_s(options)
     split_count = max(1, int(math.ceil(duration / max_display_s)) - 1)
-    positions = _candidate_text_positions_for_dp(text, split_count=split_count)
+    # Character offsets that correspond to a measured word start, so the DP can
+    # break where a word begins rather than where the character count says.
+    word_positions = _word_boundary_text_positions(block, text)
+    positions = _candidate_text_positions_for_dp(
+        text,
+        split_count=split_count,
+        word_positions=word_positions,
+    )
     if not positions:
         return None
     ratios_by_position = _text_unit_prefix_ratios(text, positions)
     anchors = _anchor_times(block, start=start, end=end)
+    # Reverse map: a word-gap anchor knows which word follows it, and that word's
+    # character offset is the position it should pair with exactly.
+    position_by_word_start = {
+        round(word_start, 4): position for position, word_start in word_positions.items()
+    }
     snap_window_s = _weak_cut_snap_window_s(duration, options)
     nodes: list[dict] = [
         {
@@ -412,7 +535,14 @@ def _long_display_dp_plan(
         )
     for anchor in anchors:
         anchor_ratio = (float(anchor["time_s"]) - start) / max(duration, 1e-6)
-        if positions:
+        exact_position = position_by_word_start.get(
+            round(float(anchor.get("next_word_start_s") or -1.0), 4)
+        )
+        if exact_position is not None:
+            # A word-gap anchor: text position and time are the same measurement,
+            # so pair them directly and let the snap distance be zero.
+            position = exact_position
+        elif positions:
             position = min(
                 positions,
                 key=lambda item: (
@@ -432,8 +562,11 @@ def _long_display_dp_plan(
                 "time_s": float(anchor["time_s"]),
                 "ratio": ratios_by_position.get(position, anchor_ratio),
                 "source": str(anchor["anchor_type"]),
+                "anchor_source": str(anchor.get("anchor_source") or ""),
                 "anchor_strength": float(anchor.get("strength") or anchor.get("score") or 0.0),
-                "snap_distance_s": abs(float(anchor["time_s"]) - target),
+                "snap_distance_s": 0.0
+                if exact_position is not None
+                else abs(float(anchor["time_s"]) - target),
             }
         )
     nodes.append(
@@ -559,9 +692,15 @@ def _split_long_display_block(
         for position in timing_positions
     ]
     split_sources = [str(node["source"]) for node in nodes[1:-1]]
-    split_source = "acoustic_anchor_dp" if any(
-        source in {"primary_cut", "weak_cut"} for source in split_sources
-    ) else "proportional_text_dp"
+    split_anchor_sources = [str(node.get("anchor_source") or "") for node in nodes[1:-1]]
+    if any(source == "word_gap" for source in split_anchor_sources):
+        # Split at a measured silence between two words, which is the only
+        # source here that cannot land mid-word.
+        split_source = "word_gap_dp"
+    elif any(source in {"primary_cut", "weak_cut"} for source in split_sources):
+        split_source = "acoustic_anchor_dp"
+    else:
+        split_source = "proportional_text_dp"
 
     boundaries = [start, *split_times, end]
     text_fields = {}
@@ -611,13 +750,20 @@ def _split_long_display_block(
         item["timing_model"] = options.timing_model
         boundary_node = nodes[index + 1] if index + 1 < len(nodes) else None
         boundary_source = str(boundary_node.get("source") or "") if boundary_node else ""
+        boundary_anchor_source = (
+            str(boundary_node.get("anchor_source") or "") if boundary_node else ""
+        )
         item["anchor_used"] = boundary_source in {"primary_cut", "weak_cut"}
         item["anchor_type"] = boundary_source if item["anchor_used"] else ""
         item["anchor_score"] = 0.0 if boundary_node is None else float(boundary_node.get("anchor_strength") or 0.0)
         item["snap_distance_s"] = 0.0 if boundary_node is None else float(boundary_node.get("snap_distance_s") or 0.0)
         item["snap_reason"] = "anchor_aware_dp_v2"
         item["layout_score"] = float(plan.get("score") or 0.0)
-        item["text_break_type"] = "dp_text_boundary"
+        item["text_break_type"] = (
+            "word_gap_boundary"
+            if boundary_anchor_source == "word_gap"
+            else "dp_text_boundary"
+        )
         item["proportional_fallback_used"] = not item["anchor_used"]
         split_blocks.append(item)
     return split_blocks
