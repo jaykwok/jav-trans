@@ -50,6 +50,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_DTYPE": "bfloat16",
     # Attention implementation. sdpa uses PyTorch scaled-dot-product attention.
     "ASR_ATTENTION": "sdpa",
+    # CTC alignment head over the ASR encoder: word-level subtitle timing and
+    # pause-aware chunk cuts. The head is encoder-specific (trained on the
+    # 1.7B SFT encoder); clear this to fall back to proportional timing and
+    # fixed-length chunks. Accuracy validated on clean speech; real-domain
+    # onset accuracy still under audit.
+    "ASR_ALIGNMENT_HEAD_PATH": "./src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/ctc_aligner.pt",
 
     # --- ASR Language & Generation ---
     # Source audio language hint passed to ASR.

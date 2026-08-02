@@ -400,6 +400,18 @@ def speech_extent(
 ALIGNMENT_HEAD_PATH_ENV = "ASR_ALIGNMENT_HEAD_PATH"
 
 
+def alignment_head_configured() -> bool:
+    """True when `ASR_ALIGNMENT_HEAD_PATH` points at something.
+
+    Cheap env probe for callers that must make lifecycle decisions (keep the
+    ASR model loaded through the alignment pass, consult the finalize cache)
+    before anyone pays for actually loading the head.
+    """
+    import os
+
+    return bool((os.environ.get(ALIGNMENT_HEAD_PATH_ENV) or "").strip())
+
+
 class AlignmentHead:
     """A loaded head, ready to turn encoder features into character times.
 

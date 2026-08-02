@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from asr.backends.base import BaseAsrBackend
+from asr.alignment import alignment_head_configured
 from asr.alignment_quality import classify_alignment_quality
 from asr import chunking as _chunking_module
 from asr import result_cache as _result_cache_module
@@ -466,15 +467,89 @@ def _align_TRANSCRIPTION_results(
             "alignment_s": time.perf_counter() - align_started
         }
 
-    if getattr(backend, "model", None) is not None:
+    head_configured = alignment_head_configured()
+
+    if head_configured:
+        # Word timing is worth caching only on this path: with a head each
+        # chunk pays an encoder forward + a Viterbi walk, and the output pins
+        # one more artifact (the head checkpoint, hashed into the key).
+        cache_hits = 0
+        uncached_results: list[dict] = []
+        uncached_indices: list[int] = []
+        for text_result, result_index in zip(pending_results, pending_indices):
+            cached = _result_cache_module.finalize_lookup(
+                str(text_result.get("normalized_path") or ""),
+                text=str(text_result.get("text") or "").strip(),
+            )
+            if cached is None:
+                uncached_results.append(text_result)
+                uncached_indices.append(result_index)
+            else:
+                prepared[result_index] = cached
+                cache_hits += 1
+        pending_results = uncached_results
+        pending_indices = uncached_indices
+        if cache_hits:
+            _emit_progress(on_stage, f"字幕时间轴缓存命中 {cache_hits} 个块")
+
+    if not pending_results:
+        if getattr(backend, "model", None) is not None:
+            backend.unload_model(on_stage=on_stage)
+        # Still report the stage as run-and-finished. The web progress bar keys
+        # off this label, and a fully cached run that skipped it silently made
+        # the bar jump straight from text transcription to writing.
+        if on_stage:
+            on_stage(f"字幕时间轴 {len(text_results)}/{len(text_results)}...")
+        return [
+            item
+            if item is not None
+            else _empty_alignment_placeholder(
+                text_results[idx],
+                reason="Subtitle timing skipped: missing finalize result",
+            )
+            for idx, item in enumerate(prepared)
+        ], {"alignment_s": time.perf_counter() - align_started}
+
+    if head_configured:
+        # The aligned pass reads encoder features off the very model that just
+        # decoded. Unloading it here — the old unconditional behavior — made
+        # _align_characters bail on `self.model is None` and silently degraded
+        # every chunk to proportional timing, so a configured head never
+        # actually ran in this flow. A fully cache-hit text stage arrives with
+        # the model never loaded at all; load it now.
+        if getattr(backend, "model", None) is None:
+            loader = getattr(backend, "load", None)
+            if callable(loader):
+                try:
+                    loader(on_stage=on_stage)
+                except Exception as error:  # noqa: BLE001
+                    logger.warning("ASR model load for alignment failed: %s", error)
+                    _emit_progress(
+                        on_stage,
+                        f"[WARN] 对齐用 ASR 模型加载失败，本轮退化为比例时间轴: {error}",
+                    )
+    elif getattr(backend, "model", None) is not None:
         backend.unload_model(on_stage=on_stage)
 
     if on_stage:
         on_stage(f"字幕时间轴 {len(pending_results)}/{len(pending_results)}...")
-    finalized_batch = backend.finalize_text_results(
-        pending_results,
-        on_stage=on_stage,
-    )
+    try:
+        finalized_batch = backend.finalize_text_results(
+            pending_results,
+            on_stage=on_stage,
+        )
+    finally:
+        if head_configured and getattr(backend, "model", None) is not None:
+            backend.unload_model(on_stage=on_stage)
+    if head_configured:
+        for text_result, finalized in zip(pending_results, finalized_batch):
+            finalized_result, finalized_log = finalized
+            _result_cache_module.finalize_store(
+                str(text_result.get("normalized_path") or ""),
+                text=str(text_result.get("text") or "").strip(),
+                result=finalized_result,
+                log=finalized_log,
+            )
     for result_index, finalized in zip(pending_indices, finalized_batch):
         prepared[result_index] = finalized
     if len(finalized_batch) < len(pending_results):

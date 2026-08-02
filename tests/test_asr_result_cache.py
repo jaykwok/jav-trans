@@ -243,3 +243,124 @@ def test_transcribe_loop_resumes_entirely_from_cache(monkeypatch, tmp_path):
         any("ASR result cache hit" in entry for entry in result.get("log", []))
         for result in resumed
     )
+
+
+def _setup_head_env(monkeypatch, tmp_path: Path) -> Path:
+    head_path = tmp_path / "ctc_aligner.pt"
+    head_path.write_bytes(b"head-weights-v1")
+    monkeypatch.setenv("ASR_ALIGNMENT_HEAD_PATH", str(head_path))
+    return head_path
+
+
+def _aligned_result(mode: str = "ctc_forced_alignment") -> dict:
+    return {
+        "words": [{"start": 0.1, "end": 0.4, "word": "テスト"}],
+        "text": "テスト",
+        "raw_text": "テスト",
+        "alignment_mode": mode,
+        "duration": 0.05,
+        "language": "Japanese",
+    }
+
+
+def test_finalize_cache_roundtrip_and_text_guard(monkeypatch, tmp_path):
+    _setup_cache_env(monkeypatch, tmp_path)
+    _setup_head_env(monkeypatch, tmp_path)
+    wav = tmp_path / "chunk.wav"
+    _write_wav(wav, value=7)
+
+    result_cache.finalize_store(
+        wav, text="テスト", result=_aligned_result(), log=["decoded", "aligned"]
+    )
+    cached = result_cache.finalize_lookup(wav, text="テスト")
+
+    assert cached is not None
+    restored_result, restored_log = cached
+    assert restored_result["alignment_mode"] == "ctc_forced_alignment"
+    assert restored_result["words"]
+    assert any("finalize cache hit" in entry for entry in restored_log)
+    # Different source text means different words: must miss.
+    assert result_cache.finalize_lookup(wav, text="別のテキスト") is None
+
+
+def test_finalize_cache_inert_without_head(monkeypatch, tmp_path):
+    cache_root = _setup_cache_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("ASR_ALIGNMENT_HEAD_PATH", raising=False)
+    wav = tmp_path / "chunk.wav"
+    _write_wav(wav, value=7)
+
+    result_cache.finalize_store(
+        wav, text="テスト", result=_aligned_result(), log=[]
+    )
+
+    assert result_cache.finalize_lookup(wav, text="テスト") is None
+    assert not cache_root.exists()
+
+
+def test_finalize_cache_stores_only_real_alignments(monkeypatch, tmp_path):
+    _setup_cache_env(monkeypatch, tmp_path)
+    _setup_head_env(monkeypatch, tmp_path)
+    wav = tmp_path / "chunk.wav"
+    _write_wav(wav, value=7)
+
+    result_cache.finalize_store(
+        wav,
+        text="テスト",
+        result=_aligned_result(mode="boundary_proportional"),
+        log=["Subtitle timing: alignment declined, using proportional"],
+    )
+
+    assert result_cache.finalize_lookup(wav, text="テスト") is None
+
+
+def test_finalize_cache_key_changes_with_head_digest(monkeypatch, tmp_path):
+    _setup_cache_env(monkeypatch, tmp_path)
+    head_path = _setup_head_env(monkeypatch, tmp_path)
+    wav = tmp_path / "chunk.wav"
+    _write_wav(wav, value=7)
+
+    result_cache.finalize_store(wav, text="テスト", result=_aligned_result(), log=[])
+    assert result_cache.finalize_lookup(wav, text="テスト") is not None
+
+    head_path.write_bytes(b"head-weights-v2-retrained")
+
+    assert result_cache.finalize_lookup(wav, text="テスト") is None
+
+
+def test_align_results_second_pass_served_from_finalize_cache(monkeypatch, tmp_path):
+    _setup_cache_env(monkeypatch, tmp_path)
+    _setup_head_env(monkeypatch, tmp_path)
+    from asr import transcribe
+    from tests.test_alignment_head_wiring import _LifecycleBackend
+
+    wav = tmp_path / "chunk_0000.wav"
+    _write_wav(wav, value=7)
+    text_result = {
+        "text": "テスト",
+        "raw_text": "テスト",
+        "duration": 0.05,
+        "language": "Japanese",
+        "normalized_path": str(wav),
+        "log": [],
+    }
+
+    first_backend = _LifecycleBackend(
+        model=object(), finalize_mode="ctc_forced_alignment"
+    )
+    first_results, _ = transcribe._align_TRANSCRIPTION_results(
+        first_backend, [dict(text_result)]
+    )
+    assert first_results[0][0]["alignment_mode"] == "ctc_forced_alignment"
+
+    second_backend = _LifecycleBackend(model=None, finalize_mode="ctc_forced_alignment")
+    second_results, _ = transcribe._align_TRANSCRIPTION_results(
+        second_backend, [dict(text_result)]
+    )
+
+    assert second_results[0][0]["alignment_mode"] == "ctc_forced_alignment"
+    assert any(
+        "finalize cache hit" in entry for entry in second_results[0][1]
+    )
+    # No model load, no finalize call: the whole pass came from the cache.
+    assert "load" not in second_backend.events
+    assert not [e for e in second_backend.events if not isinstance(e, str)]

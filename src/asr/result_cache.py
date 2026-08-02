@@ -243,3 +243,109 @@ def restore_text_result(chunk: dict, cached: dict) -> dict:
     result_log.append("ASR result cache hit: restored chunk text")
     result["log"] = result_log
     return result
+
+
+# --- finalize-stage cache (word timing; active only with an alignment head) ---
+#
+# The text-stage cache above spares the decoder. Once an alignment head is
+# configured, finalize additionally pays one encoder pass + a Viterbi walk per
+# chunk, and its output depends on one more artifact: the head checkpoint. So
+# the finalize entry lives under its own signature (stage="final" + head
+# digest) and stores the source text it aligned, verified on lookup — a text
+# mismatch means the entry describes different words, not different audio.
+#
+# Only real alignments (alignment_mode == "ctc_forced_alignment") are stored.
+# Declines and failures re-run on the next pass: an encoder forward on the few
+# declined chunks is cheap, and caching a degraded result would freeze what
+# might have been a transient error into a permanent proportional timeline.
+
+_ALIGNED_FINALIZE_MODE = "ctc_forced_alignment"
+_HEAD_DIGEST_CACHE: dict[tuple[str, int, int], str] = {}
+
+
+def _alignment_head_digest() -> str | None:
+    raw_path = (os.environ.get("ASR_ALIGNMENT_HEAD_PATH") or "").strip()
+    if not raw_path:
+        return None
+    try:
+        head_path = Path(raw_path).resolve()
+        stat = head_path.stat()
+        cache_key = (str(head_path), stat.st_size, stat.st_mtime_ns)
+        cached = _HEAD_DIGEST_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha256(head_path.read_bytes()).hexdigest()
+        _HEAD_DIGEST_CACHE.clear()
+        _HEAD_DIGEST_CACHE[cache_key] = digest
+        return digest
+    except Exception:
+        return None
+
+
+def finalize_signature() -> dict | None:
+    head_digest = _alignment_head_digest()
+    if head_digest is None:
+        return None
+    signature = model_signature()
+    signature["stage"] = "final"
+    signature["alignment_head"] = {"sha256": head_digest}
+    return signature
+
+
+def finalize_lookup(chunk_path: str | Path, *, text: str) -> tuple[dict, list[str]] | None:
+    if not result_cache_enabled():
+        return None
+    signature = finalize_signature()
+    if signature is None:
+        return None
+    try:
+        entry_path = _cache_dir(signature) / f"{chunk_audio_sha256(chunk_path)}.json"
+        if not entry_path.exists():
+            return None
+        payload = json.loads(entry_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if payload.get("schema") != CACHE_SCHEMA or payload.get("stage") != "final":
+        return None
+    if str(payload.get("source_text") or "") != str(text or ""):
+        return None
+    result = payload.get("result")
+    log = payload.get("log")
+    if not isinstance(result, dict) or not isinstance(log, list):
+        return None
+    restored_log = [str(entry) for entry in log]
+    restored_log.append("ASR finalize cache hit: restored word timing")
+    return dict(result), restored_log
+
+
+def finalize_store(
+    chunk_path: str | Path,
+    *,
+    text: str,
+    result: dict,
+    log: list[str],
+) -> None:
+    if not result_cache_enabled():
+        return
+    if str(result.get("alignment_mode") or "") != _ALIGNED_FINALIZE_MODE:
+        return
+    signature = finalize_signature()
+    if signature is None:
+        return
+    try:
+        cache_dir = _cache_dir(signature)
+        signature_path = cache_dir / "signature.json"
+        if not signature_path.exists():
+            _atomic_write_json(signature_path, signature)
+        _atomic_write_json(
+            cache_dir / f"{chunk_audio_sha256(chunk_path)}.json",
+            {
+                "schema": CACHE_SCHEMA,
+                "stage": "final",
+                "source_text": str(text or ""),
+                "result": dict(result),
+                "log": [str(entry) for entry in log],
+            },
+        )
+    except Exception:
+        return

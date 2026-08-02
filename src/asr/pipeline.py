@@ -12,7 +12,7 @@ import numpy as np
 from asr import chunking as _chunking_module
 from asr import result_cache as _result_cache_module
 from asr import transcribe as _transcribe_module
-from asr.alignment import AlignmentHead, blank_runs
+from asr.alignment import AlignmentHead, alignment_head_configured, blank_runs
 from asr.cueqc import build_candidate as build_cueqc_candidate
 from asr.postgate import POSTGATE_SCHEMA, review_all as postgate_review_all
 from asr.pregate import PREGATE_SCHEMA, cut_at_pauses
@@ -37,15 +37,9 @@ _JSON_PAYLOAD_INLINE_ARRAY_LIMIT = 4096
 # window the ASR encoder is happiest with, not a property of the chunking.
 _FEATURE_CHUNK_S = 30.0
 ASR_LANGUAGE_FOR_CHUNKING = os.getenv("ASR_LANGUAGE", "Japanese").strip() or "Japanese"
-# Loaded at most once per process, and only when an alignment head is actually
-# configured. With no head the chunker never touches a model at all.
-_FEATURE_MODEL: tuple[Any, Any] | None = None
 
 
 def _load_asr_model_for_features() -> tuple[Any, Any]:
-    global _FEATURE_MODEL
-    if _FEATURE_MODEL is not None:
-        return _FEATURE_MODEL
     import torch
     from transformers import AutoModelForMultimodalLM, AutoProcessor
 
@@ -62,8 +56,25 @@ def _load_asr_model_for_features() -> tuple[Any, Any]:
         spec, dtype=dtype, device_map=str(device)
     )
     model.eval()
-    _FEATURE_MODEL = (model, processor)
-    return _FEATURE_MODEL
+    return model, processor
+
+
+def _release_feature_model_vram() -> None:
+    # The decode stage loads its own copy of the same weights right after
+    # chunking. On an 8GB card the two cannot coexist (3.8GiB each), so the
+    # feature model is strictly scoped to the blank-run pass — holding it as a
+    # per-process cache OOM'd the very first head-enabled run at batch 1. The
+    # caller drops every reference first; this only returns the freed blocks.
+    try:
+        import gc as _gc
+
+        import torch
+
+        _gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 
@@ -220,6 +231,8 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
     if head is None:
         return [], duration_s, "fixed_length_no_head_configured"
 
+    model = None
+    processor = None
     try:
         import numpy as _np
         import torch
@@ -275,6 +288,11 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
         # cuts are worse placed, not wrong, because nothing is dropped either way.
         _pipeline_logger.warning("[chunking] blank runs unavailable: %s", error)
         return [], duration_s, "fixed_length_blank_runs_failed"
+    finally:
+        if model is not None or processor is not None:
+            model = None
+            processor = None
+            _release_feature_model_vram()
 
 
 def _build_processing_spans(
@@ -839,17 +857,31 @@ def _transcribe_and_align_local(
         backend = _resolve_asr_backend(device)
         word_dicts: list[dict] = []
         try:
-            load_started = time.perf_counter()
             _model_lifecycle_event(
                 model_manager,
                 stage="asr",
                 action="load_exclusive",
                 on_stage=on_stage,
             )
-            backend.load(on_stage=on_stage)
-            load_elapsed = time.perf_counter() - load_started
-            _record_stage_timing(
-                log, timings, "asr_model_load_s", "ASR模型加载", load_elapsed
+            # No eager load. Every consumer below (transcribe_texts, the
+            # alignment pass) loads on demand, so a rerun whose chunks are all
+            # served from the result cache never pays for the weights at all -
+            # it used to spend ~5s loading a model it then immediately unloaded.
+            # The lifecycle event still fires here: it resets CUDA state for the
+            # exclusive-ownership window, which is about the window, not the load.
+            load_before_text_s = float(getattr(backend, "cumulative_load_s", 0.0))
+            text_results, text_timings = _transcribe_asr_chunks_text_only(
+                backend,
+                chunk_infos,
+                "ASR 文本转写",
+                on_stage=on_stage,
+            )
+            # Loading now happens inside whichever stage first needs the weights,
+            # so that stage's wall clock contains it. Report the load separately
+            # and net it out of the host stage, or the summary double-counts it
+            # and the rows stop adding up to the total.
+            text_load_s = (
+                float(getattr(backend, "cumulative_load_s", 0.0)) - load_before_text_s
             )
             _record_cuda_memory(
                 log,
@@ -857,19 +889,12 @@ def _transcribe_and_align_local(
                 "asr_model_load_done",
                 elapsed_s=time.perf_counter() - total_started,
             )
-
-            text_results, text_timings = _transcribe_asr_chunks_text_only(
-                backend,
-                chunk_infos,
-                "ASR 文本转写",
-                on_stage=on_stage,
-            )
             _record_stage_timing(
                 log,
                 timings,
                 "asr_text_transcribe_s",
                 "ASR文本转写",
-                text_timings["text_transcribe_s"],
+                max(0.0, text_timings["text_transcribe_s"] - text_load_s),
             )
             for timing_key, timing_value in text_timings.items():
                 if timing_key == "text_transcribe_s":
@@ -888,13 +913,20 @@ def _transcribe_and_align_local(
             ]
 
             unload_started = time.perf_counter()
-            backend.unload_model(on_stage=on_stage)
-            _model_lifecycle_event(
-                model_manager,
-                stage="asr",
-                action="unload",
-                on_stage=on_stage,
-            )
+            # With an alignment head configured, finalize immediately re-reads
+            # encoder features off this same model; unloading here would force
+            # a pointless multi-second reload inside _align_TRANSCRIPTION_
+            # results (which owns the unload on that path). Without a head the
+            # early unload stays: proportional finalize never touches the GPU.
+            head_owns_unload = alignment_head_configured()
+            if not head_owns_unload:
+                backend.unload_model(on_stage=on_stage)
+                _model_lifecycle_event(
+                    model_manager,
+                    stage="asr",
+                    action="unload",
+                    on_stage=on_stage,
+                )
             unload_elapsed = time.perf_counter() - unload_started
             _record_stage_timing(
                 log,
@@ -915,12 +947,31 @@ def _transcribe_and_align_local(
                 text_results,
                 on_stage=on_stage,
             )
+            if head_owns_unload:
+                # The alignment pass did the unload (it needed the model through
+                # finalize); the manager's CUDA reset belongs after that, not
+                # before it.
+                _model_lifecycle_event(
+                    model_manager,
+                    stage="asr",
+                    action="unload",
+                    on_stage=on_stage,
+                )
+            total_load_s = float(getattr(backend, "cumulative_load_s", 0.0))
+            align_load_s = max(0.0, total_load_s - load_before_text_s - text_load_s)
+            _record_stage_timing(
+                log,
+                timings,
+                "asr_model_load_s",
+                "ASR模型加载",
+                total_load_s,
+            )
             _record_stage_timing(
                 log,
                 timings,
                 "alignment_s",
                 "字幕时间轴生成",
-                align_timings["alignment_s"],
+                max(0.0, align_timings["alignment_s"] - align_load_s),
             )
             _record_cuda_memory(
                 log,
@@ -962,6 +1013,10 @@ def _transcribe_and_align_local(
                             "start": chunk["start"] + float(word["start"]),
                             "end": chunk["start"] + float(word["end"]),
                             "word": word["word"],
+                            # The writer's anchor guard reads this to refuse
+                            # synthetic word starts; dropping it here silently
+                            # disarmed that guard for every production run.
+                            "timestamp_kind": str(word.get("timestamp_kind") or ""),
                             "source_chunk_index": chunk.get("index", idx - 1),
                             "alignment_mode": outcome.get("alignment_mode", ""),
                             "alignment_quality": outcome.get("alignment_quality", ""),

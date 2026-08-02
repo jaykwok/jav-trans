@@ -2,6 +2,7 @@ import concurrent.futures
 import gc
 import logging
 import os
+import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -326,12 +327,18 @@ class LocalAsrBackend:
         # set. `False` means "not looked at yet"; `None` means "looked, absent",
         # which stops a missing checkpoint from being re-probed per chunk.
         self._alignment_head: AlignmentHead | None | bool = False
+        # Seconds spent inside load(), summed over every load this backend has
+        # done. The pipeline no longer loads eagerly, so this is how the stage
+        # timings still report what the weights actually cost - and report zero
+        # on a rerun served entirely from the result cache.
+        self.cumulative_load_s = 0.0
 
     def load(self, on_stage: Callable[[str], None] | None = None) -> None:
         from transformers import AutoModelForMultimodalLM, AutoProcessor
 
         if self.model is not None:
             return
+        load_started = time.perf_counter()
 
         _notify(on_stage, "加载本地 ASR 模型...")
         model_spec = resolve_model_spec(
@@ -354,6 +361,7 @@ class LocalAsrBackend:
         )
         self.model.eval()
         _apply_generation_safety(self.model)
+        self.cumulative_load_s += time.perf_counter() - load_started
 
     def unload_model(self, on_stage: Callable[[str], None] | None = None) -> None:
         # If a timed-out generate is still running inside the GPU worker, join
