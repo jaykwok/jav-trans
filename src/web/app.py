@@ -26,11 +26,11 @@ def _events_port() -> int:
         return int(
             os.getenv(
                 "JAV_TRANS_EVENTS_PORT",
-                DEFAULT_SETTINGS.get("JAV_TRANS_EVENTS_PORT", "17322"),
+                DEFAULT_SETTINGS.get("JAV_TRANS_EVENTS_PORT", "2234"),
             )
         )
     except ValueError:
-        return 17322
+        return 2234
 
 
 @asynccontextmanager

@@ -21,7 +21,7 @@ def _parse_advanced(values: list[str]) -> dict[str, str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Submit a Web API smoke job.")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8888")
+    parser.add_argument("--base-url", default="http://127.0.0.1:2233")
     parser.add_argument("--video-path", action="append", required=True, help="Video path; repeat for batch jobs.")
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--run-dir", default="", help="Defaults to agents/temp/YYYYMMDD_HHMMSS_web-smoke-submit")

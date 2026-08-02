@@ -95,7 +95,7 @@ $env:PYTHONIOENCODING="utf-8"
 uv run --no-sync python launcher.py
 ```
 
-默认地址为 `http://127.0.0.1:8888`。首次运行可以没有 `.env`；打开页面后在“翻译设置”面板填写 API Key、Base URL、模型和目标语言，保存或开始任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、显存预算等运行参数会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，可在“识别设置”里填写代理协议、地址和端口。
+默认地址为 `http://127.0.0.1:2233`（SSE 用 2234）。端口被占用时会自动往后找下一个可用端口，实际地址在启动时打印；也可以用 `JAV_TRANS_PORT` / `JAV_TRANS_EVENTS_PORT` 指定。首次运行可以没有 `.env`；打开页面后在“翻译设置”面板填写 API Key、Base URL、模型和目标语言，保存或开始任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、显存预算等运行参数会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，可在“识别设置”里填写代理协议、地址和端口。
 
 **翻译后端支持**：通过 `TRANSLATION_BACKEND` 选择三种后端。`openai`——OpenAI 兼容 API（支持 Chat 与 Responses）。`llamacpp`——**本地翻译推荐**：程序托管官方 llama-server 运行 GGUF 量化模型，预设为 galgame 特调的 Sakura-GalTransl 系列（7B Q6_K 约 6.3GB，官方 8G 显存档；另有 6G 档 IQ4_XS 与 14B 档），需先 `winget install llama.cpp` 或从 GitHub Releases 下载 CUDA 包并在设置里填路径；Sakura 系模型会自动切换到其官方行式翻译模板（术语表 + 历史上文），其许可为 CC-BY-NC-SA 4.0 禁止商用；翻译开始时临时释放 ASR 显存、切回 ASR 时自动重载。`local`——进程内 Transformers（bf16，不支持 GGUF；量化需求请用 `llamacpp`）。详细配置和扩展指南见 [翻译后端架构文档](docs/translation-backend-architecture.md)。
 

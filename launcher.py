@@ -52,8 +52,33 @@ _SMOKE_IMPORTS = "--smoke-imports" in sys.argv
 def _webview_icon_arg() -> str | None:
     return str(_APP_ICON_PATH) if _APP_ICON_PATH.exists() else None
 
-PORT = int(os.getenv("JAV_TRANS_PORT", "8888"))
-EVENTS_PORT = int(os.getenv("JAV_TRANS_EVENTS_PORT", "17322"))
+def _first_free_port(preferred: int, attempts: int = 20) -> int:
+    """`preferred` if it is free, else the next port that is.
+
+    The console runs on a fixed default, and a default is a number someone
+    else also picked: another app holding it used to surface as a traceback in
+    a daemon thread while the window opened anyway - pointing at whatever was
+    already listening there. Walking forward is what Jupyter does with 8888.
+    """
+    import socket
+
+    for offset in range(max(1, attempts)):
+        candidate = preferred + offset
+        if candidate > 65535:
+            break
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", candidate))
+            except OSError:
+                continue
+        return candidate
+    return preferred
+
+
+PORT = _first_free_port(int(os.getenv("JAV_TRANS_PORT", "2233")))
+EVENTS_PORT = _first_free_port(int(os.getenv("JAV_TRANS_EVENTS_PORT", "2234")))
+if EVENTS_PORT == PORT:
+    EVENTS_PORT = _first_free_port(PORT + 1)
 
 # Globs inside tmp/ that are always safe to remove (one-time run artifacts).
 # Coverage note: atexit cleanup is best-effort; it only sweeps these top-level
@@ -333,7 +358,10 @@ def _run_server() -> None:
     import uvicorn
     from web.app import create_app
 
-    os.environ.setdefault("JAV_TRANS_EVENTS_PORT", str(EVENTS_PORT))
+    # Assignment, not setdefault: EVENTS_PORT already started from whatever the
+    # env asked for, and if that one was taken the app has to hear about the
+    # port we actually resolved.
+    os.environ["JAV_TRANS_EVENTS_PORT"] = str(EVENTS_PORT)
     uvicorn.run(
         create_app(),
         host="127.0.0.1",
@@ -347,6 +375,7 @@ def _run_server() -> None:
 _shutdown = threading.Event()
 
 if __name__ == "__main__":
+    print(f"jav-trans: http://127.0.0.1:{PORT}", flush=True)
     t = threading.Thread(target=_run_server, daemon=True)
     t.start()
     time.sleep(1.5)

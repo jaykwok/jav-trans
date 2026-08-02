@@ -215,9 +215,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Persistent diagnostics root. Runtime creates one subdirectory per job id.
     "RUN_LOG_DIR": "./tmp/log",
     # Internal TCP port used by the web console to receive StageEvent lines.
-    "JAV_TRANS_EVENTS_PORT": "17322",
+    "JAV_TRANS_EVENTS_PORT": "2234",
     # Web console HTTP port used by launcher.py.
-    "JAV_TRANS_PORT": "8888",
+    "JAV_TRANS_PORT": "2233",
 
     # --- Audio ---
     # 1 applies dynamic normalization before ASR.
