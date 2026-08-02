@@ -1,5 +1,46 @@
 # Windows release packaging
 
+There are two builds. The setup build is what users get; the full bundle is the
+offline fallback.
+
+## Setup build (default for releases)
+
+```powershell
+.\packaging\build_setup.ps1 -Clean
+```
+
+Produces `dist/release-assets/jav-trans-setup-windows-x64.zip` (~100 MB), whose
+payload is `jav-trans-setup.exe`, `bin/` (FFmpeg Shared), `src/`, `launcher.py`,
+`pyproject.toml`, `uv.lock`, and `README.txt`. FFmpeg is most of the size.
+
+PyTorch, the ASR weights, and the CTC head are not in the archive. The installer
+downloads them on the user's machine, which is what takes a release from ~6 GB
+to ~150 MB and makes a patch release cheap to publish. The console stays open
+during `uv sync` so the user can see the download rate and decide whether they
+need a proxy; `bootstrap.py` measures against the real torch wheel named in
+`uv.lock` and reports the estimated time rather than applying a threshold.
+
+FFmpeg travels with the archive because TorchCodec loads its shared DLLs at
+import time and uv cannot install them. `launcher.py` finds them at `bin/`.
+
+uv is not bundled. The installer uses one already on `PATH`, and otherwise
+downloads the Windows wheel from PyPI into `bin/` - the same host the dependency
+install needs a moment later, so shipping 50-80 MB of uv would buy no
+reachability that the rest of the install does not already require. `-BundleUv`
+includes it anyway, for building an archive that has to travel to a network
+where PyPI itself is blocked.
+
+Options: `-SkipArchive` stops after the payload directory, `-UvExe` /
+`-FfmpegExe` / `-FfprobeExe` override tool discovery, `-ArchiveName` renames the
+zip. zip rather than the `.7z` below because this archive is small enough that
+the ratio does not matter and Windows opens zip with nothing installed.
+
+Keep `build_setup.ps1` ASCII-only: Windows PowerShell 5.1 reads a BOM-less
+`.ps1` as the system code page, so a Chinese string literal in it ships as
+mojibake.
+
+## Full bundle (offline)
+
 Build from the repository root after creating the project virtual environment
 with `uv venv` and installing dependencies:
 
