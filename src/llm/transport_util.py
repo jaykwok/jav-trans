@@ -62,9 +62,27 @@ def _coerce_optional_int(value) -> int | None:
     return None
 
 
+def _first_present(usage, *paths: tuple[str, ...]):
+    """First path that resolves to something, so one reader serves both APIs."""
+    for path in paths:
+        value = _coerce_optional_int(_get_nested_value(usage, *path))
+        if value is not None:
+            return value
+    return None
+
+
 def _extract_usage_metrics(usage) -> dict:
-    cached_tokens = _coerce_optional_int(
-        _get_nested_value(usage, "prompt_tokens_details", "cached_tokens")
+    # Chat Completions and Responses report the same quantities under different
+    # names, and `total_tokens` is the only one they share. Reading only the Chat
+    # names meant a run with LLM_API_FORMAT=responses recorded `total_tokens` and
+    # nothing else - every prompt-cache field came back null, which read as "the
+    # provider does not cache" when in fact the accounting was simply never
+    # parsed. Verified 2026-08-02 against DeepSeek: a repeated prefix reports
+    # 3200/3230 cached, and it was invisible here.
+    cached_tokens = _first_present(
+        usage,
+        ("prompt_tokens_details", "cached_tokens"),   # Chat Completions
+        ("input_tokens_details", "cached_tokens"),    # Responses
     )
     cache_hit_tokens = _coerce_optional_int(
         _get_nested_value(usage, "prompt_cache_hit_tokens")
@@ -72,15 +90,25 @@ def _extract_usage_metrics(usage) -> dict:
     cache_miss_tokens = _coerce_optional_int(
         _get_nested_value(usage, "prompt_cache_miss_tokens")
     )
+    # Not synthesised from `input_tokens - cached_tokens`: hit/miss is a billing
+    # split the provider owns, and a derived number here would be indistinguishable
+    # from a reported one in the timings.
     metrics = {
         "cached_tokens": cached_tokens,
         "cache_hit_tokens": cache_hit_tokens,
         "cache_miss_tokens": cache_miss_tokens,
     }
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        value = _coerce_optional_int(_get_nested_value(usage, key))
-        if value is not None:
-            metrics[key] = value
+    prompt_tokens = _first_present(usage, ("prompt_tokens",), ("input_tokens",))
+    if prompt_tokens is not None:
+        metrics["prompt_tokens"] = prompt_tokens
+    completion_tokens = _first_present(
+        usage, ("completion_tokens",), ("output_tokens",)
+    )
+    if completion_tokens is not None:
+        metrics["completion_tokens"] = completion_tokens
+    total_tokens = _coerce_optional_int(_get_nested_value(usage, "total_tokens"))
+    if total_tokens is not None:
+        metrics["total_tokens"] = total_tokens
     return metrics
 
 
