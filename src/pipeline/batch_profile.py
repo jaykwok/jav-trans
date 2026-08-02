@@ -12,7 +12,10 @@ from utils.runtime_paths import runtime_path
 
 
 PROFILE_SCHEMA = "gpu_inference_batch_profiles_v2"
-PROFILE_VERSION = 2
+# v3 adds chunk geometry to the identity (see gpu_worker._profile_identity).
+# Bumped rather than migrated: a v2 entry's safe_batch was measured under an
+# unknown chunk length, so it is not a claim about any v3 identity.
+PROFILE_VERSION = 3
 _LOCK = threading.RLock()
 
 
@@ -189,6 +192,10 @@ def record_oom(
             safe_batch = max(0, int(entry.get("safe_batch") or 0))
         except (TypeError, ValueError):
             safe_batch = 0
+        # A batch that OOM'd retires every "safe" claim at or above it. Without
+        # this a corrupt or hand-edited profile could keep proposing a value the
+        # card has already refused.
+        safe_batch = min(safe_batch, max(0, unsafe_batch - 1))
         if safe_batch > 0 and unsafe_batch - safe_batch > 1:
             recommended = (safe_batch + unsafe_batch) // 2
         elif safe_batch > 0:

@@ -467,6 +467,21 @@ def _profile_identity(
             env.get("ASR_MAX_NEW_TOKENS")
             or os.getenv("ASR_MAX_NEW_TOKENS", "")
         ).strip(),
+        # Chunk geometry belongs in the identity because it, not the model, sets
+        # the activation footprint: a batch of 8 x 30s and a batch of 8 x 20s are
+        # different amounts of encoder sequence. Leaving it out let a profile
+        # learned on fixed-length 30s chunks govern an alignment-head run whose
+        # chunks average 20s, and the carried-over `safe_batch` pushed the
+        # recommendation to 15 against a real ceiling of ~11 - one OOM and one
+        # worker restart per job, every job. GPU name, physical VRAM and budget
+        # are already here, so an 8GB and a 16GB card were never sharing a
+        # profile; this closes the same hole for the workload side.
+        "chunk_max_s": str(
+            env.get("ASR_CHUNK_MAX_S") or os.getenv("ASR_CHUNK_MAX_S", "")
+        ).strip(),
+        "chunk_target_s": str(
+            env.get("ASR_CHUNK_TARGET_S") or os.getenv("ASR_CHUNK_TARGET_S", "")
+        ).strip(),
     }
 
 
