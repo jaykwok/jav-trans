@@ -5,6 +5,7 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+from llm import engine as engine_module
 from llm import translator
 
 
@@ -64,12 +65,16 @@ def test_save_cache_entry_concurrent_jsonl_intact(tmp_path):
 def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
     cache_path = tmp_path / "translation_cache.jsonl"
     segments = _segments(4)
+    # The prompt shape is part of the key, so seeding a cache means saying which
+    # shape it holds. These segments are far under the prefix budget, so the run
+    # will use the full-prefix shape.
     cache_key = translator._translation_cache_key(
         0,
         segments[:2],
         glossary="",
         target_lang="简体中文",
         character_reference="",
+        prefix_mode=engine_module.prefix_mode_label(True),
     )
     cache_path.write_text(
         json.dumps({"key": cache_key, "value": ["cached-0", "cached-1"]}, ensure_ascii=False) + "\n",
@@ -112,6 +117,7 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
             glossary="",
             target_lang="简体中文",
             character_reference="",
+            prefix_mode=engine_module.prefix_mode_label(True),
         )
     ] == ["zh-2", "zh-3"]
     assert cache_path.exists()
@@ -363,3 +369,70 @@ def test_translation_cache_key_changes_with_character_reference():
 
     assert first != second
 
+
+
+class TestSignatureCoversWhatChangesTheTranslation:
+    """A cache key must name every input that changes the cached value.
+
+    `LLM_REASONING_EFFORT` did not, until 2026-08-03: none / medium / max
+    produced one identical key, so turning thinking up re-served the
+    no-thinking translation and any A/B over the tier measured the cache. The
+    prompt shape (`full_json_prefix` vs `summary_fallback`) had the same hole,
+    and it flips on its own once the whole-film prefix outgrows
+    `TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS`.
+    """
+
+    def test_the_thinking_tier_changes_the_batch_key(self, monkeypatch):
+        segments = _segments(2)
+        monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
+        without = translator._translation_cache_key(0, segments)
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+        assert translator._translation_cache_key(0, segments) != without
+
+    def test_the_thinking_tier_changes_the_memory_key(self, monkeypatch):
+        """Memory is deliberately coarse - model *family*, no prompt-length mode -
+        but the tier is not that kind of detail: it changes what the line says."""
+        monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
+        without = translator._translation_memory_key("いい天気ですね")
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+        assert translator._translation_memory_key("いい天気ですね") != without
+
+    def test_the_prompt_shape_changes_the_batch_key(self):
+        segments = _segments(2)
+        full = translator._translation_cache_key(
+            0, segments, prefix_mode=engine_module.prefix_mode_label(True)
+        )
+        fallback = translator._translation_cache_key(
+            0, segments, prefix_mode=engine_module.prefix_mode_label(False)
+        )
+        assert full != fallback
+
+    def test_a_backend_without_thinking_keeps_its_existing_keys(self, monkeypatch):
+        """The fix must not fragment caches it does not concern: the local backend
+        has no tier to configure, so the tier stays out of its signature and every
+        entry written before this change still resolves."""
+        segments = _segments(2)
+        monkeypatch.setenv("TRANSLATION_BACKEND", "local")
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
+        low = translator._translation_cache_key(0, segments)
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+        assert translator._translation_cache_key(0, segments) == low
+        assert translator._effective_reasoning_effort() == ""
+
+    def test_a_duck_typed_backend_is_assumed_to_think(self, monkeypatch):
+        """Omitting the tier would reinstate the bug; including it can only cost
+        reuse. `supports_reasoning` is not on the backend protocol, so a shim
+        without it has to fall on the safe side."""
+
+        class _Minimal:
+            def cache_identity(self) -> str:
+                return "shim:x"
+
+            def name(self) -> str:
+                return "shim"
+
+        monkeypatch.setattr(translator, "get_backend", lambda *_a, **_k: _Minimal())
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+        assert translator._effective_reasoning_effort() == "max"

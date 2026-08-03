@@ -191,6 +191,7 @@ def run_line_profile(
     glossary: str,
     character_reference: str,
     cache_lock: threading.Lock,
+    reasoning_effort: str = "",
     on_batch_done=None,
     on_progress: Callable[[dict], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -231,6 +232,7 @@ def run_line_profile(
             character_reference=character_reference,
             prompt_version=prompt_version,
             model_name=model_identity,
+            reasoning_effort=reasoning_effort,
         )
 
     def _ctx(history: list[str]) -> ProfileContext:
@@ -318,6 +320,7 @@ def run_line_profile(
                 prompt_version=prompt_version,
                 model_name=model_identity,
                 compact_system_prompt=llm_settings.COMPACT_SYSTEM_PROMPT,
+                reasoning_effort=reasoning_effort,
             )
             usages: list[dict] = []
             request_count = 0
@@ -444,6 +447,17 @@ def _normalize_text(text) -> str | None:
     return json_v3._normalize_translation_text(text)
 
 
+def prefix_mode_label(use_full_json_prefix: bool) -> str:
+    """Name for the prompt shape a run uses.
+
+    Folded into the batch cache key, and reported in the timings - the two must
+    be the same string, which is why neither side spells it itself. The two
+    shapes send different prompts for the same batch, so a key without it serves
+    the other shape's translation.
+    """
+    return "full_json_prefix" if use_full_json_prefix else "summary_fallback"
+
+
 def run_batched(
     segments: list[dict],
     *,
@@ -470,6 +484,7 @@ def run_batched(
     prompt_version: str,
     model_identity: str,
     compact_system_prompt: bool,
+    reasoning_effort: str = "",
     on_batch_done=None,
     on_progress: Callable[[dict], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -487,7 +502,7 @@ def run_batched(
     started = time.perf_counter()
     batches = _split_into_batches(segments, batch_size)
     expected_total = len(segments)
-    prefix_mode = "full_json_prefix" if use_full_json_prefix else "summary_fallback"
+    prefix_mode = prefix_mode_label(use_full_json_prefix)
     progress_callbacks, _ = _make_aggregated_progress_callback(
         len(batches),
         expected_total,
@@ -536,6 +551,8 @@ def run_batched(
             prompt_version=prompt_version,
             model_name=model_identity,
             compact_system_prompt=compact_system_prompt,
+            reasoning_effort=reasoning_effort,
+            prefix_mode=prefix_mode,
         )
 
     def _memory_key_for(source_text: str) -> str:
@@ -547,6 +564,7 @@ def run_batched(
             character_reference=character_reference,
             prompt_version=prompt_version,
             model_name=model_identity,
+            reasoning_effort=reasoning_effort,
         )
 
     for batch_index, batch_segments in enumerate(batches):

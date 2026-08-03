@@ -153,6 +153,27 @@ def _translation_model_identity() -> str:
     return get_backend(backend_name).cache_identity()
 
 
+def _effective_reasoning_effort(override: str | None = None) -> str:
+    """The thinking tier a request will actually carry, for cache keys.
+
+    Resolved the same way `_chat_with_reasoning` resolves it, because a key that
+    disagrees with the request is worse than no key. Empty for a backend that has
+    no thinking to configure, which keeps the tier out of its signatures
+    entirely - local and llamacpp caches are unaffected by this.
+
+    `supports_reasoning` is on `BaseTranslationBackend` but not on the
+    `TranslationBackend` protocol, so a duck-typed backend need not have it. Such
+    a backend is assumed to think: including the tier in its keys can only cost
+    reuse, while omitting it would reinstate the bug this function exists for.
+    """
+    supports = getattr(get_backend(selected_backend_name()), "supports_reasoning", None)
+    if callable(supports) and not supports():
+        return ""
+    return _normalize_reasoning_effort(
+        override or os.getenv("LLM_REASONING_EFFORT", LLM_REASONING_EFFORT)
+    )
+
+
 def _effective_prompt_version() -> str:
     # The active profile produces different text for the same source lines, so
     # profiles must not share cache/memory entries. The profile signature
@@ -179,6 +200,8 @@ def _compute_prompt_signature(
     glossary: str = "",
     target_lang: str = "简体中文",
     character_reference: str = "",
+    reasoning_effort: str | None = None,
+    prefix_mode: str = "",
 ) -> str:
     return translation_cache._compute_prompt_signature(
         extra_glossary,
@@ -188,6 +211,8 @@ def _compute_prompt_signature(
         prompt_version=_effective_prompt_version(),
         model_name=_translation_model_identity(),
         compact_system_prompt=COMPACT_SYSTEM_PROMPT,
+        reasoning_effort=_effective_reasoning_effort(reasoning_effort),
+        prefix_mode=prefix_mode,
     )
 
 
@@ -199,6 +224,8 @@ def _translation_cache_key(
     glossary: str = "",
     target_lang: str = "简体中文",
     character_reference: str = "",
+    reasoning_effort: str | None = None,
+    prefix_mode: str = "",
 ) -> str:
     return translation_cache._translation_cache_key(
         batch_index,
@@ -210,6 +237,8 @@ def _translation_cache_key(
         prompt_version=_effective_prompt_version(),
         model_name=_translation_model_identity(),
         compact_system_prompt=COMPACT_SYSTEM_PROMPT,
+        reasoning_effort=_effective_reasoning_effort(reasoning_effort),
+        prefix_mode=prefix_mode,
     )
 
 
@@ -220,6 +249,7 @@ def _translation_memory_key(
     glossary: str = "",
     target_lang: str = "简体中文",
     character_reference: str = "",
+    reasoning_effort: str | None = None,
 ) -> str:
     return translation_cache._translation_memory_key(
         source_text,
@@ -229,6 +259,7 @@ def _translation_memory_key(
         character_reference=character_reference,
         prompt_version=_effective_prompt_version(),
         model_name=_translation_model_identity(),
+        reasoning_effort=_effective_reasoning_effort(reasoning_effort),
     )
 
 
@@ -389,6 +420,7 @@ def translate_segments(
                 target_lang=effective_target_lang,
                 glossary=effective_glossary,
                 character_reference=effective_character_reference,
+                reasoning_effort=_effective_reasoning_effort(reasoning_effort),
                 on_batch_done=on_batch_done,
                 on_progress=on_progress,
                 cancel_event=cancel_event,
@@ -455,6 +487,7 @@ def translate_segments(
             prompt_version=_effective_prompt_version(),
             model_identity=_translation_model_identity(),
             compact_system_prompt=COMPACT_SYSTEM_PROMPT,
+            reasoning_effort=_effective_reasoning_effort(reasoning_effort),
             on_batch_done=on_batch_done,
             on_progress=on_progress,
             cancel_event=cancel_event,
@@ -479,6 +512,10 @@ def translate_segments(
                 "glossary": effective_glossary,
                 "target_lang": effective_target_lang,
                 "character_reference": effective_character_reference,
+                # Same two inputs the engine keyed on, or the repaired text is
+                # written under a key nothing ever reads again.
+                "reasoning_effort": reasoning_effort,
+                "prefix_mode": engine_module.prefix_mode_label(use_full_json_prefix),
             }
             for b_index, b_segments in enumerate(
                 _split_into_batches(segments, effective_batch_size)

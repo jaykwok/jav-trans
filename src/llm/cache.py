@@ -133,6 +133,26 @@ def _save_memory_entries(path, entries: list[tuple[str, str]], lock) -> None:
                 )
 
 
+def _optional_signature_parts(*, reasoning_effort: str = "", prefix_mode: str = "") -> str:
+    """Signature components that are appended only when they apply.
+
+    Both change the text the model returns, so a cache key that omits them
+    replays the other setting's translation - `LLM_REASONING_EFFORT` did exactly
+    that until 2026-08-03: none / medium / max produced one identical key, so
+    turning thinking up re-served the no-thinking output.
+
+    Appended conditionally rather than always, so the fix costs nothing to anyone
+    it does not concern: a backend without thinking passes "" and keeps every
+    cache and memory entry it already has.
+    """
+    parts = ""
+    if reasoning_effort:
+        parts += f"\nreasoning={reasoning_effort.strip().lower()}"
+    if prefix_mode:
+        parts += f"\nprefix={prefix_mode.strip().lower()}"
+    return parts
+
+
 def _compute_prompt_signature(
     extra_glossary: str = "",
     *,
@@ -142,6 +162,8 @@ def _compute_prompt_signature(
     prompt_version: str,
     model_name: str,
     compact_system_prompt: bool,
+    reasoning_effort: str = "",
+    prefix_mode: str = "",
 ) -> str:
     compact = "1" if compact_system_prompt else "0"
     normalized_glossary = normalize_glossary_text(glossary)
@@ -150,6 +172,9 @@ def _compute_prompt_signature(
         f"{prompt_version}\n{target_lang.strip()}\n{normalized_glossary}\n"
         f"{normalized_extra_glossary}\n{(character_reference or '').strip()}\n"
         f"{model_name.strip()}\ncompact={compact}"
+    )
+    payload += _optional_signature_parts(
+        reasoning_effort=reasoning_effort, prefix_mode=prefix_mode
     )
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
@@ -162,6 +187,7 @@ def _compute_translation_memory_signature(
     character_reference: str = "",
     prompt_version: str,
     model_name: str,
+    reasoning_effort: str = "",
 ) -> str:
     payload = (
         f"{prompt_version}\n{target_lang.strip()}\n"
@@ -170,6 +196,11 @@ def _compute_translation_memory_signature(
         f"{(character_reference or '').strip()}\n"
         f"{_model_family(model_name)}"
     )
+    # Deliberately coarser than the batch signature: memory keys on the model
+    # *family* and ignores `compact_system_prompt`, so one line translated once
+    # is reusable across point releases and prompt-length modes. The thinking
+    # tier is not that kind of detail - it changes what the line says.
+    payload += _optional_signature_parts(reasoning_effort=reasoning_effort)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
 
@@ -182,6 +213,7 @@ def _translation_memory_key(
     character_reference: str = "",
     prompt_version: str,
     model_name: str,
+    reasoning_effort: str = "",
 ) -> str:
     normalized_source = _normalize_translation_memory_source(source_text)
     source_sig = hashlib.sha1(normalized_source.encode("utf-8")).hexdigest()[:16]
@@ -192,6 +224,7 @@ def _translation_memory_key(
         character_reference=character_reference,
         prompt_version=prompt_version,
         model_name=model_name,
+        reasoning_effort=reasoning_effort,
     )
     return f"tm::{memory_sig}::{source_sig}"
 
@@ -231,6 +264,8 @@ def _translation_cache_key(
     prompt_version: str,
     model_name: str,
     compact_system_prompt: bool,
+    reasoning_effort: str = "",
+    prefix_mode: str = "",
 ) -> str:
     source_payload = []
     for seg in batch_segments:
@@ -266,5 +301,7 @@ def _translation_cache_key(
         prompt_version=prompt_version,
         model_name=model_name,
         compact_system_prompt=compact_system_prompt,
+        reasoning_effort=reasoning_effort,
+        prefix_mode=prefix_mode,
     )
     return f"{prompt_sig}::{batch_index}::{source_sig}"
