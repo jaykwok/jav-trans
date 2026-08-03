@@ -117,6 +117,9 @@ _ASR_STAGE_ADVANCED_PREFIXES = (
     "ASR_NATIVE_",
     "ASR_CHUNK_",
     "ASR_ALIGNMENT_",
+    # Decode budget and loop guard. Every one of them changes where a sequence
+    # stops, so they are all cache-relevant and none belongs in the neutral set.
+    "ASR_DECODE_",
 )
 _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_STAGE_WORKER_TIMEOUT_S",
@@ -144,6 +147,23 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_BATCH_SIZE_BY_REPO",
     "ASR_CHUNK_ROOT",
     "KEEP_ASR_CHUNKS",
+    # These two move segment end times, so they change the value the
+    # aligned-segments cache stores. `_asr_stage_config_signature_for_env` is
+    # built from this same predicate, so being absent from it meant absent from
+    # that signature too: changing either one replayed the old segments.
+    "ASR_INVALID_SEGMENT_DURATION",
+    "ASR_MIN_REPAIRED_SEGMENT_DURATION",
+    # Batch sizes for the two GPU passes that are not the text decode. Cost-only,
+    # like ASR_BATCH_SIZE, and the ones a user reaches for after an OOM.
+    "ASR_ALIGN_BATCH_SIZE",
+    "ASR_FEATURE_BATCH_SIZE",
+    # Operational siblings of the worker settings above; left out by oversight.
+    "ASR_STAGE_WORKER_MAX_IDLE_S",
+    "ASR_SHARED_VRAM_SPILL_TOLERANCE_MB",
+    # Already declared cache-neutral below, which only means anything if they can
+    # reach the stage in the first place.
+    "ASR_RESULT_CACHE_ENABLED",
+    "ASR_RESULT_CACHE_ROOT",
 }
 _ASR_STAGE_CACHE_NEUTRAL_KEYS = {
     "ASR_BATCH_SIZE",
@@ -165,6 +185,10 @@ _ASR_STAGE_CACHE_NEUTRAL_KEYS = {
     "ASR_RESULT_CACHE_ENABLED",
     "ASR_RESULT_CACHE_ROOT",
     "TRANSCRIPTION_TIMEOUT_S",
+    "ASR_ALIGN_BATCH_SIZE",
+    "ASR_FEATURE_BATCH_SIZE",
+    "ASR_STAGE_WORKER_MAX_IDLE_S",
+    "ASR_SHARED_VRAM_SPILL_TOLERANCE_MB",
 }
 
 

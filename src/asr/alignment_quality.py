@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 
 AlignmentQuality = Literal[
+    "aligned",
     "boundary",
     "partial",
     "nonlexical",
@@ -12,10 +13,21 @@ AlignmentQuality = Literal[
 AlignmentIssueType = Literal["none", "unknown"]
 
 
+# Every mode a timing pass can report. `ctc_forced_alignment` was missing from
+# 2026-08-01, when the alignment head became the default and therefore the
+# dominant mode: it fell through to "unknown", so **every successfully aligned
+# chunk** was reported as `partial` / `alignment_mode_unknown` with
+# `alignment_issue_active` set, which pinned `alignment_issue_ratio` at ~1.0 and
+# left the counters unable to show a real alignment regression. Measured on a
+# 283-chunk film: `{"nonlexical": 31, "partial": 252}` and not one `aligned`.
+#
+# `nonlexical` is here for symmetry with the quality label; no timing pass emits
+# it as a mode.
 _NORMAL_MODES = {
     "",
     "empty",
     "boundary_proportional",
+    "ctc_forced_alignment",
     "nonlexical",
 }
 
@@ -128,6 +140,16 @@ def classify_alignment_quality(
         }
 
     mode = (alignment_mode or "").strip()
+    if mode == "ctc_forced_alignment" and (word_count > 0 or aligned_segment_count > 0):
+        # Its own label rather than sharing `boundary`: the whole point of the
+        # counters is to show when the head stopped aligning and the chunk fell
+        # back to proportional timing, and one label for both hides exactly that.
+        return {
+            "alignment_quality": "aligned",
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
+            "alignment_quality_reasons": [],
+        }
     if mode == "boundary_proportional" and (word_count > 0 or aligned_segment_count > 0):
         return {
             "alignment_quality": "boundary",
