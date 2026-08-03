@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from asr import local_backend
+from asr.decode_guard import plausible_token_budget
 from helpers import ASR_17B_BACKEND
 
 
@@ -21,7 +22,11 @@ def test_qwen_text_result_includes_generation_metadata(monkeypatch, tmp_path):
 
     assert result["text"] == "テスト"
     assert result["asr_generation"]["backend"] == ASR_17B_BACKEND
-    assert result["asr_generation"]["configured_max_new_tokens"] == local_backend.ASR_MAX_NEW_TOKENS
+    # Recorded per chunk because the budget is per chunk: it comes from this
+    # chunk's 1.25s of audio, not from a flat setting.
+    assert result["asr_generation"][
+        "configured_max_new_tokens"
+    ] == plausible_token_budget(1.25)
     assert result["asr_generation"]["model_max_target_positions"] is None
     assert result["asr_generation"]["policy"] == "native_transformers_generate"
     assert result["asr_generation"]["error_kind"] is None

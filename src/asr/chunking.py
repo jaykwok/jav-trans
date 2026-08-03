@@ -121,7 +121,6 @@ def cut_at_pauses(
     blank_spans: list[tuple[float, float]],
     total_s: float,
     *,
-    target_s: float = 20.0,
     max_s: float = 30.0,
     min_s: float = 2.0,
 ) -> list[tuple[float, float]]:
@@ -143,14 +142,26 @@ def cut_at_pauses(
 
     Cuts land at the middle of a pause rather than its edge, which is where a
     boundary does least damage to the words on either side.
+
+    **The latest legal pause wins, so chunks run as long as `max_s` allows.**
+    This used to aim for a separate `target_s` of 20s, and that cost real
+    transcription quality on 2026-08-02: `max_s` is the encoder's own window
+    (`asr.pipeline._FEATURE_CHUNK_S`) and the processor pads anything shorter up
+    to it, so a 20s chunk buys nothing back for the third of the context it
+    gives away. Measured on one 2h09m film, 384 chunks at 20s against 258 at
+    30s: `成人になるために` came back as `政治になるために`, a chunk of pure
+    vocalisation hallucinated `カレロンか`, and postgate's `repeated_unit` rate
+    went 10.5% -> 14.6%. Aiming at the ceiling instead keeps the old 30s decode
+    window and still lands every boundary in a pause, which fixed-length cutting
+    never did.
     """
     total_s = max(0.0, float(total_s))
     if total_s <= 0.0:
         return []
-    if max_s <= 0.0 or target_s <= 0.0:
-        raise ValueError("target_s and max_s must be > 0")
-    if target_s > max_s:
-        raise ValueError("target_s must be <= max_s")
+    if max_s <= 0.0:
+        raise ValueError("max_s must be > 0")
+    if min_s > max_s:
+        raise ValueError("min_s must be <= max_s")
     if total_s <= max_s:
         return [(0.0, total_s)]
 
@@ -168,13 +179,11 @@ def cut_at_pauses(
             for point in candidates
             if cursor + min_s <= point <= cursor + max_s
         ]
-        # Nearest to the target length, so chunks stay evenly sized instead of
-        # collapsing to the first pause after `min_s`.
-        cut = (
-            min(window, key=lambda point: abs(point - (cursor + target_s)))
-            if window
-            else cursor + max_s
-        )
+        # The last pause in the window, so the chunk is as long as `max_s`
+        # permits. A hard cut at `max_s` is the fallback when the window holds no
+        # pause at all - that is the fixed-length behaviour, and it is what every
+        # chunk got before the head was configured.
+        cut = max(window) if window else cursor + max_s
         chunks.append((cursor, cut))
         cursor = cut
     chunks.append((cursor, total_s))

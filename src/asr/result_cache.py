@@ -134,8 +134,27 @@ def model_signature() -> dict:
             "asr_force_language": _env_lower("ASR_FORCE_LANGUAGE", "1"),
         },
         "generation": {
-            "asr_max_new_tokens": _env_text("ASR_MAX_NEW_TOKENS", "128"),
+            # Empty means "derive the budget from each chunk's duration", which
+            # is the default; an explicit value is a hard ceiling that can
+            # truncate, so it changes the text and belongs here either way.
+            "asr_max_new_tokens": _env_text("ASR_MAX_NEW_TOKENS", ""),
+            # The rate ceiling *is* the budget when no explicit cap is set.
+            "asr_decode_tokens_per_second": _env_text(
+                "ASR_DECODE_TOKENS_PER_SECOND", ""
+            ),
             "asr_repetition_penalty": _env_text("ASR_REPETITION_PENALTY", "1.05"),
+            # The loop guard ends sequences early, so it is part of what the text
+            # *is* - not a speed setting. Left out of the signature it made the
+            # cache lie: switching it off replayed guard-on text and made the two
+            # settings indistinguishable, which is exactly the comparison anyone
+            # touching the guard needs to run.
+            "asr_decode_loop_guard": _env_lower("ASR_DECODE_LOOP_GUARD", "1"),
+            "asr_decode_loop_budget_fraction": _env_text(
+                "ASR_DECODE_LOOP_BUDGET_FRACTION", ""
+            ),
+            "asr_decode_loop_max_ngram": _env_text("ASR_DECODE_LOOP_MAX_NGRAM", ""),
+            "asr_decode_loop_min_repeats": _env_text("ASR_DECODE_LOOP_MIN_REPEATS", ""),
+            "asr_decode_loop_min_tokens": _env_text("ASR_DECODE_LOOP_MIN_TOKENS", ""),
         },
     }
 

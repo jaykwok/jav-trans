@@ -201,7 +201,6 @@ def _json_payload(value: Any) -> Any:
 
 def _chunking_config() -> dict:
     return {
-        "target_chunk_s": _env_float("ASR_CHUNK_TARGET_S", "20.0"),
         "max_chunk_s": _env_float("ASR_CHUNK_MAX_S", "30.0"),
         "min_chunk_s": _env_float("ASR_CHUNK_MIN_S", "2.0"),
         "min_blank_s": _env_float("ASR_CHUNK_MIN_PAUSE_S", "0.6"),
@@ -350,7 +349,6 @@ def _build_processing_spans(
     spans = cut_at_pauses(
         runs,
         duration_s,
-        target_s=cfg["target_chunk_s"],
         max_s=cfg["max_chunk_s"],
         min_s=cfg["min_chunk_s"],
     )
@@ -705,6 +703,28 @@ def _apply_postgate(
     }
 
 
+def _count_decode_cap_truncations(text_results: list[dict], *, log: list[str]) -> int:
+    """Chunks that emitted more tokens than their audio can physically hold.
+
+    The budget is derived from each chunk's duration (`decode_guard`), so this is
+    a runaway counter, not a "raise the cap" hint: the model generated faster than
+    anyone can speak. Reported because such a decode has no other symptom - the
+    text comes back well-formed and simply stops, so nothing downstream can tell
+    it from a chunk that had less to say.
+    """
+    flagged = sum(
+        1
+        for result in text_results
+        if bool((result.get("asr_generation") or {}).get("truncated_at_cap"))
+    )
+    if flagged:
+        log.append(
+            f"解码超出音频可容纳的 token 量 {flagged}/{len(text_results)} 块"
+            "（超出发音速率上限，判为解码失控；文本尾部已截断）"
+        )
+    return flagged
+
+
 def _segment_alignment_outcome(segment: dict, outcomes: dict[int, dict]) -> dict:
     unique_indices = _segment_chunk_indices(segment)
     if not unique_indices:
@@ -1034,6 +1054,7 @@ def _transcribe_and_align_local(
                             "Subtitle timing",
                             "Subtitle timing word count",
                             "ASR 原始文本长度",
+                            "ASR 解码超出音频可容纳",
                             "speech-island",
                         )
                     ):
@@ -1065,6 +1086,10 @@ def _transcribe_and_align_local(
                 chunk_infos,
                 prepared_results,
                 transcript_chunks,
+                log=log,
+            )
+            decode_cap_truncations = _count_decode_cap_truncations(
+                text_results,
                 log=log,
             )
         finally:
@@ -1153,6 +1178,7 @@ def _transcribe_and_align_local(
             "segment_count": len(segments),
             "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
             "postgate": postgate_report,
+            "decode_cap_truncations": decode_cap_truncations,
             "alignment_issue_count": sum(
                 1
                 for outcome in alignment_outcomes.values()

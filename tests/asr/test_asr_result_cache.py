@@ -364,3 +364,47 @@ def test_align_results_second_pass_served_from_finalize_cache(monkeypatch, tmp_p
     # No model load, no finalize call: the whole pass came from the cache.
     assert "load" not in second_backend.events
     assert not [e for e in second_backend.events if not isinstance(e, str)]
+
+
+class TestSignatureCoversWhatChangesTheText:
+    """A cache key must name every input that changes the cached value.
+
+    The loop guard was the counter-example: it ends sequences early, so guard-on
+    and guard-off produce different text for the same audio - and with the guard
+    absent from the signature, flipping it replayed the other setting's text.
+    Anyone measuring the guard would have measured the cache.
+    """
+
+    def test_the_loop_guard_is_in_the_signature(self, monkeypatch) -> None:
+        monkeypatch.setenv("ASR_DECODE_LOOP_GUARD", "1")
+        with_guard = result_cache._signature_hash(result_cache.model_signature())
+        monkeypatch.setenv("ASR_DECODE_LOOP_GUARD", "0")
+        without_guard = result_cache._signature_hash(result_cache.model_signature())
+        assert with_guard != without_guard
+
+    def test_the_guard_thresholds_are_in_the_signature(self, monkeypatch) -> None:
+        monkeypatch.delenv("ASR_DECODE_LOOP_MIN_REPEATS", raising=False)
+        base = result_cache._signature_hash(result_cache.model_signature())
+        monkeypatch.setenv("ASR_DECODE_LOOP_MIN_REPEATS", "3")
+        assert result_cache._signature_hash(result_cache.model_signature()) != base
+
+    def test_the_guard_fraction_is_in_the_signature(self, monkeypatch) -> None:
+        monkeypatch.delenv("ASR_DECODE_LOOP_BUDGET_FRACTION", raising=False)
+        base = result_cache._signature_hash(result_cache.model_signature())
+        monkeypatch.setenv("ASR_DECODE_LOOP_BUDGET_FRACTION", "0.7")
+        assert result_cache._signature_hash(result_cache.model_signature()) != base
+
+    def test_the_token_cap_is_in_the_signature(self, monkeypatch) -> None:
+        monkeypatch.setenv("ASR_MAX_NEW_TOKENS", "128")
+        base = result_cache._signature_hash(result_cache.model_signature())
+        monkeypatch.setenv("ASR_MAX_NEW_TOKENS", "192")
+        assert result_cache._signature_hash(result_cache.model_signature()) != base
+
+    def test_the_rate_ceiling_is_in_the_signature(self, monkeypatch) -> None:
+        """With no explicit cap the rate ceiling *is* the budget, so changing it
+        changes where every sequence stops."""
+        monkeypatch.setenv("ASR_MAX_NEW_TOKENS", "")
+        monkeypatch.setenv("ASR_DECODE_TOKENS_PER_SECOND", "10.0")
+        base = result_cache._signature_hash(result_cache.model_signature())
+        monkeypatch.setenv("ASR_DECODE_TOKENS_PER_SECOND", "20.0")
+        assert result_cache._signature_hash(result_cache.model_signature()) != base

@@ -86,3 +86,32 @@ def test_profile_v1_is_not_silently_migrated(monkeypatch, tmp_path):
 
     assert recommended == 5
     assert entry == {}
+
+
+def test_a_stale_version_is_not_silently_migrated(monkeypatch, tmp_path):
+    """The version bumps in `batch_profile` exist because a `safe_batch` learned
+    under a different chunk geometry or decode budget is not a claim about the
+    current one. That only holds if the version is read - it was written and
+    never checked, and a live file stamped `version: 2` was still handing out a
+    `safe_batch: 16` measured against a quarter of the current KV cache."""
+    profile_path = tmp_path / "profiles.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "schema": batch_profile.PROFILE_SCHEMA,
+                "version": batch_profile.PROFILE_VERSION - 1,
+                "profiles": {"legacy": {"safe_batch": 16, "recommended_batch": 16}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GPU_BATCH_PROFILE_PATH", str(profile_path))
+
+    recommended, entry = batch_profile.recommendation(
+        {"stage": "asr_text_transcribe"},
+        heuristic_batch=5,
+        max_batch=16,
+    )
+
+    assert recommended == 5
+    assert entry == {}

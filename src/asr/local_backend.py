@@ -6,7 +6,7 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from utils.model_paths import resolve_model_spec
 from asr.backends.qwen import (
@@ -16,7 +16,11 @@ from asr.backends.qwen import (
     qwen_asr_default_batch_size,
 )
 from asr.alignment import AlignmentHead
-from asr.decode_guard import build_stopping_criteria
+from asr.decode_guard import (
+    DEFAULT_BUDGET_SECONDS,
+    build_stopping_criteria,
+    plausible_token_budget,
+)
 from asr.subtitle_timing import (
     build_aligned_word_timestamps,
     build_boundary_word_timestamps,
@@ -42,7 +46,6 @@ def _resolve_asr_batch_size() -> int:
     return max(1, int(raw))
 
 
-ASR_MAX_NEW_TOKENS = max(64, int(os.getenv("ASR_MAX_NEW_TOKENS", "128")))
 TRANSCRIPTION_TIMEOUT_S = float(os.getenv("TRANSCRIPTION_TIMEOUT_S", "180"))
 # --- Windows Job Object: kill the GPU worker if the parent dies abnormally
 # (kill -9 / segfault / OOM-killer / task-manager end). daemon=True only covers
@@ -239,11 +242,61 @@ def _apply_generation_safety(model) -> None:
     )
 
 
-def _asr_max_new_tokens() -> int:
-    try:
-        return max(64, int(os.getenv("ASR_MAX_NEW_TOKENS", str(ASR_MAX_NEW_TOKENS))))
-    except (TypeError, ValueError):
-        return ASR_MAX_NEW_TOKENS
+def _asr_max_new_tokens(duration_s: float = DEFAULT_BUDGET_SECONDS) -> int:
+    """The decode budget for a chunk of this length - see asr.decode_guard.
+
+    Kept as a function of duration because a flat budget is the thing that was
+    silently truncating dialogue: 128 tokens across a 30s chunk is 4.27 tok/s,
+    and this domain reaches 4.45.
+    """
+    return plausible_token_budget(duration_s)
+
+
+def _rows_truncated_at_cap(suffix, model, caps: Sequence[int] | int) -> list[bool]:
+    """Per row: did it generate more tokens than its audio can hold?
+
+    `caps` is one budget per row (an int is broadcast). Because the budget comes
+    from the chunk's duration, reaching it is unambiguous - real speech cannot
+    exceed `TOKENS_PER_SECOND_CEILING`, so a row that hit its own budget was
+    generating rather than transcribing. That was not true of the old flat cap,
+    where hitting 128 could equally mean a chunk with more speech than 128 tokens
+    covers, and the tail of it never reached the subtitle.
+
+    A row counts when it contains no stop token and emitted at least its own
+    budget. Rows the loop guard cut are padded short of it, so they do not count
+    here; they are `runaway_repetition` in the postgate report instead.
+    """
+    import torch
+
+    stop_ids = getattr(model.generation_config, "eos_token_id", None)
+    if stop_ids is None:
+        stop_ids = getattr(model.config, "eos_token_id", None)
+    if isinstance(stop_ids, int):
+        stop_ids = [stop_ids]
+    stop_ids = [int(item) for item in (stop_ids or [])]
+    pad_id = getattr(model.generation_config, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(model.config, "pad_token_id", None)
+
+    rows, length = suffix.shape
+    if not stop_ids:
+        # Without a stop token there is nothing to distinguish "finished" from
+        # "ran out of budget", and guessing would over-report on every chunk.
+        return [False] * rows
+    budgets = [int(caps)] * rows if isinstance(caps, int) else [int(c) for c in caps]
+    if len(budgets) != rows:
+        return [False] * rows
+    stopped = torch.isin(
+        suffix, torch.tensor(stop_ids, device=suffix.device)
+    ).any(dim=1)
+    if pad_id is None or int(pad_id) in stop_ids:
+        # Padding is indistinguishable from a stop token, so fall back to the
+        # full row length. `stopped` already excludes every padded row.
+        emitted = torch.full((rows,), length, device=suffix.device)
+    else:
+        emitted = (suffix != int(pad_id)).sum(dim=1)
+    reached = emitted >= torch.tensor(budgets, device=suffix.device)
+    return [bool(value) for value in ((~stopped) & reached).tolist()]
 
 
 def _transcription_timeout_s() -> float:
@@ -271,11 +324,12 @@ def _qwen_generation_metadata(
     error_kind: str | None = None,
     error_detail: str = "",
     worker_mode: str = "gpu_worker",
+    duration_s: float = DEFAULT_BUDGET_SECONDS,
 ) -> dict:
     return {
         "backend": current_qwen_asr_backend(),
         "model_id": active_qwen_asr_model_id(),
-        "configured_max_new_tokens": _asr_max_new_tokens(),
+        "configured_max_new_tokens": _asr_max_new_tokens(duration_s),
         "model_max_target_positions": None,
         "policy": "native_transformers_generate",
         "worker_mode": worker_mode,
@@ -310,6 +364,7 @@ def normalize_word_dicts(words: list[dict]) -> list[dict]:
 class NativeAsrTranscription:
     language: str | None
     text: str
+    truncated_at_cap: bool = False
 
 
 class LocalAsrBackend:
@@ -479,13 +534,20 @@ class LocalAsrBackend:
             log.append(f"ASR 清洗后文本长度: {len(master_text)}")
         log.append("ASR 输出模式: text_only")
 
+        generation = _qwen_generation_metadata(duration_s=duration)
+        if getattr(asr_result, "truncated_at_cap", False):
+            generation["truncated_at_cap"] = True
+            # Both the flag and the line: the flag is what the pipeline counts,
+            # the line is what survives into the run log for one chunk.
+            log.append("ASR 解码超出音频可容纳的 token 量（判为失控，尾部已截断）")
+
         payload = {
             "text": master_text,
             "raw_text": raw_master_text,
             "duration": duration,
             "language": detected_language,
             "normalized_path": normalized_path,
-            "asr_generation": _qwen_generation_metadata(),
+            "asr_generation": generation,
         }
         return payload, log
 
@@ -596,7 +658,11 @@ class LocalAsrBackend:
                     asr_result,
                     language_hint,
                 )
-                payload_log.append(f"ASR 加载生成上限: {_asr_max_new_tokens()}")
+                payload_log.append(
+                    "ASR 生成上限: "
+                    f"{_asr_max_new_tokens(payload.get('duration') or 0.0)}"
+                    f"（{payload.get('duration') or 0.0:.1f}s 音频派生）"
+                )
                 payload["log"] = payload_log
                 payloads.append(payload)
         finally:
@@ -633,18 +699,32 @@ class LocalAsrBackend:
                 device=self.device,
                 dtype=self.dtype,
             )
-            # A sequence stuck in a repetition loop never emits EOS, and
-            # `generate` runs until every sequence is done - so one runaway
-            # chunk makes the whole batch pay for `max_new_tokens` steps. See
-            # asr.decode_guard for the measurement.
-            stopping_criteria = build_stopping_criteria(int(moved["input_ids"].shape[1]))
+            # Each row gets the budget its own duration can fill, and the batch
+            # runs to the largest of them - a sequence stuck in a repetition loop
+            # never emits EOS, and `generate` returns only when every sequence is
+            # done, so without the per-row stop the shortest chunk in the batch
+            # would be free to generate the longest chunk's worth of tokens. See
+            # asr.decode_guard for why the bound is arithmetic.
+            budgets = [
+                plausible_token_budget(_get_wav_duration_or_zero(path)) for path in paths
+            ]
+            cap = max(budgets)
+            stopping_criteria = build_stopping_criteria(
+                int(moved["input_ids"].shape[1]), token_budgets=budgets
+            )
             generated_ids = self.model.generate(
                 **moved,
-                max_new_tokens=_asr_max_new_tokens(),
+                max_new_tokens=cap,
                 do_sample=False,
                 **({"stopping_criteria": stopping_criteria} if stopping_criteria else {}),
             )
             generated_suffix = generated_ids[:, moved["input_ids"].shape[1] :]
+            try:
+                truncated = _rows_truncated_at_cap(generated_suffix, self.model, budgets)
+            except Exception as error:  # noqa: BLE001
+                # Instrumentation must never fail a transcription that succeeded.
+                logger.warning("decode cap accounting failed: %s", error)
+                truncated = [False] * len(paths)
             decoded = self.processor.batch_decode(
                 generated_suffix,
                 skip_special_tokens=True,
@@ -653,11 +733,14 @@ class LocalAsrBackend:
             parsed = self.processor.parse_output(decoded)
             if isinstance(parsed, dict):
                 parsed = [parsed]
-            for item in parsed:
+            for offset, item in enumerate(parsed):
                 results.append(
                     NativeAsrTranscription(
                         language=str(item.get("language") or "").strip() or language_hint,
                         text=str(item.get("transcription") or ""),
+                        truncated_at_cap=bool(
+                            truncated[offset] if offset < len(truncated) else False
+                        ),
                     )
                 )
         return results

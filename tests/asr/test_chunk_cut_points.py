@@ -215,21 +215,32 @@ class TestLosslessCutting:
 
     def test_a_cut_lands_in_the_middle_of_a_pause(self) -> None:
         """Not at its edge - that is where it does least damage to either side."""
-        chunks = cut_at_pauses([(20.0, 21.0)], 45.0, target_s=20.0, max_s=30.0)
+        chunks = cut_at_pauses([(20.0, 21.0)], 45.0, max_s=30.0)
         assert chunks[0][1] == pytest.approx(20.5)
 
-    def test_the_cut_nearest_the_target_is_chosen(self) -> None:
+    def test_the_latest_pause_under_the_ceiling_is_chosen(self) -> None:
+        """The decode window is the thing being maximised, not evenness.
+
+        A 20s target picked the middle pause here, and that cost transcription
+        quality on 2026-08-02: `max_s` is the encoder's audio window and shorter
+        chunks are padded up to it anyway, so the context given away buys nothing.
+        """
         chunks = cut_at_pauses(
-            [(3.0, 3.2), (19.8, 20.2), (28.0, 28.4)], 60.0, target_s=20.0, max_s=30.0
+            [(3.0, 3.2), (19.8, 20.2), (28.0, 28.4)], 60.0, max_s=30.0
         )
-        assert chunks[0][1] == pytest.approx(20.0)
+        assert chunks[0][1] == pytest.approx(28.2)
+
+    def test_a_pause_past_the_ceiling_is_not_reachable(self) -> None:
+        """Greedy must stay inside `max_s`, or a chunk outgrows the encoder."""
+        chunks = cut_at_pauses([(9.0, 9.4), (31.0, 31.4)], 60.0, max_s=30.0)
+        assert chunks[0][1] == pytest.approx(9.2)
 
     def test_a_hard_cut_is_taken_when_no_pause_is_available(self) -> None:
-        chunks = cut_at_pauses([(0.5, 0.7)], 60.0, target_s=20.0, max_s=25.0)
+        chunks = cut_at_pauses([(0.5, 0.7)], 60.0, max_s=25.0)
         assert chunks[0][1] == pytest.approx(25.0)
 
     def test_a_sliver_tail_is_merged_backwards(self) -> None:
-        chunks = cut_at_pauses([], 61.0, target_s=30.0, max_s=30.0, min_s=2.0)
+        chunks = cut_at_pauses([], 61.0, max_s=30.0, min_s=2.0)
         assert chunks[-1][1] == pytest.approx(61.0)
         assert all(end - begin >= 2.0 for begin, end in chunks)
 
@@ -237,5 +248,11 @@ class TestLosslessCutting:
         assert cut_at_pauses([(0.0, 1.0)], 0.0) == []
 
     def test_incoherent_lengths_are_refused(self) -> None:
-        with pytest.raises(ValueError, match="target_s"):
-            cut_at_pauses([], 100.0, target_s=40.0, max_s=30.0)
+        with pytest.raises(ValueError, match="min_s"):
+            cut_at_pauses([], 100.0, min_s=40.0, max_s=30.0)
+
+    def test_the_separate_target_length_is_gone(self) -> None:
+        """It was a knob that never ran until the head was configured, and then
+        it silently shortened every decode window. Pinned so it cannot return."""
+        with pytest.raises(TypeError):
+            cut_at_pauses([], 100.0, target_s=20.0, max_s=30.0)

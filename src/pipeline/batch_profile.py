@@ -15,7 +15,18 @@ PROFILE_SCHEMA = "gpu_inference_batch_profiles_v2"
 # v3 adds chunk geometry to the identity (see gpu_worker._profile_identity).
 # Bumped rather than migrated: a v2 entry's safe_batch was measured under an
 # unknown chunk length, so it is not a claim about any v3 identity.
-PROFILE_VERSION = 3
+#
+# v4 drops `chunk_target_s` from that identity, and the bump is load-bearing for
+# the same reason: every v3 entry was learned while chunks averaged the 20s
+# target, and chunks now run to the 30s ceiling. Carrying a v3 `safe_batch` over
+# would recommend a batch measured against two thirds of the real activation
+# footprint - the exact OOM-per-job the geometry keys were added to stop.
+#
+# v5 is the decode budget: it stopped being a flat 128 and became
+# `duration x ASR_DECODE_TOKENS_PER_SECOND`, which at 30s chunks is 316 rather
+# than 128 tokens of KV cache per sequence. A v4 `safe_batch` was measured
+# against a quarter of that and would OOM.
+PROFILE_VERSION = 5
 _LOCK = threading.RLock()
 
 
@@ -69,6 +80,14 @@ def _load_payload(path: Path | None = None) -> dict[str, Any]:
     except (OSError, ValueError, TypeError):
         return _empty_payload()
     if not isinstance(payload, dict) or payload.get("schema") != PROFILE_SCHEMA:
+        return _empty_payload()
+    if payload.get("version") != PROFILE_VERSION:
+        # The bumps above are load-bearing, so the version has to actually be
+        # read. It was written and never checked, which meant every "bumped
+        # rather than migrated" claim in this file was decorative: entries stayed
+        # in place and only a change in the identity keys retired any of them.
+        # Found with a live file still stamped `version: 2` holding a
+        # `safe_batch: 16` learned under an unknown chunk length.
         return _empty_payload()
     profiles = payload.get("profiles")
     if not isinstance(profiles, dict):

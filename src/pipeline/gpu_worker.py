@@ -467,6 +467,13 @@ def _profile_identity(
             env.get("ASR_MAX_NEW_TOKENS")
             or os.getenv("ASR_MAX_NEW_TOKENS", "")
         ).strip(),
+        # The decode budget sets the KV-cache footprint, and with no explicit cap
+        # the rate ceiling is what sets the budget - so a profile learned at 10
+        # tok/s must not govern a run at 20.
+        "tokens_per_second": str(
+            env.get("ASR_DECODE_TOKENS_PER_SECOND")
+            or os.getenv("ASR_DECODE_TOKENS_PER_SECOND", "")
+        ).strip(),
         # Chunk geometry belongs in the identity because it, not the model, sets
         # the activation footprint: a batch of 8 x 30s and a batch of 8 x 20s are
         # different amounts of encoder sequence. Leaving it out let a profile
@@ -476,11 +483,12 @@ def _profile_identity(
         # worker restart per job, every job. GPU name, physical VRAM and budget
         # are already here, so an 8GB and a 16GB card were never sharing a
         # profile; this closes the same hole for the workload side.
+        #
+        # `chunk_max_s` alone is the geometry now: cuts take the latest pause
+        # under the ceiling, so chunk length tracks the ceiling and the separate
+        # target length is gone.
         "chunk_max_s": str(
             env.get("ASR_CHUNK_MAX_S") or os.getenv("ASR_CHUNK_MAX_S", "")
-        ).strip(),
-        "chunk_target_s": str(
-            env.get("ASR_CHUNK_TARGET_S") or os.getenv("ASR_CHUNK_TARGET_S", "")
         ).strip(),
     }
 

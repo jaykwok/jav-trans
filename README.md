@@ -127,10 +127,13 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
   -> 切分（asr.chunking.cut_at_pauses）
      - ASR encoder 前向 -> CTC 对齐头 -> 每帧 blank 后验
      - 连续 blank 游程即停顿，切点落在停顿中央
+     - 取 ASR_CHUNK_MAX_S 之内最靠后的停顿，块长跑满上限；上限即 encoder 音频窗口
      - 输出精确铺满 [0, 总时长]，相邻块共边，不丢任何音频
      - 未配置 ASR_ALIGNMENT_HEAD_PATH 时退化为定长切分
   -> ASR wav chunk export
   -> Qwen ASR text transcription
+     - 每块的解码预算由自身时长派生（时长 × ASR_DECODE_TOKENS_PER_SECOND）
+     - 音频装不下更多 token，所以这个界不会截断真实对白；用完预算即判解码失控
   -> CTC 强制对齐（asr.alignment）
      - 复用同一个 encoder 再跑一次前向（RTF 0.00069，约为一次解码的 0.56%）
      - 逐字时间戳 + 对齐分数
@@ -223,11 +226,14 @@ ASR_STAGE_WORKER_HEARTBEAT_S=10
 ASR_STAGE_WORKER_OOM_RETRY_LIMIT=6
 GPU_BATCH_PROFILE_ENABLED=1
 GPU_BATCH_PROFILE_GROWTH_THRESHOLD=0.80
-ASR_CHUNK_TARGET_S=20.0
 ASR_CHUNK_MAX_S=30.0
 ASR_CHUNK_MIN_S=2.0
 ASR_CHUNK_MIN_PAUSE_S=0.6
+ASR_MAX_NEW_TOKENS=
+ASR_DECODE_TOKENS_PER_SECOND=10.0
 ```
+
+解码预算按每块自身时长派生：`时长 × ASR_DECODE_TOKENS_PER_SECOND`。日语快速语速约 10 音拍/秒，该 checkpoint 约 1 token/音拍（实测中位 1.00 字符/token），所以这是「这段音频最多能装多少 token」的上界，不会截断真实对白。`ASR_MAX_NEW_TOKENS` 留空即按时长派生；填数字则是硬上限，能压解码成本但会截断，**不要把它当默认值**——固定 128 在 30 秒块上等于 4.27 token/秒，而实测最快的块是 4.45。用完自己的预算说明模型吐得比人说话还快，计入 `decode_cap_truncations`（判为解码失控，不是「上限太低」）。
 
 ASR stage 固定由统一 GPU worker 持有 CUDA：切分用的 encoder 前向、ASR 解码和 CTC 对齐都在同一个 GPU owner 进程里顺序执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM、CUDA 状态异常或超过 `ASR_STAGE_WORKER_VRAM_BUDGET_MB` 时会杀掉 worker，不会把 Web 主进程一起带崩。
 
@@ -239,9 +245,9 @@ GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长�
 
 每个 ASR chunk 的转写结果另有一层跨任务的内容寻址缓存（`tmp/asr_cache/<模型签名>/<音频sha256>.json`）：键为 chunk 音频 PCM 内容加模型与解码参数，与路径、chunk 序号和任务无关。同一部片重跑、崩溃续跑、甚至不同任务里字节相同的 chunk 都直接命中，整段跳过 encoder+decoder。超时与隔离结果不会入缓存；`ASR_RESULT_CACHE_ENABLED=0` 可关闭，`ASR_RESULT_CACHE_ROOT` 改位置。
 
-`ASR_BATCH_SIZE=auto` 以 5600MB 下的 repo 默认表为基线，按显存预算比例放缩初始 batch。ASR text batch 发生 GPU OOM 时会重启 worker、降低 batch 并从结果缓存续跑。切分阶段逐个编码固定 30 秒窗口，没有可降的 batch，在那里 OOM 会直接停止而不是假装重试。RAM OOM 同样直接停止，不伪装成可由 GPU batch 修复的问题。
+`ASR_BATCH_SIZE=auto` 以 5600MB 下的 repo 默认表为基线，按显存预算比例放缩初始 batch。ASR text batch 发生 GPU OOM 时会重启 worker、降低 batch 并从结果缓存续跑。切分阶段按 `ASR_FEATURE_BATCH_SIZE`（默认 4）编码固定 30 秒窗口，OOM 时不参与自动降 batch，会直接停止而不是假装重试。RAM OOM 同样直接停止，不伪装成可由 GPU batch 修复的问题。
 
-auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、显存预算、模型、精度、attention 实现和 chunk 时长跨任务学习。v3 profile 记录已验证安全 batch 与 OOM 不安全上界：阶段 peak allocated 低于预算 `80%` 时，在两者之间二分探测；尚无 OOM 上界时则向当前阶段上限折半推进，OOM 后本次任务仍先减半恢复，同时把安全值压到不安全值以下。chunk 时长是 profile 身份的一部分，因此不同显存和不同 chunk 几何各自学各自的上限，不需要手动配置。当前只覆盖 ASR chunk batch；显式数字 batch 不参与 profile 学习。
+auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、显存预算、模型、精度、attention 实现、chunk 时长和解码预算跨任务学习。profile 记录已验证安全 batch 与 OOM 不安全上界：阶段 peak allocated 低于预算 `80%` 时，在两者之间二分探测；尚无 OOM 上界时则向当前阶段上限折半推进，OOM 后本次任务仍先减半恢复，同时把安全值压到不安全值以下。chunk 时长是 profile 身份的一部分，因此不同显存和不同 chunk 几何各自学各自的上限，不需要手动配置。当前只覆盖 ASR chunk batch；显式数字 batch 不参与 profile 学习。
 
 推理只需要 ASR Hugging Face 模型本身；同一份权重会被加载两处，切分阶段短暂加载一次取 encoder 特征（算完即卸，不与解码模型同驻），解码阶段再加载一次并一直用到对齐 pass 结束。**权重按需加载**：需要它的阶段自己加载，所以整片命中缓存的续跑完全不会加载模型。源码运行时如果本地没有模型，会按需下载到 `models/`。对齐头（14.7MB）默认从同一个 HF repo 按固定 commit sha 取，落在 `models/ctc_aligner.pt`；置空则**不报错**，切分退化为定长、字幕时间轴退化为按字数比例摊开。
 

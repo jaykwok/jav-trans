@@ -131,7 +131,6 @@ def test_default_model_download_root_is_project_models():
     assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
     assert "0.6B" not in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
     assert "ASR_WORKER_MODE_BY_REPO" not in config.DEFAULT_SETTINGS
-    assert config.DEFAULT_SETTINGS["ASR_CHUNK_TARGET_S"] == "20.0"
     assert config.DEFAULT_SETTINGS["ASR_CHUNK_MAX_S"] == "30.0"
     assert config.DEFAULT_SETTINGS["ASR_CHUNK_MIN_PAUSE_S"] == "0.6"
     # The retired chain must not leave settings behind: an advertised knob that
@@ -151,6 +150,10 @@ def test_default_model_download_root_is_project_models():
         "BOUNDARY_CACHE_DIR",
         "BOUNDARY_FEATURE_FRAME_HOP_S",
         "PRE_ASR_CUEQC_ENABLED",
+        # Chunks run to ASR_CHUNK_MAX_S now. A separate target length only ever
+        # took effect once the alignment head was configured, and then it cut the
+        # decode window by a third without saying so.
+        "ASR_CHUNK_TARGET_S",
     ):
         assert retired not in config.DEFAULT_SETTINGS
     assert not hasattr(qwen, "QWEN_ASR_06B_REPO_ID")

@@ -104,8 +104,16 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # to the resolved VRAM budget, while an explicit ASR_BATCH_SIZE stays exact.
     "ASR_BATCH_SIZE": "auto",
     "ASR_BATCH_SIZE_BY_REPO": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4",
-    # Max generated tokens configured when loading the Qwen ASR wrapper.
-    "ASR_MAX_NEW_TOKENS": "128",
+    # Decode budget. Empty derives it from each chunk's duration: audio cannot
+    # contain more than ASR_DECODE_TOKENS_PER_SECOND tokens of speech per second,
+    # so the bound cannot cut a transcription short. Setting a number makes it a
+    # hard ceiling instead, which bounds decode cost but can truncate dialogue -
+    # a flat 128 was doing exactly that at 30s chunks (4.27 tok/s against a
+    # measured 4.45). See src/asr/decode_guard.py.
+    "ASR_MAX_NEW_TOKENS": "",
+    # Tokens per second of audio that no real speech can exceed. ~10 mora/s for
+    # fast Japanese, ~1 token per mora on this checkpoint, plus punctuation.
+    "ASR_DECODE_TOKENS_PER_SECOND": "10.0",
     # Generation penalty to reduce repeated ASR text.
     "ASR_REPETITION_PENALTY": "1.05",
 
@@ -116,7 +124,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Split v4, CueQC v13, Inner v2) were retired on 2026-07-31; their settings
     # are gone from here because leaving them advertised knobs that do nothing.
     # With no alignment head configured this degrades to fixed-length chunks.
-    "ASR_CHUNK_TARGET_S": "20.0",
+    #
+    # There is no separate target length: cuts take the *latest* pause that fits
+    # under ASR_CHUNK_MAX_S, so chunks run to the ceiling. The ceiling is the
+    # encoder's own audio window and the processor pads shorter chunks up to it,
+    # so a shorter target gives away context for free - see
+    # `asr.chunking.cut_at_pauses` for what the 20s target measured on 2026-08-02.
     "ASR_CHUNK_MAX_S": "30.0",
     "ASR_CHUNK_MIN_S": "2.0",
     # Below ~0.5s a pause is between words, not between sentences: an earlier
