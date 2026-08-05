@@ -111,6 +111,156 @@ class TestDegradation:
         assert sum(end - begin for begin, end in spans) == pytest.approx(95.0)
 
 
+class TestWindowSeams:
+    """The head must see the same context in production that it saw in training.
+
+    Audio longer than one encoder window is windowed, and the head used to be
+    run on each window independently: every frame within ~1.15 s of a seam was
+    convolved against zeros standing in for audio that exists, once per 30 s.
+    The fix overlaps the AUDIO by the head's own receptive field and drops the
+    overlap afterwards. It has to be the audio - the encoder runs per window
+    too, so concatenating features from butt-jointed windows would leave the
+    same hole one layer down.
+
+    The head here returns its input frame indices verbatim, so the tensor that
+    reaches `blank_runs` says exactly which window each output frame came from.
+    """
+
+    SECONDS = 95.0
+
+    @pytest.fixture()
+    def wired(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        torch = pytest.importorskip("torch")
+        import numpy as np
+
+        from asr import encoder_features, qwen_native
+        from audio import loading
+
+        path = _wav(tmp_path / "long.wav", self.SECONDS)
+        total = int(self.SECONDS * 16000)
+        # Sample i holds the value i, so a window reveals where it was cut from.
+        monkeypatch.setattr(
+            loading,
+            "load_audio_16k_mono",
+            lambda _p: (np.arange(total, dtype=np.float32), 16000),
+        )
+
+        seen: list[np.ndarray] = []
+
+        def _prepare(_processor, *, audio, language=None):
+            seen.extend(audio)
+            return {"audio": list(audio)}
+
+        def _move(inputs, *, device=None, dtype=None):
+            group = inputs["audio"]
+            return {
+                "input_features": group,
+                "input_features_mask": torch.tensor(
+                    [[len(piece)] for piece in group], dtype=torch.long
+                ),
+            }
+
+        def _lengths(samples):
+            return [int(round(int(v) * 13 / 16000)) for v in samples.tolist()]
+
+        class _Features:
+            def __init__(self, pooler_output) -> None:
+                self.pooler_output = pooler_output
+
+        class _Model:
+            device = "cpu"
+            dtype = None
+
+            def get_audio_features(self, *, input_features, input_features_mask):
+                rows = []
+                for piece in input_features:
+                    base = int(round(float(piece[0]) * 13 / 16000))
+                    frames = int(round(len(piece) * 13 / 16000))
+                    rows.append(
+                        np.arange(base, base + frames, dtype=np.float32)[:, None]
+                    )
+                return _Features(torch.from_numpy(np.concatenate(rows, axis=0)))
+
+        class _Head:
+            upsample = 2
+            context_frames = 15
+
+            @classmethod
+            def from_env(cls):
+                return cls()
+
+            def log_probs(self, features):
+                return torch.from_numpy(np.asarray(features)).repeat_interleave(
+                    2, dim=0
+                )
+
+        captured: dict = {}
+
+        def _blank_runs(log_probs, *, upsample, min_seconds):
+            captured["log_probs"] = log_probs
+            return [(1.0, 2.0)]
+
+        monkeypatch.setattr(qwen_native, "prepare_transcription_inputs", _prepare)
+        monkeypatch.setattr(qwen_native, "move_processor_inputs", _move)
+        monkeypatch.setattr(
+            encoder_features, "qwen3_asr_audio_output_lengths", _lengths
+        )
+        monkeypatch.setattr(asr, "AlignmentHead", _Head)
+        monkeypatch.setattr(asr, "blank_runs", _blank_runs)
+        monkeypatch.setattr(
+            asr, "_load_asr_model_for_features", lambda: (_Model(), object())
+        )
+        return path, seen, captured
+
+    def test_the_windows_handed_to_the_encoder_overlap(self, wired) -> None:
+        path, seen, _ = wired
+        runs, _duration, source = asr._blank_runs_for_audio(str(path))
+        assert source == "alignment_head_blank_runs"
+        assert runs == [(1.0, 2.0)]
+        assert len(seen) > 1
+        starts = [int(piece[0]) for piece in seen]
+        # 15 encoder frames a side, so consecutive windows share 30 frames of
+        # audio: hop = (390 - 30) frames, not the full 390.
+        hop_samples = int(round((390 - 30) * 16000 / 13))
+        for earlier, later in zip(starts, starts[1:]):
+            assert later - earlier == hop_samples
+
+    def test_no_frame_is_dropped_or_counted_twice(self, wired) -> None:
+        """What the seam fix must not break while fixing context: the timeline.
+
+        `blank_runs` reads frame indices as seconds, so a duplicated or missing
+        frame at a seam does not look like an error - it shifts every cut after
+        it by 38.5 ms per occurrence.
+        """
+        path, _seen, captured = wired
+        asr._blank_runs_for_audio(str(path))
+        values = [int(v) for v in captured["log_probs"][:, 0].tolist()]
+        expected_frames = int(round(self.SECONDS * 13))
+        assert values[::2] == list(range(expected_frames))
+        assert values[1::2] == list(range(expected_frames))
+
+    def test_every_kept_frame_came_from_a_window_that_had_its_context(
+        self, wired
+    ) -> None:
+        """The point of the exercise, stated as the property it buys."""
+        path, seen, captured = wired
+        asr._blank_runs_for_audio(str(path))
+        kept = [int(v) for v in captured["log_probs"][::2, 0].tolist()]
+        spans = []
+        for piece in seen:
+            base = int(round(float(piece[0]) * 13 / 16000))
+            spans.append((base, base + int(round(len(piece) * 13 / 16000))))
+        last_frame = kept[-1]
+        for frame in kept:
+            best = max(
+                min(frame - begin, end - 1 - frame)
+                for begin, end in spans
+                if begin <= frame < end
+            )
+            # 15 frames on each side, except where the file itself ends.
+            assert best >= min(15, frame, last_frame - frame)
+
+
 class TestSpansDigest:
     """Counts alone do not identify a set of cuts.
 

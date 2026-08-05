@@ -184,3 +184,82 @@ class TestOneFeasibilityJudgment:
         # あああ: three frames of text, but five frames of CTC path.
         assert minimum_ctc_frames("あああ") == 5
         assert minimum_ctc_frames("あああ") > len("あああ")
+
+
+class TestHeldOutGrouping:
+    """Validation has to be a set of speakers, not a set of clips.
+
+    The split was a per-clip random draw over a corpus of visual novel voice
+    lines, so the same actor reading the same script style sat on both sides and
+    the val loss reported memorisation as generalisation. Every architecture
+    comparison that number decides is decided on a contaminated metric - which
+    is why this had to be fixed before, not after, any A/B.
+    """
+
+    @staticmethod
+    def _extractor():
+        from tools.align import build_alignment_features
+
+        return build_alignment_features
+
+    def test_an_explicit_group_field_wins_when_the_manifest_has_one(self) -> None:
+        build = self._extractor()
+        key = build._group_key({"speaker": "aoi"}, 7, field="speaker", block=200)
+        assert key == "speaker=aoi"
+
+    def test_a_missing_group_field_is_refused_rather_than_ignored(self) -> None:
+        """Falling back would produce a leaky split under a name that claims
+        otherwise, and nothing downstream could tell."""
+        build = self._extractor()
+        with pytest.raises(SystemExit, match="group-field"):
+            build._group_key({"audio_id": "x"}, 0, field="speaker", block=200)
+
+    def test_without_a_field_consecutive_manifest_rows_group_together(self) -> None:
+        """The galgame manifest keeps only ids, text and upstream order, and
+        source order groups by game - the same property the extractor already
+        relies on when it refuses to subsample by truncation."""
+        build = self._extractor()
+        keys = [
+            build._group_key({"index": i}, i, field="", block=100) for i in range(250)
+        ]
+        assert keys[0] == keys[99] != keys[100]
+        assert len(set(keys)) == 3
+
+    def test_a_group_never_appears_on_both_sides_of_the_split(self) -> None:
+        build = self._extractor()
+        rows = [
+            {"audio_id": str(i), "group": f"block={i // 50}"} for i in range(1000)
+        ]
+        build._assign_partitions(
+            rows, val_fraction=0.1, rng=np.random.default_rng(0)
+        )
+        sides: dict[str, set[str]] = {}
+        for row in rows:
+            sides.setdefault(row["group"], set()).add(row["partition"])
+        assert all(len(side) == 1 for side in sides.values())
+
+    def test_the_val_share_lands_near_the_requested_fraction(self) -> None:
+        """Whole groups overshoot; the split is not allowed to drift far."""
+        build = self._extractor()
+        rows = [{"audio_id": str(i), "group": f"block={i // 20}"} for i in range(2000)]
+        report = build._assign_partitions(
+            rows, val_fraction=0.05, rng=np.random.default_rng(1)
+        )
+        assert 0.05 <= report["val_fraction_actual"] <= 0.06
+        assert report["groups_total"] == 100
+        assert report["groups_val"] == 5
+
+    def test_block_zero_restores_the_old_per_clip_behaviour(self) -> None:
+        """Kept deliberately: the first cache was built this way and a rerun
+        that wants to reproduce it must be able to say so out loud."""
+        build = self._extractor()
+        keys = [build._group_key({"index": i}, i, field="", block=0) for i in range(5)]
+        assert len(set(keys)) == 5
+
+    def test_the_cache_row_carries_its_group(self) -> None:
+        """Without this the split cannot be audited or redrawn later - which is
+        exactly the state the 30k-clip cache is in."""
+        source = (
+            PROJECT_ROOT / "tools" / "align" / "build_alignment_features.py"
+        ).read_text(encoding="utf-8")
+        assert '"group": row["group"]' in source

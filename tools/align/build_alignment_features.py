@@ -76,6 +76,70 @@ def _held_out_ids(composite_manifest: Path | None) -> set[str]:
     return ids
 
 
+def _group_key(row: dict, position: int, *, field: str, block: int) -> str:
+    """Which held-out group a clip belongs to.
+
+    Validation was a per-clip random draw, which on this corpus is barely
+    validation at all: the clips come from visual novels, so the same voice
+    actor reading the same script style lands on both sides of the split and the
+    val loss reports memorisation of a speaker as generalisation. Any
+    architecture A/B decided on that number is decided on a contaminated metric.
+
+    `field` is the honest key and is used whenever the manifest carries one
+    (game, voice actor, source work). The galgame manifest does not - it keeps
+    only `audio_id`, text, duration and the upstream row order - so the fallback
+    groups consecutive manifest rows into blocks. Source order groups clips by
+    game, which this extractor already relied on when it refused to subsample by
+    truncation, so blocks approximate speaker disjointness without pretending to
+    be exact. It is a proxy, and the summary says which one was used.
+    """
+    if field:
+        value = row.get(field)
+        if value is None or str(value) == "":
+            raise SystemExit(
+                f"--group-field {field!r} is missing from the manifest; "
+                "grouping cannot silently fall back to a leaky split"
+            )
+        return f"{field}={value}"
+    if block > 0:
+        index = row.get("index")
+        sequence = int(index) if isinstance(index, (int, float)) else position
+        return f"block={sequence // block}"
+    return f"clip={position}"
+
+
+def _assign_partitions(rows: list[dict], *, val_fraction: float, rng) -> dict:
+    """Put whole groups in val until it is big enough, then stop.
+
+    Group-level rather than clip-level, so val is a set of speakers the head
+    never trained on. The count lands near `val_fraction` rather than on it -
+    the last group taken usually overshoots - which is the price of the split
+    meaning something.
+    """
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(row["group"], []).append(row)
+    order = sorted(groups)
+    rng.shuffle(order)
+    target = val_fraction * len(rows)
+    val_rows, val_groups = 0, 0
+    for name in order:
+        if val_rows >= target:
+            break
+        for row in groups[name]:
+            row["partition"] = "val"
+        val_rows += len(groups[name])
+        val_groups += 1
+    for row in rows:
+        row.setdefault("partition", "train")
+    return {
+        "groups_total": len(groups),
+        "groups_val": val_groups,
+        "val_rows": val_rows,
+        "val_fraction_actual": round(val_rows / len(rows), 5) if rows else 0.0,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, help="galgame clip manifest")
@@ -92,6 +156,21 @@ def main() -> None:
     parser.add_argument("--max-seconds", type=float, default=25.0)
     parser.add_argument("--model-path", default="")
     parser.add_argument("--val-fraction", type=float, default=0.02)
+    parser.add_argument(
+        "--group-field",
+        default="",
+        help="manifest field naming the game/voice actor a clip belongs to. "
+        "When the manifest has one, this is the honest split key.",
+    )
+    parser.add_argument(
+        "--group-block",
+        type=int,
+        default=200,
+        help="fallback when no --group-field exists: treat this many "
+        "consecutive manifest rows as one group. Source order groups clips by "
+        "game, so contiguous blocks approximate speaker disjointness; 0 "
+        "restores the old per-clip random split.",
+    )
     parser.add_argument("--seed", type=int, default=20260731)
     args = parser.parse_args()
 
@@ -104,7 +183,7 @@ def main() -> None:
     rows = _read_jsonl(Path(args.manifest))
     eligible: list[dict] = []
     skipped = Counter()
-    for row in rows:
+    for position, row in enumerate(rows):
         audio_id = str(row.get("audio_id") or "")
         text = normalize_text(str(row.get("text") or ""))
         duration = float(row.get("duration_s") or 0.0)
@@ -125,7 +204,13 @@ def main() -> None:
             skipped["text_denser_than_frame_rate"] += 1
             continue
         eligible.append({"audio_id": audio_id, "audio": row["audio"], "text": text,
-                         "duration_s": duration})
+                         "duration_s": duration,
+                         "group": _group_key(
+                             row,
+                             position,
+                             field=args.group_field,
+                             block=args.group_block,
+                         )})
 
     if not eligible:
         raise SystemExit("no eligible clips after filtering")
@@ -140,9 +225,7 @@ def main() -> None:
         eligible = [eligible[i] for i in sorted(chosen)]
         skipped["not_sampled"] = len(rows) - len(eligible)
 
-    assignment = rng.random(len(eligible))
-    for row, draw in zip(eligible, assignment):
-        row["partition"] = "val" if draw < args.val_fraction else "train"
+    split = _assign_partitions(eligible, val_fraction=args.val_fraction, rng=rng)
 
     # Sorting by duration keeps each batch nearly uniform in length, so the
     # padding the processor adds is spent on a few frames rather than on the
@@ -208,6 +291,10 @@ def main() -> None:
                             "audio_id": row["audio_id"],
                             "text": row["text"],
                             "partition": row["partition"],
+                            # Carried into the cache so a later run can regroup
+                            # or audit the split without the manifest, which is
+                            # exactly what was impossible for the first cache.
+                            "group": row["group"],
                             "duration_s": round(row["duration_s"], 4),
                             "frames": frames,
                             "shard": f"features_{shard_index:04d}.npy",
@@ -245,6 +332,18 @@ def main() -> None:
         "skipped": dict(skipped),
         "held_out_ids": len(held_out),
         "partitions": dict(partitions),
+        # How val was drawn. A run that reports a val loss without saying which
+        # of these produced it is not comparable with one that used the other:
+        # a per-clip split shares voice actors across the boundary and reads
+        # lower for that reason alone.
+        "split": {
+            "mode": (
+                f"field:{args.group_field}"
+                if args.group_field
+                else (f"block:{args.group_block}" if args.group_block > 0 else "clip")
+            ),
+            **split,
+        },
         "audio_hours": round(audio_seconds / 3600.0, 3),
         "distinct_characters": len(counts),
         "total_characters": int(sum(counts.values())),

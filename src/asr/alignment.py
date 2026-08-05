@@ -57,6 +57,10 @@ UNK_INDEX = 1
 RESERVED_INDICES = 2
 
 ALIGNMENT_VOCAB_SCHEMA = "asr_ctc_alignment_char_vocab_v1"
+# v2 differs in one way that cannot be expressed as a flag on v1: its classes
+# are pronounceable characters only, so its targets are not the same sequence
+# for the same text.
+ACOUSTIC_VOCAB_SCHEMA = "asr_ctc_alignment_char_vocab_v2"
 ALIGNMENT_MODEL_SCHEMA = "asr_ctc_alignment_head_v1"
 
 
@@ -96,17 +100,69 @@ def normalize_text(text: str) -> str:
     return "".join(ch for ch in folded if not ch.isspace())
 
 
+def is_acoustic_char(char: str) -> bool:
+    """True when a character stands for a sound the head could emit.
+
+    Letters and digits, by Unicode category - which keeps kana, kanji, latin,
+    numbers, and the modifier letters Japanese pronounces (`ー` prolongation,
+    `々` iteration), and drops punctuation and symbols: `。、…！？「」・♪♡`.
+
+    The reason for the split is that punctuation was 16.9% of the training
+    targets, 92.3% of clips carried some, and 527 clips had `...` as their
+    ENTIRE target - so the head was being asked to emit a class at a pause, in
+    the middle of the blank run the chunker reads. There is no sound to align it
+    to; the best it can learn is "punctuation follows silence", which is exactly
+    the confusion that makes a blank run stop being a clean pause.
+
+    `〜` is dropped with the rest of the punctuation even though it is often
+    voiced: it marks prolongation OF the previous vowel, which already has a
+    target, so it has no acoustic extent of its own to occupy.
+    """
+    if not char:
+        return False
+    return unicodedata.category(char)[0] in {"L", "N"}
+
+
+def acoustic_text(text: str) -> tuple[str, list[int]]:
+    """Split normalised text into what is pronounced and where it came from.
+
+    Returns the pronounceable characters and, for each, its index in `text`.
+    The indices are what lets punctuation be put back afterwards: alignment runs
+    on sound, and the subtitle layer still needs one span per character of the
+    original.
+    """
+    kept: list[str] = []
+    origins: list[int] = []
+    for index, char in enumerate(text):
+        if is_acoustic_char(char):
+            kept.append(char)
+            origins.append(index)
+    return "".join(kept), origins
+
+
 @dataclass(frozen=True)
 class AlignmentVocab:
-    """Character inventory shared by the head, its targets and its decoder."""
+    """Character inventory shared by the head, its targets and its decoder.
+
+    `acoustic_only` says whether this inventory covers only pronounceable
+    characters. It travels in the checkpoint because it is not a preference at
+    inference time: a head trained on acoustic-only targets has no punctuation
+    classes to emit, and asking it to align punctuation would put a character
+    where the model can only answer with blank.
+    """
 
     chars: tuple[str, ...]
+    acoustic_only: bool = False
 
     def __post_init__(self) -> None:
         if len(set(self.chars)) != len(self.chars):
             raise ValueError("alignment vocab contains duplicate characters")
         if any(len(ch) != 1 for ch in self.chars):
             raise ValueError("alignment vocab entries must be single characters")
+        if self.acoustic_only and not all(is_acoustic_char(ch) for ch in self.chars):
+            raise ValueError(
+                "an acoustic-only vocab cannot contain punctuation or symbols"
+            )
 
     @property
     def size(self) -> int:
@@ -140,51 +196,83 @@ class AlignmentVocab:
         return self.chars[position]
 
     def encode(self, text: str) -> list[int]:
-        """Target sequence for CTC. Normalisation is applied here, once."""
-        return [self.index_of(ch) for ch in normalize_text(text)]
+        """Target sequence for CTC. Normalisation is applied here, once.
+
+        An acoustic-only vocab drops what it cannot pronounce, so the targets
+        and the classifier agree about what a class is.
+        """
+        normalized = normalize_text(text)
+        if self.acoustic_only:
+            normalized = acoustic_text(normalized)[0]
+        return [self.index_of(ch) for ch in normalized]
 
     @classmethod
     def from_counts(
-        cls, counts: dict[str, int], *, max_size: int = 0, min_count: int = 1
+        cls,
+        counts: dict[str, int],
+        *,
+        max_size: int = 0,
+        min_count: int = 1,
+        acoustic_only: bool = False,
     ) -> "AlignmentVocab":
         """Build from character frequencies, most frequent first.
 
         Ordering by frequency makes `max_size` a coverage decision rather than an
         arbitrary cut: on the galgame corpus the top 2,000 of 3,080 characters
         cover 99.81% of occurrences.
+
+        Filtering here rather than at the call site is deliberate: the inventory
+        is what defines a class, so an acoustic-only head cannot acquire a
+        punctuation class through a caller that forgot to strip its counts.
         """
         eligible = [
             (char, count)
             for char, count in counts.items()
-            if count >= min_count and len(char) == 1 and not char.isspace()
+            if count >= min_count
+            and len(char) == 1
+            and not char.isspace()
+            and (not acoustic_only or is_acoustic_char(char))
         ]
         eligible.sort(key=lambda item: (-item[1], item[0]))
         if max_size > 0:
             eligible = eligible[:max_size]
-        return cls(chars=tuple(char for char, _ in eligible))
+        return cls(
+            chars=tuple(char for char, _ in eligible), acoustic_only=acoustic_only
+        )
 
     def to_payload(self) -> dict:
         return {
-            "schema": ALIGNMENT_VOCAB_SCHEMA,
+            "schema": (
+                ACOUSTIC_VOCAB_SCHEMA if self.acoustic_only else ALIGNMENT_VOCAB_SCHEMA
+            ),
             "blank_index": BLANK_INDEX,
             "unk_index": UNK_INDEX,
             "size": self.size,
+            "acoustic_only": self.acoustic_only,
             "chars": list(self.chars),
         }
 
     @classmethod
     def from_payload(cls, payload: dict) -> "AlignmentVocab":
         schema = str(payload.get("schema") or "")
-        if schema != ALIGNMENT_VOCAB_SCHEMA:
+        # The schema, not just a flag, because the two are not interchangeable:
+        # a v2 head has no punctuation classes, and a reader that ignored the
+        # flag would align punctuation against a model that can only answer
+        # blank there. An old build must fail on a v2 checkpoint, loudly.
+        if schema not in {ALIGNMENT_VOCAB_SCHEMA, ACOUSTIC_VOCAB_SCHEMA}:
             raise ValueError(
-                f"alignment vocab schema must be {ALIGNMENT_VOCAB_SCHEMA}, got {schema!r}"
+                f"alignment vocab schema must be one of "
+                f"{ALIGNMENT_VOCAB_SCHEMA}/{ACOUSTIC_VOCAB_SCHEMA}, got {schema!r}"
             )
         # A checkpoint whose blank moved would silently reinterpret every frame.
         if int(payload.get("blank_index", -1)) != BLANK_INDEX:
             raise ValueError("alignment vocab blank_index must be 0")
         if int(payload.get("unk_index", -1)) != UNK_INDEX:
             raise ValueError("alignment vocab unk_index must be 1")
-        return cls(chars=tuple(str(ch) for ch in payload.get("chars") or ()))
+        return cls(
+            chars=tuple(str(ch) for ch in payload.get("chars") or ()),
+            acoustic_only=schema == ACOUSTIC_VOCAB_SCHEMA,
+        )
 
     def dumps(self) -> str:
         return json.dumps(self.to_payload(), ensure_ascii=False)
@@ -201,6 +289,96 @@ def output_frame_count(encoder_frames: int, *, upsample: int) -> int:
     if upsample < 1:
         raise ValueError("upsample must be >= 1")
     return int(encoder_frames) * int(upsample)
+
+
+def plan_head_windows(
+    total_samples: int,
+    *,
+    window_samples: int,
+    context_frames: int,
+    sample_rate: int = 16000,
+    min_samples: int = 8000,
+) -> list[tuple[int, int, int]]:
+    """Overlap-save windows for running the head over audio longer than one pass.
+
+    Returns `(start_sample, end_sample, base_frame)` per window, where
+    `base_frame` is the window's first frame on the whole clip's frame axis.
+
+    The head has to see `context_frames` on each side of a frame to compute it
+    the way it was trained. Butt-jointed windows give the frames at a seam zeros
+    instead, so consecutive windows overlap by `2 * context_frames` and the
+    overlap is dropped afterwards - the classic overlap-save arrangement.
+    Overlapping the AUDIO is what is required, not concatenating features from
+    butt-jointed windows: the encoder runs per window too, so its features are
+    already missing that context by the time anything is concatenated.
+
+    The frame axis is authoritative and sample offsets are derived from it,
+    rather than the other way round. One encoder frame is 16000/13 = 1230.77
+    samples, so a hop chosen in samples would land between frames and the error
+    would accumulate across a long file; a hop chosen in frames keeps every
+    window's `base_frame` exact and pushes the sub-sample rounding somewhere
+    harmless.
+    """
+    if window_samples <= 0:
+        raise ValueError("window_samples must be positive")
+    if context_frames < 0:
+        raise ValueError("context_frames must be >= 0")
+    window_frames = int(round(window_samples * ENCODER_FPS / sample_rate))
+    hop_frames = window_frames - 2 * context_frames
+    if hop_frames < 1:
+        raise ValueError(
+            f"window of {window_frames} frames cannot carry {context_frames} "
+            "frames of context on both sides"
+        )
+    windows: list[tuple[int, int, int]] = []
+    index = 0
+    while True:
+        base_frame = index * hop_frames
+        start = int(round(base_frame * sample_rate / ENCODER_FPS))
+        if start >= int(total_samples):
+            break
+        end = min(start + window_samples, int(total_samples))
+        # A sliver carries no pause decision and the processor pads it to a full
+        # window anyway, so it is only encoder time. With overlap this can only
+        # ever fire on the first window - i.e. on a clip that is itself a sliver.
+        # A later window always has at least the 2 * context_frames of new audio
+        # that made its predecessor stop short of the file end.
+        if end - start < min_samples:
+            break
+        windows.append((start, end, base_frame))
+        if end >= int(total_samples):
+            break
+        index += 1
+    return windows
+
+
+def overlap_save_slices(
+    windows: list[tuple[int, int]], *, context_frames: int
+) -> list[tuple[int, int]]:
+    """Which frames to keep from each window, as local `(start, end)` slices.
+
+    `windows` is `(base_frame, frames_returned)` per window, in order. The
+    returned slices tile the frame axis exactly once: each window gives up its
+    trailing `context_frames` to its successor, and every frame is taken from
+    the window that had real audio on both sides of it.
+
+    The leading trim is not applied explicitly - it falls out of continuing from
+    wherever the previous window stopped. That is also what makes this safe when
+    a window comes back shorter than planned: the result can never contain a
+    frame twice, and the seam does not silently shift.
+    """
+    slices: list[tuple[int, int]] = []
+    emitted = 0
+    for index, (base, frames) in enumerate(windows):
+        last = index == len(windows) - 1
+        end = base + int(frames) - (0 if last else context_frames)
+        start = max(int(base), emitted)
+        if end <= start:
+            slices.append((0, 0))
+            continue
+        slices.append((start - int(base), end - int(base)))
+        emitted = end
+    return slices
 
 
 @dataclass(frozen=True)
@@ -222,6 +400,7 @@ def forced_align(
     *,
     upsample: int = 2,
     chars: str = "",
+    blank_bias: float = 0.0,
 ):
     """Viterbi-align a known character sequence to per-frame posteriors.
 
@@ -232,6 +411,17 @@ def forced_align(
     support aligns badly, and the score is where that shows up.
 
     `log_probs` is (T, V) for a single utterance. Returns the character spans.
+
+    `blank_bias` is subtracted from the blank column before the search, and only
+    for the search. CTC posteriors are peaky - the path sits in blank until
+    evidence has accumulated - so making blank fractionally more expensive widens
+    every character onto the frames it actually occupies. Zero reproduces the
+    untouched behaviour exactly.
+
+    The scores are deliberately read off the ORIGINAL tensor. They feed the
+    hallucination signal downstream, and a score computed against a biased blank
+    would move that threshold silently: the same audio and the same text would
+    score differently because a timing knob was turned.
     """
     import torch
 
@@ -244,6 +434,16 @@ def forced_align(
         raise ValueError("target index outside the classifier width")
     if any(t == BLANK_INDEX for t in targets):
         raise ValueError("targets must not contain the blank index")
+    if blank_bias < 0.0:
+        # A negative bias makes blank cheaper, i.e. shrinks characters further
+        # into their own middles. Nothing wants that, and allowing it would make
+        # the knob able to manufacture the defect it exists to correct.
+        raise ValueError("blank_bias must be >= 0")
+
+    searched = log_probs
+    if blank_bias > 0.0:
+        searched = log_probs.clone()
+        searched[:, BLANK_INDEX] -= float(blank_bias)
 
     # The CTC lattice: blanks interleaved around every label, so that repeated
     # characters are forced apart by a blank and cannot collapse into one.
@@ -272,9 +472,9 @@ def forced_align(
 
     neg_inf = -1e30
     scores = torch.full((states,), neg_inf, dtype=torch.float32, device=device)
-    scores[0] = log_probs[0, BLANK_INDEX]
+    scores[0] = searched[0, BLANK_INDEX]
     if states > 1:
-        scores[1] = log_probs[0, extended[1]]
+        scores[1] = searched[0, extended[1]]
     backpointers = torch.zeros((frames, states), dtype=torch.uint8, device=device)
 
     for t in range(1, frames):
@@ -284,7 +484,7 @@ def forced_align(
         skip = torch.where(can_skip, skip, torch.full_like(skip, neg_inf))
         stacked = torch.stack((stay, advance, skip), dim=0)
         best, choice = stacked.max(dim=0)
-        scores = best + log_probs[t].index_select(0, state_tokens)
+        scores = best + searched[t].index_select(0, state_tokens)
         backpointers[t] = choice.to(torch.uint8)
 
     # A valid path ends on the last label or on the blank after it.
@@ -323,11 +523,92 @@ def forced_align(
     return spans
 
 
-def align_text(log_probs, text: str, vocab: AlignmentVocab, *, upsample: int = 2):
-    """Align raw text by normalising and encoding it the same way training did."""
+def align_text(
+    log_probs,
+    text: str,
+    vocab: AlignmentVocab,
+    *,
+    upsample: int = 2,
+    blank_bias: float = 0.0,
+):
+    """Align raw text by normalising and encoding it the same way training did.
+
+    Returns one span per character of `normalize_text(text)` - including the
+    characters an acoustic-only head never aligned, because the subtitle layer
+    indexes spans by character position and falls back to synthetic timing on
+    any count mismatch.
+    """
     normalized = normalize_text(text)
-    targets = [vocab.index_of(ch) for ch in normalized]
-    return forced_align(log_probs, targets, upsample=upsample, chars=normalized)
+    if not vocab.acoustic_only:
+        targets = [vocab.index_of(ch) for ch in normalized]
+        return forced_align(
+            log_probs,
+            targets,
+            upsample=upsample,
+            chars=normalized,
+            blank_bias=blank_bias,
+        )
+
+    spoken, origins = acoustic_text(normalized)
+    if not spoken:
+        # Nothing pronounceable to align against: `...` on its own was 527 clips
+        # of the training corpus, and there is no honest span for it.
+        raise ValueError("text has no acoustic characters to align")
+    targets = [vocab.index_of(ch) for ch in spoken]
+    aligned = forced_align(
+        log_probs, targets, upsample=upsample, chars=spoken, blank_bias=blank_bias
+    )
+    return _spans_for_full_text(aligned, normalized, origins, upsample=upsample)
+
+
+def _spans_for_full_text(
+    aligned: list[CharSpan], normalized: str, origins: list[int], *, upsample: int
+) -> list[CharSpan]:
+    """Put the unpronounced characters back, as zero-width marks.
+
+    A comma occupies no audio, so it gets no width: it is anchored to the end of
+    the character before it, or to the start of the one after it when it leads.
+    Giving it width would take that width from a character that was actually
+    spoken, and every downstream consumer reads these as measurements.
+
+    The score is inherited from the anchor rather than invented. It feeds the
+    hallucination signal as a mean over characters, and both alternatives are
+    worse: a fabricated score would move that mean, and a NaN would poison it.
+    """
+    by_origin = {origin: span for origin, span in zip(origins, aligned)}
+    spans: list[CharSpan] = []
+    previous: CharSpan | None = None
+    for index, char in enumerate(normalized):
+        span = by_origin.get(index)
+        if span is not None:
+            previous = span
+            spans.append(
+                CharSpan(
+                    char=char,
+                    index=index,
+                    start_frame=span.start_frame,
+                    end_frame=span.end_frame,
+                    start_s=span.start_s,
+                    end_s=span.end_s,
+                    score=span.score,
+                )
+            )
+            continue
+        anchor = previous if previous is not None else aligned[0]
+        frame = anchor.end_frame if previous is not None else anchor.start_frame
+        moment = frame_to_seconds(frame, upsample=upsample)
+        spans.append(
+            CharSpan(
+                char=char,
+                index=index,
+                start_frame=frame,
+                end_frame=frame,
+                start_s=moment,
+                end_s=moment,
+                score=anchor.score,
+            )
+        )
+    return spans
 
 
 def blank_runs(log_probs, *, upsample: int = 2, min_seconds: float = 0.0):
@@ -383,9 +664,16 @@ def speech_extent(
     the path stays in blank until evidence has accumulated, so the opening
     character's span starts partway into its own acoustic realisation and the
     closing one ends before its decay. The measured signature is an inset at
-    BOTH edges - a lag would shift both the same way - and a blind listening
-    pass on 2026-07-31 heard the head-side inset directly: cutting at the
-    predicted start was called chopped 48.1% of the time against a 3.3% floor.
+    BOTH edges - a lag would shift both the same way.
+
+    The evidence is geometric, not perceptual, and this docstring used to claim
+    otherwise: it cited a blind pass hearing the inset at "48.1% chopped against
+    a 3.3% floor", which were the mid-pass numbers from a `result.json` written
+    before its own verdicts finished. The completed 110/110 pass says 11.5%
+    against a 0.0% floor, CI95 of the difference [-0.7, +23.8] - i.e. the ear
+    could NOT separate the uncorrected onset from the floor. What still supports
+    the correction is the composite geometry above; what no longer supports it
+    is anyone's hearing.
 
     The fix does not guess a constant to subtract. It walks outward from the
     edge characters through frames the head itself labels blank, which is the
@@ -428,6 +716,11 @@ def speech_extent(
 
 
 ALIGNMENT_HEAD_PATH_ENV = "ASR_ALIGNMENT_HEAD_PATH"
+# Log-probability penalty applied to blank during the Viterbi search only.
+# Default 0.0: the sweep that would set it has to be run against composite
+# geometry first, and shipping an unmeasured non-zero here would move every
+# subtitle boundary on a hunch.
+ALIGNMENT_BLANK_BIAS_ENV = "ASR_ALIGNMENT_BLANK_BIAS"
 ALIGNMENT_HEAD_HF_SCHEME = "hf:"
 ALIGNMENT_HEAD_DEFAULT_FILENAME = "ctc_aligner.pt"
 
@@ -540,6 +833,25 @@ def resolve_alignment_head_path(reference: str, *, download: bool = True) -> str
     return downloaded
 
 
+def blank_bias_from_env() -> float:
+    """`ASR_ALIGNMENT_BLANK_BIAS`, or 0.0 when unset or unreadable.
+
+    A malformed value reads as "off" rather than raising: this is a timing knob
+    on a stage whose whole design is to degrade instead of taking transcription
+    down, and 0.0 is the behaviour that was actually measured.
+    """
+    import os
+
+    raw = (os.environ.get(ALIGNMENT_BLANK_BIAS_ENV) or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.0
+    return value if value > 0.0 else 0.0
+
+
 def alignment_head_configured() -> bool:
     """True when `ASR_ALIGNMENT_HEAD_PATH` points at something.
 
@@ -564,14 +876,37 @@ class AlignmentHead:
     been established on clean speech only.
     """
 
-    def __init__(self, module, vocab: AlignmentVocab, upsample: int, device) -> None:
+    def __init__(
+        self,
+        module,
+        vocab: AlignmentVocab,
+        upsample: int,
+        device,
+        blank_bias: float = 0.0,
+    ) -> None:
         self.module = module
         self.vocab = vocab
         self.upsample = int(upsample)
         self.device = device
+        self.blank_bias = float(blank_bias)
+
+    @property
+    def context_frames(self) -> int:
+        """Encoder frames of context the head needs on each side of a frame.
+
+        Whoever slices audio into windows has to overlap them by at least this
+        much and drop the overlap afterwards; a frame computed with less than
+        this on either side was convolved against zeros standing in for audio
+        that exists.
+        """
+        return int(self.module.context_frames)
+
+    @property
+    def context_seconds(self) -> float:
+        return self.context_frames * ENCODER_FRAME_S
 
     @classmethod
-    def load(cls, checkpoint_path: str, *, device=None) -> "AlignmentHead":
+    def load(cls, checkpoint_path: str, *, device=None, blank_bias=None) -> "AlignmentHead":
         import torch
 
         resolved_path = resolve_alignment_head_path(checkpoint_path)
@@ -595,7 +930,15 @@ class AlignmentHead:
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         module.to(resolved).eval()
-        return cls(module, vocab, int(payload["upsample"]), resolved)
+        return cls(
+            module,
+            vocab,
+            int(payload["upsample"]),
+            resolved,
+            blank_bias=(
+                blank_bias_from_env() if blank_bias is None else float(blank_bias)
+            ),
+        )
 
     @classmethod
     def from_env(cls, *, device=None) -> "AlignmentHead | None":
@@ -641,7 +984,13 @@ class AlignmentHead:
             return None
         try:
             log_probs = self.log_probs(features)
-            spans = align_text(log_probs, text, self.vocab, upsample=self.upsample)
+            spans = align_text(
+                log_probs,
+                text,
+                self.vocab,
+                upsample=self.upsample,
+                blank_bias=self.blank_bias,
+            )
         except (ValueError, RuntimeError):
             return None
         extent = speech_extent(log_probs, spans, upsample=self.upsample)
@@ -691,11 +1040,22 @@ def build_head(
             self.activation = nn.GELU()
             self.dropout = nn.Dropout(dropout)
 
-        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        def forward(self, x: "torch.Tensor", mask=None) -> "torch.Tensor":
             residual = x
-            y = self.norm(x).transpose(1, 2)
-            y = self.pointwise(self.activation(self.depthwise(y)))
-            return residual + self.dropout(y.transpose(1, 2))
+            y = self.norm(x)
+            # Re-zero INSIDE the block, not only around it. `LayerNorm` maps an
+            # all-zero padded position to its own bias, and the convolution one
+            # line below reads across time - so an unmasked pad would feed that
+            # bias into every real frame within the receptive field. Zeroing here
+            # makes the batched result identical to running the clip alone, where
+            # `conv1d` pads with actual zeros.
+            if mask is not None:
+                y = y * mask
+            y = y.transpose(1, 2)
+            y = self.pointwise(self.activation(self.depthwise(y))).transpose(1, 2)
+            if mask is not None:
+                y = y * mask
+            return residual + self.dropout(y)
 
     class CtcAlignmentHead(nn.Module):
         def __init__(self) -> None:
@@ -719,13 +1079,59 @@ def build_head(
             self.output_norm = nn.LayerNorm(hidden_dim)
             self.classifier = nn.Linear(hidden_dim, vocab_size)
 
-        def forward(self, features: "torch.Tensor") -> "torch.Tensor":
-            """(B, T, input_dim) -> (B, T*upsample, vocab) log-probabilities."""
+        @property
+        def context_frames(self) -> int:
+            """One-sided receptive field, in ENCODER frames, rounded up.
+
+            Read off the modules rather than restated as a constant, so that a
+            change to the dilation schedule or the block count reaches every
+            caller that has to supply context - notably the pipeline, which
+            slices long audio into windows and must overlap them by at least
+            this much or the head loses that context at every seam.
+
+            With the defaults: kernel 5 at dilations 1/2/4/8 gives a 61-frame
+            receptive field at 26 fps (2.35 s), so 30 output frames per side,
+            i.e. 15 encoder frames (1.15 s).
+            """
+            span = 1
+            for block in self.blocks:
+                kernel = int(block.depthwise.kernel_size[0])
+                dilation = int(block.depthwise.dilation[0])
+                span += (kernel - 1) * dilation
+            one_sided = (span - 1) // 2
+            return -(-one_sided // self.upsample)
+
+        def forward(self, features: "torch.Tensor", lengths=None) -> "torch.Tensor":
+            """(B, T, input_dim) -> (B, T*upsample, vocab) log-probabilities.
+
+            `lengths` is the real frame count of each row. Give it whenever the
+            batch is padded: without it a short clip's tail is convolved against
+            the padding's LayerNorm bias instead of against silence, so its
+            output depends on which clips it was batched with. Length bucketing
+            shrinks that contamination but cannot remove it. A single unpadded
+            clip - which is every inference call - is unaffected either way, so
+            omitting it stays numerically exact there.
+            """
+            mask = None
+            if lengths is not None:
+                positions = torch.arange(features.shape[1], device=features.device)
+                mask = (positions[None, :] < lengths.to(features.device)[:, None]).to(
+                    features.dtype
+                )[..., None]
+                features = features * mask
             x = self.project(self.input_norm(features))
+            if mask is not None:
+                x = x * mask
             if self.expand is not None:
                 x = self.expand(x.transpose(1, 2)).transpose(1, 2)
+                if mask is not None:
+                    # Stride equals kernel, so a padded input frame maps to
+                    # exactly `upsample` padded output frames and nothing mixes.
+                    mask = mask.repeat_interleave(self.upsample, dim=1)
+            if mask is not None:
+                x = x * mask
             for block in self.blocks:
-                x = block(x)
+                x = block(x, mask)
             logits = self.classifier(self.output_norm(x))
             return nn.functional.log_softmax(logits, dim=-1)
 

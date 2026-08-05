@@ -205,10 +205,21 @@ function createAuditReviewCore(config){
 /*
  * Shared editable complete-partition helpers.  Adapters may keep their own
  * state shape, but should use these helpers rather than silently inventing
- * different boundary semantics.  A partition is frame based and uses the
- * three central labels; gaps are allowed while editing and rejected at save.
+ * different boundary semantics.  A partition is frame based; gaps are allowed
+ * while editing and rejected at save.
+ *
+ * The label vocabulary is the adapter's, not the core's.  It used to be three
+ * hardcoded boundary-chain names, which meant a second task could only reuse
+ * this machinery by relabelling its own question in someone else's words.  The
+ * invariants the core actually owns - frame alignment, no gaps, no overlaps,
+ * full coverage, canonical ordering, a signature over the result - are the same
+ * whatever the labels are called.
  */
-const AUDIT_PARTITION_LABELS=new Set(['vocal_candidate','non_vocal_candidate','unsure']);
+const AUDIT_PARTITION_DEFAULT_LABELS=['vocal_candidate','non_vocal_candidate','unsure'];
+function auditPartitionLabelSet(labels){
+  const values=Array.isArray(labels)&&labels.length?labels:AUDIT_PARTITION_DEFAULT_LABELS;
+  return new Set(values.map(String));
+}
 function cloneAuditPartition(segments){
   return (Array.isArray(segments)?segments:[]).map((segment,index)=>({
     id:String(segment.id||`segment-${index}`),
@@ -232,13 +243,14 @@ function normalizeAuditPartition(segments){
   }
   return result;
 }
-function validateAuditPartition(segments,frameCount){
+function validateAuditPartition(segments,frameCount,labels){
   const count=Number(frameCount),normalized=normalizeAuditPartition(segments);
+  const allowed=auditPartitionLabelSet(labels);
   if(!Number.isInteger(count)||count<=0)return {ok:false,error:'无效的 frame_count'};
   if(!normalized.length)return {ok:false,error:'至少需要一个区间'};
   let cursor=0;
   for(const segment of normalized){
-    if(!AUDIT_PARTITION_LABELS.has(segment.label))return {ok:false,error:`未知标签：${segment.label}`};
+    if(!allowed.has(segment.label))return {ok:false,error:`未知标签：${segment.label}`};
     if(!Number.isInteger(segment.start_frame)||!Number.isInteger(segment.end_frame))return {ok:false,error:'区间边界必须对齐到 frame'};
     if(segment.start_frame<0||segment.end_frame>count||segment.end_frame<=segment.start_frame)return {ok:false,error:'存在越界或空区间'};
     if(segment.start_frame<cursor)return {ok:false,error:'区间重叠'};

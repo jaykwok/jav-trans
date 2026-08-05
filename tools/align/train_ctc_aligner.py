@@ -35,6 +35,7 @@ from asr.alignment import (  # noqa: E402
     BLANK_INDEX,
     AlignmentVocab,
     build_head,
+    is_acoustic_char,
     minimum_ctc_frames,
 )
 from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
@@ -154,6 +155,13 @@ def main() -> None:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--vocab-max-size", type=int, default=3000)
     parser.add_argument("--vocab-min-count", type=int, default=2)
+    parser.add_argument(
+        "--acoustic-targets",
+        action="store_true",
+        help="align only pronounceable characters (vocab v2). Punctuation was "
+        "16.9%% of targets and 527 clips were nothing but `...`, all of it "
+        "asking the head to emit a class where there is no sound.",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -184,10 +192,19 @@ def main() -> None:
     for row in train_rows:
         counts.update(row["text"])
     vocab = AlignmentVocab.from_counts(
-        counts, max_size=args.vocab_max_size, min_count=args.vocab_min_count
+        counts,
+        max_size=args.vocab_max_size,
+        min_count=args.vocab_min_count,
+        acoustic_only=args.acoustic_targets,
     )
     covered = sum(counts[ch] for ch in vocab.chars)
     total = sum(counts.values())
+    # Coverage is over ALL counted characters, so on the acoustic arm it reads
+    # as "share of the corpus this head is asked to explain" - by construction
+    # below 1, and the gap is the punctuation that no longer has a class.
+    acoustic_total = sum(
+        count for char, count in counts.items() if is_acoustic_char(char)
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     head = build_head(
@@ -255,14 +272,15 @@ def main() -> None:
     def batches(rows: list[dict], *, shuffle: bool):
         """Length-bucketed batches, shuffled at the batch level.
 
-        Grouping by length is not only a throughput win. Padded positions are
-        zeros, but the head's input `LayerNorm` maps an all-zero vector to its
-        own bias rather than to zero, and the conv stack's receptive field
-        reaches ~2.3 s - so with mixed-length batches a short clip's tail would
-        be convolved against a different context in training than at
-        single-clip inference. Near-uniform batches shrink that padding to a few
-        frames. Shuffling the batch order rather than the rows keeps the
-        gradient noise that shuffling is there to provide.
+        Grouping by length is a throughput win, and it used to be doing a second
+        job badly: padded positions are zeros, but the head's input `LayerNorm`
+        maps an all-zero vector to its own bias, and the conv stack reaches
+        ~2.3 s - so a short clip's tail was convolved against a context that
+        does not exist at single-clip inference. Bucketing shrank that padding
+        to a few frames without removing it. The head now masks padded positions
+        outright, so this is back to being only about throughput. Shuffling the
+        batch order rather than the rows keeps the gradient noise that shuffling
+        is there to provide.
         """
         order = sorted(range(len(rows)), key=lambda i: rows[i]["frames"])
         groups = [
@@ -288,7 +306,12 @@ def main() -> None:
             targets = targets.to(device)
             input_lengths = frame_lengths * args.upsample
             with torch.set_grad_enabled(train):
-                log_probs = head(features)
+                # Padded positions are masked inside the head. Without this the
+                # padding's LayerNorm bias is convolved into the real frames near
+                # a clip's tail, so a clip's own output depends on what it was
+                # batched with - and none of that happens at inference, where
+                # clips arrive one at a time.
+                log_probs = head(features, frame_lengths)
                 # CTCLoss wants (T, B, V).
                 loss = criterion(
                     log_probs.transpose(0, 1),
@@ -394,6 +417,13 @@ def main() -> None:
         "val_clips": len(val_rows),
         "vocab_size": vocab.size,
         "vocab_coverage": round(covered / total, 5) if total else 0.0,
+        # Two runs with different target sets do NOT have comparable losses -
+        # fewer targets is a shorter sequence and a lower CTC loss for that
+        # reason alone. Recorded so nobody reads the acoustic arm's val number
+        # as an improvement over the punctuated one; the comparison that means
+        # something is geometry on the composite set.
+        "acoustic_targets": bool(args.acoustic_targets),
+        "acoustic_character_share": round(acoustic_total / total, 5) if total else 0.0,
         "head_parameters": parameters,
         # Rows whose loss `zero_infinity` zeroed. Non-zero means every loss in
         # `history` is diluted by that fraction and the run is not comparable

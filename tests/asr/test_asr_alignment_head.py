@@ -423,3 +423,448 @@ class TestSpeechExtent:
         be a claim the data does not make.
         """
         assert 0.0 < alignment.ONSET_BACKOFF_MAX_S < alignment.CODA_EXTEND_MAX_S
+
+
+class TestBlankBias:
+    """The peak-widening knob, and the two things it must not touch.
+
+    CTC posteriors are peaky: the path stays in blank until evidence has piled
+    up, so every character's span starts inside its own sound. Subtracting a
+    constant from the blank column before the search makes staying in blank
+    slightly more expensive and widens the characters back out. It is free at
+    runtime and needs no retraining, which is why it is worth a sweep - but it
+    is also a knob that can manufacture accuracy on any metric that only
+    penalises being late, so what it must NOT do is pinned here.
+    """
+
+    def test_zero_reproduces_the_untouched_search_exactly(self) -> None:
+        """The default has to be bit-identical or every stored timestamp moves."""
+        a, i = VOCAB.index_of("あ"), VOCAB.index_of("い")
+        blank = alignment.BLANK_INDEX
+        log_probs = _posteriors([a, blank, i], vocab_size=VOCAB.size)
+        plain = alignment.forced_align(log_probs, [a, i], upsample=1)
+        biased = alignment.forced_align(log_probs, [a, i], upsample=1, blank_bias=0.0)
+        assert [(s.start_frame, s.end_frame) for s in plain] == [
+            (s.start_frame, s.end_frame) for s in biased
+        ]
+
+    def test_a_bias_widens_a_character_into_the_blank_beside_it(self) -> None:
+        a = VOCAB.index_of("あ")
+        blank = alignment.BLANK_INDEX
+        # Blank is only mildly preferred either side of the sound, so a small
+        # penalty is enough to hand those frames to the character.
+        probs = torch.full((5, VOCAB.size), 0.02)
+        probs[:, blank] = 0.6
+        probs[2, blank] = 0.1
+        probs[2, a] = 0.7
+        probs[1, a] = 0.35
+        probs[3, a] = 0.35
+        log_probs = probs.log()
+
+        narrow = alignment.forced_align(log_probs, [a], upsample=1)
+        wide = alignment.forced_align(log_probs, [a], upsample=1, blank_bias=1.5)
+        assert wide[0].start_frame <= narrow[0].start_frame
+        assert wide[0].end_frame >= narrow[0].end_frame
+        assert (wide[0].end_frame - wide[0].start_frame) > (
+            narrow[0].end_frame - narrow[0].start_frame
+        )
+
+    def test_the_score_is_read_off_the_unbiased_posteriors(self) -> None:
+        """The score is the hallucination signal. If the bias moved it, the same
+        audio and the same text would score differently because a TIMING knob was
+        turned, and the post-gate's threshold would drift with it."""
+        a = VOCAB.index_of("あ")
+        log_probs = _posteriors([a, a, a], vocab_size=VOCAB.size)
+        plain = alignment.forced_align(log_probs, [a], upsample=1)
+        biased = alignment.forced_align(log_probs, [a], upsample=1, blank_bias=2.0)
+        assert plain[0].score == pytest.approx(biased[0].score, abs=1e-6)
+        # And the score stays a log-probability, not a penalised one.
+        assert biased[0].score == pytest.approx(float(log_probs[0, a]), abs=1e-6)
+
+    def test_a_negative_bias_is_refused(self) -> None:
+        """It would shrink characters further into their middles - the defect
+        this exists to correct, with a knob to produce it on demand."""
+        a = VOCAB.index_of("あ")
+        log_probs = _posteriors([a], vocab_size=VOCAB.size)
+        with pytest.raises(ValueError, match="blank_bias"):
+            alignment.forced_align(log_probs, [a], upsample=1, blank_bias=-0.5)
+
+    def test_the_input_tensor_is_not_modified(self) -> None:
+        """The caller reuses this tensor for `speech_extent` and `blank_runs`."""
+        a = VOCAB.index_of("あ")
+        log_probs = _posteriors([a, a], vocab_size=VOCAB.size)
+        before = log_probs.clone()
+        alignment.forced_align(log_probs, [a], upsample=1, blank_bias=1.0)
+        assert torch.equal(log_probs, before)
+
+    def test_the_default_is_off_until_a_sweep_says_otherwise(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(alignment.ALIGNMENT_BLANK_BIAS_ENV, raising=False)
+        assert alignment.blank_bias_from_env() == 0.0
+
+    def test_the_env_knob_reads_a_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(alignment.ALIGNMENT_BLANK_BIAS_ENV, "1.25")
+        assert alignment.blank_bias_from_env() == pytest.approx(1.25)
+
+    def test_a_malformed_or_negative_knob_reads_as_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """This stage's contract is to degrade, not to take transcription down,
+        and 0.0 is the arm that was actually measured."""
+        for raw in ("", "  ", "abc", "-1.0"):
+            monkeypatch.setenv(alignment.ALIGNMENT_BLANK_BIAS_ENV, raw)
+            assert alignment.blank_bias_from_env() == 0.0
+
+
+class TestAcousticTargets:
+    """Punctuation is not a sound, so it is not a class.
+
+    16.9% of the training targets were Unicode punctuation or symbols, 92.3% of
+    clips carried some, and 527 clips had `...` as their entire target. Every
+    one of those asks the head to emit a character where the audio is a pause -
+    inside the blank run the chunker reads to choose a cut. The v2 vocab aligns
+    only what can be pronounced and puts the rest back afterwards, because the
+    subtitle layer indexes spans by character position and drops to synthetic
+    timing on any count mismatch.
+    """
+
+    ACOUSTIC = alignment.AlignmentVocab(chars=tuple("あいうえお"), acoustic_only=True)
+
+    def test_letters_and_digits_are_acoustic_and_marks_are_not(self) -> None:
+        for char in "あアか漢A7":
+            assert alignment.is_acoustic_char(char), char
+        for char in "、。…！？「」・♪♡〜":
+            assert not alignment.is_acoustic_char(char), char
+
+    def test_prolongation_and_iteration_marks_count_as_sound(self) -> None:
+        """`ー` and `々` are pronounced and occupy audio; dropping them would
+        leave that audio to be explained by the character before them."""
+        assert alignment.is_acoustic_char("ー")
+        assert alignment.is_acoustic_char("々")
+
+    def test_the_origin_of_every_kept_character_is_recorded(self) -> None:
+        spoken, origins = alignment.acoustic_text("あ、い。")
+        assert spoken == "あい"
+        assert origins == [0, 2]
+
+    def test_a_v2_vocab_refuses_to_hold_punctuation(self) -> None:
+        with pytest.raises(ValueError, match="acoustic-only"):
+            alignment.AlignmentVocab(chars=("あ", "、"), acoustic_only=True)
+
+    def test_the_inventory_filters_counts_rather_than_trusting_the_caller(self) -> None:
+        vocab = alignment.AlignmentVocab.from_counts(
+            {"あ": 10, "、": 99, "…": 50, "い": 5}, acoustic_only=True
+        )
+        assert vocab.chars == ("あ", "い")
+
+    def test_encoding_drops_what_the_head_cannot_emit(self) -> None:
+        assert len(self.ACOUSTIC.encode("あ、い。")) == 2
+        punctuated = alignment.AlignmentVocab(chars=tuple("あい、。"))
+        assert len(punctuated.encode("あ、い。")) == 4
+
+    def test_the_schema_says_which_kind_of_head_this_is(self) -> None:
+        """Not a flag on v1: a reader that ignored it would align punctuation
+        against a model whose only answer there is blank."""
+        payload = self.ACOUSTIC.to_payload()
+        assert payload["schema"] == alignment.ACOUSTIC_VOCAB_SCHEMA
+        assert alignment.AlignmentVocab.from_payload(payload) == self.ACOUSTIC
+        old = alignment.AlignmentVocab(chars=tuple("あい"))
+        assert old.to_payload()["schema"] == alignment.ALIGNMENT_VOCAB_SCHEMA
+        assert alignment.AlignmentVocab.from_payload(old.to_payload()) == old
+
+    def test_an_unknown_schema_is_still_refused(self) -> None:
+        with pytest.raises(ValueError, match="schema"):
+            alignment.AlignmentVocab.from_payload(
+                {"schema": "something_else", "blank_index": 0, "unk_index": 1}
+            )
+
+    def test_one_span_per_character_of_the_original_text(self) -> None:
+        """The contract `build_aligned_word_timestamps` enforces: a count
+        mismatch there silently falls back to proportional timing."""
+        a, i = self.ACOUSTIC.index_of("あ"), self.ACOUSTIC.index_of("い")
+        log_probs = _posteriors(
+            [a, alignment.BLANK_INDEX, i], vocab_size=self.ACOUSTIC.size
+        )
+        spans = alignment.align_text(log_probs, "あ、い。", self.ACOUSTIC, upsample=1)
+        assert [s.char for s in spans] == ["あ", "、", "い", "。"]
+        assert [s.index for s in spans] == [0, 1, 2, 3]
+
+    def test_punctuation_takes_no_audio_from_the_character_before_it(self) -> None:
+        a, i = self.ACOUSTIC.index_of("あ"), self.ACOUSTIC.index_of("い")
+        log_probs = _posteriors(
+            [a, alignment.BLANK_INDEX, i], vocab_size=self.ACOUSTIC.size
+        )
+        spans = alignment.align_text(log_probs, "あ、い。", self.ACOUSTIC, upsample=1)
+        assert [(s.start_frame, s.end_frame) for s in spans] == [
+            (0, 1),
+            (1, 1),
+            (2, 3),
+            (3, 3),
+        ]
+
+    def test_leading_punctuation_anchors_to_the_first_sound(self) -> None:
+        a = self.ACOUSTIC.index_of("あ")
+        log_probs = _posteriors(
+            [alignment.BLANK_INDEX, a], vocab_size=self.ACOUSTIC.size
+        )
+        spans = alignment.align_text(log_probs, "…あ", self.ACOUSTIC, upsample=1)
+        assert spans[0].start_frame == spans[0].end_frame == spans[1].start_frame
+
+    def test_the_spans_stay_monotonic(self) -> None:
+        a, i, u = (self.ACOUSTIC.index_of(ch) for ch in "あいう")
+        blank = alignment.BLANK_INDEX
+        log_probs = _posteriors([a, blank, i, blank, u], vocab_size=self.ACOUSTIC.size)
+        spans = alignment.align_text(log_probs, "…あ、い。う!", self.ACOUSTIC, upsample=1)
+        starts = [s.start_frame for s in spans]
+        assert starts == sorted(starts)
+        assert all(s.end_frame >= s.start_frame for s in spans)
+
+    def test_text_with_nothing_to_pronounce_is_refused(self) -> None:
+        """`...` alone was 527 clips of the corpus. There is no honest span for
+        it, and the caller's fallback to synthetic timing is the right answer."""
+        log_probs = _posteriors([alignment.BLANK_INDEX] * 4, vocab_size=self.ACOUSTIC.size)
+        with pytest.raises(ValueError, match="acoustic"):
+            alignment.align_text(log_probs, "……", self.ACOUSTIC, upsample=1)
+
+    def test_a_v1_head_still_aligns_punctuation_as_before(self) -> None:
+        """The old checkpoint is the one in production; its behaviour is fixed."""
+        vocab = alignment.AlignmentVocab(chars=tuple("あい、"))
+        a, comma = vocab.index_of("あ"), vocab.index_of("、")
+        log_probs = _posteriors([a, comma], vocab_size=vocab.size)
+        spans = alignment.align_text(log_probs, "あ、", vocab, upsample=1)
+        assert [(s.start_frame, s.end_frame) for s in spans] == [(0, 1), (1, 2)]
+
+
+class TestPaddingMask:
+    """A clip's output must not depend on what it was batched with.
+
+    Padded positions are zeros, but the head's input `LayerNorm` maps an
+    all-zero vector to its own bias, and every conv in the stack reads across
+    time - so without masking, the padding's bias is convolved into the real
+    frames near a clip's tail. Training batches clips; inference never does. The
+    head therefore learned on a tail context that does not exist in production,
+    and length bucketing only made the padding shorter, not absent.
+    """
+
+    @staticmethod
+    def _head(blocks: int = 2, upsample: int = 2):
+        head = alignment.build_head(
+            vocab_size=VOCAB.size,
+            input_dim=8,
+            hidden_dim=8,
+            upsample=upsample,
+            blocks=blocks,
+            dropout=0.0,
+        )
+        return head.eval()
+
+    def test_a_padded_clip_matches_the_same_clip_alone(self) -> None:
+        head = self._head()
+        torch.manual_seed(0)
+        short, long_ = 11, 40
+        clip = torch.randn(1, short, 8)
+        batch = torch.zeros(2, long_, 8)
+        batch[0] = torch.randn(long_, 8)
+        batch[1, :short] = clip[0]
+        lengths = torch.tensor([long_, short])
+
+        with torch.inference_mode():
+            batched = head(batch, lengths)
+            alone = head(clip)
+
+        assert torch.allclose(batched[1, : short * head.upsample], alone[0], atol=1e-6)
+
+    def test_the_padding_content_cannot_reach_the_real_frames(self) -> None:
+        """The sharper form: fill the pad with noise instead of zeros.
+
+        Zeros are a special case the head might survive by accident. If the
+        masking is real, the pad can hold anything and the answer is the same.
+        """
+        head = self._head()
+        torch.manual_seed(1)
+        short, long_ = 9, 40
+        content = torch.randn(short, 8)
+        quiet = torch.zeros(1, long_, 8)
+        quiet[0, :short] = content
+        loud = torch.randn(1, long_, 8) * 10.0
+        loud[0, :short] = content
+        lengths = torch.tensor([short])
+
+        with torch.inference_mode():
+            first = head(quiet, lengths)
+            second = head(loud, lengths)
+
+        assert torch.allclose(
+            first[0, : short * head.upsample],
+            second[0, : short * head.upsample],
+            atol=1e-6,
+        )
+
+    def test_without_lengths_the_padding_does_reach_them(self) -> None:
+        """The bug being fixed, pinned so the test above cannot pass vacuously."""
+        head = self._head()
+        torch.manual_seed(2)
+        short, long_ = 9, 40
+        content = torch.randn(short, 8)
+        quiet = torch.zeros(1, long_, 8)
+        quiet[0, :short] = content
+        loud = torch.randn(1, long_, 8) * 10.0
+        loud[0, :short] = content
+
+        with torch.inference_mode():
+            first = head(quiet)
+            second = head(loud)
+
+        assert not torch.allclose(
+            first[0, : short * head.upsample],
+            second[0, : short * head.upsample],
+            atol=1e-4,
+        )
+
+    def test_a_single_full_length_clip_is_unaffected_by_the_argument(self) -> None:
+        """Inference passes one unpadded clip, so it must be exactly as before."""
+        head = self._head()
+        torch.manual_seed(3)
+        clip = torch.randn(1, 20, 8)
+        with torch.inference_mode():
+            assert torch.equal(head(clip), head(clip, torch.tensor([20])))
+
+
+class TestReceptiveField:
+    """The head reports its own context so callers do not restate it.
+
+    The pipeline has to overlap its windows by this much; a dilation schedule
+    changed here and not there would silently reintroduce the seam.
+    """
+
+    def test_the_default_stack_needs_fifteen_encoder_frames(self) -> None:
+        head = alignment.build_head(vocab_size=VOCAB.size, input_dim=8, hidden_dim=8)
+        # kernel 5 at dilations 1/2/4/8 spans 1 + 4*(1+2+4+8) = 61 output frames,
+        # so 30 per side at 26 fps, i.e. 15 encoder frames of 77 ms.
+        assert head.context_frames == 15
+        assert alignment.ENCODER_FRAME_S * 15 == pytest.approx(1.1538, abs=1e-4)
+
+    def test_more_blocks_means_more_context(self) -> None:
+        wider = alignment.build_head(
+            vocab_size=VOCAB.size, input_dim=8, hidden_dim=8, blocks=6
+        )
+        assert wider.context_frames > 15
+
+    def test_the_loaded_head_exposes_the_same_number(self) -> None:
+        module = alignment.build_head(vocab_size=VOCAB.size, input_dim=8, hidden_dim=8)
+        head = alignment.AlignmentHead(module, VOCAB, 2, torch.device("cpu"))
+        assert head.context_frames == module.context_frames
+        assert head.context_seconds == pytest.approx(
+            module.context_frames * alignment.ENCODER_FRAME_S
+        )
+
+
+class TestOverlapSaveWindows:
+    """Long audio is windowed for the encoder; the head must not pay for it.
+
+    Before this, `pipeline.py` ran the head on butt-jointed 30 s windows and
+    concatenated the results, so every frame within ~1.15 s of a seam was
+    convolved against zeros standing in for audio that exists - one seam every
+    30 s, i.e. ~7.6% of a 40-minute timeline computed on absent context.
+    Concatenating encoder features instead of head outputs would not fix it: the
+    encoder runs per window too, so the audio itself has to overlap.
+    """
+
+    WIDTH = 30 * 16000
+    CONTEXT = 15
+
+    def _plan(self, seconds: float):
+        return alignment.plan_head_windows(
+            int(seconds * 16000), window_samples=self.WIDTH, context_frames=self.CONTEXT
+        )
+
+    @staticmethod
+    def _frames(start: int, end: int) -> int:
+        return int(round((end - start) * alignment.ENCODER_FPS / 16000))
+
+    def test_consecutive_windows_overlap_by_twice_the_context(self) -> None:
+        plan = self._plan(120.0)
+        assert len(plan) > 1
+        bases = [base for _, _, base in plan]
+        window_frames = int(round(self.WIDTH * alignment.ENCODER_FPS / 16000))
+        for earlier, later in zip(bases, bases[1:]):
+            assert later - earlier == window_frames - 2 * self.CONTEXT
+
+    def test_the_kept_slices_tile_the_timeline_exactly_once(self) -> None:
+        plan = self._plan(300.0)
+        lengths = [self._frames(start, end) for start, end, _ in plan]
+        bases = [base for _, _, base in plan]
+        slices = alignment.overlap_save_slices(
+            list(zip(bases, lengths)), context_frames=self.CONTEXT
+        )
+        covered: list[int] = []
+        for base, (begin, finish) in zip(bases, slices):
+            covered.extend(range(base + begin, base + finish))
+        assert covered == list(range(len(covered))), "holes or repeats on the frame axis"
+        assert abs(len(covered) - int(300 * alignment.ENCODER_FPS)) <= 1
+
+    def test_every_kept_frame_has_real_context_on_both_sides(self) -> None:
+        """The property the overlap exists for, checked frame by frame."""
+        total_frames = int(round(300.0 * alignment.ENCODER_FPS))
+        plan = self._plan(300.0)
+        lengths = [self._frames(start, end) for start, end, _ in plan]
+        bases = [base for _, _, base in plan]
+        slices = alignment.overlap_save_slices(
+            list(zip(bases, lengths)), context_frames=self.CONTEXT
+        )
+        for base, length, (begin, finish) in zip(bases, lengths, slices):
+            for frame in range(base + begin, base + finish):
+                # What this window can offer the frame, against what the clip
+                # has to offer at all - at the very edges of the file there is
+                # nothing to be had and zeros are the truth.
+                inside_left = frame - base
+                inside_right = base + length - 1 - frame
+                assert inside_left >= min(self.CONTEXT, frame)
+                assert inside_right >= min(self.CONTEXT, total_frames - 1 - frame)
+
+    def test_audio_shorter_than_one_window_is_a_single_untrimmed_pass(self) -> None:
+        plan = self._plan(4.0)
+        assert len(plan) == 1
+        start, end, base = plan[0]
+        assert (start, base) == (0, 0)
+        length = self._frames(start, end)
+        assert alignment.overlap_save_slices(
+            [(base, length)], context_frames=self.CONTEXT
+        ) == [(0, length)]
+
+    def test_audio_too_short_to_chunk_gets_no_window_at_all(self) -> None:
+        """Under half a second decides no pause and the processor pads it to a
+        full window anyway, so it is pure encoder time - the same filter the
+        butt-jointed version applied, now reachable only here. Every later
+        window carries at least the 2 * context of new audio that stopped its
+        predecessor from reaching the file end."""
+        assert self._plan(0.3) == []
+        tail = self._plan(30.2)
+        assert len(tail) == 2
+        start, end, _ = tail[1]
+        assert end - start >= 2 * self.CONTEXT * 16000 / alignment.ENCODER_FPS
+
+    def test_a_window_returning_fewer_frames_than_planned_cannot_duplicate_output(
+        self,
+    ) -> None:
+        """Defensive: the trim continues from where the previous window stopped
+        rather than from an assumed length, so a short middle window degrades to
+        a gap instead of to repeated frames - repeats would move every later
+        timestamp."""
+        bases = [0, 360, 720]
+        lengths = [390, 200, 390]
+        slices = alignment.overlap_save_slices(
+            list(zip(bases, lengths)), context_frames=self.CONTEXT
+        )
+        covered: list[int] = []
+        for base, (begin, finish) in zip(bases, slices):
+            covered.extend(range(base + begin, base + finish))
+        assert len(covered) == len(set(covered))
+        assert covered == sorted(covered)
+
+    def test_a_context_wider_than_the_window_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="context"):
+            alignment.plan_head_windows(
+                16000 * 60, window_samples=16000, context_frames=200
+            )

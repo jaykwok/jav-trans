@@ -10,7 +10,13 @@ from typing import Any, Callable
 import numpy as np
 
 from asr import chunking, result_cache, transcribe
-from asr.alignment import AlignmentHead, alignment_head_configured, blank_runs
+from asr.alignment import (
+    AlignmentHead,
+    alignment_head_configured,
+    blank_runs,
+    overlap_save_slices,
+    plan_head_windows,
+)
 from asr.backends import registry
 from asr.chunking import (
     CHUNK_CUT_SCHEMA,
@@ -242,13 +248,21 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
         duration_s = len(clip) / 16000.0
 
         width = int(_FEATURE_CHUNK_S * 16000)
+        # Overlap-save rather than butt-jointed windows. The head convolves over
+        # ~2.35 s, so a frame at a seam used to be computed against zeros where
+        # the rest of the file was: at one seam per 30 s that is ~2.3 s of
+        # degraded pause map every window, ~7.6% of a 40-minute timeline. The
+        # overlap is the head's own one-sided receptive field, asked for rather
+        # than hardcoded, and it costs ~10% more encoder passes - 0.2 s on the
+        # 40-minute measurement below.
+        context_frames = head.context_frames
+        plan = plan_head_windows(
+            len(clip), window_samples=width, context_frames=context_frames
+        )
         windows = [
-            _np.ascontiguousarray(clip[offset : offset + width])
-            for offset in range(0, len(clip), width)
+            _np.ascontiguousarray(clip[start:end]) for start, end, _ in plan
         ]
-        # Anything under half a second cannot carry a pause decision and the
-        # processor pads it to a full window anyway, so it only costs encoder time.
-        windows = [piece for piece in windows if len(piece) >= 8000]
+        bases = [base for _, _, base in plan]
 
         # Batched because this is a pure encoder pass; the windows are
         # fixed-length by construction, so batching adds no padding waste.
@@ -269,6 +283,7 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
         # on the same GPU moves it.
         batch_size = max(1, _env_int("ASR_FEATURE_BATCH_SIZE", "4"))
         pieces = []
+        returned_frames: list[int] = []
         for start in range(0, len(windows), batch_size):
             group = windows[start : start + batch_size]
             inputs = prepare_transcription_inputs(
@@ -294,13 +309,26 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
             offset = 0
             for length in lengths:
                 pieces.append(head.log_probs(hidden[offset : offset + length]))
+                returned_frames.append(int(length))
                 offset += length
         if not pieces:
             return [], duration_s, "fixed_length_no_features"
-        # Concatenated before deriving runs: a pause straddling a feature-chunk
-        # seam would otherwise arrive as two shorter runs, fail the minimum
-        # length, and stop being a legal cut point exactly at the seams.
-        log_probs = torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0]
+        # Drop each window's overlap, then concatenate. Deriving the runs from
+        # one tensor rather than per window is load-bearing on its own: a pause
+        # straddling a seam would otherwise arrive as two shorter runs, fail the
+        # minimum length, and stop being a legal cut point exactly at the seams.
+        keep = overlap_save_slices(
+            list(zip(bases[: len(pieces)], returned_frames)),
+            context_frames=context_frames,
+        )
+        kept = [
+            piece[begin * head.upsample : finish * head.upsample]
+            for piece, (begin, finish) in zip(pieces, keep)
+            if finish > begin
+        ]
+        if not kept:
+            return [], duration_s, "fixed_length_no_features"
+        log_probs = torch.cat(kept, dim=0) if len(kept) > 1 else kept[0]
         runs = blank_runs(
             log_probs,
             upsample=head.upsample,
