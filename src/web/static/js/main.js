@@ -8,7 +8,12 @@ import { installFiles } from './files.js';
 import { installJobAreaHandlers } from './jobsRender.js';
 import { fetchAllJobs, startJobPolling } from './jobsApi.js';
 import { connectSSE } from './sse.js';
-import { loadConfig, loadSettings, installSettingsPanel } from './settings.js';
+import {
+  loadConfig,
+  loadSettings,
+  installSettingsPanel,
+  syncSettingsFromFormForSubmit,
+} from './settings.js';
 
 // Install all event listeners before any async work
 installFormMemory();
@@ -17,7 +22,7 @@ installPresetChips();
 installSkipTransLink();
 installLog();
 installFiles();
-installJobAreaHandlers(fetchAllJobs);
+installJobAreaHandlers(fetchAllJobs, syncSettingsFromFormForSubmit);
 installSettingsPanel();
 startJobPolling();
 

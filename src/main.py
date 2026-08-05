@@ -11,6 +11,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 from core import events
+from core import stage_errors
 from core.config import load_config
 from core.job_context import JobContext
 from asr import noise as asr_noise_module
@@ -482,6 +483,36 @@ def _setup_run_logger(
     return logger, log_path
 
 
+def _reopen_snapshot_run_logger(artifacts: "AsrArtifacts") -> None:
+    """Give a retried translation its run log back.
+
+    A translation retry rebuilds the artifacts from the on-disk snapshot, which
+    cannot carry a live FileHandler - so `logger` came back as None and every
+    stage line from the retry went nowhere. The run log then ended at the moment
+    the first attempt failed, which is exactly the run someone would go looking
+    for. The path survives the snapshot, so re-attach to it in append mode.
+    """
+    if isinstance(artifacts.logger, logging.Logger) or not artifacts.run_log_path:
+        return
+    log_path = Path(artifacts.run_log_path)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+    except OSError:
+        # Diagnostics are not worth failing a run that is otherwise fine.
+        return
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger = logging.getLogger(f"jav-trans.run.retry.{log_path.stem}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for existing in list(logger.handlers):
+        existing.close()
+        logger.removeHandler(existing)
+    logger.addHandler(handler)
+    artifacts.logger = logger
+    events._thread_local.run_logger = logger
+
+
 def _close_run_logger(logger: logging.Logger | None) -> None:
     if logger is None:
         return
@@ -883,6 +914,10 @@ def _run_asr_alignment_impl(
     events._thread_local.video = os.path.basename(video_path)
     events.set_current_job_id(job_id)
     _raise_if_cancelled(cancel_event)
+    # Ahead of ffprobe/ffmpeg, which would report a moved file as a non-zero
+    # exit code and get described as a damaged or silent video.
+    if not os.path.isfile(video_path):
+        raise RuntimeError(f"{stage_errors.VIDEO_FILE_MISSING}\n{video_path}")
     video_duration_s = audio_module.probe_video_duration_s(video_path)
     with _temporary_env(_asr_stage_env_for_ctx(effective_ctx)):
         backend_label = asr_module.get_backend_label()
@@ -1287,6 +1322,7 @@ def run_translation_and_write(
     job_id: str = "",
     cancel_event=None,
 ) -> list[str]:
+    _reopen_snapshot_run_logger(artifacts)
     try:
         return _run_translation_and_write_impl(
             video_path,
@@ -1710,6 +1746,19 @@ def _run_translation_and_write_impl(
     # 5. Batch-concurrent translation with full-film context
     translation_started = time.perf_counter()
     _log_stage(logger, f"stage_start translation cues={len(translation_segments)}")
+    # The job runs with the settings it was queued (or retried) with, not with
+    # whatever the panel shows now. Record them, so "why is it still thinking?"
+    # is answerable from the log instead of by guessing.
+    _log_stage(
+        logger,
+        "translation_settings "
+        f"backend={llm_backends.selected_backend_name()} "
+        f"model={os.getenv('LLM_MODEL_NAME', '').strip() or '-'} "
+        f"api_format={ctx.llm_api_format} "
+        f"reasoning_effort={ctx.llm_reasoning_effort} "
+        f"target_lang={ctx.target_lang} "
+        f"workers={ctx.translation_max_workers}",
+    )
     _raise_if_cancelled(cancel_event)
 
     with Progress(

@@ -579,3 +579,63 @@ class TestVerdictLogic:
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
         with pytest.raises(ValueError, match="unknown row_id"):
             evaluate.build(answers_path, verdicts_path)
+
+
+class TestInputProvenance:
+    """A result must carry enough about its inputs to be caught when stale.
+
+    This audit's verdicts are typed by hand over days. The first `result.json`
+    was written mid-pass, recorded `aligned` at 48.1% and a verdict of "the head
+    IS systematically late", and sat on disk for two days after the completed
+    110/110 pass reversed both - because nothing in the file said which verdicts
+    it had been built from.
+    """
+
+    def test_the_result_records_the_verdict_file_it_was_built_from(
+        self, tmp_path: Path
+    ) -> None:
+        result = _evaluate(tmp_path, {"aligned": (2, 8), "control_early": (1, 9)})
+        verdicts = result["inputs"]["verdicts"]
+        assert verdicts["rows"] == 20
+        assert verdicts["verdict_counts"] == {"clipped": 3, "intact": 17}
+        assert len(verdicts["sha256"]) == 64
+
+    def test_editing_one_verdict_changes_the_recorded_digest(
+        self, tmp_path: Path
+    ) -> None:
+        """The check that makes staleness mechanical: re-hash the input file and
+        compare it with what the result claims."""
+        answers, verdicts = _verdicts({"aligned": (2, 8), "control_early": (1, 9)})
+        answers_path = tmp_path / "answers.jsonl"
+        verdicts_path = tmp_path / "verdicts.jsonl"
+
+        def _write(rows: list[dict]) -> None:
+            with verdicts_path.open("w", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        with answers_path.open("w", encoding="utf-8") as handle:
+            for row in answers:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        _write(verdicts)
+        before = evaluate.build(answers_path, verdicts_path)
+        verdicts[0]["verdict"] = "non_semantic"
+        _write(verdicts)
+        after = evaluate.build(answers_path, verdicts_path)
+        assert before["inputs"]["verdicts"]["sha256"] != after["inputs"]["verdicts"]["sha256"]
+
+    def test_the_newest_edit_time_is_carried_through(self, tmp_path: Path) -> None:
+        answers, verdicts = _verdicts({"aligned": (2, 8), "control_early": (1, 9)})
+        for position, row in enumerate(verdicts):
+            row["updated_at"] = f"2026-08-01T16:{position:02d}:00.000Z"
+        answers_path = tmp_path / "answers.jsonl"
+        verdicts_path = tmp_path / "verdicts.jsonl"
+        for path, rows in ((answers_path, answers), (verdicts_path, verdicts)):
+            with path.open("w", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        result = evaluate.build(answers_path, verdicts_path)
+        assert result["inputs"]["verdicts"]["latest_updated_at"] == (
+            "2026-08-01T16:19:00.000Z"
+        )

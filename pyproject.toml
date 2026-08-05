@@ -10,6 +10,10 @@ dependencies = [
     "librosa",
     "numpy",
     "openai",
+    # Pure-Python OpenCC port: forces translated output into the Chinese variant
+    # the user picked. Pure Python matters because the release is a PyInstaller
+    # bundle - the C extension build would need a toolchain on every machine.
+    "opencc-python-reimplemented",
     "psutil",
     "python-dotenv",
     "python-multipart",

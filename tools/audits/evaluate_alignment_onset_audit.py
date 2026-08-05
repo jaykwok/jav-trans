@@ -24,6 +24,8 @@ had no power at that offset rather than that the model is good.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -56,6 +58,32 @@ MIN_DECISIVE_FOR_A_BOUND = 12
 def _rows(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8-sig") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def _input_summary(path: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Enough about an input to notice this result no longer describes it.
+
+    This audit's verdicts are typed by hand over days, and the first result.json
+    was written while the pass was still running: it recorded `aligned` at 48.1%
+    and a verdict of "the head IS systematically late", both of which the
+    completed 110/110 pass reversed. Nothing in the file said it was partial, so
+    it stayed on disk for two days looking authoritative. A digest and the newest
+    `updated_at` make that check mechanical - re-hash the input, compare, and a
+    result that predates its own evidence is obvious.
+    """
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    stamps = [str(row.get("updated_at") or "") for row in rows]
+    verdicts = [str(row.get("verdict") or "") for row in rows if "verdict" in row]
+    summary: dict[str, Any] = {
+        "path": path.as_posix(),
+        "rows": len(rows),
+        "sha256": digest,
+    }
+    if any(stamps):
+        summary["latest_updated_at"] = max(stamp for stamp in stamps if stamp)
+    if verdicts:
+        summary["verdict_counts"] = dict(sorted(Counter(verdicts).items()))
+    return summary
 
 
 def join(answers: list[dict], verdicts: list[dict]) -> list[dict]:
@@ -98,7 +126,9 @@ def stratum_report(rows: list[dict]) -> dict[str, Any]:
 
 
 def build(answers_path: Path, verdicts_path: Path) -> dict[str, Any]:
-    rows = join(_rows(answers_path), _rows(verdicts_path))
+    answer_rows = _rows(answers_path)
+    verdict_rows = _rows(verdicts_path)
+    rows = join(answer_rows, verdict_rows)
     by_stratum: dict[str, list[dict]] = {}
     for row in rows:
         by_stratum.setdefault(str(row["stratum"]), []).append(row)
@@ -196,6 +226,10 @@ def build(answers_path: Path, verdicts_path: Path) -> dict[str, Any]:
 
     return {
         "schema": RESULT_SCHEMA,
+        "inputs": {
+            "answers": _input_summary(answers_path, answer_rows),
+            "verdicts": _input_summary(verdicts_path, verdict_rows),
+        },
         "total_rows": len(rows),
         "strata": strata,
         "comparisons_vs_floor": comparisons,
@@ -208,6 +242,15 @@ def build(answers_path: Path, verdicts_path: Path) -> dict[str, Any]:
 
 def render(result: dict[str, Any]) -> str:
     lines = ["", "对齐起点审计 · 按可听出的切分档位读", ""]
+    verdict_input = (result.get("inputs") or {}).get("verdicts") or {}
+    if verdict_input:
+        lines.append(
+            f"输入裁决：{verdict_input.get('rows')} 行，最后更新 "
+            f"{verdict_input.get('latest_updated_at', '未知')}，"
+            f"分布 {verdict_input.get('verdict_counts')}"
+        )
+        lines.append(f"sha256 {str(verdict_input.get('sha256'))[:16]}…")
+        lines.append("")
     lines.append(
         f"{'stratum':20s} {'offset':>8s} {'n(A+B)':>7s} {'非语义':>7s} "
         f"{'unsure':>7s} {'被切率':>8s}  CI95"

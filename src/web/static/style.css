@@ -691,25 +691,36 @@ main {
 .other-files summary:hover { color: var(--text-2); }
 .other-files .btn-sm { margin-top: 4px; display: inline-block; }
 
+/* Wraps rather than ellipsises: these messages say what setting is missing and
+   where to fill it in, and a clipped one loses exactly that half. */
 .job-error {
   font-size: 11px; color: var(--error); font-family: var(--mono);
   background: var(--error-soft); border: 1px solid rgba(251, 113, 133, 0.22);
   border-radius: var(--radius-xs);
-  padding: 6px 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 6px 10px;
+  white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5;
   user-select: text;
 }
 .job-error-wrap { font-size: 11px; font-family: var(--mono); }
 .job-error-summary {
   list-style: none; cursor: pointer;
-  display: flex; align-items: center; gap: 6px;
+  display: flex; align-items: flex-start; gap: 6px;
   color: var(--error); background: var(--error-soft);
   border: 1px solid rgba(251, 113, 133, 0.22);
   border-radius: var(--radius-xs); padding: 6px 10px;
+  line-height: 1.5;
 }
 .job-error-summary::-webkit-details-marker { display: none; }
-.job-error-summary::before { content: '▸'; font-size: 9px; color: var(--muted); flex-shrink: 0; }
+.job-error-summary::before {
+  content: '▸'; font-size: 9px; color: var(--muted); flex-shrink: 0; line-height: 1.8;
+}
 .job-error-wrap[open] .job-error-summary::before { content: '▾'; }
-.job-error-short { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The collapsed head wraps too, up to three lines - a long provider payload
+   still needs the fold, but the actionable first sentence is never cut. */
+.job-error-short {
+  flex: 1; min-width: 0; overflow: hidden; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
+}
 .job-error-wrap[open] .job-error-short { display: none; }
 .job-error-wrap[open] .job-error-summary::after { content: '收起'; font-size: 10px; color: var(--muted); }
 .job-error-full {

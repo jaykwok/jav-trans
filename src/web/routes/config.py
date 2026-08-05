@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, get_args
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from asr.backends.qwen import active_qwen_asr_model_id
 from core.config import (
@@ -89,6 +89,9 @@ def _runtime_or_env_or_setting(key: str, fallback: str = "") -> str:
 
 
 _ENV_FILE_LOCK = threading.Lock()
+# Any line of the template that no other writer produces. Used to tell "this
+# .env has never been seeded" from "the user deleted the examples on purpose".
+_ENV_TEMPLATE_MARKER = "# Defaults live in src/core/config.py"
 
 
 def _initial_env_template_lines() -> list[str]:
@@ -146,8 +149,17 @@ def _update_env_file(updates: dict[str, str]) -> None:
         lines = (
             env_path.read_text(encoding="utf-8").splitlines(keepends=True)
             if env_path.exists()
-            else _initial_env_template_lines()
+            else []
         )
+        # Seed on "no template yet", not on "no file yet". The first-run
+        # installer creates `.env` before this page can exist - it has to ask
+        # about the proxy before there is a web server - and bootstrap.py is
+        # frozen alone and stdlib-only, so it cannot share this template. Keying
+        # on file existence therefore handed the documented examples only to
+        # users who declined a proxy; everyone who accepted one - the audience
+        # the prompt exists for - kept a four-line `.env` forever.
+        if not any(line.startswith(_ENV_TEMPLATE_MARKER) for line in lines):
+            lines = _initial_env_template_lines() + lines
         pending = dict(updates)
         new_lines: list[str] = []
         for line in lines:
@@ -171,10 +183,6 @@ def _mask_key(k: str) -> str:
     if len(k) <= 8:
         return "***"
     return k[:4] + "****..." + k[-4:]
-
-
-def _truthy(value: str) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _short_model_name(repo_id: str) -> str:
@@ -404,7 +412,16 @@ async def get_config() -> dict[str, Any]:
 
 
 @router.get("/model-requirements")
-async def get_model_requirements() -> dict[str, Any]:
+async def get_model_requirements(
+    include_cuda: bool = Query(default=True),
+) -> dict[str, Any]:
+    """Model readiness, plus the CUDA probe unless the caller opts out.
+
+    The readiness notice re-checks itself on a timer while a model is still
+    missing (a first run downloads it while the notice is on screen). Those polls
+    pass include_cuda=0: the probe spawns a torch-importing child, which is not
+    something to repeat every few seconds next to a running job.
+    """
     load_config()
     # One ASR model serves transcription, the encoder features, and the
     # alignment head; the optional aligner checkpoint rides on
@@ -417,7 +434,8 @@ async def get_model_requirements() -> dict[str, Any]:
         ),
     ]
     missing = [item for item in requirements if not item["present"]]
-    cuda_status = _cuda_environment_status()
+    cuda_status = _cuda_environment_status() if include_cuda else None
+    gpu_ready = bool(cuda_status.get("ok")) if cuda_status else None
     return {
         "required_models": requirements,
         "cuda": cuda_status,
@@ -425,8 +443,8 @@ async def get_model_requirements() -> dict[str, Any]:
         "needs_download": any(item["download_enabled"] for item in missing),
         "download_disabled": any(not item["download_enabled"] for item in missing),
         "all_present": not missing,
-        "gpu_ready": bool(cuda_status.get("ok")),
-        "pipeline_ready": not missing and bool(cuda_status.get("ok")),
+        "gpu_ready": gpu_ready,
+        "pipeline_ready": (not missing and gpu_ready) if cuda_status else None,
     }
 
 
@@ -443,20 +461,8 @@ async def get_settings() -> SettingsRead:
     )
     target_lang = _runtime_or_env_or_setting("TARGET_LANG", "简体中文")
     translation_backend = _runtime_or_env_or_setting("TRANSLATION_BACKEND", "openai")
-    if translation_backend not in {"openai", "local", "llamacpp"}:
+    if translation_backend not in {"openai", "llamacpp"}:
         translation_backend = "openai"
-    local_model_path = _runtime_or_env_or_setting("LOCAL_MODEL_PATH", "")
-    local_model_device = _runtime_or_env_or_setting("LOCAL_MODEL_DEVICE", "cuda")
-    if local_model_device not in {"cuda", "cpu"}:
-        local_model_device = "cuda"
-    try:
-        local_model_max_length = int(
-            _runtime_or_env_or_setting("LOCAL_MODEL_MAX_LENGTH", "32768")
-        )
-    except (TypeError, ValueError):
-        local_model_max_length = 32768
-    local_model_max_length = max(512, min(1_000_000, local_model_max_length))
-    local_model_auto_download = _truthy(_runtime_or_env_or_setting("LOCAL_MODEL_AUTO_DOWNLOAD", "1"))
     llamacpp_server_path = _runtime_or_env_or_setting("LLAMACPP_SERVER_PATH", "")
     llamacpp_model_repo = _runtime_or_env_or_setting("LLAMACPP_MODEL_REPO", "")
     llamacpp_model_file = _runtime_or_env_or_setting("LLAMACPP_MODEL_FILE", "")
@@ -475,10 +481,6 @@ async def get_settings() -> SettingsRead:
         llm_reasoning_effort=llm_reasoning_effort,
         target_lang=target_lang,
         translation_backend=translation_backend,
-        local_model_path=local_model_path,
-        local_model_device=local_model_device,
-        local_model_max_length=local_model_max_length,
-        local_model_auto_download=local_model_auto_download,
         llamacpp_server_path=llamacpp_server_path,
         llamacpp_model_repo=llamacpp_model_repo,
         llamacpp_model_file=llamacpp_model_file,
@@ -489,7 +491,6 @@ async def get_settings() -> SettingsRead:
 @router.post("/settings")
 async def post_settings(update: SettingsUpdate) -> dict:
     changes: dict[str, str] = {}
-    reset_local_translation_backend = False
     reset_llamacpp_translation_backend = False
     if update.api_key is not None:
         changes["API_KEY"] = update.api_key
@@ -521,35 +522,14 @@ async def post_settings(update: SettingsUpdate) -> dict:
         changes["TARGET_LANG"] = update.target_lang
         os.environ["TARGET_LANG"] = update.target_lang
     if update.translation_backend is not None:
-        if update.translation_backend not in {"openai", "local", "llamacpp"}:
+        if update.translation_backend not in {"openai", "llamacpp"}:
             raise HTTPException(
                 status_code=422,
-                detail="translation_backend must be one of: openai, local, llamacpp",
+                detail="translation_backend must be one of: openai, llamacpp",
             )
         changes["TRANSLATION_BACKEND"] = update.translation_backend
         os.environ["TRANSLATION_BACKEND"] = update.translation_backend
-        reset_local_translation_backend = update.translation_backend != "local"
         reset_llamacpp_translation_backend = update.translation_backend != "llamacpp"
-    if update.local_model_path is not None:
-        changes["LOCAL_MODEL_PATH"] = update.local_model_path
-        os.environ["LOCAL_MODEL_PATH"] = update.local_model_path
-        reset_local_translation_backend = True
-    if update.local_model_device is not None:
-        if update.local_model_device not in {"cuda", "cpu"}:
-            raise HTTPException(
-                status_code=422,
-                detail="local_model_device must be one of: cuda, cpu",
-            )
-        changes["LOCAL_MODEL_DEVICE"] = update.local_model_device
-        os.environ["LOCAL_MODEL_DEVICE"] = update.local_model_device
-        reset_local_translation_backend = True
-    if update.local_model_max_length is not None:
-        changes["LOCAL_MODEL_MAX_LENGTH"] = str(update.local_model_max_length)
-        os.environ["LOCAL_MODEL_MAX_LENGTH"] = str(update.local_model_max_length)
-    if update.local_model_auto_download is not None:
-        changes["LOCAL_MODEL_AUTO_DOWNLOAD"] = "1" if update.local_model_auto_download else "0"
-        os.environ["LOCAL_MODEL_AUTO_DOWNLOAD"] = "1" if update.local_model_auto_download else "0"
-        reset_local_translation_backend = True
     for field_name, env_key in (
         ("llamacpp_server_path", "LLAMACPP_SERVER_PATH"),
         ("llamacpp_model_repo", "LLAMACPP_MODEL_REPO"),
@@ -566,15 +546,12 @@ async def post_settings(update: SettingsUpdate) -> dict:
     if changes:
         _clear_saved_hf_mirror_if_present(changes)
         _update_env_file(changes)
-    if reset_local_translation_backend or reset_llamacpp_translation_backend:
+    if reset_llamacpp_translation_backend:
         from llm.backends import reset_backend
 
         # Releasing a model may wait for an active generate() call. Keep that
         # wait off the FastAPI event loop so SSE and cancellation stay alive.
-        if reset_local_translation_backend:
-            await asyncio.to_thread(reset_backend, "local")
-        if reset_llamacpp_translation_backend:
-            await asyncio.to_thread(reset_backend, "llamacpp")
+        await asyncio.to_thread(reset_backend, "llamacpp")
     return {"ok": True}
 
 
@@ -614,9 +591,10 @@ async def get_models() -> dict[str, list[str]]:
     api_key = _runtime_or_env_value("API_KEY")
     base_url = _runtime_or_env_value("OPENAI_COMPATIBILITY_BASE_URL")
     if not api_key or not base_url:
+        missing = "API Key" if not api_key else "API Base URL"
         raise HTTPException(
             status_code=400,
-            detail="API_KEY and OPENAI_COMPATIBILITY_BASE_URL are required",
+            detail=f"缺少「{missing}」：请在「翻译设置」中填写并保存后，再点「获取」。",
         )
 
     errors: list[str] = []
@@ -653,7 +631,10 @@ async def get_models() -> dict[str, list[str]]:
                 return {"models": models}
             errors.append(f"{url}: JSON response did not contain data[].id")
 
-    detail = "Failed to fetch models"
+    detail = (
+        "获取模型列表失败：请确认「API Base URL」填的是服务商的接口地址"
+        "（例如 https://api.deepseek.com），以及该 Key 是否可用。"
+    )
     if errors:
-        detail += ": " + "; ".join(errors)
+        detail += "\n尝试过的地址：" + "; ".join(errors)
     raise HTTPException(status_code=502, detail=detail)

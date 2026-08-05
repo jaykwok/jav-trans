@@ -1,5 +1,5 @@
 import { state } from './state.js';
-import { $ } from './util.js';
+import { $, readErrorDetail } from './util.js';
 import { addLog } from './log.js';
 import { btnAddFolder, btnSubmit, dropZone } from './dom.js';
 import { fetchAllJobs } from './jobsApi.js';
@@ -41,7 +41,7 @@ function readTranslationMaxWorkers() {
 async function pickFiles() {
   try {
     const r = await fetch('/api/pick-files', { method: 'POST' });
-    if (!r.ok) { alert('文件选择失败：' + await r.text()); return; }
+    if (!r.ok) { alert('文件选择失败：' + await readErrorDetail(r)); return; }
     const { paths } = await r.json();
     addPathsToState(paths);
   } catch (e) {
@@ -122,14 +122,14 @@ export function installFiles() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(spec),
       });
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw new Error(await readErrorDetail(r));
       const { ids } = await r.json();
       addLog(`开始 ${ids.length} 个任务：${ids.join(', ')}`, 'stage-start');
       state.files = state.files.filter(f => !pendingIds.has(f.pendingId));
       renderPendingSelection();
       await fetchAllJobs();
     } catch (e) {
-      alert('启动失败：' + e.message);
+      alert('启动失败：\n' + e.message);
     }
     btnSubmit.disabled = state.files.length === 0;
     btnSubmit.textContent = '开始任务';

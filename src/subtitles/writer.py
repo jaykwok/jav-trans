@@ -1109,8 +1109,10 @@ def write_srt(
     blocks = [dict(block) for block in blocks]
     path_obj = Path(path)
     path_obj.parent.mkdir(parents=True, exist_ok=True)
+    kept: list[dict] = []
+    dropped = 0
     with path_obj.open("w", encoding="utf-8-sig") as f:
-        for idx, block in enumerate(blocks, 1):
+        for block in blocks:
             start = _safe_float(block.get("display_start", block.get("start")), 0.0)
             end = max(start + 0.05, _safe_float(block.get("display_end", block.get("end")), start))
             block["start"] = start
@@ -1119,15 +1121,26 @@ def write_srt(
             block["display_end"] = end
             block["display_duration"] = max(0.0, end - start)
 
-            start_str = format_timestamp(start)
-            end_str   = format_timestamp(end)
             zh_text = str(block.get("zh_text", "")).strip()
             wrapped = _render_zh_subtitle_text(zh_text, options=options)
             if not wrapped:
-                logger.warning("Empty translated subtitle at index %s; using placeholder", idx)
-                wrapped = "「未翻译」"
-            f.write(f"{idx}\n{start_str} --> {end_str}\n{wrapped}\n\n")
-    return blocks
+                # Nothing displayable: either the translation was empty, or it
+                # was punctuation only and the CHS style rules (no periods or
+                # commas, no trailing 、) legitimately cleared it. A placeholder
+                # line here read as a translation failure to the viewer; the cue
+                # is dropped instead, and the returned list is what the quality
+                # report and the sidecar see, so all three agree.
+                dropped += 1
+                continue
+            kept.append(block)
+            start_str = format_timestamp(start)
+            end_str   = format_timestamp(end)
+            f.write(f"{len(kept)}\n{start_str} --> {end_str}\n{wrapped}\n\n")
+    if dropped:
+        logger.warning(
+            "Dropped %s of %s cues with no displayable text", dropped, len(blocks)
+        )
+    return kept
 
 
 def write_bilingual_srt(
@@ -1139,8 +1152,10 @@ def write_bilingual_srt(
     """blocks: [{start, end, ja_text, zh_text}] — Japanese line above Chinese."""
     options = _coerce_options(options)
     blocks = [dict(block) for block in blocks]
+    kept: list[dict] = []
+    dropped = 0
     with open(path, "w", encoding="utf-8-sig") as f:
-        for idx, block in enumerate(blocks, 1):
+        for block in blocks:
             start = _safe_float(block.get("display_start", block.get("start")), 0.0)
             end = max(start + 0.05, _safe_float(block.get("display_end", block.get("end")), start))
             block["start"] = start
@@ -1149,18 +1164,26 @@ def write_bilingual_srt(
             block["display_end"] = end
             block["display_duration"] = max(0.0, end - start)
 
-            start_str = format_timestamp(start)
-            end_str   = format_timestamp(end)
             ja_line = _wrap_subtitle_text(block.get("ja_text", ""), options=options)
             zh_line = _render_zh_subtitle_text(
                 str(block.get("zh_text", "")).strip(),
                 options=options,
             )
-            if not zh_line:
-                logger.warning("Empty translated subtitle at index %s; using placeholder", idx)
-                zh_line = "「未翻译」"
+            # No placeholder line: in this mode the Japanese is still worth
+            # showing on its own, and a cue is only dropped when neither side
+            # has anything to display.
             content = "\n".join(
                 line for line in (ja_line + "\n" + zh_line).split("\n") if line.strip()
             )
-            f.write(f"{idx}\n{start_str} --> {end_str}\n{content}\n\n")
-    return blocks
+            if not content.strip():
+                dropped += 1
+                continue
+            kept.append(block)
+            start_str = format_timestamp(start)
+            end_str   = format_timestamp(end)
+            f.write(f"{len(kept)}\n{start_str} --> {end_str}\n{content}\n\n")
+    if dropped:
+        logger.warning(
+            "Dropped %s of %s cues with no displayable text", dropped, len(blocks)
+        )
+    return kept

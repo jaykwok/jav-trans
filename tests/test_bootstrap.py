@@ -51,6 +51,31 @@ class TestEnvFile:
     def test_a_missing_file_is_empty_not_an_error(self, tmp_path: Path) -> None:
         assert bootstrap.read_env_file(tmp_path / "absent") == {}
 
+    def test_quotes_are_stripped_like_the_app_strips_them(self, tmp_path: Path) -> None:
+        """The settings page writes every value quoted, and the app reads the
+        same file through python-dotenv. Reading it literally here would make
+        the two halves of the program disagree about the value."""
+        path = tmp_path / ".env"
+        path.write_text(
+            'PROXY_PROTOCOL="socks5"\nPROXY_HOST="127.0.0.1"\nPROXY_PORT=\'1080\'\n',
+            encoding="utf-8",
+        )
+        assert bootstrap.read_env_file(path) == {
+            "PROXY_PROTOCOL": "socks5",
+            "PROXY_HOST": "127.0.0.1",
+            "PROXY_PORT": "1080",
+        }
+
+    def test_a_proxy_switched_off_in_the_ui_yields_no_proxy(self, tmp_path: Path) -> None:
+        """`PROXY_HOST=""` is how the settings page records "no proxy". Kept as
+        the literal two-character string it is truthy, and every launch exported
+        `HTTP_PROXY=http://"":""` to uv and to the model downloader."""
+        path = tmp_path / ".env"
+        path.write_text(
+            'PROXY_PROTOCOL="http"\nPROXY_HOST=""\nPROXY_PORT=""\n', encoding="utf-8"
+        )
+        assert bootstrap.proxy_url_from(bootstrap.read_env_file(path)) == ""
+
     def test_writing_preserves_unrelated_lines(self, tmp_path: Path) -> None:
         """The settings page owns this file too. Rewriting it wholesale would
         drop the user's API key on the next launch."""
@@ -83,6 +108,11 @@ class TestEnvFile:
         path = tmp_path / ".env"
         bootstrap.update_env_file({"PROXY_HOST": "127.0.0.1"}, path)
         assert bootstrap.read_env_file(path)["PROXY_HOST"] == "127.0.0.1"
+
+    def test_new_file_does_not_start_with_a_blank_line(self, tmp_path):
+        path = tmp_path / ".env"
+        bootstrap.update_env_file({"PROXY_HOST": "127.0.0.1"}, path)
+        assert path.read_text(encoding="utf-8").startswith("# ---")
 
 
 class TestProxyUrl:

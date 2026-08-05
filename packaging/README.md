@@ -9,11 +9,18 @@ offline fallback.
 .\packaging\build_setup.ps1 -Clean
 ```
 
-Produces `dist/release-assets/jav-trans-setup-windows-x64.zip` (~100 MB), whose
-payload is `jav-trans-setup.exe`, `bin/` (FFmpeg Shared), `src/`, `launcher.py`,
+Produces `dist/release-assets/jav-trans-windows-x64.zip` (~100 MB), whose payload
+is `jav-trans.exe`, `bin/` (FFmpeg Shared), `src/`, `launcher.py`,
 `pyproject.toml`, `uv.lock`, and `README.txt`. FFmpeg is most of the size.
 
-PyTorch, the ASR weights, and the CTC head are not in the archive. The installer
+The exe is named `jav-trans.exe`, not `jav-trans-setup.exe`: installing is only
+what the first run does, and it is the launcher on every run after that. Both
+specs therefore build a target named `jav-trans`, so this build stages its
+payload under `dist/setup-payload/jav-trans` and passes its own `--workpath`
+(`build/jav-trans-setup`) - one PyInstaller cache shared by two different
+Analysis inputs is a stale-build trap.
+
+PyTorch, the ASR weights, and the CTC head are not in the archive. The first run
 downloads them on the user's machine, which is what takes a release from ~6 GB
 to ~150 MB and makes a patch release cheap to publish. The console stays open
 during `uv sync` so the user can see the download rate and decide whether they
@@ -23,7 +30,7 @@ need a proxy; `bootstrap.py` measures against the real torch wheel named in
 FFmpeg travels with the archive because TorchCodec loads its shared DLLs at
 import time and uv cannot install them. `launcher.py` finds them at `bin/`.
 
-uv is not bundled. The installer uses one already on `PATH`, and otherwise
+uv is not bundled. The first run uses one already on `PATH`, and otherwise
 downloads the Windows wheel from PyPI into `bin/` - the same host the dependency
 install needs a moment later, so shipping 50-80 MB of uv would buy no
 reachability that the rest of the install does not already require. `-BundleUv`
@@ -57,11 +64,10 @@ It bundles:
 - `src/assets/images/icon.png` for the in-app header, drop zone image, and PNG favicon
 - `src/assets/images/icon.ico` for the pywebview native window icon and packaged executable icon
 - `models/ctc_aligner.pt`, the CTC alignment head
-- the bundled Hugging Face inference model directories:
-  - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`
-  - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`
+- the bundled Hugging Face inference model directory
+  `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`
 
-The build script prepares those two Hugging Face models before running
+The build script prepares that Hugging Face model before running
 PyInstaller. Training-only files such as `optimizer.pt`, scheduler state,
 trainer state, RNG state, and `training_args.bin` are excluded from the package
 even if they exist in the local `models/` directories.

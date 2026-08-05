@@ -368,7 +368,9 @@ def test_download_snapshot_rejects_incomplete_success(monkeypatch, tmp_path):
     fake_module = types.SimpleNamespace(snapshot_download=fake_snapshot_download)
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_module)
 
-    with pytest.raises(RuntimeError, match="did not produce a complete local model"):
+    # The message goes to the task bar, so it says what to do next in Chinese
+    # rather than describing the state in English.
+    with pytest.raises(RuntimeError, match="没有下载完整"):
         model_paths._download_snapshot("owner/repo", target)
 
     assert (target / "model-00001-of-00002.safetensors").exists()
@@ -387,6 +389,66 @@ def test_download_snapshot_rejects_hf_endpoint_without_protocol(monkeypatch, tmp
         model_paths._download_snapshot("owner/repo", tmp_path / "model")
 
 
-def test_huggingface_runtime_cache_is_not_models_top_level():
-    assert model_paths.HF_RUNTIME_CACHE_ROOT == model_paths.PROJECT_ROOT / "tmp" / "cache" / "hf"
-    assert model_paths.HF_RUNTIME_CACHE_ROOT.parent != model_paths.MODELS_ROOT
+def test_downloaded_weights_live_under_models_not_tmp():
+    """`tmp/` is documented as safe to delete. A 5GB GGUF cached there means
+    "clear the cache" silently costs a re-download, so the Hub caches were moved
+    under `models/` on 2026-08-05 - they hold weights, not scratch."""
+    assert model_paths.HF_RUNTIME_CACHE_ROOT == model_paths.MODELS_ROOT
+    assert model_paths.TMP_ROOT not in model_paths.HF_RUNTIME_CACHE_ROOT.parents
+    assert model_paths.HF_RUNTIME_CACHE_ROOT != model_paths.TMP_ROOT
+
+
+def test_no_cache_default_points_back_into_tmp():
+    """Source-level, because both defaults are applied at import time and this
+    module has already been imported. Two independent places set them - the
+    frozen and source branches here, plus `launcher.py` for the packaged
+    entrypoint - and a stale copy is exactly how one of them drifts back."""
+    from pathlib import Path as _Path
+
+    for path in (
+        _Path(model_paths.__file__),
+        model_paths.PROJECT_ROOT / "launcher.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        for line in source.splitlines():
+            if "HF_HUB_CACHE" in line or "HF_XET_CACHE" in line:
+                assert "tmp" not in line, f"{path.name}: {line.strip()}"
+
+
+# --- the CLI token surviving a redirected HF_HOME ------------------------------
+
+
+def test_the_token_path_is_not_derived_from_the_redirected_hf_home():
+    """huggingface_hub computes HF_TOKEN_PATH from HF_HOME, and this app points
+    HF_HOME at ./models so weights land inside the app directory. That silently
+    logged the user out: `hf auth login` writes to the *default* HF_HOME, so
+    every download went out anonymous - slower, and a bare 401 on gated repos.
+    """
+    import os
+
+    token_path = os.environ.get("HF_TOKEN_PATH", "")
+    assert token_path, "HF_TOKEN_PATH must be pinned, not left to HF_HOME"
+    assert token_path == str(model_paths.default_hf_token_path())
+    assert os.path.basename(token_path) == "token"
+
+
+def test_the_token_path_follows_xdg_cache_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    assert model_paths.default_hf_token_path() == tmp_path / "huggingface" / "token"
+
+
+def test_the_token_path_falls_back_to_the_home_cache(monkeypatch, tmp_path):
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.setattr(model_paths.Path, "home", classmethod(lambda cls: tmp_path))
+    assert (
+        model_paths.default_hf_token_path()
+        == tmp_path / ".cache" / "huggingface" / "token"
+    )
+
+
+def test_an_explicit_token_path_is_respected(monkeypatch):
+    """setdefault, not assignment: a user who exports HF_TOKEN_PATH keeps it."""
+    import inspect
+
+    source = inspect.getsource(model_paths)
+    assert 'os.environ.setdefault("HF_TOKEN_PATH"' in source

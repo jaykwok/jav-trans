@@ -7,19 +7,28 @@ param(
     [string]$FfprobeExe = "",
     [string]$SpecPath = "packaging/jav-trans-setup.spec",
     [string]$OutputDir = "dist/release-assets",
-    [string]$ArchiveName = "jav-trans-setup-windows-x64.zip"
+    [string]$ArchiveName = "jav-trans-windows-x64.zip"
 )
 
-# Assemble the lightweight release: the installer executable, uv, FFmpeg, and
-# the source the installer syncs against. Everything else - PyTorch, the ASR
-# weights, the CTC head - is fetched on the user's machine at first run, which
-# is what takes the release from ~6 GB to ~150 MB.
+# Assemble the lightweight release: the entry-point executable, uv, FFmpeg, and
+# the source it syncs against. Everything else - PyTorch, the ASR weights, the
+# CTC head - is fetched on the user's machine at first run, which is what takes
+# the release from ~6 GB to ~150 MB.
+#
+# The exe is jav-trans.exe, not jav-trans-setup.exe: installing is only what the
+# first run does, and it is the launcher every time after that.
 
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $Root
 
-$Payload = Join-Path $Root "dist/jav-trans-setup"
+# Staged one level down so the in-zip folder can be named jav-trans without
+# colliding with the full bundle's onedir output at dist/jav-trans.
+$PayloadRoot = Join-Path $Root "dist/setup-payload"
+$Payload = Join-Path $PayloadRoot "jav-trans"
+# Not shared with the full bundle: both specs build a target named jav-trans, and
+# one PyInstaller cache for two different Analysis inputs is a stale-build trap.
+$WorkPath = Join-Path $Root "build/jav-trans-setup"
 
 function Move-BuildArtifactToRm {
     param(
@@ -82,24 +91,24 @@ foreach ($Pattern in @("avcodec-*.dll", "avformat-*.dll", "avutil-*.dll")) {
 }
 
 if ($Clean) {
-    Move-BuildArtifactToRm $Payload "dist-jav-trans-setup"
-    & uv run --no-sync python -m PyInstaller --noconfirm --clean $SpecPath
+    Move-BuildArtifactToRm $Payload "dist-jav-trans-setup-payload"
+    & uv run --no-sync python -m PyInstaller --noconfirm --clean --workpath $WorkPath $SpecPath
 } else {
-    & uv run --no-sync python -m PyInstaller --noconfirm $SpecPath
+    & uv run --no-sync python -m PyInstaller --noconfirm --workpath $WorkPath $SpecPath
 }
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-$SetupExe = Join-Path $Root "dist/jav-trans-setup.exe"
-if (-not (Test-Path $SetupExe)) {
-    throw "Build finished but the installer was not found: $SetupExe"
+$EntryExe = Join-Path $Root "dist/jav-trans.exe"
+if (-not (Test-Path $EntryExe)) {
+    throw "Build finished but the executable was not found: $EntryExe"
 }
 
 New-Item -ItemType Directory -Force -Path $Payload | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $Payload "bin") | Out-Null
 
-Move-Item -LiteralPath $SetupExe -Destination (Join-Path $Payload "jav-trans-setup.exe") -Force
+Move-Item -LiteralPath $EntryExe -Destination (Join-Path $Payload "jav-trans.exe") -Force
 if ($UvSource) {
     Copy-Item -LiteralPath $UvSource -Destination (Join-Path $Payload "uv.exe") -Force
 }

@@ -60,6 +60,10 @@ def test_model_requirements_includes_cuda_driver_warning(tmp_path, monkeypatch):
     asyncio.run(_test_model_requirements_includes_cuda_driver_warning(tmp_path, monkeypatch))
 
 
+def test_model_requirements_can_skip_the_cuda_probe(tmp_path, monkeypatch):
+    asyncio.run(_test_model_requirements_can_skip_the_cuda_probe(tmp_path, monkeypatch))
+
+
 def test_cuda_environment_status_reads_frozen_probe_file(tmp_path, monkeypatch):
     config_routes._cuda_environment_status.cache_clear()
     monkeypatch.setattr(config_routes, "is_frozen", lambda: True)
@@ -151,6 +155,54 @@ def test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch):
     asyncio.run(_test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch))
 
 
+def test_settings_seeds_template_into_an_installer_written_env(tmp_path, monkeypatch):
+    """The installer writes `.env` before the web page can exist, so keying the
+    template off "file missing" gave the examples only to users who declined a
+    proxy - the opposite of who needs them. Seed off the marker instead, and
+    never clobber the proxy the installer just wrote."""
+    from dotenv import dotenv_values
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "# --- network proxy (written by the first-run installer) ---\n"
+        "PROXY_PROTOCOL=http\nPROXY_HOST=127.0.0.1\nPROXY_PORT=7890\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_routes, "PROJECT_ROOT", tmp_path)
+
+    config_routes._update_env_file({"TARGET_LANG": "简体中文"})
+    text = env_path.read_text(encoding="utf-8")
+    assert config_routes._ENV_TEMPLATE_MARKER in text
+    assert "# ASR_BATCH_SIZE_BY_REPO=" in text
+    values = dotenv_values(env_path)
+    assert values["PROXY_HOST"] == "127.0.0.1"
+    assert values["PROXY_PORT"] == "7890"
+    assert values["TARGET_LANG"] == "简体中文"
+
+    config_routes._update_env_file({"TARGET_LANG": "繁體中文"})
+    second = env_path.read_text(encoding="utf-8")
+    assert second.count(config_routes._ENV_TEMPLATE_MARKER) == 1
+    assert dotenv_values(env_path)["TARGET_LANG"] == "繁體中文"
+
+
+def test_settings_respects_a_user_who_deleted_the_examples(tmp_path, monkeypatch):
+    """Seeding is one-shot. A user who stripped the commented block does not get
+    it pushed back on every save."""
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "# jav-trans local overrides.\n"
+        "# Defaults live in src/core/config.py. Keep these examples commented unless\n"
+        'TARGET_LANG="简体中文"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_routes, "PROJECT_ROOT", tmp_path)
+
+    config_routes._update_env_file({"TARGET_LANG": "English"})
+    text = env_path.read_text(encoding="utf-8")
+    assert "# ASR_BATCH_SIZE_BY_REPO=" not in text
+    assert text.count(config_routes._ENV_TEMPLATE_MARKER) == 1
+
+
 def test_models_api_falls_back_to_v1_models(monkeypatch):
     asyncio.run(_test_models_api_falls_back_to_v1_models(monkeypatch))
 
@@ -161,6 +213,16 @@ def test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
 
 def test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch):
     asyncio.run(_test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch))
+
+
+def test_jobs_api_rejects_a_job_that_cannot_translate(tmp_path, monkeypatch):
+    asyncio.run(_test_jobs_api_rejects_a_job_that_cannot_translate(tmp_path, monkeypatch))
+
+
+def test_retry_rejects_and_then_rereads_translation_settings(tmp_path, monkeypatch):
+    asyncio.run(
+        _test_retry_rejects_and_then_rereads_translation_settings(tmp_path, monkeypatch)
+    )
 
 
 def test_public_error_message_prefers_exception_detail():
@@ -309,6 +371,34 @@ async def _test_model_requirements_missing_model_needs_download(tmp_path, monkey
     assert payload["download_disabled"] is False
     assert payload["all_present"] is False
     assert payload["pipeline_ready"] is False
+
+
+async def _test_model_requirements_can_skip_the_cuda_probe(tmp_path, monkeypatch):
+    """The readiness notice polls this while a model downloads; the probe spawns
+    a torch-importing child, so the poll must be able to leave it out."""
+    _isolate_model_requirement_env(tmp_path, monkeypatch)
+    probes = 0
+
+    def counting_probe():
+        nonlocal probes
+        probes += 1
+        return {"status": "ok", "ok": True, "code": "ok", "message": "CUDA 可用。"}
+
+    monkeypatch.setattr(config_routes, "_cuda_environment_status", counting_probe)
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        skipped = await client.get("/api/model-requirements?include_cuda=0")
+        included = await client.get("/api/model-requirements")
+
+    assert skipped.status_code == 200
+    assert skipped.json()["cuda"] is None
+    assert skipped.json()["missing_count"] == 1
+    assert included.json()["cuda"]["ok"] is True
+    assert probes == 1
 
 
 async def _test_model_requirements_includes_cuda_driver_warning(tmp_path, monkeypatch):
@@ -780,6 +870,9 @@ async def _test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch):
 
 async def _test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    # POST /api/jobs preflights the translation config; pin a key so the test
+    # exercises snapshotting rather than the machine's .env.
+    monkeypatch.setenv("API_KEY", "test-key")
     monkeypatch.setenv("ASR_CONTEXT", "小那海")
     monkeypatch.setenv("TRANSLATION_GLOSSARY", "ねこ-猫")
     monkeypatch.setenv("TARGET_LANG", "繁體中文")
@@ -815,6 +908,7 @@ async def _test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
 
 async def _test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch):
     monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    monkeypatch.setenv("API_KEY", "test-key")
     await _reset_pm_state()
 
     try:
@@ -933,5 +1027,81 @@ async def _test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
         assert (open_kind, str(video_path.resolve())) in opened
         assert (open_kind, str(artifact_path.resolve())) in opened
         assert (open_kind, str(output_dir.resolve())) in opened
+    finally:
+        await _reset_pm_state()
+
+
+async def _test_jobs_api_rejects_a_job_that_cannot_translate(tmp_path, monkeypatch):
+    """A forgotten API key is worth 400 at submit, not ten minutes of ASR."""
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
+    monkeypatch.setenv("API_KEY", "")
+    await _reset_pm_state()
+
+    try:
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            rejected = await client.post(
+                "/api/jobs",
+                json={"video_paths": ["sample.mp4"]},
+            )
+            assert rejected.status_code == 400
+            detail = rejected.json()["detail"]
+            assert "API Key" in detail and "翻译设置" in detail
+            assert await pm.list_jobs() == []
+
+            # The same job with translation off has nothing to preflight.
+            accepted = await client.post(
+                "/api/jobs",
+                json={"video_paths": ["sample.mp4"], "skip_translation": True},
+            )
+            assert accepted.status_code == 201
+    finally:
+        await _reset_pm_state()
+
+
+async def _test_retry_rejects_and_then_rereads_translation_settings(tmp_path, monkeypatch):
+    """Retry runs with the settings in effect now, not the ones that failed."""
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
+    monkeypatch.setenv("API_KEY", "test-key")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "medium")
+    monkeypatch.setenv("LLM_API_FORMAT", "chat")
+    await _reset_pm_state()
+
+    try:
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            created = await client.post(
+                "/api/jobs",
+                json={"video_paths": ["sample.mp4"]},
+            )
+            assert created.status_code == 201
+            job_id = created.json()["ids"][0]
+            assert (await client.delete(f"/api/jobs/{job_id}")).status_code == 200
+
+            queued_spec = (await client.get(f"/api/jobs/{job_id}")).json()["spec"]
+            assert queued_spec["llm_reasoning_effort"] == "medium"
+
+            # Clearing the key blocks the retry with the same actionable message.
+            monkeypatch.setenv("API_KEY", "")
+            blocked = await client.post(f"/api/jobs/{job_id}/retry")
+            assert blocked.status_code == 400
+            assert "API Key" in blocked.json()["detail"]
+
+            monkeypatch.setenv("API_KEY", "test-key")
+            monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
+            monkeypatch.setenv("LLM_API_FORMAT", "responses")
+            retried = await client.post(f"/api/jobs/{job_id}/retry")
+            assert retried.status_code == 200
+            spec = retried.json()["spec"]
+            assert spec["llm_reasoning_effort"] == "none"
+            assert spec["llm_api_format"] == "responses"
     finally:
         await _reset_pm_state()

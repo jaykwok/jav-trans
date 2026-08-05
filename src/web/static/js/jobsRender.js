@@ -1,5 +1,5 @@
 import { state } from './state.js';
-import { escHtml } from './util.js';
+import { escHtml, readErrorDetail } from './util.js';
 import { jobArea, jobAreaHeader, emptyState, btnClearDone } from './dom.js';
 import { addLog } from './log.js';
 
@@ -60,6 +60,28 @@ function clampPct(value) {
 }
 
 export const CLEARABLE = new Set(['done', 'failed', 'cancelled']);
+
+// Our own messages name the missing setting and the panel that fills it in, so
+// they are shown whole (wrapped, never ellipsised). Only a payload long enough
+// to bury the card - a provider traceback, say - still gets folded away, and
+// even then the first line stays visible.
+const MAX_INLINE_ERROR_CHARS = 260;
+
+function renderJobError(error) {
+  const text = String(error ?? '').trim();
+  if (!text) return '';
+  if (text.length <= MAX_INLINE_ERROR_CHARS) {
+    return `<div class="job-error">${escHtml(text)}</div>`;
+  }
+  const firstLine = text.split('\n')[0];
+  const head = firstLine.length > MAX_INLINE_ERROR_CHARS
+    ? `${firstLine.slice(0, MAX_INLINE_ERROR_CHARS)}…`
+    : firstLine;
+  return `<details class="job-error-wrap">
+            <summary class="job-error-summary"><span class="job-error-short">${escHtml(head)}</span></summary>
+            <pre class="job-error-full">${escHtml(text)}</pre>
+          </details>`;
+}
 
 function jobTitle(job) {
   if (!job.spec?.video_paths?.length) return job.id;
@@ -183,14 +205,7 @@ export function renderJobs() {
       ? `<button class="btn-sm btn-folder" data-folder="${escHtml(folderPath)}" title="打开输出文件夹">📂 文件夹</button>`
       : '';
 
-    const errorMsg = job.status === 'failed' && job.error
-      ? job.error.length > 100
-        ? `<details class="job-error-wrap">
-            <summary class="job-error-summary"><span class="job-error-short">${escHtml(job.error.slice(0, 100))}…</span></summary>
-            <pre class="job-error-full">${escHtml(job.error)}</pre>
-          </details>`
-        : `<div class="job-error">${escHtml(job.error)}</div>`
-      : '';
+    const errorMsg = job.status === 'failed' ? renderJobError(job.error) : '';
 
     const dl = job._download;
     const dlPct = dl ? clampPct(dl.pct ?? 0) : 0;
@@ -267,8 +282,11 @@ export function renderJobs() {
   });
 }
 
-// fetchAllJobs is injected from main.js to avoid circular imports
-export function installJobAreaHandlers(fetchAllJobs) {
+// fetchAllJobs and syncSettings are injected from main.js to avoid circular
+// imports. syncSettings pushes the panel's current values to the server before a
+// retry, so 重试 honours a setting the user just changed - which is usually why
+// they are retrying at all.
+export function installJobAreaHandlers(fetchAllJobs, syncSettings = null) {
   jobArea.addEventListener('click', async e => {
     const pending = e.target.closest('[data-remove-pending]');
     if (pending) {
@@ -321,13 +339,14 @@ export function installJobAreaHandlers(fetchAllJobs) {
       const job = state.jobs[retry.dataset.retry];
       if (job?.spec) {
         try {
+          if (syncSettings) await syncSettings();
           const r = await fetch(`/api/jobs/${retry.dataset.retry}/retry`, { method: 'POST' });
           if (r.ok) {
             const retried = await r.json();
             addLog(`重试任务：${retried.id}`, 'stage-start');
             await fetchAllJobs();
           } else {
-            alert('重试失败：' + await r.text());
+            alert('重试失败：\n' + await readErrorDetail(r));
           }
         } catch (e) {
           alert('重试出错：' + e.message);

@@ -140,3 +140,47 @@ def test_single_cache_still_works_without_repeats(caches):
     cache = FeatureCache([galgame])
     assert len(cache.rows) == 2
     assert all(row["cache_index"] == 0 for row in cache.rows)
+
+
+class TestOneFeasibilityJudgment:
+    """Extraction, inference and the loss must agree on "the text fits".
+
+    They did not. Three sites carried three different bounds - the extractor
+    filtered on `frames < len(text)`, inference refused `frames < len(targets)+1`,
+    and `zero_infinity=True` silently zeroed whatever reached the loss anyway.
+    None of them counted the mandatory blank between adjacent identical
+    characters, which Japanese produces constantly (`ああ`, `っっ`, `ーー`).
+
+    The consequence was ordered badly: the *looser* check ran first, so a clip
+    could pass extraction, train against a silently-zeroed loss, and then be
+    refused at inference by the stricter one.
+    """
+
+    def test_the_extractor_uses_the_same_bound_as_inference(self) -> None:
+        source = (
+            PROJECT_ROOT / "tools" / "align" / "build_alignment_features.py"
+        ).read_text(encoding="utf-8")
+        assert "minimum_ctc_frames" in source
+        # The bound that ignored repeated characters, in either of its spellings.
+        assert "frames < len(row[" not in source
+        assert "len(text) > duration" not in source
+
+    def test_the_trainer_counts_what_zero_infinity_hides(self) -> None:
+        """`zero_infinity` turns an infeasible row into a zero loss, not an
+        error, so it dilutes every reported loss with no other symptom."""
+        source = (
+            PROJECT_ROOT / "tools" / "align" / "train_ctc_aligner.py"
+        ).read_text(encoding="utf-8")
+        assert "minimum_ctc_frames" in source
+        assert "infeasible_rows" in source
+        # Counted at the length CTC actually sees, not the cached frame count.
+        assert 'int(row["frames"]) * args.upsample' in source
+
+    def test_the_extractor_bound_rejects_a_clip_inference_would_refuse(self) -> None:
+        """The property behind the source assertions: no clip may pass
+        extraction and then be refused by `forced_align`."""
+        from asr.alignment import minimum_ctc_frames
+
+        # あああ: three frames of text, but five frames of CTC path.
+        assert minimum_ctc_frames("あああ") == 5
+        assert minimum_ctc_frames("あああ") > len("あああ")

@@ -1,12 +1,9 @@
 import json
 import contextlib
-import hashlib
 import os
 import re
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from pathlib import Path
 from typing import Callable
 
 from openai import OpenAI
@@ -18,12 +15,12 @@ from llm import global_glossary
 from llm import repair as repair_module
 from llm import profiles as profiles_module
 from llm.profiles import json_v3
-from llm.profiles import sakura_galtransl as sakura_module
+from llm.profiles.base import ProfileContext
 from llm import settings as llm_settings
 from llm import transport_util
 from llm.backends import get_backend, selected_backend_name
 from llm.backends import openai_compat as openai_transport
-from llm.glossary import normalize_glossary_text, parse_glossary_pairs
+from llm.glossary import normalize_glossary_text
 from llm import prompt as prompt_module
 from llm.errors import (
     RetryableTranslationFormatError,
@@ -47,13 +44,6 @@ _normalize_source_text = prompt_module._normalize_source_text
 
 _cancel_requested = transport_util._cancel_requested
 _raise_if_cancelled = transport_util._raise_if_cancelled
-
-
-def _required_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"{name} must be set in config.py or .env")
-    return value
 
 
 OPENAI_COMPATIBILITY_BASE_URL = llm_settings.OPENAI_COMPATIBILITY_BASE_URL
@@ -86,31 +76,24 @@ TRANSLATION_REPAIR_CONTEXT_RADIUS = llm_settings.TRANSLATION_REPAIR_CONTEXT_RADI
 TRANSLATION_REPAIR_LENGTH_RATIO_MIN = llm_settings.TRANSLATION_REPAIR_LENGTH_RATIO_MIN
 TRANSLATION_REPAIR_LENGTH_RATIO_MAX = llm_settings.TRANSLATION_REPAIR_LENGTH_RATIO_MAX
 
-_TRANSLATION_OUTPUT_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "translations": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "id": {"type": "integer"},
-                    "text": {"type": "string"},
-                },
-                "required": ["id", "text"],
-            },
-        },
-    },
-    "required": ["translations"],
-}
-
 _GLOSSARY_OUTPUT_SCHEMA = global_glossary._GLOSSARY_OUTPUT_SCHEMA
+
+# Distinguishes "caller said nothing" from "caller said no schema". The line
+# contract needs the second, and collapsing them would hand Hy-MT2 a JSON
+# grammar - the configuration that scored 152/300 untranslated against 6/300
+# on its own template.
+_SCHEMA_UNSET: dict = {"__schema__": "unset"}
 
 
 def _translation_output_schema() -> dict:
-    return json.loads(json.dumps(_TRANSLATION_OUTPUT_SCHEMA))
+    """The JSON contract's schema, owned by the profile that defines it.
+
+    This used to be a second literal copy living here, which meant
+    `profile.schema` was never actually read by anything on the request path.
+    """
+    from llm.profiles.json_v3 import TRANSLATION_OUTPUT_SCHEMA
+
+    return json.loads(json.dumps(TRANSLATION_OUTPUT_SCHEMA))
 
 
 _is_deepseek_model = openai_transport._is_deepseek_model
@@ -183,15 +166,7 @@ def _effective_prompt_version() -> str:
 
 def _translation_context_char_limit() -> int:
     """Conservative prompt-context budget before per-batch JSON is added."""
-    if selected_backend_name() != "local":
-        return TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS
-    try:
-        max_length = int(os.getenv("LOCAL_MODEL_MAX_LENGTH", "32768"))
-    except ValueError:
-        max_length = 32768
-    # Japanese/Chinese often approach one token per character. Reserve roughly
-    # half the window for the system prompt, requested batch, and generation.
-    return max(2048, int(max_length * 0.45))
+    return TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS
 
 
 def _compute_prompt_signature(
@@ -379,54 +354,39 @@ def translate_segments(
 
     effective_max_workers = max(1, int(max_workers))
     backend_name = selected_backend_name()
-    if backend_name == "local":
-        effective_max_workers = 1
-    elif backend_name == "llamacpp":
+    if backend_name == "llamacpp":
         # More client workers than server slots just queue inside llama-server
         # and inflate per-request latency past the watchdog timeouts.
         effective_max_workers = min(
             effective_max_workers,
             _env_int_clamped("LLAMACPP_PARALLEL", 4, 1, 16),
         )
+    # Selected before sizing because a profile may cap the batch. The cap is
+    # applied after the worker-aware sizing rather than instead of it, so a
+    # one-cue-per-request contract still saturates the pool - it just does so
+    # with more, smaller requests.
+    profile = profiles_module.select_profile()
     effective_batch_size = _auto_translation_batch_size(
         len(segments),
         effective_max_workers,
     )
+    profile_batch_cap = profile.max_batch_size()
+    if profile_batch_cap is not None:
+        effective_batch_size = min(effective_batch_size, max(1, int(profile_batch_cap)))
     effective_cache_path = cache_path or ""
     effective_target_lang = (target_lang or DEFAULT_TARGET_LANG).strip() or DEFAULT_TARGET_LANG
     effective_glossary = normalize_glossary_text(glossary)
     effective_character_reference = (character_reference or "").strip()
+    _warn_about_inert_context(
+        profile,
+        glossary=effective_glossary,
+        character_reference=effective_character_reference,
+    )
     previous_retry_events = getattr(_RETRY_CONTEXT, "events", None)
     retry_events: list[dict] = []
     _RETRY_CONTEXT.events = retry_events
     try:
         _raise_if_cancelled(cancel_event)
-        profile = profiles_module.select_profile()
-        if profile.id == "sakura_galtransl":
-            # Sakura/GalTransl models answer their own line-oriented template
-            # only; the JSON batch contract (and the JSON repair pass) would
-            # produce garbage. Mismatches fall back line-by-line inside.
-            zh_texts, timings = engine_module.run_line_profile(
-                segments,
-                profile=profile,
-                backend=get_backend(),
-                batch_size=_env_int_clamped("SAKURA_BATCH_SIZE", 8, 1, 32),
-                shard_limit=min(
-                    effective_max_workers,
-                    _env_int_clamped("SAKURA_WORKERS", 4, 1, 16),
-                ),
-                cache_path=effective_cache_path,
-                cache_lock=_cache_lock,
-                target_lang=effective_target_lang,
-                glossary=effective_glossary,
-                character_reference=effective_character_reference,
-                reasoning_effort=_effective_reasoning_effort(reasoning_effort),
-                on_batch_done=on_batch_done,
-                on_progress=on_progress,
-                cancel_event=cancel_event,
-            )
-            return zh_texts, timings, list(retry_events)
-
         extra_glossary_value = (
             _resolve_translation_extra_glossary(
                 segments,
@@ -562,9 +522,12 @@ def _chat_with_reasoning(
     expected_count: int,
     reasoning_effort: str | None = None,
     api_format: str | None = None,
+    max_tokens: int | None = None,
     on_progress: Callable[[dict], None] | None = None,
     on_usage: Callable[[dict], None] | None = None,
     cancel_event: threading.Event | None = None,
+    bounded_response_schema: dict | None = None,
+    response_schema: dict | None = _SCHEMA_UNSET,
 ) -> str:
     _raise_if_cancelled(cancel_event)
     effective_effort = _normalize_reasoning_effort(
@@ -576,6 +539,12 @@ def _chat_with_reasoning(
         "cancel_event": cancel_event,
         "reasoning_effort": effective_effort,
     }
+    if max_tokens is not None:
+        chat_kwargs["max_tokens"] = max_tokens
+    if bounded_response_schema is not None:
+        chat_kwargs["bounded_response_schema"] = bounded_response_schema
+    if response_schema is not _SCHEMA_UNSET:
+        chat_kwargs["response_schema"] = response_schema
     if api_format is not None:
         chat_kwargs["api_format"] = api_format
     if on_usage is not None:
@@ -648,12 +617,6 @@ def _auto_translation_batch_size(segment_count: int, max_workers: int) -> int:
     count = max(0, int(segment_count))
     if count <= 0:
         return 0
-    if selected_backend_name() == "local":
-        try:
-            local_batch_size = int(os.getenv("LOCAL_MODEL_BATCH_SIZE", "16"))
-        except ValueError:
-            local_batch_size = 16
-        return min(count, max(1, min(64, local_batch_size)))
     workers = max(1, int(max_workers))
     if workers == 1:
         # Nothing to balance. Splitting here would only pay the per-request
@@ -784,18 +747,50 @@ _emit_progress = transport_util._emit_progress
 _make_aggregated_progress_callback = engine_module._make_aggregated_progress_callback
 
 
+def _warn_about_inert_context(profile, *, glossary: str, character_reference: str) -> None:
+    """Say so when the chosen contract cannot carry a setting the user filled in.
+
+    Accepting a glossary and silently ignoring it is the "配置项写了没人读"
+    failure this repo hunts elsewhere; the local per-line contract genuinely
+    cannot use one (every context layer measured worse on Hy-MT2), but the user
+    typed it into the UI and is entitled to know where it went.
+    """
+    reporter = getattr(profile, "warn_about_inert_context", None)
+    if reporter is None:
+        return
+    inert = reporter(
+        ProfileContext(glossary=glossary, character_reference=character_reference)
+    )
+    if inert:
+        print(
+            f"[translation] 本地逐句翻译不使用：{'、'.join(inert)}"
+            "（这些设置只在 OpenAI 兼容 API 后端生效）",
+            flush=True,
+        )
+
+
 def _chat(
     messages: list[dict],
     expected_count: int = 0,
     on_progress: Callable[[dict], None] | None = None,
     reasoning_effort: str | None = None,
     api_format: str | None = None,
+    max_tokens: int | None = None,
     on_usage: Callable[[dict], None] | None = None,
     cancel_event: threading.Event | None = None,
-    response_schema: dict | None = None,
+    response_schema: dict | None = _SCHEMA_UNSET,
     response_schema_name: str = "subtitle_translations",
+    bounded_response_schema: dict | None = None,
 ) -> str:
     _raise_if_cancelled(cancel_event)
+    if response_schema is _SCHEMA_UNSET:
+        response_schema = _translation_output_schema()
+    # The configured value is a ceiling for API models; a caller-supplied budget
+    # is an upper bound on what this particular reply can legitimately need, and
+    # is what stops a local model looping to the ceiling.
+    effective_max_tokens = min(
+        TRANSLATION_MAX_TOKENS, max_tokens if max_tokens is not None else TRANSLATION_MAX_TOKENS
+    )
     backend_name = selected_backend_name()
     if backend_name != "openai":
         backend = get_backend(backend_name)
@@ -803,8 +798,14 @@ def _chat(
             messages,
             temperature=TRANSLATION_TEMPERATURE,
             top_p=TRANSLATION_TOP_P,
-            max_tokens=TRANSLATION_MAX_TOKENS,
-            response_format=response_schema or _translation_output_schema(),
+            max_tokens=effective_max_tokens,
+            # Local-only, and deliberately not passed to the OpenAI transports
+            # below: their strict structured-output mode validates against a
+            # fixed keyword allowlist that has no `maxLength` for strings, so
+            # sending it is a 400 at request time rather than a tighter grammar.
+            # Nothing is lost - the repetition loop this bounds was only ever
+            # measured on local GGUF models, never on an API one.
+            response_format=bounded_response_schema or response_schema,
             reasoning_effort=reasoning_effort,
             api_format=api_format,
             expected_count=expected_count,
@@ -822,6 +823,7 @@ def _chat(
             cancel_event=cancel_event,
             response_schema=response_schema,
             response_schema_name=response_schema_name,
+            max_tokens=effective_max_tokens,
         )
     return _chat_completions(
         messages,
@@ -832,6 +834,7 @@ def _chat(
         cancel_event=cancel_event,
         response_schema=response_schema,
         response_schema_name=response_schema_name,
+        max_tokens=effective_max_tokens,
     )
 
 

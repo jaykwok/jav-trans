@@ -17,10 +17,6 @@ REQUIRED_MODEL_SPECS = [
         "label": "bundled default 1.7B ASR / SpeechBoundary model",
         "repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
     },
-    {
-        "label": "bundled low-config 0.6B ASR / SpeechBoundary model",
-        "repo_id": "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf",
-    },
 ]
 
 

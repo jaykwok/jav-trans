@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, status
 
+from llm.preflight import translation_config_problems
 from web.models import JobSpec, JobState
 from web import pipeline_manager as pm
 
@@ -11,6 +12,12 @@ router = APIRouter()
 
 @router.post("/jobs", status_code=status.HTTP_201_CREATED)
 async def post_jobs(spec: JobSpec) -> dict[str, list[str]]:
+    # Refuse a job whose translation stage cannot possibly run rather than
+    # discovering it after ASR has spent ten minutes on the video.
+    if not spec.skip_translation:
+        problems = translation_config_problems()
+        if problems:
+            raise HTTPException(status_code=400, detail="\n".join(problems))
     jobs = await pm.create_job(spec)
     return {"ids": [job.id for job in jobs]}
 
@@ -33,6 +40,10 @@ async def retry_job(job_id: str) -> JobState:
     job = await pm.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    if not job.spec.skip_translation:
+        problems = translation_config_problems()
+        if problems:
+            raise HTTPException(status_code=400, detail="\n".join(problems))
     retried = await pm.retry_job(job_id)
     if retried is None:
         raise HTTPException(

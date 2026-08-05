@@ -15,10 +15,12 @@ from typing import Callable
 
 from openai import OpenAI
 
+from core.stage_errors import MISSING_MODEL
 from llm import settings as llm_settings
 from llm import transport_util
 from llm.backends.base import BaseTranslationBackend
 from llm.errors import RetryableTranslationFormatError
+from llm.preflight import require_translation_config
 
 _raise_if_cancelled = transport_util._raise_if_cancelled
 _emit_progress = transport_util._emit_progress
@@ -57,13 +59,6 @@ _CLIENT_KEY: tuple[str, str] = ("", "")
 _CLIENT_LOCK = threading.Lock()
 
 
-def _required_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"{name} must be set in config.py or .env")
-    return value
-
-
 def _is_deepseek_model(model_name: str | None) -> bool:
     return "deepseek" in (model_name or "").lower()
 
@@ -85,6 +80,9 @@ def _normalize_openai_compat_base_url(base_url: str | None) -> str | None:
 
 def _get_client() -> OpenAI:
     global _CLIENT, _CLIENT_KEY
+    # Ask first, so a forgotten API key reads as the setting it is instead of
+    # the SDK's "The api_key client option must be set ..." from __init__.
+    require_translation_config("openai")
     current_key = os.getenv("API_KEY", "").strip() or None
     current_url = _normalize_openai_compat_base_url(
         os.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip()
@@ -297,7 +295,7 @@ def _chat_completions(
     _raise_if_cancelled(cancel_event)
     model_name = os.getenv("LLM_MODEL_NAME", llm_settings.LLM_MODEL_NAME).strip()
     if not model_name:
-        raise RuntimeError("请先在「翻译设置」中获取并选择翻译模型，再开始任务")
+        raise RuntimeError(MISSING_MODEL)
     effective_effort = llm_settings._normalize_reasoning_effort(
         reasoning_effort
         or os.getenv("LLM_REASONING_EFFORT", llm_settings.LLM_REASONING_EFFORT)
@@ -429,7 +427,7 @@ def _chat_responses(
     _raise_if_cancelled(cancel_event)
     model_name = os.getenv("LLM_MODEL_NAME", llm_settings.LLM_MODEL_NAME).strip()
     if not model_name:
-        raise RuntimeError("请先在「翻译设置」中获取并选择翻译模型，再开始任务")
+        raise RuntimeError(MISSING_MODEL)
 
     effective_reasoning_effort = llm_settings._normalize_reasoning_effort(
         reasoning_effort

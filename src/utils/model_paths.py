@@ -11,7 +11,10 @@ RESOURCE_ROOT = resource_root()
 MODELS_ROOT = PROJECT_ROOT / "models"
 BUNDLED_MODELS_ROOT = RESOURCE_ROOT / "models"
 TMP_ROOT = PROJECT_ROOT / "tmp"
-HF_RUNTIME_CACHE_ROOT = TMP_ROOT / "cache" / "hf"
+# Downloaded weights belong with the other models, not in the throwaway
+# tree: `tmp/` is documented as safe to delete, and a 5GB GGUF landing
+# there means "clear the cache" silently costs a re-download.
+HF_RUNTIME_CACHE_ROOT = MODELS_ROOT
 DEFAULT_HF_ENDPOINT = "https://huggingface.co"
 DEFAULT_INFERENCE_IGNORE_PATTERNS = [
     "optimizer.pt",
@@ -40,14 +43,30 @@ MODEL_WEIGHT_PATTERNS = (
 )
 SHARDED_SAFETENSORS_RE = re.compile(r"^model-\d{5}-of-\d{5}\.safetensors$")
 
+def default_hf_token_path() -> Path:
+    """Where ``hf auth login`` actually put the token.
+
+    huggingface_hub derives ``HF_TOKEN_PATH`` from ``HF_HOME``, and this app
+    redirects ``HF_HOME`` so weights land inside the app directory - which
+    silently logs the user out: the token sits at the *default* HF_HOME and is
+    never read. Every download then goes out anonymous, which is slower and is
+    a flat 401 on any gated repo, with nothing saying why. Pinning the token
+    path back keeps `hf auth login` meaning what it says without copying a
+    secret into the project tree.
+    """
+    cache_root = os.getenv("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(cache_root) / "huggingface" / "token"
+
+
 if is_frozen():
     os.environ.setdefault("HF_HOME", str(MODELS_ROOT))
     os.environ.setdefault("HF_HUB_CACHE", str(HF_RUNTIME_CACHE_ROOT / "hub"))
     os.environ.setdefault("HF_XET_CACHE", str(HF_RUNTIME_CACHE_ROOT / "xet"))
 else:
     os.environ.setdefault("HF_HOME", "./models")
-    os.environ.setdefault("HF_HUB_CACHE", "./tmp/cache/hf/hub")
-    os.environ.setdefault("HF_XET_CACHE", "./tmp/cache/hf/xet")
+    os.environ.setdefault("HF_HUB_CACHE", "./models/hub")
+    os.environ.setdefault("HF_XET_CACHE", "./models/xet")
+os.environ.setdefault("HF_TOKEN_PATH", str(default_hf_token_path()))
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
@@ -283,9 +302,9 @@ def _download_snapshot(
             hf_progress.fallback_done(fallback_token)
     if not _path_has_model_files(target_dir):
         raise RuntimeError(
-            f"Model download for {repo_id} did not produce a complete local model at "
-            f"{_project_relative(target_dir)}. The partial files were kept; retrying "
-            "the run will continue the download."
+            f"模型 {repo_id} 没有下载完整（已下载的部分保留在 "
+            f"{_project_relative(target_dir)}）。请检查网络后重试，重试会接着下载；"
+            "网络太慢可以先在「网络代理」中配置代理。"
         )
     return str(target_dir)
 

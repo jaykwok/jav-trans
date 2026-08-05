@@ -101,11 +101,13 @@ def list_backends() -> list[str]:
 
 def _register_builtin_backends() -> None:
     from llm.backends.llamacpp_server import LlamaCppServerBackend
-    from llm.backends.local_model import LocalModelBackend
     from llm.backends.openai_compat import OpenAICompatBackend
 
+    # Two backends, matching the two prompt contracts: an OpenAI-compatible API
+    # for the JSON batch contract, and llama.cpp for the local per-line one. The
+    # in-process Transformers backend was removed on 2026-08-05 - it was a third
+    # way to run a local model that no shipped model targeted.
     register_backend("openai", OpenAICompatBackend)
-    register_backend("local", LocalModelBackend)
     register_backend("llamacpp", LlamaCppServerBackend)
 
 

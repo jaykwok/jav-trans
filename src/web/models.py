@@ -68,11 +68,7 @@ class SettingsRead(BaseModel):
     llm_api_format: Literal["chat", "responses"] = "chat"
     llm_reasoning_effort: Literal["none", "medium", "max"] = "medium"
     target_lang: str = "简体中文"
-    translation_backend: Literal["openai", "local", "llamacpp"] = "openai"
-    local_model_path: str = ""
-    local_model_device: Literal["cuda", "cpu"] = "cuda"
-    local_model_max_length: int = 32768
-    local_model_auto_download: bool = True
+    translation_backend: Literal["openai", "llamacpp"] = "openai"
     llamacpp_server_path: str = ""
     llamacpp_model_repo: str = ""
     llamacpp_model_file: str = ""
@@ -90,11 +86,7 @@ class SettingsUpdate(BaseModel):
     llm_api_format: Literal["chat", "responses"] | None = None
     llm_reasoning_effort: Literal["none", "medium", "max"] | None = None
     target_lang: str | None = None
-    translation_backend: Literal["openai", "local", "llamacpp"] | None = None
-    local_model_path: str | None = None
-    local_model_device: Literal["cuda", "cpu"] | None = None
-    local_model_max_length: int | None = Field(default=None, ge=512, le=1000000)
-    local_model_auto_download: bool | None = None
+    translation_backend: Literal["openai", "llamacpp"] | None = None
     llamacpp_server_path: str | None = None
     llamacpp_model_repo: str | None = None
     llamacpp_model_file: str | None = None

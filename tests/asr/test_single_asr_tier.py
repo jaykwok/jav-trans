@@ -3,8 +3,13 @@
 It was unmaintained, and the CTC alignment head is only trained against the
 1.7B encoder, so a second tier meant every setting, registry and OOM message
 carried a per-repo dimension that no one was validating. These tests pin the
-removal across all four surfaces it used to touch: the repo registry, the
-default settings, the job schema, and the browser.
+removal across all five surfaces it used to touch: the repo registry, the
+default settings, the job schema, the browser, and the installer.
+
+The installer surface was added on 2026-08-05, after the original sweep missed
+it: `src/` had been clean since 07-31, but `packaging/` kept downloading and
+bundling the 0.6B weights into every release. Nothing failed - the release was
+just permanently larger for a model no code path could select.
 """
 
 from __future__ import annotations
@@ -53,6 +58,17 @@ def test_job_spec_rejects_the_dropped_backend() -> None:
 def test_browser_cannot_offer_the_dropped_backend() -> None:
     static = ROOT / "src" / "web" / "static"
     sources = [static / "index.html"] + sorted((static / "js").glob("*.js"))
+    for path in sources:
+        assert "0.6B" not in path.read_text(encoding="utf-8"), path
+
+
+def test_the_installer_does_not_download_or_bundle_the_dropped_repo() -> None:
+    """`packaging/` is a separate surface from `src/` and was missed by the
+    original removal: it kept fetching the 0.6B weights in
+    `prepare_default_model.py` and adding them to the PyInstaller `datas`."""
+    packaging = ROOT / "packaging"
+    sources = sorted(packaging.glob("*.py")) + sorted(packaging.glob("*.spec"))
+    assert sources, "packaging sources not found"
     for path in sources:
         assert "0.6B" not in path.read_text(encoding="utf-8"), path
 

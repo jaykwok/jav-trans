@@ -44,6 +44,17 @@ LLM_API_FORMAT = os.getenv("LLM_API_FORMAT", "chat").strip().lower() or "chat"
 LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "medium").strip() or "medium"
 
 TRANSLATION_MAX_TOKENS = 384000
+# Arithmetic bound on how long a reply may legitimately get, so a model that
+# falls into a repetition loop stops at the bound instead of at
+# TRANSLATION_MAX_TOKENS (a ceiling sized for API models, i.e. no bound at all
+# locally). Measured 2026-08-04 over 1098 clean translations from three local
+# models: output/source character ratio p50 0.69, p95 0.88, p99 0.97, max 1.27.
+# Chinese is denser than Japanese kana, so a translation is essentially never
+# longer than its source; the ratio below leaves margin over the observed max
+# while still being far under a loop. Validated against 20 real 12-line batches:
+# none would have been cut, tightest margin 1.76x. Raising it only costs time on
+# runaway replies; lowering it below ~1.3 starts truncating real translations.
+TRANSLATION_OUTPUT_CHAR_RATIO = _env_float("TRANSLATION_OUTPUT_CHAR_RATIO", 1.5)
 TRANSLATION_TEMPERATURE = _env_float("LLM_TEMPERATURE", 0.6)
 TRANSLATION_TOP_P = 0.9
 # Worker-independent request granularity. Env override (restart required);

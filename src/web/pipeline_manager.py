@@ -16,6 +16,7 @@ from typing import Any
 from core import events
 from core.config import DEFAULT_SETTINGS
 from core.job_context import JobContext
+from core.stage_errors import describe_stage_failure
 from pipeline.artifacts import (
     AsrArtifacts,
     load_translation_artifacts_snapshot,
@@ -190,10 +191,7 @@ def _is_pipeline_cancelled(exc: BaseException) -> bool:
 
 
 def _public_error_message(exc: BaseException) -> str:
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, str) and detail.strip():
-        return detail.strip()
-    return str(exc)
+    return describe_stage_failure(exc)
 
 
 def _resume_cache_job_id(job: JobState) -> str:
@@ -254,28 +252,45 @@ def _runtime_setting(key: str, fallback: str = "") -> str:
     return str(DEFAULT_SETTINGS.get(key, fallback)).strip()
 
 
-def _snapshot_translation_settings(spec: JobSpec) -> JobSpec:
-    updates: dict[str, str] = {}
-
-    target_lang = getattr(spec, "target_lang", None)
-    if target_lang is None or not str(target_lang).strip():
-        updates["target_lang"] = _runtime_setting("TARGET_LANG", "简体中文") or "简体中文"
-
-    if getattr(spec, "translation_glossary", None) is None:
-        updates["translation_glossary"] = _runtime_setting("TRANSLATION_GLOSSARY", "")
-
-    if getattr(spec, "llm_api_format", None) is None:
-        updates["llm_api_format"] = _normalize_llm_api_format(
+def _current_translation_settings() -> dict[str, str]:
+    return {
+        "target_lang": _runtime_setting("TARGET_LANG", "简体中文") or "简体中文",
+        "translation_glossary": _runtime_setting("TRANSLATION_GLOSSARY", ""),
+        "llm_api_format": _normalize_llm_api_format(
             _runtime_setting("LLM_API_FORMAT", "chat")
-        )
-
-    reasoning_effort = getattr(spec, "llm_reasoning_effort", None)
-    if reasoning_effort is None or not str(reasoning_effort).strip():
-        updates["llm_reasoning_effort"] = _normalize_llm_reasoning_effort(
+        ),
+        "llm_reasoning_effort": _normalize_llm_reasoning_effort(
             _runtime_setting("LLM_REASONING_EFFORT", "medium")
-        )
+        ),
+    }
 
+
+def _snapshot_translation_settings(spec: JobSpec) -> JobSpec:
+    """Fill in whatever the caller left out, from the settings in effect now."""
+    current = _current_translation_settings()
+    updates: dict[str, str] = {}
+    for name, value in current.items():
+        given = getattr(spec, name, None)
+        # An empty glossary is a real choice; an empty language or format is not.
+        blank = given is None or (
+            name != "translation_glossary" and not str(given).strip()
+        )
+        if blank:
+            updates[name] = value
     return spec.model_copy(update=updates) if updates else spec
+
+
+def _refresh_translation_settings(spec: JobSpec) -> JobSpec:
+    """Re-read the translation settings that a retry should honour.
+
+    The spec is a snapshot taken when the job was queued, which is what keeps a
+    draining queue consistent while the panel is being edited. A retry is a new
+    decision, though - usually made *because* a setting was just changed - so it
+    runs with the current values instead of replaying the ones that failed.
+    Without this, turning 推理强度 down to none and hitting 重试 re-ran the job
+    with the effort it was queued with, and the thinking tokens kept coming.
+    """
+    return spec.model_copy(update=_current_translation_settings())
 
 
 def _job_context(job: JobState) -> JobContext:
@@ -578,6 +593,7 @@ async def retry_job(job_id: str) -> JobState | None:
         retry_artifacts = _load_translation_retry_artifacts(job)
         retried = job.model_copy(
             update={
+                "spec": _refresh_translation_settings(job.spec),
                 "status": "queued",
                 "current_stage": None,
                 "progress": {},

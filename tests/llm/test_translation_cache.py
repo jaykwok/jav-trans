@@ -410,11 +410,11 @@ class TestSignatureCoversWhatChangesTheTranslation:
         assert full != fallback
 
     def test_a_backend_without_thinking_keeps_its_existing_keys(self, monkeypatch):
-        """The fix must not fragment caches it does not concern: the local backend
-        has no tier to configure, so the tier stays out of its signature and every
-        entry written before this change still resolves."""
+        """The fix must not fragment caches it does not concern: the llama.cpp
+        backend has no tier to configure, so the tier stays out of its signature
+        and every entry written before this change still resolves."""
         segments = _segments(2)
-        monkeypatch.setenv("TRANSLATION_BACKEND", "local")
+        monkeypatch.setenv("TRANSLATION_BACKEND", "llamacpp")
         monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
         low = translator._translation_cache_key(0, segments)
         monkeypatch.setenv("LLM_REASONING_EFFORT", "max")

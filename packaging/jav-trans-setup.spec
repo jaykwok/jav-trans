@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Build the first-run installer as a single console executable.
+"""Build the release entry point as a single console executable.
 
 Deliberately the opposite of jav-trans-web.spec: that one freezes the whole
 environment, this one freezes nothing but `bootstrap.py` and lets uv build a
@@ -7,9 +7,15 @@ real virtual environment at the user's machine. A PyInstaller bundle is not an
 installable environment - you cannot `uv sync` into it - so the installer has to
 stay outside the thing it installs.
 
-`console=True` is the feature, not an oversight: the reason for shipping an
-installer at all is that the user can watch uv download torch and decide whether
-they need a proxy.
+Named `jav-trans`, not `jav-trans-setup`: installing is only what the first run
+does, and every run after that launches the app. Both specs therefore produce a
+`jav-trans` name - build_setup.ps1 passes its own --workpath so the two builds
+cannot share PyInstaller's analysis cache, and onefile writes `dist/jav-trans.exe`
+next to (not into) the full bundle's `dist/jav-trans/`.
+
+`console=True` is the feature, not an oversight: the reason for shipping this
+rather than a frozen bundle is that the user can watch uv download torch and
+decide whether they need a proxy.
 """
 
 from pathlib import Path
@@ -72,7 +78,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="jav-trans-setup",
+    name="jav-trans",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

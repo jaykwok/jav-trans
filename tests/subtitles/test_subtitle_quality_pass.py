@@ -16,17 +16,72 @@ def _cue_count(content: str) -> int:
     return len(re.findall(r"^\d+$", content.lstrip("﻿"), flags=re.MULTILINE))
 
 
-def test_bilingual_srt_uses_placeholder_for_empty_translation(tmp_path, caplog):
+def test_bilingual_srt_keeps_the_japanese_when_the_translation_is_empty(tmp_path):
+    """No 「未翻译」 line: it read as a translation failure to the viewer, and in
+    this mode the Japanese is still worth showing on its own."""
     path = tmp_path / "out.srt"
 
-    subtitle.write_bilingual_srt(
+    written = subtitle.write_bilingual_srt(
         [{"start": 0.0, "end": 1.0, "ja_text": "いい", "zh_text": ""}],
         str(path),
     )
 
     content = path.read_text(encoding="utf-8")
-    assert "「未翻译」" in content
-    assert "Empty translated subtitle" in caplog.text
+    assert "「未翻译」" not in content
+    assert "いい" in content
+    assert len(written) == 1
+
+
+def test_a_punctuation_only_translation_is_not_a_translation(tmp_path):
+    """The CHS style rules clear 。 / ， / 、 by design (no periods or commas,
+    no trailing 、). A cue whose whole translation was punctuation therefore has
+    nothing to display - which is what nonverbal cues translate to in practice."""
+    path = tmp_path / "punct.srt"
+
+    written = subtitle.write_srt(
+        [
+            {"start": 0.0, "end": 1.0, "ja_text": "あっ…", "zh_text": "。"},
+            {"start": 1.0, "end": 2.0, "ja_text": "いや", "zh_text": "不要"},
+            {"start": 2.0, "end": 3.0, "ja_text": "ああ", "zh_text": "、、、"},
+        ],
+        str(path),
+    )
+
+    content = path.read_text(encoding="utf-8")
+    assert "「未翻译」" not in content
+    assert [block["zh_text"] for block in written] == ["不要"]
+    # Renumbered, not just skipped: a gap in the sequence breaks some players.
+    assert _cue_count(content) == 1
+    assert content.lstrip("﻿").startswith("1\n")
+
+
+def test_a_dropped_cue_is_dropped_from_the_returned_blocks_too(tmp_path):
+    """The quality report and the .json sidecar are built from the return value,
+    so a cue kept there but missing from the SRT would make them disagree."""
+    path = tmp_path / "all-punct.srt"
+
+    written = subtitle.write_srt(
+        [{"start": 0.0, "end": 1.0, "ja_text": "あっ", "zh_text": "，"}],
+        str(path),
+    )
+
+    assert written == []
+    assert path.read_text(encoding="utf-8-sig") == ""
+
+
+def test_bilingual_drops_a_cue_only_when_both_lines_are_empty(tmp_path):
+    path = tmp_path / "both.srt"
+
+    written = subtitle.write_bilingual_srt(
+        [
+            {"start": 0.0, "end": 1.0, "ja_text": "", "zh_text": "。"},
+            {"start": 1.0, "end": 2.0, "ja_text": "はい", "zh_text": "。"},
+        ],
+        str(path),
+    )
+
+    assert [block["ja_text"] for block in written] == ["はい"]
+    assert _cue_count(path.read_text(encoding="utf-8")) == 1
 
 
 def test_write_bilingual_srt_does_not_normalize_unprepared_blocks(tmp_path):

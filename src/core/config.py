@@ -174,45 +174,36 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Comma-separated Japanese-to-Chinese term mapping injected into translation prompts.
     "TRANSLATION_GLOSSARY": "ちんぽ-肉棒, チンポ-肉棒, おちんちん-肉棒, チンポコ-肉棒",
 
-    # --- Local Model Settings (when TRANSLATION_BACKEND=local) ---
-    # Local model path (HuggingFace model ID or local path)
-    # Examples: Qwen/Qwen2.5-72B-Instruct, Tencent-Hunyuan/Hunyuan-Large
-    "LOCAL_MODEL_PATH": "",
-    # Device for local model inference: cuda | cpu
-    "LOCAL_MODEL_DEVICE": "cuda",
-    # Empty selects float32 on CPU and bfloat16 on CUDA.
-    "LOCAL_MODEL_DTYPE": "",
-    # Maximum context length for local model
-    "LOCAL_MODEL_MAX_LENGTH": "32768",
-    # Conservative batch and generation caps for in-process inference.
-    "LOCAL_MODEL_BATCH_SIZE": "16",
-    "LOCAL_MODEL_MAX_NEW_TOKENS": "8192",
-    # Auto-download model from HuggingFace if not present locally
-    "LOCAL_MODEL_AUTO_DOWNLOAD": "1",
-
     # --- llama.cpp GGUF Settings (when TRANSLATION_BACKEND=llamacpp) ---
-    # Runs Sakura/GalTransl and other quantized GGUF models through a managed
-    # local llama-server process (official prebuilt CUDA binaries; OpenAI
-    # protocol on 127.0.0.1). Empty server path means "find llama-server on
-    # PATH" (winget install llama.cpp).
+    # Runs quantized GGUF models through a managed local llama-server process
+    # (official prebuilt CUDA binaries; OpenAI protocol on 127.0.0.1). Empty
+    # server path means "find llama-server on PATH" (winget install -e --id
+    # ggml.llamacpp, which is the Vulkan build; the CUDA zip is faster on
+    # NVIDIA and has to be pointed at explicitly).
     "LLAMACPP_SERVER_PATH": "",
-    # Default model: GalTransl 7B v3.7 Q6_K -- the galgame-specialized JA->ZH
-    # tier the model card recommends for 8GB GPUs (~6.3GB file, CC-BY-NC-SA).
-    "LLAMACPP_MODEL_REPO": "SakuraLLM/Sakura-GalTransl-7B-v3.7",
-    "LLAMACPP_MODEL_FILE": "Sakura-Galtransl-7B-v3.7.gguf",
+    # Default model: Hy-MT2-1.8B Q8_0 (~2GB), driven by the `hymt2` per-line
+    # profile rather than the JSON batch contract. Chosen for local hardware on
+    # 2026-08-05: a 9B at Q4 fits an 8GB card only at two server slots, where a
+    # 1.8B at Q8 runs eight, and the measured end-to-end difference on 300 real
+    # cues was ~11x (0.88 vs 9.97 lines/s). The context layers the JSON contract
+    # buys are largely unavailable here anyway - a whole-transcript prefix does
+    # not fit the local context budget.
+    "LLAMACPP_MODEL_REPO": "tencent/Hy-MT2-1.8B-GGUF",
+    "LLAMACPP_MODEL_FILE": "Hy-MT2-1.8B-Q8_0.gguf",
     # Explicit local GGUF path wins over repo+file download.
     "LLAMACPP_GGUF_PATH": "",
     # Context per server slot; total server context is CTX_SIZE * PARALLEL.
     "LLAMACPP_CTX_SIZE": "8192",
     "LLAMACPP_N_GPU_LAYERS": "999",
-    "LLAMACPP_PARALLEL": "4",
+    # Eight slots, because the default model is now ~2GB rather than ~5.5GB and
+    # the per-line contract makes requests small. Raise CTX_SIZE, not this, if a
+    # custom GGUF needs the JSON contract's longer prompts.
+    "LLAMACPP_PARALLEL": "8",
     "LLAMACPP_STARTUP_TIMEOUT_S": "300",
-    # Sakura line-oriented prompt profile: auto | sakura | json. auto switches
-    # on exactly when the configured model is a Sakura/GalTransl variant.
+    # Prompt contract: auto | json (off/none are accepted aliases for json).
+    # Only the JSON contract ships, so auto resolves to json everywhere; the
+    # switch stays because adding a model family means registering a profile.
     "TRANSLATION_PROMPT_PROFILE": "auto",
-    "SAKURA_BATCH_SIZE": "8",
-    "SAKURA_WORKERS": "4",
-    "SAKURA_HISTORY_LINES": "8",
 
     # --- Output & Cache ---
     # Root directory for per-video temporary files.

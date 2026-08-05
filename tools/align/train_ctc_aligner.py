@@ -35,6 +35,7 @@ from asr.alignment import (  # noqa: E402
     BLANK_INDEX,
     AlignmentVocab,
     build_head,
+    minimum_ctc_frames,
 )
 from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
 
@@ -225,6 +226,32 @@ def main() -> None:
     def _key(row: dict) -> tuple[int, str]:
         return int(row.get("cache_index") or 0), row["audio_id"]
 
+    # What `zero_infinity` is actually hiding. A row whose frames cannot hold its
+    # targets contributes a zero loss, not an error: it trains on nothing while
+    # counting as a sample, so it dilutes the reported loss by exactly its share
+    # and there is no other symptom. The extractor filters these, but it filters
+    # on characters at 1x while training runs on encoded targets at `--upsample`,
+    # so the two judgments only agree if both use `minimum_ctc_frames` - and a
+    # vocab change can create new ones under either. Counted once, up front,
+    # because a rate here invalidates every loss number below it.
+    infeasible = [
+        row
+        for row in cache.rows
+        if encoded[_key(row)]
+        and int(row["frames"]) * args.upsample < minimum_ctc_frames(encoded[_key(row)])
+    ]
+    infeasible_by_partition = Counter(
+        str(row.get("partition") or "train") for row in infeasible
+    )
+    if infeasible:
+        print(
+            f"  WARNING: {len(infeasible)} of {len(cache.rows)} rows "
+            f"({len(infeasible) / len(cache.rows):.2%}) cannot fit their targets "
+            f"at --upsample {args.upsample}; zero_infinity will zero their loss "
+            f"silently. by partition: {dict(infeasible_by_partition)}",
+            flush=True,
+        )
+
     def batches(rows: list[dict], *, shuffle: bool):
         """Length-bucketed batches, shuffled at the batch level.
 
@@ -368,6 +395,11 @@ def main() -> None:
         "vocab_size": vocab.size,
         "vocab_coverage": round(covered / total, 5) if total else 0.0,
         "head_parameters": parameters,
+        # Rows whose loss `zero_infinity` zeroed. Non-zero means every loss in
+        # `history` is diluted by that fraction and the run is not comparable
+        # with one where it is zero.
+        "infeasible_rows": len(infeasible),
+        "infeasible_rows_by_partition": dict(infeasible_by_partition),
         "upsample": args.upsample,
         "epochs": args.epochs,
         "best_val_loss": round(best_val, 4) if math.isfinite(best_val) else None,

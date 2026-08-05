@@ -6,13 +6,36 @@ import { setActivePreset } from './presets.js';
 const _SUBTITLE_MODE_LABELS = { zh: '中文字幕', bilingual: '中日双语' };
 
 let _modelRequirementsRequestSeq = 0;
+let _modelRequirementsTimer = null;
+let _lastCudaStatus = null;
+
+const MODEL_REQUIREMENTS_POLL_MS = 15000;
+
+// The notice used to be drawn once at page load, so the "缺少 <model>" banner
+// stayed up through the download that removed the reason for it - and for the
+// whole run after that. Re-check on a timer while something is still missing.
+function scheduleModelRequirementsPoll(missingModels) {
+  if (_modelRequirementsTimer) {
+    clearTimeout(_modelRequirementsTimer);
+    _modelRequirementsTimer = null;
+  }
+  if (!missingModels) return;
+  _modelRequirementsTimer = setTimeout(() => {
+    _modelRequirementsTimer = null;
+    refreshModelRequirements({ includeCuda: false });
+  }, MODEL_REQUIREMENTS_POLL_MS);
+}
 
 function renderModelRequirements(payload) {
   const notice = $('model-requirements-notice');
   if (!notice) return;
   const missing = (payload.required_models || []).filter(item => !item.present);
-  const cuda = payload.cuda || {};
+  // Polls skip the CUDA probe (it spawns a torch import), so keep the last
+  // verdict instead of reading its absence as "no problem".
+  if (payload.cuda) _lastCudaStatus = payload.cuda;
+  const cuda = payload.cuda || _lastCudaStatus || {};
   const cudaProblem = cuda.status && cuda.status !== 'ok';
+  scheduleModelRequirementsPoll(missing.length > 0);
   if (!missing.length && !cudaProblem) {
     notice.hidden = true;
     notice.textContent = '';
@@ -48,13 +71,16 @@ function renderModelRequirements(payload) {
   notice.hidden = false;
 }
 
-export async function refreshModelRequirements() {
+export async function refreshModelRequirements({ includeCuda = true } = {}) {
   const notice = $('model-requirements-notice');
   if (!notice) return;
 
   const requestSeq = ++_modelRequirementsRequestSeq;
+  const url = includeCuda
+    ? '/api/model-requirements'
+    : '/api/model-requirements?include_cuda=0';
   try {
-    const r = await fetch('/api/model-requirements');
+    const r = await fetch(url);
     if (requestSeq !== _modelRequirementsRequestSeq) return;
     if (!r.ok) {
       notice.hidden = true;
@@ -120,53 +146,10 @@ export async function loadSettings() {
       $('api-model-preview').textContent = '当前：' + s.model;
     }
 
-    // Local model backend fields
-    if (s.local_model_path) {
-      const presets = [
-        'Qwen/Qwen3-4B',
-        'Qwen/Qwen3-8B',
-        'Qwen/Qwen3-14B',
-      ];
-      const preset = $('local-model-preset');
-      if (preset) {
-        if (presets.includes(s.local_model_path)) {
-          preset.value = s.local_model_path;
-        } else {
-          preset.value = 'custom';
-          const pathField = $('local-model-path-field');
-          if (pathField) pathField.style.display = '';
-          const pathInput = $('local-model-path');
-          if (pathInput) pathInput.value = s.local_model_path;
-        }
-      }
-    }
-    if (s.local_model_device) {
-      const device = $('local-model-device');
-      if (device) device.value = s.local_model_device;
-    }
-    if (s.local_model_max_length) {
-      const maxLen = $('local-model-max-length');
-      if (maxLen) maxLen.value = s.local_model_max_length;
-    }
-    if (s.local_model_auto_download !== undefined) {
-      const autoDownload = $('local-model-auto-download');
-      if (autoDownload) autoDownload.checked = s.local_model_auto_download;
-    }
-
-    // llama.cpp (Sakura / GGUF) backend fields
-    const lcPreset = $('llamacpp-model-preset');
-    if (lcPreset) {
-      if (s.llamacpp_gguf_path) {
-        lcPreset.value = 'custom';
-        const pathField = $('llamacpp-gguf-path-field');
-        if (pathField) pathField.style.display = '';
-        const pathInput = $('llamacpp-gguf-path');
-        if (pathInput) pathInput.value = s.llamacpp_gguf_path;
-      } else if (s.llamacpp_model_repo && s.llamacpp_model_file) {
-        const key = `${s.llamacpp_model_repo}|${s.llamacpp_model_file}`;
-        if ([...lcPreset.options].some(opt => opt.value === key)) lcPreset.value = key;
-      }
-    }
+    // llama.cpp (local GGUF) backend fields. There is no model picker: one
+    // built-in model ships, and an empty path means "use it".
+    const lcPath = $('llamacpp-gguf-path');
+    if (lcPath) lcPath.value = s.llamacpp_gguf_path || '';
     const lcServer = $('llamacpp-server-path');
     if (lcServer && s.llamacpp_server_path) lcServer.value = s.llamacpp_server_path;
 
@@ -215,7 +198,7 @@ function normalizeGlossaryLine(line) {
 }
 
 // JobSpec is `extra="forbid"`, so the job body may carry only fields it
-// declares. Backend choice and local-model config belong to the settings API
+// declares. Backend choice belongs to the settings API
 // (already persisted by `syncSettingsFromFormForSubmit` before submit) and
 // would make POST /api/jobs fail with 422 if they leaked in here.
 export function readJobTranslationSpecFromForm() {
@@ -235,25 +218,11 @@ export function readTranslationSettingsFromForm() {
     ...readJobTranslationSpecFromForm(),
   };
 
-  if (backend === 'local') {
-    const preset = $('local-model-preset')?.value || '';
-    const customPath = $('local-model-path')?.value?.trim() || '';
-    body.local_model_path = preset === 'custom' ? customPath : preset;
-    body.local_model_device = $('local-model-device')?.value || 'cuda';
-    body.local_model_max_length = parseInt($('local-model-max-length')?.value || '32768', 10);
-    body.local_model_auto_download = !!$('local-model-auto-download')?.checked;
-  }
-
   if (backend === 'llamacpp') {
-    const preset = $('llamacpp-model-preset')?.value || '';
-    if (preset === 'custom') {
-      body.llamacpp_gguf_path = $('llamacpp-gguf-path')?.value?.trim() || '';
-    } else if (preset.includes('|')) {
-      const [repo, file] = preset.split('|');
-      body.llamacpp_model_repo = repo;
-      body.llamacpp_model_file = file;
-      body.llamacpp_gguf_path = '';
-    }
+    // Only the override travels. repo/file are left alone so clearing the box
+    // falls back to the shipped default rather than pinning whatever this
+    // build happened to name.
+    body.llamacpp_gguf_path = $('llamacpp-gguf-path')?.value?.trim() || '';
     body.llamacpp_server_path = $('llamacpp-server-path')?.value?.trim() || '';
   }
 
@@ -467,24 +436,8 @@ export function installSettingsPanel() {
     const backend = $('translation-backend').value;
     const openaiFields = $('openai-backend-fields');
     const llamacppFields = $('llamacpp-backend-fields');
-    const localFields = $('local-backend-fields');
     if (openaiFields) openaiFields.style.display = backend === 'openai' ? '' : 'none';
     if (llamacppFields) llamacppFields.style.display = backend === 'llamacpp' ? '' : 'none';
-    if (localFields) localFields.style.display = backend === 'local' ? '' : 'none';
-  });
-
-  // Local model preset switcher
-  $('local-model-preset')?.addEventListener('change', () => {
-    const preset = $('local-model-preset').value;
-    const pathField = $('local-model-path-field');
-    if (pathField) pathField.style.display = preset === 'custom' ? '' : 'none';
-  });
-
-  // llama.cpp GGUF preset switcher
-  $('llamacpp-model-preset')?.addEventListener('change', () => {
-    const preset = $('llamacpp-model-preset').value;
-    const pathField = $('llamacpp-gguf-path-field');
-    if (pathField) pathField.style.display = preset === 'custom' ? '' : 'none';
   });
 
 }

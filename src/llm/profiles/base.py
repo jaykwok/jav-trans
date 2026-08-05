@@ -29,8 +29,6 @@ class ProfileContext:
     # Full-transcript JSON payload for prefix-cache-friendly prompts (JSON
     # contract only; None disables the prefix).
     full_source_payload: str | None = None
-    # Rolling translated history for line-oriented profiles (most recent last).
-    history: tuple[str, ...] = ()
     total_count: int = 0
     compact_system_prompt: bool = False
     # Per-request scheduling info the engine fills in: which batch this is and
@@ -45,13 +43,6 @@ class TranslationProfile(abc.ABC):
     id: str = ""
     version: str = ""
 
-    # Scheduling: contiguous shards with sequential in-shard execution so the
-    # rolling history is real, instead of free parallel batches.
-    needs_history: bool = False
-    history_limit: int = 0
-    # Retry ladder: after batch-level format retries are exhausted, may the
-    # engine fall back to one-line-per-request?
-    line_capable: bool = False
     # Orchestration stages the profile opts into.
     wants_repair_pass: bool = False
     wants_extra_glossary: bool = False
@@ -66,9 +57,43 @@ class TranslationProfile(abc.ABC):
         that alters output for identical input."""
         return f"{self.id}@{self.version}"
 
-    def sampling(self, batch_size: int) -> dict:
-        """Sampling overrides (temperature/top_p/max_tokens) for a batch."""
-        return {}
+    def max_batch_size(self) -> int | None:
+        """Hard cap on how many cues may share one request, or None for no cap.
+
+        A cap, not a preference: the line-oriented contract returns one bare
+        translation with no ids in it, so two cues in one request cannot be told
+        apart afterwards. `translate_segments` applies this *after* its own
+        worker-aware sizing, so a capped profile still fills the worker pool -
+        it just does so with more, smaller requests.
+        """
+        return None
+
+    def response_token_budget(self, segments: list[dict]) -> int | None:
+        """Upper bound on reply length for these segments, or None for no bound.
+
+        Not a tuning knob: it is how long the answer *can* be, so a model stuck
+        in a repetition loop stops at the bound rather than at the configured
+        ceiling. Profiles own it because only the profile knows what structure
+        it asked the model to emit around the translations.
+        """
+        del segments
+        return None
+
+    def bounded_schema(self, segments: list[dict]) -> dict | None:
+        """`schema` narrowed to what these segments can legitimately produce.
+
+        The static `schema` pins the shape but not the size, so a model can sit
+        inside the grammar and still write one field forever. Returning None
+        means "the static schema is already tight enough".
+
+        Separate from `response_token_budget` because they fail differently: a
+        token budget truncates the reply mid-string and leaves unparseable JSON,
+        while a bound in the grammar makes the runaway *unrepresentable* - the
+        sampler cannot pick a token that would exceed it, so the reply is still
+        valid JSON. Only the second one is a correctness fix.
+        """
+        del segments
+        return None
 
     def serialize_source(
         self,

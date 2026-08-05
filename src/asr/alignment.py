@@ -34,6 +34,7 @@ pre-decode gate the pipeline needs. So blank is index 0 and stays interpretable.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 import json
@@ -57,6 +58,31 @@ RESERVED_INDICES = 2
 
 ALIGNMENT_VOCAB_SCHEMA = "asr_ctc_alignment_char_vocab_v1"
 ALIGNMENT_MODEL_SCHEMA = "asr_ctc_alignment_head_v1"
+
+
+def minimum_ctc_frames(targets: Sequence) -> int:
+    """Shortest frame count that admits a monotonic CTC path for `targets`.
+
+    Every label needs one frame of its own, and each pair of *adjacent identical*
+    labels needs a mandatory blank between them - otherwise the two collapse into
+    one emission and the path spells something shorter than the target. Leading
+    and trailing blanks are optional, so they cost nothing.
+
+    The obvious `len(targets) + 1` is wrong in both directions, and both were
+    reproduced: `[a, b]` at T=2 has the legal path `a b` yet gets rejected, while
+    `[a, a, a]` at T=4 needs 5 frames, passes the guard, and dies much later in
+    the backtrace with `alignment path skipped character 0`. Japanese hits the
+    second case routinely - `ああ`, `っっ`, `ーー`, and any doubled punctuation.
+
+    Works on encoded indices or on the characters themselves. Characters are a
+    lower bound when several out-of-vocabulary characters sit next to each other,
+    since those all encode to `UNK_INDEX` and become an adjacent-identical pair
+    the character view cannot see; the encoded view is the authoritative one.
+    """
+    if len(targets) == 0:
+        return 0
+    repeats = sum(1 for a, b in zip(targets, targets[1:]) if a == b)
+    return len(targets) + repeats
 
 
 def normalize_text(text: str) -> str:
@@ -225,10 +251,13 @@ def forced_align(
     for token in targets:
         extended.extend((token, BLANK_INDEX))
     states = len(extended)
-    if frames < states - len(targets):
-        # Fewer frames than characters: no monotonic path exists at all.
+    required = minimum_ctc_frames(targets)
+    if frames < required:
+        # Too few frames for any monotonic path: one per character, plus the
+        # blank each pair of identical neighbours must be held apart by.
         raise ValueError(
-            f"cannot align {len(targets)} characters to {frames} frames; "
+            f"cannot align {len(targets)} characters to {frames} frames "
+            f"(needs at least {required}); "
             "raise the upsample factor or shorten the segment"
         )
 

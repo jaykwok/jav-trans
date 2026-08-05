@@ -74,10 +74,8 @@ def test_translation_backend_choice_stays_out_of_the_job_body() -> None:
     body_keys = _job_body_keys()
     for settings_only in (
         "translation_backend",
-        "local_model_path",
-        "local_model_device",
-        "local_model_max_length",
-        "local_model_auto_download",
+        "llamacpp_gguf_path",
+        "llamacpp_server_path",
         "api_key",
         "base_url",
         "model",

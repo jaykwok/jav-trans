@@ -36,7 +36,11 @@ for root in (PROJECT_ROOT, SRC_ROOT):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-from asr.alignment import ENCODER_FPS, normalize_text  # noqa: E402
+from asr.alignment import (  # noqa: E402
+    ENCODER_FPS,
+    minimum_ctc_frames,
+    normalize_text,
+)
 from audio.loading import load_audio_16k_mono  # noqa: E402
 from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
 from asr.encoder_features import EncoderFeatureConfig, Qwen3AsrEncoder  # noqa: E402
@@ -115,7 +119,9 @@ def main() -> None:
             continue
         # CTC cannot emit more characters than it has frames. Upsampling gives
         # headroom, but a clip below even the 1x bound is unusable at any factor.
-        if len(text) > duration * ENCODER_FPS:
+        # `minimum_ctc_frames`, not `len(text)`: repeated characters each need a
+        # blank between them, and this is the same judgment inference applies.
+        if minimum_ctc_frames(text) > duration * ENCODER_FPS:
             skipped["text_denser_than_frame_rate"] += 1
             continue
         eligible.append({"audio_id": audio_id, "audio": row["audio"], "text": text,
@@ -191,7 +197,7 @@ def main() -> None:
             features = extractor.encode_batch(audios, sample_rate=SAMPLE_RATE)
             for row, audio, feature in zip(kept, audios, features):
                 frames = int(feature.shape[0])
-                if frames < len(row["text"]):
+                if frames < minimum_ctc_frames(row["text"]):
                     skipped["frames_below_text_length"] += 1
                     continue
                 shard_rows.append(feature.astype(np.float16))

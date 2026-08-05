@@ -4,7 +4,7 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 项目目标：本地完成视频、音频、切分、ASR 和字幕时间轴重计算；LLM 只负责翻译、术语一致和口吻连贯，不负责脑补剧情或修正 ASR 误听。
 
-**翻译可以完全本地运行**：除 OpenAI 兼容 API 外，内置 llama.cpp 后端托管 GGUF 量化模型（预设 galgame 特调的 Sakura-GalTransl，7B Q6_K 适配 8G 显存），以及进程内 Transformers 后端。选本地后端时整条流水线不出网。详见下方「翻译后端支持」。
+**翻译可以完全本地运行**：除 OpenAI 兼容 API 外，内置 llama.cpp 后端托管 GGUF 量化模型（适配 8G 显存，无需选型）。选本地后端时整条流水线不出网。详见下方「翻译后端支持」。
 
 致谢：[WhisperJAV](https://github.com/a63n/WhisperJAV) 为本项目早期路线提供了重要参考。
 
@@ -14,7 +14,7 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 ![网页控制台主界面](docs/images/ui-web-console.png)
 
-任务提交、翻译后端选择（API / 本地 GGUF / 本地 Transformers）、实时阶段进度、显存与耗时监控、质量报告都在本地网页控制台完成。更多截图放在 `docs/images/`。
+任务提交、翻译后端选择（API / 本地 GGUF）、实时阶段进度、显存与耗时监控、质量报告都在本地网页控制台完成。更多截图放在 `docs/images/`。
 
 ---
 
@@ -29,7 +29,7 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 - **切分**只决定边界落在哪里。切点由对齐头的停顿给出；没有配对齐头时退化为定长切分。切错只是边界变差，永远丢不了词。
 - **ASR 解码**输出日文文本。
 - **CTC 强制对齐**把文本逐字对回音频，产出真实字级时间戳与对齐分数。
-- **后置闸**（`src/asr/postgate.py`）只对已有文本**打标不删除**：失控重复、不可能的语速、与邻块重复等。标记随字幕下发，由下游决定是否过滤。
+- **后置闸**（`src/asr/postgate.py`）只对已有文本**打标不删除**：失控重复、不可能的语速、与邻块重复等。标记写进 ASR 产物和 segment，**目前没有任何阶段按它过滤**——它是可观测性，不是过滤器（`min_alignment_score` 未标定，那一项默认关闭）。
 - **字幕 layout** 只处理显示规则，不反向修改 ASR chunk 语义。
 
 设计演进、实验记录和失败路线见 [docs/HISTORY.md](docs/HISTORY.md)。
@@ -38,16 +38,23 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 ## 快速开始
 
-### 发布版（推荐给新用户）
+### 从Releases下载并运行
 
-解压发布包，双击 `jav-trans-setup.exe`。它自带 FFmpeg Shared 和 uv，第一次运行会：
+解压发布包，双击 `jav-trans.exe`。它自带 FFmpeg Shared（uv 在首次运行时下载到程序目录的 `bin/`），第一次运行会：
 
 1. 读取 PyTorch 官方源上的 torch 安装包测速，报出实测速度和预计耗时；太慢或连不上时可以在控制台填写本地代理，代理会写入 `.env`，之后下载 ASR 模型也复用同一份设置。
+
+   例如设置代理地址127.0.0.1，端口设置为7890，代理协议为http等。
+
 2. 用 uv 同步依赖，控制台实时显示下载进度。安装后约占 3.3GB 磁盘。中断后重新双击即可续装。
 
-装完自动启动；之后每次双击同一个 exe 会跳过安装直接启动。ASR 模型（约 3.9GB）和 CTC 对齐头在第一次转录时按需下载到 `models/`。
+装完自动启动，程序窗口出现后控制台窗口自动隐藏；之后每次双击同一个 `jav-trans.exe` 会跳过安装直接启动（它既是安装器也是启动器）。ASR 模型（约 3.9GB）和 CTC 对齐头在第一次转录时按需下载到 `models/`。
 
-发布包不打包 PyTorch 和模型权重，因此需要解压到有 15GB 以上空闲空间、且不需要管理员权限的目录（`.venv`、`models/`、`tmp/` 都建在程序目录内）。可用参数：`--proxy <URL>` 指定代理，`--yes` 直连安装不询问，`--reinstall` 重装环境，`--install-only` 只装不启动。
+每次启动都会先做一次结构自检（程序文件、FFmpeg 共享库、`.venv` 里的关键包）。安装记录只说明「装过」，删掉几个包不会改变它，所以缺包时会显示「修复运行环境」并只补回缺的那几个，而不是整个重装。窗口始终打不开时运行 `jav-trans.exe --doctor`：它会真的导入一遍 torch 等库，报出缺什么、补装、再启动；启动失败时控制台不会隐藏，也会提示运行 `--doctor`。
+
+发布包不打包 PyTorch 和模型权重，因此需要解压到有 15GB 以上空闲空间、且不需要管理员权限的目录（`.venv`、`models/`、`tmp/`、uv 缓存都建在程序目录内，不会写注册表或改系统环境变量）。可用参数：`--doctor` 自检并修复，`--keep-console` 窗口打开后保留控制台，`--proxy <URL>` 指定代理，`--yes` 不提问，`--reinstall` 重装环境，`--install-only` 只装不启动。
+
+用 API 翻译前先在界面「翻译设置」里填好 API Key 并保存；漏填就开始任务会被当场拦下并说明缺什么，只要日文字幕可以打开「不翻译（仅日文字幕）」。
 
 ### 从源码运行
 
@@ -86,7 +93,7 @@ uv venv
 uv sync
 ```
 
-Qwen3-ASR 原生支持要求 `transformers>=5.13.0`（由 `uv sync` 按 `pyproject.toml` 安装）。`pyproject.toml` 同时把 `torch` 钉到 `pytorch-cu130` 索引，请勿改用 `pip install` 逐个装依赖——那样会从 PyPI 取到 CPU 版 torch。
+Qwen3-ASR-HF 原生支持要求 `transformers>=5.13.0`（由 `uv sync` 按 `pyproject.toml` 安装）。`pyproject.toml` 同时把 `torch` 钉到 `pytorch-cu130` 索引，请勿改用 `pip install` 逐个装依赖——那样会从 PyPI 取到 CPU 版 torch。
 
 启动网页控制台：
 
@@ -95,9 +102,9 @@ $env:PYTHONIOENCODING="utf-8"
 uv run --no-sync python launcher.py
 ```
 
-默认地址为 `http://127.0.0.1:2233`（SSE 用 2234）。端口被占用时会自动往后找下一个可用端口，实际地址在启动时打印；也可以用 `JAV_TRANS_PORT` / `JAV_TRANS_EVENTS_PORT` 指定。首次运行可以没有 `.env`；打开页面后在“翻译设置”面板填写 API Key、Base URL、模型和目标语言，保存或开始任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、显存预算等运行参数会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，可在“识别设置”里填写代理协议、地址和端口。
+默认地址为 `http://127.0.0.1:2233`（SSE 用 2234）。端口被占用时会自动往后找下一个可用端口，实际地址在启动时打印；也可以用 `JAV_TRANS_PORT` / `JAV_TRANS_EVENTS_PORT` 指定。首次运行可以没有 `.env`；打开页面后在“翻译设置”面板填写 API Key、Base URL、模型和目标语言，保存或开始任务时会自动写入项目根目录 `.env`。目标语言选“简体中文”或“繁體中文”时，译文会统一转换到所选字形（模型偶尔会答成另一种），选“English”则原样保留。新建的 `.env` 只启用实际保存的本机值，ASR batch、显存预算等运行参数会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，可在“识别设置”里填写代理协议、地址和端口。
 
-**翻译后端支持**：通过 `TRANSLATION_BACKEND` 选择三种后端。`openai`——OpenAI 兼容 API（支持 Chat 与 Responses）。`llamacpp`——**本地翻译推荐**：程序托管官方 llama-server 运行 GGUF 量化模型，预设为 galgame 特调的 Sakura-GalTransl 系列（7B Q6_K 约 6.3GB，官方 8G 显存档；另有 6G 档 IQ4_XS 与 14B 档），需先 `winget install llama.cpp` 或从 GitHub Releases 下载 CUDA 包并在设置里填路径；Sakura 系模型会自动切换到其官方行式翻译模板（术语表 + 历史上文），其许可为 CC-BY-NC-SA 4.0 禁止商用；翻译开始时临时释放 ASR 显存、切回 ASR 时自动重载。`local`——进程内 Transformers（bf16，不支持 GGUF；量化需求请用 `llamacpp`）。详细配置和扩展指南见 [翻译后端架构文档](docs/translation-backend-architecture.md)。
+**翻译后端支持**：通过 `TRANSLATION_BACKEND` 选择两种后端。`openai`——OpenAI 兼容 API（支持 Chat 与 Responses）。`llamacpp`——**本地翻译**：程序托管官方 llama-server 运行 GGUF 量化模型（只有一个内置模型，首次使用自动下载，不需要选型），需先 `winget install -e --id ggml.llamacpp`（Vulkan 构建，装完即在 PATH 上）或从 GitHub Releases 下载 CUDA 包并在设置里填路径（N 卡上更快）；本地后端逐句翻译，不使用术语表、角色参考和全片上下文（这些只在 API 后端生效）；翻译开始时临时释放 ASR 显存、切回 ASR 时自动重载。详细配置和扩展指南见 [翻译后端架构文档](docs/translation-backend-architecture.md)。
 
 Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而不是浏览器本身。完整 ASR smoke 应确认日志中出现 `cuda_available=True`、`device=cuda:0` 或 `actual_device=cuda`。
 Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
@@ -140,7 +147,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
      - 起点/终点按对齐头自己判为 blank 的帧向外走，修正 CTC 尖峰造成的跨度内缩
   -> 后置闸（asr.postgate）
      - 失控重复 / 语速不可能 / 与邻块重复 等只打标，不删除
-     - 标记随 chunk 下发到 segment，由下游决定是否过滤
+     - 标记随 chunk 下发到 segment，只落在产物里，当前不参与任何删除决策
   -> Subtitle Layout v2
      - acoustic/display 双时间轴
      - 20-frame 最小显示时间（固定 `24000/1001` 基准）
@@ -237,7 +244,9 @@ ASR_DECODE_TOKENS_PER_SECOND=10.0
 
 ASR stage 固定由统一 GPU worker 持有 CUDA：切分用的 encoder 前向、ASR 解码和 CTC 对齐都在同一个 GPU owner 进程里顺序执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM、CUDA 状态异常或超过 `ASR_STAGE_WORKER_VRAM_BUDGET_MB` 时会杀掉 worker，不会把 Web 主进程一起带崩。
 
-`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 约为 `7779MiB`。**推荐 8GB 及以上**：1.7B 权重约 3.4GB 常驻，默认配置（batch 8 / 20 秒块）在 8GB 卡上峰值约 `5692MiB`。`ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO` 的 `6144MiB` 是**硬下限**而不是推荐值：低于它直接拒绝启动，等于它则需要 auto batch 降到 4~6 才能跑，余量很小。检查在模型加载前完成；shared VRAM 不计入可用预算，任何正的基线增量都立即视为 soft OOM，显式放大的 worker budget 和 CPU fallback 都不能绕过。监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
+`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；**推荐 8GB 及以上**：1.7B 权重约 3.4GB 常驻，默认配置（batch 8 / 20 秒块）在 8GB 卡上峰值约 `5692MiB`。
+
+`ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO` 的 `6144MiB` 是**硬下限**而不是推荐值：低于它直接拒绝启动，等于它则需要 auto batch 降到 4~6 才能跑，余量很小。检查在模型加载前完成；shared VRAM 不计入可用预算，任何正的基线增量都立即视为 soft OOM，显式放大的 worker budget 和 CPU fallback 都不能绕过。监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
 
 GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长心跳。字幕 cue plan 会单独记录 timeline normalize、两轮 anchor-aware DP、polish 和 finalize 进度。
 
@@ -274,7 +283,7 @@ auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、显存预算、�
 - `tmp/jobs/<job_id>/`：Web / pipeline 单次任务临时目录；`JOB_TEMP_DIR` 默认是 `./tmp/jobs`。
 - `tmp/chunks/`：ASR wav chunk 的一次性运行目录。
 - `tmp/asr_cache/`：跨任务 ASR 结果缓存；按内容寻址，任务删除时保留。
-- `tmp/cache/torch/`、`tmp/cache/hf/`：torch / Hugging Face 运行缓存。
+- `tmp/cache/torch/`：torch 运行缓存。（Hugging Face 下载缓存在 `models/hub`、`models/xet`，属于模型权重，删掉要重下。）
 - `tmp/log/<job_id>/`：默认启用的本地诊断目录；包含 `.run.log` 和持久化 `.timings.json`。
 - `datasets/`：本地训练、验证、测试数据归档，默认 ignored；不进入 GitHub 源码仓库。
 - `agents/temp/`：研究脚本、smoke、临时日志和中间产物。
@@ -306,7 +315,7 @@ PROXY_PORT=7890
 
 或提前把模型下载到 `models/` 对应目录。发布版安装器在首次运行时也会写同样的三个键，安装依赖和下载模型共用这一份代理。
 
-这一份设置覆盖所有出网请求：安装 PyTorch、下载 ASR 权重与对齐头、下载 Sakura/GGUF 翻译模型、调用远程 LLM API。本机回环（`127.0.0.1` / `localhost` / `::1`）自动豁免，所以填了代理不会影响本地 llama-server。唯一不经过代理的是 `llama-server.exe` 本身——它由 `winget install llama.cpp` 或 GitHub release 手动安装。
+这一份设置覆盖所有出网请求：安装 PyTorch、下载 ASR 权重与对齐头、下载 GGUF 翻译模型、调用远程 LLM API。本机回环（`127.0.0.1` / `localhost` / `::1`）自动豁免，所以填了代理不会影响本地 llama-server。唯一不经过代理的是 `llama-server.exe` 本身——它由 `winget install -e --id ggml.llamacpp` 或 GitHub release 手动安装。
 
 ### CUDA 没有被使用
 

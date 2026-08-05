@@ -180,6 +180,9 @@ def _torchcodec_binaries() -> list[tuple[str, str]]:
 
 
 datas = collect_data_files("webview", include_py_files=False)
+# OpenCC keeps its conversion tables as package data, not as code, so a frozen
+# build without these raises at the first 简繁 conversion instead of at import.
+datas += collect_data_files("opencc", include_py_files=False)
 datas += copy_metadata("torchcodec")
 datas += [
     (str(_require_path("src/web/static", "web static assets")), "src/web/static"),
@@ -192,11 +195,6 @@ if not _env_bool("JAV_TRANS_SKIP_MODELS"):
         "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
         "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
         "bundled default 1.7B ASR / SpeechBoundary model",
-    )
-    datas += _collect_inference_model_dir(
-        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf",
-        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf",
-        "bundled low-config 0.6B ASR / SpeechBoundary model",
     )
 
 binaries = _ffmpeg_binaries()

@@ -220,16 +220,72 @@ def _missing_indexes(values: list[str | None]) -> list[int]:
     return [idx for idx, value in enumerate(values) if value is None or value == ""]
 
 
+# One `{"id":123,"text":"…"},` of scaffolding per translated line, plus the
+# `{"translations":[…]}` wrapper. Counted in characters and spent as tokens:
+# for this contract that is conservative in both directions, since the ASCII
+# structure is well under one token per character and CJK text is around 0.7.
+_STRUCTURE_TOKENS_PER_ITEM = 28
+_WRAPPER_TOKENS = 32
+_MIN_TOKEN_BUDGET = 96
+
+# Floor for the per-field character bound, so a batch of very short cues still
+# leaves room for a legitimately expansive rendering of one of them (`ん` ->
+# `嗯嗯嗯…`). Measured on 1362 clean translations: no output ever exceeded its
+# source by more than 7 characters in absolute terms, so 32 is far clear of it.
+_MIN_TEXT_MAX_LENGTH = 32
+
+
 class JsonProfile(TranslationProfile):
     id = "json"
     version = prompt_module.PROMPT_VERSION
 
-    needs_history = False
-    line_capable = False
     wants_repair_pass = True
     wants_extra_glossary = True
     supports_partial_reissue = True
     schema = TRANSLATION_OUTPUT_SCHEMA
+
+    def response_token_budget(self, segments: list[dict]) -> int | None:
+        if not segments:
+            return None
+        from llm import settings as llm_settings
+
+        source_chars = sum(len(str(seg.get("text", ""))) for seg in segments)
+        body = source_chars * llm_settings.TRANSLATION_OUTPUT_CHAR_RATIO
+        structure = _STRUCTURE_TOKENS_PER_ITEM * len(segments) + _WRAPPER_TOKENS
+        return max(_MIN_TOKEN_BUDGET, int(body + structure))
+
+    def bounded_schema(self, segments: list[dict]) -> dict | None:
+        """`maxLength` on `text`, sized by the longest source line in the batch.
+
+        `minItems`/`maxItems` already pin how many objects come back, which is
+        why a runaway still satisfies the grammar: the model emits the right
+        twelve objects and writes `嗯嗯嗯…` into one of them until it hits
+        `max_tokens`. Bounding the field closes that, and unlike a token budget
+        it cannot produce broken JSON - the grammar simply stops offering the
+        sampler a token that would overflow, so the string closes and the object
+        completes.
+
+        The bound is the *longest* line in the batch rather than each line's own
+        length, because one `items` schema applies to every element. That costs
+        nothing in practice: over 4000 simulated 12-line batches drawn from 1362
+        clean translations, the worst observed
+        `max(len(translation)) / max(len(source))` was 1.025, so the 1.5 ratio
+        leaves a 1.46x margin on the tightest case measured.
+        """
+        if not segments:
+            return None
+        from llm import settings as llm_settings
+
+        longest = max((len(str(seg.get("text", ""))) for seg in segments), default=0)
+        limit = max(
+            _MIN_TEXT_MAX_LENGTH,
+            int(longest * llm_settings.TRANSLATION_OUTPUT_CHAR_RATIO),
+        )
+        schema = json.loads(json.dumps(TRANSLATION_OUTPUT_SCHEMA))
+        schema["properties"]["translations"]["items"]["properties"]["text"][
+            "maxLength"
+        ] = limit
+        return schema
 
     def serialize_source(
         self,

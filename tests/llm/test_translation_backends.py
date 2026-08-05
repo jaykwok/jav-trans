@@ -14,23 +14,29 @@ os.environ["PYTHONIOENCODING"] = "utf-8"
 
 
 def test_backend_registry():
-    """测试后端注册表"""
+    """One backend per prompt contract, and nothing else.
+
+    The in-process Transformers backend ("local") was removed on 2026-08-05: it
+    was a third way to run a local model that no shipped model targeted, and it
+    carried its own device/dtype/context settings that nothing validated.
+    """
     from llm.backends import list_backends, get_backend
 
     backends = list_backends()
     print(f"[test] Available backends: {backends}")
 
     assert "openai" in backends, "OpenAI backend should be registered"
-    assert "local" in backends, "Local backend should be registered"
+    assert "llamacpp" in backends, "llama.cpp backend should be registered"
+    assert "local" not in backends, "the Transformers backend was removed"
 
     # 后端是进程级共享实例，避免本地大模型被每个 batch worker 重复加载。
     openai_backend = get_backend("openai")
     assert openai_backend.name() == "openai"
     assert get_backend("openai") is openai_backend
 
-    local_backend = get_backend("local")
-    assert local_backend.name() == "local"
-    assert get_backend("local") is local_backend
+    llamacpp_backend = get_backend("llamacpp")
+    assert llamacpp_backend.name() == "llamacpp"
+    assert get_backend("llamacpp") is llamacpp_backend
 
     print("[test] OK Backend registry test passed")
 
@@ -47,164 +53,6 @@ def test_openai_backend():
     print(f"[test] OpenAI backend JSON schema support: {backend.supports_json_schema()}")
 
     print("[test] OK OpenAI backend test passed")
-
-
-def test_local_backend():
-    """测试本地模型后端基本功能"""
-    from llm.backends.local_model import LocalModelBackend
-
-    backend = LocalModelBackend()
-
-    # 测试功能支持
-    # 当前 transformers 实现使用同步 generate；进度事件不等于 token 流。
-    assert backend.supports_streaming() is False
-    print(f"[test] Local backend JSON schema support: {backend.supports_json_schema()}")
-    print(f"[test] Local backend reasoning support: {backend.supports_reasoning()}")
-
-    print("[test] OK Local backend test passed")
-
-
-def test_local_backend_wait_is_cancellable(monkeypatch):
-    from llm.backends.local_model import LocalModelBackend
-    from llm.errors import TranslationCancelledError
-
-    backend = LocalModelBackend()
-    backend._inference_lock.acquire()
-    monkeypatch.setattr(backend, "_ensure_model", lambda: None)
-    cancel = threading.Event()
-    timer = threading.Timer(0.1, cancel.set)
-    timer.start()
-    started = time.perf_counter()
-    try:
-        try:
-            backend.chat_completion([], cancel_event=cancel)
-        except TranslationCancelledError:
-            pass
-        else:
-            raise AssertionError("cancelled local request should raise")
-    finally:
-        timer.cancel()
-        backend._inference_lock.release()
-    assert time.perf_counter() - started < 0.8
-
-
-def test_local_backend_serializes_generate(monkeypatch):
-    from llm.backends.local_model import LocalModelBackend
-
-    backend = LocalModelBackend()
-    monkeypatch.setattr(backend, "_ensure_model", lambda: None)
-    state = {"active": 0, "peak": 0}
-    state_lock = threading.Lock()
-
-    def fake_generate(*_args, **_kwargs):
-        with state_lock:
-            state["active"] += 1
-            state["peak"] = max(state["peak"], state["active"])
-        time.sleep(0.05)
-        with state_lock:
-            state["active"] -= 1
-        return '{"translations":[]}'
-
-    monkeypatch.setattr(backend, "_generate", fake_generate)
-    threads = [
-        threading.Thread(target=lambda: backend.chat_completion([]))
-        for _ in range(2)
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=1.0)
-
-    assert state["peak"] == 1
-
-
-def test_local_backend_rejects_full_context_before_generate():
-    import pytest
-    import torch
-
-    from llm.backends.local_model import LocalModelBackend
-    from llm.errors import TranslationContextLengthError
-
-    class FakeTokenizer:
-        model_max_length = 4
-        pad_token_id = 0
-        eos_token_id = 1
-
-        def apply_chat_template(self, *_args, **_kwargs):
-            return "prompt"
-
-        def __call__(self, *_args, **_kwargs):
-            return {"input_ids": torch.ones((1, 4), dtype=torch.long)}
-
-    class FakeModel:
-        device = torch.device("cpu")
-
-        def generate(self, **_kwargs):
-            raise AssertionError("generate must not run for an overlong prompt")
-
-    backend = LocalModelBackend()
-    backend._tokenizer = FakeTokenizer()
-    backend._model = FakeModel()
-    backend._max_length = 4
-
-    with pytest.raises(TranslationContextLengthError, match="上下文已超限"):
-        backend._generate(
-            [],
-            temperature=0.0,
-            top_p=1.0,
-            max_tokens=8,
-            cancel_event=None,
-            on_progress=None,
-            on_usage=None,
-        )
-
-
-def test_local_backend_disables_thinking_in_chat_template():
-    import torch
-
-    from llm.backends.local_model import LocalModelBackend
-
-    seen_kwargs = {}
-
-    class FakeTokenizer:
-        model_max_length = 64
-        pad_token_id = 0
-        eos_token_id = 1
-
-        def apply_chat_template(self, _messages, **kwargs):
-            seen_kwargs.update(kwargs)
-            return "prompt"
-
-        def __call__(self, *_args, **_kwargs):
-            return {"input_ids": torch.ones((1, 4), dtype=torch.long)}
-
-        def decode(self, *_args, **_kwargs):
-            return '{"translations":[]}'
-
-    class FakeModel:
-        device = torch.device("cpu")
-
-        def generate(self, **kwargs):
-            return torch.ones((1, 5), dtype=torch.long)
-
-    backend = LocalModelBackend()
-    backend._tokenizer = FakeTokenizer()
-    backend._model = FakeModel()
-    backend._max_length = 64
-
-    backend._generate(
-        [{"role": "user", "content": "x"}],
-        temperature=0.0,
-        top_p=1.0,
-        max_tokens=8,
-        cancel_event=None,
-        on_progress=None,
-        on_usage=None,
-    )
-
-    # Qwen3-style templates read this flag to skip the <think> prelude; without
-    # it a thinking model spends most of the generation budget before the JSON.
-    assert seen_kwargs.get("enable_thinking") is False
 
 
 def test_translator_routes_custom_backend_and_preserves_task_format(monkeypatch):
@@ -247,8 +95,8 @@ def test_backend_identity_separates_translation_cache(monkeypatch):
     monkeypatch.setenv("LLM_MODEL_NAME", "api-model")
     api_key = translator._translation_cache_key(0, segments)
 
-    monkeypatch.setenv("TRANSLATION_BACKEND", "local")
-    monkeypatch.setenv("LOCAL_MODEL_PATH", "local/model")
+    monkeypatch.setenv("TRANSLATION_BACKEND", "llamacpp")
+    monkeypatch.setenv("LLAMACPP_GGUF_PATH", "D:\\models\\local.gguf")
     local_key = translator._translation_cache_key(0, segments)
 
     assert api_key != local_key

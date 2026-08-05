@@ -15,8 +15,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Callable
 
 from llm import cache as translation_cache
-from llm import settings as llm_settings
 from llm import transport_util
+from llm import zh_variant
 from llm.errors import RetryableTranslationFormatError, TranslationCancelledError
 from llm.profiles.base import ProfileContext, TranslationProfile
 
@@ -162,283 +162,6 @@ def _make_aggregated_progress_callback(
     return [make_wrapper(batch_id) for batch_id in range(num_batches)], None
 
 
-def _request_kwargs(profile: TranslationProfile, backend, batch_size: int) -> dict:
-    """Sampling/schema kwargs gated on backend capabilities."""
-    kwargs: dict = {}
-    sampling = profile.sampling(batch_size) or {}
-    for key in ("temperature", "top_p", "max_tokens"):
-        if key in sampling:
-            kwargs[key] = sampling[key]
-    supports_schema = False
-    try:
-        supports_schema = bool(backend.supports_json_schema())
-    except Exception:
-        supports_schema = False
-    if profile.schema is not None and supports_schema:
-        kwargs["response_format"] = profile.schema
-    return kwargs
-
-
-def run_line_profile(
-    segments: list[dict],
-    *,
-    profile: TranslationProfile,
-    backend,
-    batch_size: int,
-    shard_limit: int,
-    cache_path: str,
-    target_lang: str,
-    glossary: str,
-    character_reference: str,
-    cache_lock: threading.Lock,
-    reasoning_effort: str = "",
-    on_batch_done=None,
-    on_progress: Callable[[dict], None] | None = None,
-    cancel_event: threading.Event | None = None,
-) -> tuple[list[str], list[dict]]:
-    """Line-oriented loop for history-carrying profiles (Sakura/GalTransl).
-
-    N source lines in, N translated lines out, with a rolling history block
-    for pronoun continuity. Batches are grouped into contiguous shards; shards
-    run in parallel, batches inside a shard run in order so the history is
-    real previous output rather than whatever thread finished first. The
-    auto-extracted extra glossary is skipped on purpose -- extracting it needs
-    the JSON contract, which these model families cannot speak.
-    """
-    normalize = _normalize_text
-    history_limit = int(profile.history_limit or 0)
-    batches = _split_into_batches(segments, batch_size)
-    expected_total = len(segments)
-    progress_callbacks, _ = _make_aggregated_progress_callback(
-        len(batches),
-        expected_total,
-        on_progress,
-    )
-    cache_map = translation_cache._load_translation_cache(cache_path) if cache_path else {}
-    memory_map = translation_cache._load_translation_memory(cache_path) if cache_path else {}
-    zh_texts: list[str | None] = [None] * expected_total
-    timings_by_batch: dict[int, dict] = {}
-    timings_lock = threading.Lock()
-
-    prompt_version = profile.cache_signature()
-    model_identity = backend.cache_identity()
-
-    def _memory_key_for(source_text: str) -> str:
-        return translation_cache._translation_memory_key(
-            source_text,
-            "",
-            glossary=glossary,
-            target_lang=target_lang,
-            character_reference=character_reference,
-            prompt_version=prompt_version,
-            model_name=model_identity,
-            reasoning_effort=reasoning_effort,
-        )
-
-    def _ctx(history: list[str]) -> ProfileContext:
-        return ProfileContext(
-            target_lang=target_lang,
-            glossary=glossary,
-            character_reference=character_reference,
-            history=tuple(history),
-            total_count=expected_total,
-        )
-
-    def request_lines(
-        line_segments: list[dict],
-        ids: list[int],
-        history: list[str],
-        usages: list[dict],
-    ) -> list[str]:
-        messages = profile.build_messages(line_segments, ids=ids, ctx=_ctx(history))
-        format_attempts = 0
-        api_attempts = 0
-        while True:
-            _raise_if_cancelled(cancel_event)
-            try:
-                reply = backend.chat_completion(
-                    messages,
-                    expected_count=len(ids),
-                    cancel_event=cancel_event,
-                    on_usage=usages.append,
-                    **_request_kwargs(profile, backend, len(ids)),
-                )
-                by_id = profile.parse_response(reply, ids=ids)
-                return [str(by_id.get(idx) or "") for idx in ids]
-            except RetryableTranslationFormatError:
-                format_attempts += 1
-                if format_attempts >= 2:
-                    raise
-            except Exception as exc:
-                if not transport_util._is_retryable_api_error(exc):
-                    raise
-                api_attempts += 1
-                if api_attempts > llm_settings.TRANSLATION_API_RETRIES:
-                    raise
-                transport_util._interruptible_sleep(
-                    transport_util._request_backoff_delay(api_attempts), cancel_event
-                )
-
-    def translate_single_line(
-        segment: dict,
-        seg_id: int,
-        history: list[str],
-        usages: list[dict],
-    ) -> str:
-        try:
-            return request_lines([segment], [seg_id], history, usages)[0]
-        except RetryableTranslationFormatError:
-            # Stubborn multi-line reply for a single line: keep the first
-            # non-empty line instead of failing the whole job.
-            messages = profile.build_messages([segment], ids=[seg_id], ctx=_ctx(history))
-            reply = backend.chat_completion(
-                messages,
-                expected_count=1,
-                cancel_event=cancel_event,
-                on_usage=usages.append,
-                **{**_request_kwargs(profile, backend, 1), "max_tokens": 1024},
-            )
-            for candidate in str(reply or "").splitlines():
-                if candidate.strip():
-                    return candidate.strip()
-            return ""
-
-    def run_shard(shard_batches: list[tuple[int, list[dict]]]) -> None:
-        history: list[str] = []
-        for batch_index, batch_segments in shard_batches:
-            _raise_if_cancelled(cancel_event)
-            batch_started = time.perf_counter()
-            start_index = batch_index * batch_size
-            ids = list(range(start_index, start_index + len(batch_segments)))
-            batch_key = translation_cache._translation_cache_key(
-                batch_index,
-                batch_segments,
-                extra_glossary="",
-                glossary=glossary,
-                target_lang=target_lang,
-                character_reference=character_reference,
-                prompt_version=prompt_version,
-                model_name=model_identity,
-                compact_system_prompt=llm_settings.COMPACT_SYSTEM_PROMPT,
-                reasoning_effort=reasoning_effort,
-            )
-            usages: list[dict] = []
-            request_count = 0
-            memory_hits = 0
-            cached_texts = cache_map.get(batch_key)
-            if isinstance(cached_texts, list) and len(cached_texts) == len(batch_segments):
-                final_texts = [normalize(text) or "" for text in cached_texts]
-                mode = "translation_cache_hit"
-            else:
-                sources = [str(seg.get("text", "")) for seg in batch_segments]
-                pending: list[str | None] = [None] * len(sources)
-                for offset, source_text in enumerate(sources):
-                    if not cache_path or not translation_cache._translation_memory_source_is_cacheable(
-                        source_text
-                    ):
-                        continue
-                    memory_text = memory_map.get(_memory_key_for(source_text))
-                    if isinstance(memory_text, str) and memory_text.strip():
-                        pending[offset] = normalize(memory_text) or ""
-                        memory_hits += 1
-                missing = [i for i, text in enumerate(pending) if text is None]
-                if missing:
-                    request_count += 1
-                    try:
-                        translated = request_lines(
-                            [batch_segments[i] for i in missing],
-                            [ids[i] for i in missing],
-                            list(history),
-                            usages,
-                        )
-                    except RetryableTranslationFormatError:
-                        translated = []
-                        for i in missing:
-                            request_count += 1
-                            translated.append(
-                                translate_single_line(
-                                    batch_segments[i], ids[i], list(history), usages
-                                )
-                            )
-                    for i, text in zip(missing, translated):
-                        pending[i] = normalize(text) or ""
-                final_texts = [text or "" for text in pending]
-                # 1:1 invariant: the cue plan is frozen before translation, so
-                # every batch must produce exactly one text per input line.
-                if len(final_texts) != len(batch_segments):
-                    raise RuntimeError(
-                        "translation profile violated the 1:1 line contract: "
-                        f"{len(final_texts)} texts for {len(batch_segments)} lines"
-                    )
-                mode = "line_batch"
-                translation_cache._save_cache_entry(
-                    cache_path, batch_key, final_texts, cache_lock
-                )
-                if cache_path:
-                    memory_entries = [
-                        (_memory_key_for(str(seg.get("text", ""))), text)
-                        for seg, text in zip(batch_segments, final_texts)
-                        if text
-                        and translation_cache._translation_memory_source_is_cacheable(
-                            str(seg.get("text", ""))
-                        )
-                    ]
-                    translation_cache._save_memory_entries(
-                        cache_path, memory_entries, cache_lock
-                    )
-            for offset, text in enumerate(final_texts):
-                zh_texts[start_index + offset] = text
-            if history_limit > 0:
-                history.extend(text for text in final_texts if text)
-                del history[:-history_limit]
-            timing = {
-                "batch_index": batch_index,
-                "start_index": start_index,
-                "segment_count": len(batch_segments),
-                "elapsed_s": round(time.perf_counter() - batch_started, 3),
-                "mode": mode,
-                "prompt_profile": profile.cache_signature(),
-                "request_count": request_count,
-                "cache_hit": mode == "translation_cache_hit",
-                "translation_memory_hit_count": memory_hits,
-                **transport_util._merge_usage_metrics(usages),
-            }
-            with timings_lock:
-                timings_by_batch[batch_index] = timing
-            _emit_progress(
-                progress_callbacks[batch_index],
-                {
-                    "phase": "done",
-                    "translated": len(batch_segments),
-                    "expected": len(batch_segments),
-                },
-            )
-            if on_batch_done:
-                _raise_if_cancelled(cancel_event)
-                on_batch_done(timing)
-
-    indexed_batches = list(enumerate(batches))
-    shard_count = max(1, min(int(shard_limit), len(indexed_batches))) if indexed_batches else 0
-    if not indexed_batches:
-        return [], []
-    per_shard = (len(indexed_batches) + shard_count - 1) // shard_count
-    shards = [
-        indexed_batches[i * per_shard : (i + 1) * per_shard]
-        for i in range(shard_count)
-    ]
-    shards = [shard for shard in shards if shard]
-    if len(shards) == 1:
-        run_shard(shards[0])
-    else:
-        with ThreadPoolExecutor(max_workers=len(shards)) as pool:
-            futures = [pool.submit(run_shard, shard) for shard in shards]
-            for future in futures:
-                future.result()
-
-    ordered_timings = [timings_by_batch[i] for i in sorted(timings_by_batch)]
-    return [text if text is not None else "" for text in zh_texts], ordered_timings
-
-
 def _normalize_text(text) -> str | None:
     # Line profiles reuse the JSON contract's output normalizer so cached and
     # fresh texts go through identical cleanup.
@@ -531,6 +254,20 @@ def run_batched(
         )
 
     zh_texts: list[str | None] = [None] * expected_total
+    # Applied to cache and memory hits as well as fresh output. Both keys already
+    # carry target_lang, so a hit is same-variant by construction - but entries
+    # written before this pass existed are not, and the conversion is idempotent,
+    # so running it on every path costs nothing and repairs those in place.
+    to_target_variant = zh_variant.converter_for(target_lang)
+
+    def _to_target_variant(text: str) -> str:
+        return to_target_variant(text) if text and to_target_variant is not None else text
+
+    def _final_text(text) -> str:
+        """Restore path for cached and remembered lines: same normalization as
+        before, plus the variant conversion fresh output gets."""
+        return _to_target_variant(_normalize_text(text) or "")
+
     timings_by_batch: dict[int, dict] = {}
     cache_map = translation_cache._load_translation_cache(cache_path) if cache_path else {}
     memory_map = translation_cache._load_translation_memory(cache_path) if cache_path else {}
@@ -576,7 +313,7 @@ def run_batched(
             exact_cache_hit_count += 1
             print(f"[translation-cache] restored batch {batch_index} cache_key={batch_key}")
             for offset, text in enumerate(cached_texts):
-                zh_texts[start_index + offset] = _normalize_text(text) or ""
+                zh_texts[start_index + offset] = _final_text(text)
             timing = {
                 "batch_index": batch_index,
                 "start_index": start_index,
@@ -620,7 +357,7 @@ def run_batched(
             memory_text = memory_map.get(_memory_key_for(source_text))
             if isinstance(memory_text, str) and memory_text.strip():
                 global_index = start_index + offset
-                zh_texts[global_index] = _normalize_text(memory_text) or ""
+                zh_texts[global_index] = _final_text(memory_text)
                 memory_hit_ids.append(global_index)
 
         if memory_hit_ids:
@@ -856,18 +593,41 @@ def run_batched(
                         ctx=_ctx(batch_index=batch_index),
                     )
                 request_count += 1
+                request_kwargs: dict = {}
+                # Sized per request, not per batch: a partial reissue asks for
+                # only the missing ids, so it must not carry the whole batch's
+                # budget.
+                request_segments = (
+                    pending_segments if request_count > 1 else requested_segments
+                )
+                token_budget = profile.response_token_budget(request_segments)
+                if token_budget is not None:
+                    request_kwargs["max_tokens"] = token_budget
+                bounded = profile.bounded_schema(request_segments)
+                if bounded is not None:
+                    request_kwargs["bounded_response_schema"] = bounded
+                # Always explicit, including when it is None: the line contract
+                # needs *no* schema, and a caller that simply omits the argument
+                # gets the JSON one by default. Sending a grammar to Hy-MT2 is
+                # the 152/300 failure, so "unset" and "none" must not collapse.
+                request_kwargs["response_schema"] = profile.schema
                 raw_output = chat(
                     request_messages,
                     expected_count=request_expected_count,
                     on_progress=trace_progress,
                     on_usage=request_usages.append,
                     cancel_event=cancel_event,
+                    **request_kwargs,
                 )
                 _raise_if_cancelled(cancel_event)
                 parsed = profile.parse_response(raw_output, ids=pending_ids)
                 for idx in pending_ids:
                     if parsed.get(idx):
-                        batch_results[idx] = parsed[idx]
+                        # Convert only. The profiles already normalized this, and
+                        # re-running the normalizer here could turn a truthy but
+                        # degenerate reply into "" - which this loop's own
+                        # `is None` missing-check would then count as answered.
+                        batch_results[idx] = _to_target_variant(parsed[idx])
                 missing_indexes = [
                     index
                     for index in all_batch_ids

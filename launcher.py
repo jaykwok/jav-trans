@@ -24,8 +24,8 @@ os.environ.setdefault("JAV_TRANS_RUNTIME_ROOT", str(_ROOT))
 os.environ.setdefault("JAV_TRANS_RESOURCE_ROOT", str(_RESOURCE_ROOT))
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 os.environ.setdefault("HF_HOME", str(_ROOT / "models"))
-os.environ.setdefault("HF_HUB_CACHE", str(_ROOT / "tmp" / "cache" / "hf" / "hub"))
-os.environ.setdefault("HF_XET_CACHE", str(_ROOT / "tmp" / "cache" / "hf" / "xet"))
+os.environ.setdefault("HF_HUB_CACHE", str(_ROOT / "models" / "hub"))
+os.environ.setdefault("HF_XET_CACHE", str(_ROOT / "models" / "xet"))
 os.environ.setdefault("TORCH_HOME", str(_ROOT / "tmp" / "cache" / "torch"))
 
 for _SRC in (_RESOURCE_ROOT / "src", _ROOT / "src"):
@@ -354,22 +354,70 @@ if _SMOKE_IMPORTS:
 atexit.register(_cleanup_temp)
 
 
-def _run_server() -> None:
-    import uvicorn
-    from web.app import create_app
+_server_error: list[BaseException] = []
 
-    # Assignment, not setdefault: EVENTS_PORT already started from whatever the
-    # env asked for, and if that one was taken the app has to hear about the
-    # port we actually resolved.
-    os.environ["JAV_TRANS_EVENTS_PORT"] = str(EVENTS_PORT)
-    uvicorn.run(
-        create_app(),
-        host="127.0.0.1",
-        port=PORT,
-        workers=1,
-        reload=False,
-        log_level="warning",
-    )
+
+def _run_server() -> None:
+    try:
+        import uvicorn
+        from web.app import create_app
+
+        # Assignment, not setdefault: EVENTS_PORT already started from whatever
+        # the env asked for, and if that one was taken the app has to hear about
+        # the port we actually resolved.
+        os.environ["JAV_TRANS_EVENTS_PORT"] = str(EVENTS_PORT)
+        uvicorn.run(
+            create_app(),
+            host="127.0.0.1",
+            port=PORT,
+            workers=1,
+            reload=False,
+            log_level="warning",
+        )
+    except BaseException as exc:  # noqa: BLE001 - a daemon thread swallows this
+        # Without this the thread died quietly and the window still opened, onto
+        # a port nothing was listening on: a broken .venv looked like a blank app
+        # rather than like a missing dependency.
+        _server_error.append(exc)
+        traceback.print_exc()
+
+
+def _wait_for_server(port: int, timeout_s: float = 60.0) -> bool:
+    """Block until the server accepts a connection, or it is clearly not coming.
+
+    Replaces a flat 1.5s sleep, which was a race on a cold start and, worse, hid
+    the case where the server thread had already crashed.
+    """
+    import socket
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _server_error:
+            return False
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.5)
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                return True
+        time.sleep(0.15)
+    return False
+
+
+def _signal_app_ready() -> None:
+    """Tell the launcher exe that the app is really up.
+
+    It hides its console window on this signal, so it is only ever sent once the
+    server answers and the window exists - anything earlier would hide the very
+    output that explains a failed start.
+    """
+    path = os.getenv("JAV_TRANS_READY_FILE", "").strip()
+    if not path:
+        return
+    try:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
 
 
 _shutdown = threading.Event()
@@ -378,13 +426,24 @@ if __name__ == "__main__":
     print(f"jav-trans: http://127.0.0.1:{PORT}", flush=True)
     t = threading.Thread(target=_run_server, daemon=True)
     t.start()
-    time.sleep(1.5)
+    if not _wait_for_server(PORT):
+        print("\n服务没能启动，界面无法打开。", flush=True)
+        if _server_error:
+            print(f"原因: {type(_server_error[0]).__name__}: {_server_error[0]}", flush=True)
+        else:
+            print(f"端口 {PORT} 在 60 秒内没有响应。", flush=True)
+        print("依赖可能不完整，可以运行 jav-trans.exe --doctor 自检并修复。", flush=True)
+        raise SystemExit(1)
 
     try:
         import webview
         from webview.dom import DOMEventHandler
 
         def _bind(window):
+            # pywebview calls this once the window exists, which is the moment
+            # the launcher exe is waiting for to hide its console.
+            _signal_app_ready()
+
             def _on_drop(e):
                 files = e.get("dataTransfer", {}).get("files", [])
                 paths = [f.get("pywebviewFullPath") for f in files if f.get("pywebviewFullPath")]
@@ -413,4 +472,5 @@ if __name__ == "__main__":
         import webbrowser
 
         webbrowser.open(f"http://127.0.0.1:{PORT}")
+        _signal_app_ready()
         _shutdown.wait()

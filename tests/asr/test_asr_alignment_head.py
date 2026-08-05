@@ -248,6 +248,78 @@ class TestForcedAlignment:
         assert [(s.start_frame, s.end_frame) for s in spans] == expected
 
 
+class TestMinimumFrames:
+    """The feasibility bound, which was wrong in both directions.
+
+    The old guard was `frames < states - len(targets)`, i.e. `T < L + 1`. That
+    number is not the CTC minimum: leading and trailing blanks are optional, so
+    a sequence of distinct labels needs only `L` frames, while every pair of
+    adjacent identical labels needs a mandatory blank between them and so costs
+    one extra. Both errors are silent in different ways - the first refuses a
+    clip that aligns fine, the second lets an impossible one through the gate and
+    fails several hundred lines later in the backtrace.
+    """
+
+    def test_distinct_labels_need_one_frame_each(self) -> None:
+        assert alignment.minimum_ctc_frames([2, 3]) == 2
+        assert alignment.minimum_ctc_frames("あいうえお") == 5
+
+    def test_each_adjacent_repeat_costs_a_mandatory_blank(self) -> None:
+        assert alignment.minimum_ctc_frames([2, 2]) == 3
+        assert alignment.minimum_ctc_frames([2, 2, 2]) == 5
+        # Only *adjacent* pairs: あいあ repeats a character but never twice in a
+        # row, so no blank is forced.
+        assert alignment.minimum_ctc_frames("あいあ") == 3
+        assert alignment.minimum_ctc_frames("ああい") == 4
+
+    def test_an_empty_target_needs_no_frames(self) -> None:
+        assert alignment.minimum_ctc_frames([]) == 0
+        assert alignment.minimum_ctc_frames("") == 0
+
+    def test_two_distinct_characters_in_two_frames_are_aligned(self) -> None:
+        """Regression: `T = L` is legal and the old `T < L+1` guard rejected it."""
+        a, i = VOCAB.index_of("あ"), VOCAB.index_of("い")
+        log_probs = _posteriors([a, i], vocab_size=VOCAB.size)
+        spans = alignment.forced_align(log_probs, [a, i], upsample=1)
+        assert [(s.start_frame, s.end_frame) for s in spans] == [(0, 1), (1, 2)]
+
+    def test_a_repeated_character_without_room_for_its_blank_is_refused(self) -> None:
+        """Regression: あああ needs 5 frames, not 4. At 4 the old guard passed
+        and the failure surfaced as `alignment path skipped character 0` from
+        deep inside the backtrace, which reads like a corrupt lattice rather
+        than like text that does not fit."""
+        a = VOCAB.index_of("あ")
+        log_probs = torch.randn(4, VOCAB.size).log_softmax(dim=-1)
+        with pytest.raises(ValueError, match="cannot align"):
+            alignment.forced_align(log_probs, [a, a, a], upsample=1)
+
+    def test_a_repeated_character_with_room_aligns(self) -> None:
+        a = VOCAB.index_of("あ")
+        blank = alignment.BLANK_INDEX
+        log_probs = _posteriors([a, blank, a, blank, a], vocab_size=VOCAB.size)
+        spans = alignment.forced_align(log_probs, [a, a, a], upsample=1)
+        assert [(s.start_frame, s.end_frame) for s in spans] == [(0, 1), (2, 3), (4, 5)]
+
+    def test_the_error_names_the_frame_count_the_caller_needs(self) -> None:
+        """`raise the upsample factor` is only actionable with a target."""
+        a = VOCAB.index_of("あ")
+        log_probs = torch.randn(4, VOCAB.size).log_softmax(dim=-1)
+        with pytest.raises(ValueError, match="at least 5"):
+            alignment.forced_align(log_probs, [a, a, a], upsample=1)
+
+    def test_every_feasible_length_actually_aligns(self) -> None:
+        """The bound is exact, not merely safe: at exactly `minimum_ctc_frames`
+        an alignment must exist for every one of these shapes. A conservative
+        over-estimate would pass the two regressions above while still throwing
+        away short clips."""
+        a, i, u = (VOCAB.index_of(ch) for ch in "あいう")
+        for targets in ([a], [a, i], [a, a], [a, i, u], [a, a, i], [a, i, i], [a, a, a]):
+            frames = alignment.minimum_ctc_frames(targets)
+            log_probs = torch.randn(frames, VOCAB.size).log_softmax(dim=-1)
+            spans = alignment.forced_align(log_probs, targets, upsample=1)
+            assert len(spans) == len(targets), targets
+
+
 class TestBlankRuns:
     def test_a_silent_stretch_reads_as_one_run(self) -> None:
         a = VOCAB.index_of("あ")

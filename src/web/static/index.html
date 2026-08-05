@@ -150,8 +150,7 @@
               <span>翻译后端</span>
               <select id="translation-backend">
                 <option value="openai" selected>API 调用（OpenAI 兼容）</option>
-                <option value="llamacpp">Sakura / GGUF（llama.cpp，推荐本地）</option>
-                <option value="local">本地模型（transformers）</option>
+                <option value="llamacpp">本地 GGUF（llama.cpp，推荐本地）</option>
               </select>
             </label>
 
@@ -203,24 +202,9 @@
             </div>
 
             <div id="llamacpp-backend-fields" style="display:none">
-              <label class="field">
-                <span>GGUF 模型（Sakura 系为 galgame 特调翻译模型）</span>
-                <select id="llamacpp-model-preset">
-                  <option value="SakuraLLM/Sakura-GalTransl-7B-v3.7|Sakura-Galtransl-7B-v3.7.gguf" selected>
-                    GalTransl 7B v3.7 · Q6_K（8G 显存推荐 · 约 6.3GB）</option>
-                  <option value="SakuraLLM/Sakura-GalTransl-7B-v3.7|Sakura-Galtransl-7B-v3.7-IQ4_XS.gguf">
-                    GalTransl 7B v3.7 · IQ4_XS（6G 显存 · 约 4.2GB）</option>
-                  <option value="SakuraLLM/Sakura-GalTransl-14B-v3.8|Sakura-Galtransl-14B-v3.8.gguf">
-                    GalTransl 14B v3.8 · Q6_K（≥16G 显存 · 约 12GB）</option>
-                  <option value="mmis1000/asmr-qwen3.5-9b-zh-cn-gguf-v0.1|asmr-qwen3.5-9b-zh-cn-gguf-v0.1-q4_k_m.gguf">
-                    ASMR Qwen3.5 9B v0.1 · Q4_K_M（8G 显存 · 约 5.2GB）</option>
-                  <option value="custom">自定义 GGUF 文件</option>
-                </select>
-              </label>
-
-              <label class="field" id="llamacpp-gguf-path-field" style="display:none">
-                <span>本地 GGUF 文件路径</span>
-                <input type="text" id="llamacpp-gguf-path" placeholder="例：D:\models\Sakura-Galtransl-7B-v3.7.gguf">
+              <label class="field" id="llamacpp-gguf-path-field">
+                <span>自定义 GGUF 文件路径（留空使用内置模型 Hy-MT2-1.8B）</span>
+                <input type="text" id="llamacpp-gguf-path" placeholder="留空即可，首次使用会自动下载内置模型">
               </label>
 
               <label class="field">
@@ -229,55 +213,17 @@
               </label>
 
               <p class="field-hint">
-                需要先安装 llama.cpp：<code>winget install llama.cpp</code>，或到 GitHub Releases 下载
+                需要先安装 llama.cpp：<code>winget install -e --id ggml.llamacpp</code>（Vulkan 构建，
+                装完自动在 PATH 上，上方路径可留空），N 卡想要更快可到 GitHub Releases 下载
                 <code>llama-*-bin-win-cuda-*.zip</code> 解压后填写上方路径。
-                首次使用会自动下载所选 GGUF 模型（建议配合代理）。
+                首次使用会自动下载内置的 Hy-MT2-1.8B（约 2GB，建议配合代理）。
                 翻译开始时会临时释放 ASR 显存，任务切回 ASR 时自动重载。
-                Sakura / GalTransl 系模型为 CC-BY-NC-SA 4.0 许可，禁止商用。
+                本地模型逐句翻译，不使用术语表、角色参考和全片上下文——这些只在
+                OpenAI 兼容 API 后端生效。自定义 GGUF 若不是 Hunyuan-MT 系，会被
+                当作能按 JSON 批量回答的模型处理。
               </p>
             </div>
 
-            <div id="local-backend-fields" style="display:none">
-              <label class="field">
-                <span>本地模型</span>
-                <select id="local-model-preset">
-                  <option value="">-- 选择推荐模型 --</option>
-                  <option value="Qwen/Qwen3-4B">Qwen3 4B（约 9GB 显存）</option>
-                  <option value="Qwen/Qwen3-8B">Qwen3 8B（约 17GB 显存）</option>
-                  <option value="Qwen/Qwen3-14B">Qwen3 14B（约 30GB 显存）</option>
-                  <option value="custom">自定义模型路径</option>
-                </select>
-              </label>
-
-              <label class="field" id="local-model-path-field" style="display:none">
-                <span>模型路径或 HuggingFace ID</span>
-                <input type="text" id="local-model-path" placeholder="例：D:\models\qwen3-8b 或 Qwen/Qwen3-8B">
-              </label>
-
-              <label class="field">
-                <span>设备</span>
-                <select id="local-model-device">
-                  <option value="cuda" selected>CUDA（GPU 加速）</option>
-                  <option value="cpu">CPU</option>
-                </select>
-              </label>
-
-              <label class="field">
-                <span>最大上下文长度</span>
-                <input type="number" id="local-model-max-length" value="32768" min="512" max="131072" step="512">
-              </label>
-
-              <div class="toggle-row">
-                <span>自动下载模型（首次使用）</span>
-                <label class="toggle"><input type="checkbox" id="local-model-auto-download" checked><span class="slider"></span></label>
-              </div>
-
-              <p class="field-hint">
-                模型以 bf16 精度加载，显存不够会自动溢出到内存（速度明显下降）。
-                需要量化模型（4B 以上推荐）请改用上方「Sakura / GGUF」后端。
-                首次使用会自动下载到当前 Hugging Face 缓存目录，建议使用代理加速。
-              </p>
-            </div>
 
             <label class="field">
               <span>目标语言</span>

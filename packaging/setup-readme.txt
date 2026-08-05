@@ -1,7 +1,8 @@
 jav-trans 安装与使用
 ====================
 
-双击 jav-trans-setup.exe。
+双击 jav-trans.exe。第一次运行会先装好运行环境，之后每次双击同一个
+jav-trans.exe 就是直接启动程序。
 
 第一次运行会做两件事：
 
@@ -13,14 +14,32 @@ jav-trans 安装与使用
 
 2. 安装运行环境。
    控制台会实时显示 PyTorch 等依赖的下载进度，安装后约占 3.3GB 磁盘。
-   中途断网或关掉窗口都不要紧，重新双击 jav-trans-setup.exe 会接着装，
+   中途断网或关掉窗口都不要紧，重新双击 jav-trans.exe 会接着装，
    已经下好的部分不会重下。
 
-装完会自动打开程序窗口。以后每次都双击同一个 jav-trans-setup.exe 启动，
-它会跳过安装直接启动。
+装完会自动打开程序窗口，控制台窗口（黑框）随即自动隐藏；关掉程序窗口就整个
+退出。以后启动时控制台显示「jav-trans 启动」并跳过安装。
 
 ASR 模型（约 3.9GB）在第一次转录时才下载，同样走上面设置的代理，
 存放在本目录的 models\ 下。
+
+打不开时怎么办
+--------------
+
+每次启动都会先快速检查一遍运行环境。如果 .venv 里的依赖被删掉了（例如为了
+腾磁盘），启动时会显示「jav-trans 修复运行环境」并自动补回缺的那几个包，
+不会整个重装。
+
+如果程序窗口始终打不开，运行一次自检：
+
+  jav-trans.exe --doctor
+
+它会逐项检查程序文件、FFmpeg 和依赖（会真的导入一遍 torch 等库），报出缺什么，
+缺依赖就当场补装（需要代理时仍会读 .env 里的设置，也可以加 --proxy 指定），
+补好后继续启动。控制台上的检查结果保留在窗口里，可以直接附在反馈里。
+
+自检提示「程序文件不完整」时，说明缺的是压缩包里的文件，只能重新解压一份完整
+目录——.venv、models、.env 可以从旧目录搬过去，不用重新下载。
 
 需要注意
 --------
@@ -28,6 +47,8 @@ ASR 模型（约 3.9GB）在第一次转录时才下载，同样走上面设置�
 * 请把整个文件夹解压到有至少 15GB 空闲空间的位置，不要放在 C:\Program Files
   或其他需要管理员权限的目录——程序要在自己的目录里写入 .venv、models、tmp。
 * 需要 NVIDIA 显卡和较新的显卡驱动。驱动过旧时程序会在界面上提示更新。
+* 要用 API 翻译，先在界面的「翻译设置」里填好 API Key 并保存再开始任务；
+  没填就开始会被当场拦下并说明缺什么。只要日文字幕可以打开「不翻译」。
 * 如果窗口打不开，安装 Microsoft Edge WebView2 运行时：
   https://developer.microsoft.com/en-us/microsoft-edge/webview2/
 * 出问题时，tmp\log\ 下的 .run.log 可以直接附在反馈里。
@@ -35,7 +56,9 @@ ASR 模型（约 3.9GB）在第一次转录时才下载，同样走上面设置�
 命令行参数（可选）
 ------------------
 
-  jav-trans-setup.exe --proxy http://127.0.0.1:7890   指定代理，不询问
-  jav-trans-setup.exe --yes                           直连安装，不询问
-  jav-trans-setup.exe --reinstall                     重装运行环境
-  jav-trans-setup.exe --install-only                  只安装，不启动
+  jav-trans.exe --doctor                        检查依赖，缺失就补回来，再启动
+  jav-trans.exe --keep-console                  窗口打开后保留控制台（排查问题）
+  jav-trans.exe --proxy http://127.0.0.1:7890   指定代理，不询问
+  jav-trans.exe --yes                           不提问（自检和安装都不等确认）
+  jav-trans.exe --reinstall                     重装运行环境
+  jav-trans.exe --install-only                  只安装/只自检，不启动
