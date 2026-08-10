@@ -637,15 +637,59 @@ def blank_runs(log_probs, *, upsample: int = 2, min_seconds: float = 0.0):
 
 
 # How far an utterance edge may be walked outward, away from the first/last
-# character, to reach the acoustic boundary. Sized from the composite geometry
-# that made the correction necessary: on cores whose bodies align cleanly the
-# predicted extent sits INSIDE the true one by a median 230.8 ms at the head and
-# 371.7 ms at the tail, with p75 307.7 ms / 536.2 ms. The caps cover the bulk of
-# that inset without being free parameters in the usual sense - the walk stops at
-# the first non-blank frame, so on a tight boundary the cap never binds and only
-# a real pause lets the edge move at all.
-ONSET_BACKOFF_MAX_S = 0.30
-CODA_EXTEND_MAX_S = 0.40
+# character, to reach the acoustic boundary. The walk stops at the first
+# non-blank frame, so on a tight boundary the cap never binds and only a real
+# pause lets the edge move at all.
+#
+# The onset cap was 0.30 until 2026-08-10, sized against a measured inset of
+# 230.8 ms. That figure was wrong by construction: the cores are clean galgame
+# clips carrying their own leading silence, and once that silence is measured and
+# subtracted (`tools/align/measure_core_leading_silence.py`) the real inset is
+# 110.8 ms. `tools/align/sweep_edge_caps.py` then swept the cap against
+# measured speech onsets on 1200 held-out cores - one posterior, six caps, so the
+# arms differ by nothing but this number. Reading the two costs separately, since
+# starting early only shows the line sooner while starting late cuts speech off:
+#
+#   cap    starts >100 ms LATE    starts >200 ms EARLY (audible)
+#   0.00        53.25%                     7.42%
+#   0.15        13.25%                     7.67%
+#   0.20         7.17%                     8.83%
+#   0.30         5.67%                    22.08%
+#
+# The audible-early tail is flat up to 0.15 - that ~7.4% floor is present with no
+# correction at all and belongs to the energy detector, not the walk - then costs
+# 1.16 pp at 0.20 and 13.25 pp at 0.30. The last step buys 1.50 pp of late starts
+# for ten times that in early ones, so 0.30 was past the knee and 0.20 is on it.
+#
+# The coda cap was 0.40, sized against a "tail inset" of 371.7 ms that carried
+# the same contamination - and far more of it. The clips' own TRAILING silence is
+# a median 274.8 ms, so about three quarters of that figure was never alignment
+# error; the uncorrected tail inset actually measures 99.2 ms, and the two edges
+# are therefore roughly equal rather than 1.6x apart.
+#
+# The coda could not be chosen by a knee, because unlike the onset it has no free
+# direction. `linger_s` and `max_display_shift_from_acoustic_end_s` are both 0.5,
+# so the display ceiling binds at almost exactly the linger target and an error in
+# `acoustic_end` passes into the visible out-point 1:1 in BOTH directions: early
+# and the line vanishes on the last syllable, late and it eats the gap to the next
+# cue while inflating `previous_word_end_s` for the layout DP. So it is bracketed:
+#
+#   cap    ends >100 ms LATE    ends EARLY    past core_end (cap-attributable)
+#   0.00        14.67%            75.00%              +0.00 pp
+#   0.15        27.75%            48.00%              +3.83 pp
+#   0.20        42.67%            35.42%             +11.08 pp
+#   0.40        65.58%            22.75%             +31.25 pp
+#
+# 0.15 is where the median error crosses zero (+9.7 ms) and the two directions sit
+# balanced at 48%/52%; past it the late side runs away and the walk starts leaving
+# the clip entirely. `past core_end` is exact and needs no detector - `core_end_s`
+# minus `core_start_s` is the source clip's duration - so it is the one reading
+# here that cannot be argued with, and it is what rules out 0.40.
+#
+# Note the caps are NOT ordered by inset, which is what the old comment implied.
+# The insets are nearly equal; the caps differ because the cheap direction differs.
+ONSET_BACKOFF_MAX_S = 0.20
+CODA_EXTEND_MAX_S = 0.15
 
 
 def speech_extent(

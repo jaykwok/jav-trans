@@ -370,7 +370,13 @@ class TestSpeechExtent:
         a, blank = VOCAB.index_of("あ"), alignment.BLANK_INDEX
         frames = [blank] * 3 + [a] * 2 + [blank] * 3
         log_probs, spans = self._spans(frames, "あ")
-        extent = alignment.speech_extent(log_probs, spans, upsample=1)
+        # Caps passed explicitly and sized to clear the pause: this pins the
+        # walk, not the production constants. Reading them from the module made
+        # the assertion silently depend on how many frames 0.30 happened to
+        # quantize to, so retuning the cap failed a test about the mechanism.
+        extent = alignment.speech_extent(
+            log_probs, spans, upsample=1, backoff_max_s=0.3, extend_max_s=0.3
+        )
         assert extent == (pytest.approx(0.0), pytest.approx(8 / 13.0))
         # And it really moved: the character's own span is the inner one.
         assert spans[0].start_s > extent[0]
@@ -415,14 +421,24 @@ class TestSpeechExtent:
         log_probs = _posteriors([alignment.BLANK_INDEX] * 4, vocab_size=VOCAB.size)
         assert alignment.speech_extent(log_probs, [], upsample=1) is None
 
-    def test_the_caps_are_read_from_the_measured_inset(self) -> None:
-        """Both caps are one-sided and positive, and the tail one is larger.
+    def test_the_caps_are_sized_by_cost_not_by_inset(self) -> None:
+        """Both caps are one-sided and positive, and the ONSET one is larger.
 
-        The composite geometry that motivated them is asymmetric - median inset
-        230.8 ms at the head against 371.7 ms at the tail - so equal caps would
-        be a claim the data does not make.
+        This assertion used to read the other way, justified by insets of 230.8
+        and 371.7 ms. Both figures were measured against the core's placement
+        window, so both counted the clip's own edge silence as alignment error -
+        90.0 ms of it at the head and 274.8 ms at the tail. Decontaminated, the
+        insets are near enough equal (110.8 / 99.2 ms) that they cannot order the
+        caps at all.
+
+        What orders them is which direction is cheap. At the onset, starting
+        early only shows the line sooner, so the cap is pushed past the
+        median-zero point to buy back late starts. At the coda both directions
+        reach the visible out-point 1:1 - `linger_s` and
+        `max_display_shift_from_acoustic_end_s` are both 0.5, so the ceiling
+        binds - leaving no free direction and no reason to go past median-zero.
         """
-        assert 0.0 < alignment.ONSET_BACKOFF_MAX_S < alignment.CODA_EXTEND_MAX_S
+        assert 0.0 < alignment.CODA_EXTEND_MAX_S < alignment.ONSET_BACKOFF_MAX_S
 
 
 class TestBlankBias:
