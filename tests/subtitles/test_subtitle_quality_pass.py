@@ -712,10 +712,192 @@ def test_long_cue_splits_at_measured_word_gap_not_mid_word():
     assert len(prepared) == 2
     assert prepared[0]["ja_text"] == first
     assert prepared[1]["ja_text"] == second
-    # The cut sits inside the silence, not at either word's edge.
-    assert gap_start < prepared[1]["start"] <= gap_start + 0.8
+    # Blank says the text boundary is safe; the next cue enters exactly with
+    # its first measured word, not halfway through the preceding silence.
+    assert prepared[1]["start"] == pytest.approx(gap_start + 0.8)
     assert prepared[0]["subtitle_layout_split_source"] == "word_gap_dp"
     assert prepared[0]["text_break_type"] == "word_gap_boundary"
+
+
+def test_long_grok_cue_splits_at_measured_word_gap_not_mid_word():
+    first = "あのちょっとだけ"
+    second = "まってくださいよおねがい"
+    words = _aligned_words(first, 0.0, 0.20)
+    gap_start = words[-1]["end"]
+    words += _aligned_words(second, gap_start + 0.8, 0.50)
+    for word in words:
+        word["timestamp_kind"] = "grok_stt_word"
+    block = {
+        "start": 0.0,
+        "end": words[-1]["end"],
+        "ja_text": first + second,
+        "zh_text": first + second,
+        "words": words,
+    }
+
+    prepared = subtitle.prepare_srt_blocks([block], options=SubtitleOptions())
+
+    assert len(prepared) == 2
+    assert prepared[0]["ja_text"] == first
+    assert prepared[1]["ja_text"] == second
+    assert prepared[1]["start"] == pytest.approx(gap_start + 0.8)
+    assert prepared[0]["subtitle_layout_split_source"] == "word_gap_dp"
+
+
+def test_long_cue_ratio_fallback_keeps_text_bound_to_measured_word_time():
+    text = "この村の儀式を受けてもらうために必ず儀式をしなければいけない男子は一週間耐えなければいけない"
+    words = _aligned_words(text, 0.0, 0.25)
+    target_position = text.index("必")
+    # Model a long non-speech interval before this phrase. Character ratio puts
+    # the boundary far too early; the measured word start is authoritative.
+    for index, word in enumerate(words):
+        if index >= target_position:
+            word["start"] += 5.0
+            word["end"] += 5.0
+    block = {
+        "start": 0.0,
+        "end": words[-1]["end"],
+        "ja_text": text,
+        "zh_text": text,
+        "words": words,
+    }
+
+    plan = subtitle._long_display_dp_plan(block, options=SubtitleOptions())
+
+    assert plan is not None
+    target_nodes = [
+        node for node in plan["nodes"] if node["position"] == target_position
+    ]
+    if target_nodes:
+        assert target_nodes[0]["source"] in {
+            "measured_word_start",
+            "primary_cut",
+            "weak_cut",
+        }
+        assert target_nodes[0]["time_s"] >= words[target_position - 1]["end"]
+
+
+def test_measured_word_positions_exclude_ratio_only_candidates():
+    text = "abcdefghij"
+    measured = {3: 4.0, 8: 9.0}
+
+    positions = subtitle._candidate_text_positions_for_dp(
+        text,
+        split_count=4,
+        word_positions=measured,
+    )
+
+    assert positions == [3, 8]
+
+
+def test_incomplete_measured_word_map_never_falls_back_to_proportional_time():
+    text = "この文字列は十分に長いので表示時間による分割が必要になります"
+    words = _aligned_words(text.replace("文字", ""), 0.0, 0.5)
+    block = {
+        "start": 0.0,
+        "end": 20.0,
+        "ja_text": text,
+        "zh_text": text,
+        "words": words,
+    }
+
+    pieces = subtitle._split_long_display_block(
+        block,
+        options=SubtitleOptions(),
+    )
+
+    assert len(pieces) == 1
+    assert pieces[0]["ja_text"] == text
+    assert pieces[0]["subtitle_layout_split_skipped"] == (
+        "measured_word_text_map_incomplete"
+    )
+    assert "subtitle_layout_split_source" not in pieces[0]
+
+
+def test_single_measured_token_never_gets_split_at_an_invented_time():
+    text = "ひとつの計測済みトークンとして返された長い字幕テキスト"
+    block = {
+        "start": 0.0,
+        "end": 18.0,
+        "ja_text": text,
+        "zh_text": text,
+        "words": [
+            {
+                "word": text,
+                "start": 4.0,
+                "end": 17.0,
+                "timestamp_kind": "grok_stt_word",
+            }
+        ],
+    }
+
+    pieces = subtitle._split_long_display_block(
+        block,
+        options=SubtitleOptions(),
+    )
+
+    assert len(pieces) == 1
+    assert pieces[0]["subtitle_layout_split_skipped"] == (
+        "measured_word_boundaries_unavailable"
+    )
+    assert "subtitle_layout_split_source" not in pieces[0]
+
+
+def test_ctc_punctuation_frames_do_not_become_subtitle_onsets():
+    first = "前の台詞"
+    ellipsis = "..."
+    second = "こんな出来損ない"
+    words = _aligned_words(first, 0.0, 0.35)
+    words += _aligned_words(ellipsis, 2.0, 0.60)
+    second_start = 6.5
+    words += _aligned_words(second, second_start, 0.35)
+    text = first + ellipsis + second
+    block = {
+        "start": 0.0,
+        "end": words[-1]["end"],
+        "ja_text": text,
+        "zh_text": text,
+        "words": words,
+    }
+
+    pieces = subtitle.prepare_srt_blocks([block], options=SubtitleOptions())
+
+    assert [piece["ja_text"] for piece in pieces] == [first + ellipsis, second]
+    assert pieces[1]["start"] == pytest.approx(second_start)
+    assert pieces[0]["end"] < second_start
+    assert not any(piece["display_clamped_to_max"] for piece in pieces)
+    assert not pieces[1]["ja_text"].startswith(tuple(".,，、。！？!?…；;"))
+
+
+def test_long_blank_is_a_real_gap_between_independent_cue_edges():
+    words = [
+        {
+            "word": "先",
+            "start": 0.0,
+            "end": 0.5,
+            "timestamp_kind": "ctc_forced_alignment",
+        },
+        {
+            "word": "後",
+            "start": 15.0,
+            "end": 15.5,
+            "timestamp_kind": "ctc_forced_alignment",
+        },
+    ]
+    block = {
+        "start": 0.0,
+        "end": 15.5,
+        "ja_text": "先後",
+        "zh_text": "先後",
+        "words": words,
+    }
+
+    pieces = subtitle.prepare_srt_blocks([block], options=SubtitleOptions())
+
+    assert [piece["ja_text"] for piece in pieces] == ["先", "後"]
+    assert pieces[0]["end"] < 15.0
+    assert pieces[1]["start"] == pytest.approx(15.0)
+    assert not any(piece["display_clamped_to_max"] for piece in pieces)
 
 
 def test_long_cue_split_ignores_synthetic_word_timings():

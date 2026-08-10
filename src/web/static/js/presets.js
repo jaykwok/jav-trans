@@ -86,7 +86,7 @@ export function installPresetChips() {
     saveCustomPreset();
     state.activePreset = 'custom';
     saveFormMemory();
-    showToast('自定义设置已保存，下次启动将默认选中自定义模式');
+    showToast('自定义任务模板已保存到本机浏览器，不会写入 .env');
   });
 }
 

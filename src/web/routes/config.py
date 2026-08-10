@@ -111,6 +111,7 @@ def _initial_env_template_lines() -> list[str]:
         "# ASR_STAGE_WORKER_HEARTBEAT_S=10\n",
         "# GPU_BATCH_PROFILE_ENABLED=1\n",
         "# GPU_BATCH_PROFILE_GROWTH_THRESHOLD=0.80\n",
+        "# GPU_BATCH_PROFILE_MAX_ENTRIES=16\n",
         "# ASR_STAGE_WORKER_OOM_RETRY_LIMIT=6\n",
         "\n",
         "# --- Chunking / alignment examples ---\n",
@@ -119,6 +120,10 @@ def _initial_env_template_lines() -> list[str]:
         "# timing and fixed-length chunks. Nothing is dropped either way.\n",
         "# It downloads once from the HF repo; a local path overrides that.\n",
         "# ASR_ALIGNMENT_HEAD_PATH=./models/ctc_aligner.pt\n",
+        "# Optional observation-only candidate; it never changes subtitle output.\n",
+        "# ASR_ALIGNMENT_SHADOW_HEAD_PATH=./models/ctc_aligner.shadow.pt\n",
+        "# ASR_ALIGNMENT_SHADOW_ROOT=./tmp/cache/alignment_shadow\n",
+        "# ASR_ALIGNMENT_SHADOW_MIN_DELTA_MS=20\n",
         "# Chunks run to ASR_CHUNK_MAX_S; cuts take the latest pause under it.\n",
         "# ASR_CHUNK_MAX_S=30\n",
         "# ASR_CHUNK_MIN_PAUSE_S=0.6\n",
@@ -464,9 +469,6 @@ async def get_settings() -> SettingsRead:
     if translation_backend not in {"openai", "llamacpp"}:
         translation_backend = "openai"
     llamacpp_server_path = _runtime_or_env_or_setting("LLAMACPP_SERVER_PATH", "")
-    llamacpp_model_repo = _runtime_or_env_or_setting("LLAMACPP_MODEL_REPO", "")
-    llamacpp_model_file = _runtime_or_env_or_setting("LLAMACPP_MODEL_FILE", "")
-    llamacpp_gguf_path = _runtime_or_env_or_setting("LLAMACPP_GGUF_PATH", "")
 
     return SettingsRead(
         api_key_set=bool(api_key),
@@ -482,9 +484,6 @@ async def get_settings() -> SettingsRead:
         target_lang=target_lang,
         translation_backend=translation_backend,
         llamacpp_server_path=llamacpp_server_path,
-        llamacpp_model_repo=llamacpp_model_repo,
-        llamacpp_model_file=llamacpp_model_file,
-        llamacpp_gguf_path=llamacpp_gguf_path,
     )
 
 
@@ -527,22 +526,23 @@ async def post_settings(update: SettingsUpdate) -> dict:
                 status_code=422,
                 detail="translation_backend must be one of: openai, llamacpp",
             )
+        previous_backend = _runtime_or_env_or_setting("TRANSLATION_BACKEND", "openai")
         changes["TRANSLATION_BACKEND"] = update.translation_backend
         os.environ["TRANSLATION_BACKEND"] = update.translation_backend
-        reset_llamacpp_translation_backend = update.translation_backend != "llamacpp"
-    for field_name, env_key in (
-        ("llamacpp_server_path", "LLAMACPP_SERVER_PATH"),
-        ("llamacpp_model_repo", "LLAMACPP_MODEL_REPO"),
-        ("llamacpp_model_file", "LLAMACPP_MODEL_FILE"),
-        ("llamacpp_gguf_path", "LLAMACPP_GGUF_PATH"),
-    ):
-        value = getattr(update, field_name)
-        if value is not None:
-            changes[env_key] = value
-            os.environ[env_key] = value
-            # A running llama-server keeps the old GGUF loaded; drop it so the
-            # next translation spawns with the new configuration.
-            reset_llamacpp_translation_backend = True
+        reset_llamacpp_translation_backend = (
+            previous_backend != update.translation_backend
+            and update.translation_backend != "llamacpp"
+        )
+    if update.llamacpp_server_path is not None:
+        previous_server_path = _runtime_or_env_or_setting("LLAMACPP_SERVER_PATH", "")
+        changes["LLAMACPP_SERVER_PATH"] = update.llamacpp_server_path
+        os.environ["LLAMACPP_SERVER_PATH"] = update.llamacpp_server_path
+        # A running server keeps the old executable/process; drop it so the
+        # next translation starts with the new server path.
+        reset_llamacpp_translation_backend = (
+            reset_llamacpp_translation_backend
+            or previous_server_path != update.llamacpp_server_path
+        )
     if changes:
         _clear_saved_hf_mirror_if_present(changes)
         _update_env_file(changes)

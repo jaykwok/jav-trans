@@ -113,6 +113,7 @@
             <label class="field">
               <span>字幕模式</span>
               <select id="r-mode"></select>
+              <span class="field-hint">选项名称会随“翻译设置 → 目标语言”自动更新。</span>
             </label>
             <div class="toggle-row">
               <span>不翻译（仅日文字幕）</span>
@@ -131,11 +132,12 @@
               <label class="toggle"><input type="checkbox" id="t-keep-temp"><span class="slider"></span></label>
             </div>
             <label class="field">
-              <span>环境变量覆盖（每行 KEY=VALUE，优先级高于 .env）</span>
+              <span>环境变量覆盖（每行 KEY=VALUE，优先级高于 .env 和页面同名任务参数）</span>
               <textarea id="t-env-override" rows="3"
                 placeholder="ASR_ALIGNMENT_HEAD_PATH=&#10;ASR_CHUNK_MAX_S=30"></textarea>
             </label>
-            <button class="btn btn-outline" id="btn-save-custom" type="button">保存自定义设置</button>
+            <button class="btn btn-outline" id="btn-save-custom" type="button">保存自定义任务模板</button>
+            <p class="field-hint">自定义任务模板只保存在本机浏览器中，不写入 <code>.env</code>；翻译设置请使用下方的独立保存按钮。</p>
           </div>
         </details>
       </div>
@@ -150,7 +152,7 @@
               <span>翻译后端</span>
               <select id="translation-backend">
                 <option value="openai" selected>API 调用（OpenAI 兼容）</option>
-                <option value="llamacpp">本地 GGUF（llama.cpp，推荐本地）</option>
+                <option value="llamacpp">本地翻译（Hy-MT2-1.8B · llama.cpp）</option>
               </select>
             </label>
 
@@ -165,7 +167,7 @@
               </label>
 
               <label class="field">
-                <span>API Base URL（留空使用 .env 默认）</span>
+                <span>API Base URL（留空则不修改当前值）</span>
                 <input type="text" id="api-base-url" placeholder="https://api.deepseek.com/v1">
               </label>
 
@@ -202,11 +204,6 @@
             </div>
 
             <div id="llamacpp-backend-fields" style="display:none">
-              <label class="field" id="llamacpp-gguf-path-field">
-                <span>自定义 GGUF 文件路径（留空使用内置模型 Hy-MT2-1.8B）</span>
-                <input type="text" id="llamacpp-gguf-path" placeholder="留空即可，首次使用会自动下载内置模型">
-              </label>
-
               <label class="field">
                 <span>llama-server 路径（留空则使用 PATH 中的 llama-server）</span>
                 <input type="text" id="llamacpp-server-path" placeholder="例：D:\llama.cpp\llama-server.exe">
@@ -216,11 +213,10 @@
                 需要先安装 llama.cpp：<code>winget install -e --id ggml.llamacpp</code>（Vulkan 构建，
                 装完自动在 PATH 上，上方路径可留空），N 卡想要更快可到 GitHub Releases 下载
                 <code>llama-*-bin-win-cuda-*.zip</code> 解压后填写上方路径。
-                首次使用会自动下载内置的 Hy-MT2-1.8B（约 2GB，建议配合代理）。
+                本地翻译固定使用 Hy-MT2-1.8B Q8_0 GGUF；首次使用自动下载约 2GB，建议配合代理。
                 翻译开始时会临时释放 ASR 显存，任务切回 ASR 时自动重载。
                 本地模型逐句翻译，不使用术语表、角色参考和全片上下文——这些只在
-                OpenAI 兼容 API 后端生效。自定义 GGUF 若不是 Hunyuan-MT 系，会被
-                当作能按 JSON 批量回答的模型处理。
+                OpenAI 兼容 API 后端生效。
               </p>
             </div>
 
@@ -234,10 +230,12 @@
               </select>
             </label>
 
-            <label class="field">
-              <span>术语表（每行一条，格式：日文-中文）</span>
+            <label class="field" id="translation-glossary-field">
+              <span>术语表（API 后端；每行一条，格式：日文-目标译文）</span>
               <textarea id="api-glossary" rows="4" placeholder="ちんぽ-肉棒&#10;チンポ-肉棒"></textarea>
             </label>
+
+            <button class="btn btn-outline" id="btn-save-translation" type="button">保存翻译设置到 .env</button>
 
           </div>
         </details>

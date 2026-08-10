@@ -869,11 +869,9 @@ class AlignmentHead:
 
     Deliberately not auto-discovered. The head is enabled only by pointing
     `ASR_ALIGNMENT_HEAD_PATH` at a checkpoint, and with nothing set the caller
-    keeps its previous proportional timing. The reason is the same one that
-    produced `require_boundary_pipeline_ready`: a stage that quietly starts
-    running before it has been measured on the production domain reports its
-    own unvalidated output as fact. This head's alignment accuracy has so far
-    been established on clean speech only.
+    keeps its previous proportional timing. Keeping the checkpoint reference
+    explicit and revision-pinned makes every timing change attributable to a
+    specific promoted artifact.
     """
 
     def __init__(

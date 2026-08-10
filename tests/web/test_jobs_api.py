@@ -143,8 +143,8 @@ def test_settings_translation_fields_update_runtime_env(monkeypatch):
     asyncio.run(_test_settings_translation_fields_update_runtime_env(monkeypatch))
 
 
-def test_settings_ignores_removed_asr_context(monkeypatch):
-    asyncio.run(_test_settings_ignores_removed_asr_context(monkeypatch))
+def test_settings_rejects_unknown_fields(monkeypatch):
+    asyncio.run(_test_settings_rejects_unknown_fields(monkeypatch))
 
 
 def test_settings_env_file_quotes_multiline_values(tmp_path, monkeypatch):
@@ -241,6 +241,10 @@ def test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch):
 
 def test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
     asyncio.run(_test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch))
+
+
+def test_open_folder_allows_default_video_directory(tmp_path, monkeypatch):
+    asyncio.run(_test_open_folder_allows_default_video_directory(tmp_path, monkeypatch))
 
 
 async def _test_app_exposes_icon_assets(tmp_path, monkeypatch):
@@ -640,8 +644,7 @@ def test_reasoning_effort_frontend_and_models_default_to_medium():
     ).llm_reasoning_effort == "medium"
 
 
-async def _test_settings_ignores_removed_asr_context(monkeypatch):
-    monkeypatch.delenv("ASR_CONTEXT", raising=False)
+async def _test_settings_rejects_unknown_fields(monkeypatch):
     monkeypatch.setattr(config_routes, "_update_env_file", lambda _changes: None)
 
     transport = httpx.ASGITransport(app=create_app())
@@ -651,11 +654,10 @@ async def _test_settings_ignores_removed_asr_context(monkeypatch):
     ) as client:
         response = await client.post(
             "/api/settings",
-            json={"asr_context": "小那海"},
+            json={"unexpected_setting": "value"},
         )
 
-    assert response.status_code == 200
-    assert "ASR_CONTEXT" not in os.environ
+    assert response.status_code == 422
 
 
 async def _test_settings_env_file_quotes_multiline_values(tmp_path, monkeypatch):
@@ -1027,6 +1029,67 @@ async def _test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
         assert (open_kind, str(video_path.resolve())) in opened
         assert (open_kind, str(artifact_path.resolve())) in opened
         assert (open_kind, str(output_dir.resolve())) in opened
+    finally:
+        await _reset_pm_state()
+
+
+async def _test_open_folder_allows_default_video_directory(tmp_path, monkeypatch):
+    """With no output_dir, completed subtitles live beside the source video."""
+    from web.routes import files as files_routes
+
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    monkeypatch.setattr(files_routes, "PROJECT_ROOT", project_root)
+    await _reset_pm_state()
+    video_dir = tmp_path / "videos"
+    video_dir.mkdir()
+    video_path = video_dir / "sample.mp4"
+    video_path.write_bytes(b"video")
+    artifact_path = video_dir / "sample.srt"
+    artifact_path.write_text("1\n", encoding="utf-8")
+    outside_artifact = tmp_path / "outside.srt"
+    outside_artifact.write_text("secret\n", encoding="utf-8")
+    opened: list[str] = []
+
+    if os.name == "nt":
+        monkeypatch.setattr(
+            files_routes.os,
+            "startfile",
+            lambda path: opened.append(str(path)),
+            raising=False,
+        )
+    else:
+        monkeypatch.setattr(
+            files_routes.subprocess,
+            "Popen",
+            lambda args: opened.append(str(args[-1])),
+        )
+
+    try:
+        jobs = await pm.create_job(
+            pm.JobSpec(video_paths=[str(video_path)], output_dir=None)
+        )
+        job = jobs[0]
+        async with pm._state_lock:
+            job.status = "done"
+            job.artifacts = [str(artifact_path), str(outside_artifact)]
+            pm._jobs[job.id] = job
+
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            allowed = await client.post(
+                "/api/open-folder",
+                params={"job_id": job.id, "path": str(artifact_path)},
+            )
+            blocked = await client.post(
+                "/api/open-folder",
+                params={"job_id": job.id, "path": str(outside_artifact)},
+            )
+
+        assert allowed.status_code == 200
+        assert blocked.status_code == 403
+        assert opened == [str(video_dir.resolve())]
     finally:
         await _reset_pm_state()
 

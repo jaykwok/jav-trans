@@ -8,7 +8,8 @@ backend's Qwen3 tier list, the 0.6B ASR tier. This file is the standing check so
 the next one is found by the suite instead of by a user.
 
 `api-model` is deliberately allowed: that is the *remote* API model name, which
-only the user can know.
+only the user can know. The local backend is the fixed Hy-MT2 + llama.cpp stack;
+even a free-form GGUF path would be a model picker and may not appear.
 """
 
 from __future__ import annotations
@@ -55,13 +56,26 @@ def test_the_backend_selector_offers_only_the_two_that_exist() -> None:
 
 
 def test_no_local_translation_model_can_be_named_in_the_browser() -> None:
-    """A GGUF path box stays (an escape hatch for a user who brings their own),
-    but no list of model names may reappear."""
+    """The local path is fixed to Hy-MT2; no preset or arbitrary GGUF input."""
     sources = [INDEX] + sorted((STATIC / "js").glob("*.js"))
     for path in sources:
         text = path.read_text(encoding="utf-8")
         for token in ("Qwen3-4B", "Qwen3-8B", "Qwen3-14B", "Qwen3.5", "local-model-preset"):
             assert token not in text, f"{path.name} still names {token}"
+        assert "llamacpp-gguf-path" not in text
+
+
+def test_local_backend_is_described_as_the_fixed_hymt2_stack() -> None:
+    html = _html()
+    assert "本地翻译（Hy-MT2-1.8B · llama.cpp）" in html
+    assert "本地翻译固定使用 Hy-MT2-1.8B Q8_0 GGUF" in html
+    assert "推荐本地" not in html
+
+    from web.models import SettingsRead, SettingsUpdate
+
+    for removed in ("llamacpp_model_repo", "llamacpp_model_file", "llamacpp_gguf_path"):
+        assert removed not in SettingsRead.model_fields
+        assert removed not in SettingsUpdate.model_fields
 
 
 def test_no_asr_model_can_be_chosen_in_the_browser() -> None:

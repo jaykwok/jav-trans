@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import gc
+import hashlib
 import multiprocessing as mp
 import os
 import sys
@@ -368,6 +369,71 @@ def _gpu_device_name(torch_module: Any) -> str:
         return ""
 
 
+def _gpu_hardware_identity(
+    torch_module: Any,
+    *,
+    device_name: str,
+    total_mb: float,
+) -> dict[str, Any]:
+    """Return a privacy-preserving identity for the physical CUDA device.
+
+    CUDA ordinals are deliberately excluded: ``cuda:0`` changes when device
+    visibility or enumeration order changes.  A CUDA UUID identifies the card
+    itself, while PCI coordinates are the best identity older torch builds can
+    expose.  Only a truncated hash is persisted, never the raw UUID or PCI
+    address.
+    """
+
+    properties = None
+    try:
+        if torch_module.cuda.is_available():
+            device_index = torch_module.cuda.current_device()
+            properties = torch_module.cuda.get_device_properties(device_index)
+    except Exception:
+        properties = None
+
+    major = getattr(properties, "major", None)
+    minor = getattr(properties, "minor", None)
+    compute_capability = (
+        f"{int(major)}.{int(minor)}"
+        if major is not None and minor is not None
+        else ""
+    )
+
+    raw_uuid = str(getattr(properties, "uuid", "") or "").strip().lower()
+    if raw_uuid and raw_uuid not in {"none", "unknown"}:
+        fingerprint_source = "cuda_uuid"
+        fingerprint_material = f"nvidia:uuid:{raw_uuid}"
+    else:
+        pci_parts = (
+            getattr(properties, "pci_domain_id", None),
+            getattr(properties, "pci_bus_id", None),
+            getattr(properties, "pci_device_id", None),
+        )
+        if all(part is not None for part in pci_parts):
+            fingerprint_source = "pci_location"
+            fingerprint_material = "nvidia:pci:" + ":".join(
+                str(int(part)) for part in pci_parts
+            )
+        else:
+            fingerprint_source = "model_vram_compute"
+            fingerprint_material = (
+                "nvidia:fallback:"
+                f"{str(device_name).strip().lower()}:"
+                f"{round(float(total_mb))}:{compute_capability}"
+            )
+
+    digest = hashlib.sha256(fingerprint_material.encode("utf-8")).hexdigest()[:24]
+    return {
+        "vendor": "nvidia",
+        "fingerprint": f"sha256:{digest}",
+        "fingerprint_source": fingerprint_source,
+        "name": str(device_name or "").strip(),
+        "physical_vram_mb": round(float(total_mb)),
+        "compute_capability": compute_capability,
+    }
+
+
 def _enforce_min_physical_vram(
     *,
     total_mb: float,
@@ -439,41 +505,42 @@ class _CudaStageMemoryTracker:
 def _profile_identity(
     *,
     stage: str,
-    device_name: str,
-    total_mb: float,
+    hardware: dict[str, Any],
     budget_mb: float,
     env: dict[str, str],
 ) -> dict[str, Any]:
     return {
         "profile_version": batch_profile.PROFILE_VERSION,
-        "stage": stage,
-        "gpu_name": device_name,
-        "physical_vram_mb": round(total_mb),
-        "budget_mb": round(budget_mb),
-        "backend": str(
-            env.get("ASR_BACKEND") or os.getenv("ASR_BACKEND", "")
-        ).strip(),
-        "model_id": str(
-            env.get("ASR_MODEL_ID") or os.getenv("ASR_MODEL_ID", "")
-        ).strip(),
-        "model_path": str(
-            env.get("ASR_MODEL_PATH") or os.getenv("ASR_MODEL_PATH", "")
-        ).strip(),
-        "dtype": str(env.get("ASR_DTYPE") or os.getenv("ASR_DTYPE", "")).strip(),
-        "attention": str(
-            env.get("ASR_ATTENTION") or os.getenv("ASR_ATTENTION", "")
-        ).strip(),
-        "max_new_tokens": str(
-            env.get("ASR_MAX_NEW_TOKENS")
-            or os.getenv("ASR_MAX_NEW_TOKENS", "")
-        ).strip(),
+        "hardware": dict(hardware),
+        "workload": {
+            "stage": stage,
+            "budget_mb": round(budget_mb),
+            "backend": str(
+                env.get("ASR_BACKEND") or os.getenv("ASR_BACKEND", "")
+            ).strip(),
+            "model_id": str(
+                env.get("ASR_MODEL_ID") or os.getenv("ASR_MODEL_ID", "")
+            ).strip(),
+            "model_path": str(
+                env.get("ASR_MODEL_PATH") or os.getenv("ASR_MODEL_PATH", "")
+            ).strip(),
+            "dtype": str(
+                env.get("ASR_DTYPE") or os.getenv("ASR_DTYPE", "")
+            ).strip(),
+            "attention": str(
+                env.get("ASR_ATTENTION") or os.getenv("ASR_ATTENTION", "")
+            ).strip(),
+            "max_new_tokens": str(
+                env.get("ASR_MAX_NEW_TOKENS")
+                or os.getenv("ASR_MAX_NEW_TOKENS", "")
+            ).strip(),
         # The decode budget sets the KV-cache footprint, and with no explicit cap
         # the rate ceiling is what sets the budget - so a profile learned at 10
         # tok/s must not govern a run at 20.
-        "tokens_per_second": str(
-            env.get("ASR_DECODE_TOKENS_PER_SECOND")
-            or os.getenv("ASR_DECODE_TOKENS_PER_SECOND", "")
-        ).strip(),
+            "tokens_per_second": str(
+                env.get("ASR_DECODE_TOKENS_PER_SECOND")
+                or os.getenv("ASR_DECODE_TOKENS_PER_SECOND", "")
+            ).strip(),
         # Chunk geometry belongs in the identity because it, not the model, sets
         # the activation footprint: a batch of 8 x 30s and a batch of 8 x 20s are
         # different amounts of encoder sequence. Leaving it out let a profile
@@ -487,9 +554,10 @@ def _profile_identity(
         # `chunk_max_s` alone is the geometry now: cuts take the latest pause
         # under the ceiling, so chunk length tracks the ceiling and the separate
         # target length is gone.
-        "chunk_max_s": str(
-            env.get("ASR_CHUNK_MAX_S") or os.getenv("ASR_CHUNK_MAX_S", "")
-        ).strip(),
+            "chunk_max_s": str(
+                env.get("ASR_CHUNK_MAX_S") or os.getenv("ASR_CHUNK_MAX_S", "")
+            ).strip(),
+        },
     }
 
 
@@ -590,6 +658,11 @@ def _adaptive_runtime_tuning(
     """Resolve auto VRAM budget and ASR batch inside the CUDA owner process."""
     total_mb = _physical_vram_mb(torch_module)
     device_name = _gpu_device_name(torch_module)
+    hardware = _gpu_hardware_identity(
+        torch_module,
+        device_name=device_name,
+        total_mb=total_mb,
+    )
     minimum_contract = (
         _enforce_min_physical_vram(total_mb=total_mb, env=env)
         if enforce_minimum
@@ -629,8 +702,7 @@ def _adaptive_runtime_tuning(
     if base_batch is not None:
         asr_identity = _profile_identity(
             stage="asr_text_transcribe",
-            device_name=device_name,
-            total_mb=total_mb,
+            hardware=hardware,
             budget_mb=budget_mb,
             env=env,
         )
@@ -653,6 +725,7 @@ def _adaptive_runtime_tuning(
 
     return {
         "device_name": device_name,
+        "hardware": hardware,
         "physical_vram_mb": round(total_mb, 1),
         "minimum_physical_vram_mb": minimum_contract.get(
             "minimum_physical_vram_mb"
@@ -704,6 +777,7 @@ def _record_profile_oom(runtime_tuning: dict[str, Any], stage: str) -> None:
 def _record_profile_successes(
     runtime_tuning: dict[str, Any],
     stage_peaks_mb: dict[str, float],
+    asr_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     learned: dict[str, Any] = {}
     profiles = runtime_tuning.get("batch_profiles")
@@ -717,10 +791,28 @@ def _record_profile_successes(
         peak_mb = stage_peaks_mb.get(stage)
         if peak_mb is None:
             continue
+        configured_batch = int(raw_profile.get("batch_size") or 0)
+        if stage == "asr_text_transcribe":
+            stage_timings = (
+                asr_details.get("stage_timings")
+                if isinstance(asr_details, dict)
+                else None
+            )
+            try:
+                observed_batch = int(
+                    stage_timings.get("asr_text_max_observed_batch_size") or 0
+                )
+            except (AttributeError, TypeError, ValueError):
+                observed_batch = 0
+            # A partial final batch, a short smoke, or a cache-heavy rerun did
+            # not validate the configured allocation. Do not turn it into a
+            # false safe bound or use its low peak to recommend growth.
+            if configured_batch < 1 or observed_batch < configured_batch:
+                continue
         try:
             entry = batch_profile.record_success(
                 raw_profile["identity"],
-                batch_size=int(raw_profile["batch_size"]),
+                batch_size=configured_batch,
                 peak_allocated_mb=float(peak_mb),
                 budget_mb=budget_mb,
                 max_batch=int(raw_profile["max_batch"]),
@@ -1060,6 +1152,7 @@ def worker_main(parent_conn: Connection) -> None:
                 learned_profiles = _record_profile_successes(
                     runtime_tuning,
                     stage_peaks,
+                    asr_details,
                 )
                 stage_worker = asr_details.get("stage_worker")
                 if isinstance(stage_worker, dict):

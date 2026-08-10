@@ -178,6 +178,57 @@ class TestBlindLabelling:
         assert adapter.LABEL_UNSURE in adapter.PARTITION_LABELS
 
 
+class TestSplitAffordance:
+    """The editor has to be able to produce a second interval.
+
+    It could not, at first. `splitAt` was wired to `.pause-strip`, but the label
+    segments are absolutely positioned buttons that tile that strip end to end
+    and call `stopPropagation` so that clicking one auditions it. With every
+    window starting as a single `unsure` span covering the whole width, the
+    split handler was unreachable from the very first click - the page offered
+    exactly one interval per window forever, which is the resolution this audit
+    exists to avoid.
+    """
+
+    def test_the_split_target_is_not_the_strip_the_segments_cover(
+        self, tmp_path: Path
+    ) -> None:
+        label_page.build(_manifest(tmp_path), tmp_path, "prompt")
+        text = (tmp_path / "index.html").read_text(encoding="utf-8")
+        assert 'class="pause-ruler"' in text
+        assert "ruler.onclick=" in text
+        # The regression itself: nothing may hang a gesture off the covered strip.
+        assert "strip.onclick=" not in text
+
+    def test_the_segments_still_swallow_their_own_clicks(self, tmp_path: Path) -> None:
+        """Which is correct - it is why the split needed somewhere else to live,
+        not something to undo."""
+        label_page.build(_manifest(tmp_path), tmp_path, "prompt")
+        text = (tmp_path / "index.html").read_text(encoding="utf-8")
+        assert "event.stopPropagation();" in text
+
+    def test_a_boundary_can_be_placed_at_the_playhead(self, tmp_path: Path) -> None:
+        """The ear finds a boundary by listening, not by looking at a flat bar."""
+        label_page.build(_manifest(tmp_path), tmp_path, "prompt")
+        text = (tmp_path / "index.html").read_text(encoding="utf-8")
+        assert 'data-action="cut-here"' in text
+        assert "splitAt(entry,(Number(audio.currentTime)||0)/totalSeconds)" in text
+
+    def test_a_refused_split_says_so(self, tmp_path: Path) -> None:
+        """A silent no-op reads the same as a handler that never fired, which is
+        how the dead split went unnoticed."""
+        label_page.build(_manifest(tmp_path), tmp_path, "prompt")
+        text = (tmp_path / "index.html").read_text(encoding="utf-8")
+        assert "这里已经是一条边界了" in text
+
+    def test_the_page_says_it_is_not_one_verdict_per_window(
+        self, tmp_path: Path
+    ) -> None:
+        label_page.build(_manifest(tmp_path), tmp_path, "prompt")
+        text = (tmp_path / "index.html").read_text(encoding="utf-8")
+        assert "不是整条打一个标" in text
+
+
 class TestPartitionContract:
     """Frame-aligned, gapless, complete - enforced at save, not while editing."""
 

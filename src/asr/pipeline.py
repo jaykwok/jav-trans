@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from asr import chunking, result_cache, transcribe
+from asr import alignment_shadow, chunking, result_cache, transcribe
 from asr.alignment import (
     AlignmentHead,
     alignment_head_configured,
@@ -853,6 +853,7 @@ def _transcribe_and_align_local(
     timings: dict[str, float] = {}
     cuda_memory: list[dict] = []
     transcript_chunks: list[dict] = []
+    shadow_details: dict[str, Any] | None = None
     chunk_dir: Path | None = None
     total_started = time.perf_counter()
     _record_cuda_memory(log, cuda_memory, "asr_start", elapsed_s=0.0)
@@ -1120,6 +1121,16 @@ def _transcribe_and_align_local(
                 text_results,
                 log=log,
             )
+            shadow_details = alignment_shadow.build_run_details(
+                chunk_infos,
+                prepared_results,
+            )
+            if shadow_details is not None:
+                log.append(
+                    "CTC 影子对齐: "
+                    f"记录 {int(shadow_details['comparison_count'])} 块，"
+                    f"有效分歧 {int(shadow_details['eligible_disagreement_count'])} 块"
+                )
         finally:
             backend.close()
 
@@ -1207,6 +1218,7 @@ def _transcribe_and_align_local(
             "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
             "postgate": postgate_report,
             "decode_cap_truncations": decode_cap_truncations,
+            **({"alignment_shadow": shadow_details} if shadow_details is not None else {}),
             "alignment_issue_count": sum(
                 1
                 for outcome in alignment_outcomes.values()

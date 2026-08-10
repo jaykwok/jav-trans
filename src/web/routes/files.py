@@ -35,6 +35,29 @@ def _resolve_output_base(output_dir: str | None) -> Path:
     return base.resolve()
 
 
+def _authorized_artifact_roots(job: JobState) -> list[Path]:
+    """Return every directory where this job may legitimately write artifacts.
+
+    An explicit output directory is authoritative.  When it is omitted, the
+    pipeline writes beside each source video, which may be outside the project
+    tree (the normal desktop-app case).
+    """
+    roots = [PROJECT_ROOT.resolve()]
+    if job.spec.output_dir:
+        roots.append(_resolve_output_base(job.spec.output_dir))
+    else:
+        for raw_video_path in job.spec.video_paths:
+            video_path = _resolve_existing_video_path(raw_video_path)
+            if video_path is not None:
+                roots.append(video_path.parent.resolve())
+
+    unique: list[Path] = []
+    for root in roots:
+        if root not in unique:
+            unique.append(root)
+    return unique
+
+
 def _resolve_existing_video_path(raw_path: str) -> Path | None:
     try:
         path = Path(raw_path).expanduser().resolve()
@@ -76,7 +99,7 @@ def _artifact_path_candidates(job: JobState, raw_path: str) -> list[Path]:
     if not raw_text:
         return []
     requested_name = Path(raw_text).name
-    output_base = _resolve_output_base(job.spec.output_dir)
+    allowed_roots = _authorized_artifact_roots(job)
     candidates: list[Path] = []
     for artifact in job.artifacts:
         artifact_text = str(artifact)
@@ -86,8 +109,7 @@ def _artifact_path_candidates(job: JobState, raw_path: str) -> list[Path]:
         if artifact_path.is_absolute():
             candidates.append(artifact_path)
         else:
-            candidates.append(output_base / artifact_path)
-            candidates.append(PROJECT_ROOT / artifact_path)
+            candidates.extend(root / artifact_path for root in allowed_roots)
     if requested_name:
         for artifact in job.artifacts:
             artifact_path = Path(str(artifact))
@@ -96,14 +118,12 @@ def _artifact_path_candidates(job: JobState, raw_path: str) -> list[Path]:
             if artifact_path.is_absolute():
                 candidates.append(artifact_path)
             else:
-                candidates.append(output_base / artifact_path)
-                candidates.append(PROJECT_ROOT / artifact_path)
+                candidates.extend(root / artifact_path for root in allowed_roots)
     return candidates
 
 
 def _resolve_authorized_artifact_path(job: JobState, raw_path: str) -> Path | None:
-    output_base = _resolve_output_base(job.spec.output_dir).resolve()
-    project_root = PROJECT_ROOT.resolve()
+    allowed_roots = _authorized_artifact_roots(job)
 
     for candidate in _artifact_path_candidates(job, raw_path):
         try:
@@ -113,18 +133,14 @@ def _resolve_authorized_artifact_path(job: JobState, raw_path: str) -> Path | No
         if not resolved.exists():
             continue
 
-        # Guard against path traversal: only return paths inside the job's output
-        # base or the project root, even if a persisted jobs.json artifact entry
-        # was tampered to point elsewhere.
-        try:
-            resolved.relative_to(output_base)
-        except ValueError:
+        # Guard against path traversal: even a tampered jobs.json artifact must
+        # remain inside an output root derived from this job's own specification.
+        for root in allowed_roots:
             try:
-                resolved.relative_to(project_root)
+                resolved.relative_to(root)
             except ValueError:
                 continue
-
-        return resolved
+            return resolved
     return None
 
 

@@ -21,6 +21,10 @@ def format_timestamp(seconds: float) -> str:
 _COMPACT_SPACE_RE = re.compile(r"\s+")
 _WRAP_PUNCTUATION = "，、。！？…"
 _SENTENCE_BOUNDARY_RE = re.compile(r"[。！？!?…；;，、,]\s*")
+_CLOSING_PUNCTUATION = frozenset(
+    ".,，、。！？!?…；;:：)]}）］｝」』】〉》〕〗〙〛’”"
+)
+_OPENING_PUNCTUATION = frozenset("([{（［｛「『【〈《〔〖〘〚‘“")
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -323,6 +327,22 @@ def _text_break_score(text: str, position: int) -> float:
     return 0.75
 
 
+def _is_valid_subtitle_text_boundary(text: str, position: int) -> bool:
+    """Keep closing punctuation with the text on its left.
+
+    CTC gives punctuation a frame just like lexical characters, but punctuation
+    is not a spoken onset. A long blank before an ellipsis must therefore not
+    make the following cue enter on the first dot; the safe boundary is after
+    the complete ellipsis, at the next lexical word.
+    """
+    if not 0 < position < len(text):
+        return False
+    return (
+        text[position] not in _CLOSING_PUNCTUATION
+        and text[position - 1] not in _OPENING_PUNCTUATION
+    )
+
+
 # A silence between two measured words has to be at least this long before it is
 # offered as a cue boundary. Below it the "gap" is the ordinary space between
 # syllables of continuous speech, and cutting there splits a word.
@@ -332,6 +352,18 @@ WORD_GAP_MIN_S = 0.12
 # to the chunker's own pause floor (ASR_CHUNK_MIN_PAUSE_S default 0.6s) so the
 # two readings of silence agree on what counts as a pause.
 WORD_GAP_STRONG_S = 0.60
+
+
+MEASURED_WORD_TIMESTAMP_KINDS = frozenset(
+    {
+        "ctc_forced_alignment",
+        "grok_stt_word",
+    }
+)
+
+
+def _has_measured_word_timestamp(word: dict) -> bool:
+    return str(word.get("timestamp_kind") or "") in MEASURED_WORD_TIMESTAMP_KINDS
 
 
 def _word_gap_anchors(block: dict, *, start: float, end: float) -> list[dict]:
@@ -352,7 +384,7 @@ def _word_gap_anchors(block: dict, *, start: float, end: float) -> list[dict]:
     words = [
         word
         for word in _timed_words(block)
-        if str(word.get("timestamp_kind") or "") == "ctc_forced_alignment"
+        if _has_measured_word_timestamp(word)
     ]
     if len(words) < 2:
         return []
@@ -364,9 +396,14 @@ def _word_gap_anchors(block: dict, *, start: float, end: float) -> list[dict]:
         gap = gap_end - gap_start
         if gap < WORD_GAP_MIN_S:
             continue
-        # Middle of the silence: the same rule the chunker uses, and it keeps the
-        # cue off both the decay of the previous word and the onset of the next.
-        time_s = gap_start + gap / 2.0
+        # Blank is evidence that this text boundary is safe, but a subtitle cut
+        # has two different jobs: the previous cue's out-point and the next
+        # cue's in-point. The chunker can cut audio at the middle of the blank;
+        # a shared subtitle boundary cannot, because that would display the next
+        # text for half the silence before its first measured word. Anchor the
+        # subtitle boundary at that next word instead. Timeline polish remains
+        # free to extend the previous cue into the pause independently.
+        time_s = gap_end
         if not start < time_s < end:
             continue
         strong = gap >= WORD_GAP_STRONG_S
@@ -381,6 +418,8 @@ def _word_gap_anchors(block: dict, *, start: float, end: float) -> list[dict]:
                 # tie-break and as a small bonus, both monotone in gap length.
                 "strength": round(min(gap / WORD_GAP_STRONG_S, 1.0), 4),
                 "anchor_source": "word_gap",
+                "gap_start_s": gap_start,
+                "gap_midpoint_s": gap_start + gap / 2.0,
                 # The word this silence ends at. Lets the DP pair the anchor with
                 # the exact character the word starts at instead of guessing the
                 # position back out of a ratio.
@@ -390,7 +429,10 @@ def _word_gap_anchors(block: dict, *, start: float, end: float) -> list[dict]:
     return anchors
 
 
-def _word_boundary_text_positions(block: dict, text: str) -> dict[int, float]:
+def _measured_word_text_map(
+    block: dict,
+    text: str,
+) -> tuple[dict[int, float], dict[int, float], bool, int]:
     """Character offsets in `text` where a measured word starts, by time.
 
     The DP picks a text position and a time independently and pays a penalty for
@@ -402,29 +444,37 @@ def _word_boundary_text_positions(block: dict, text: str) -> dict[int, float]:
     words = [
         word
         for word in _timed_words(block)
-        if str(word.get("timestamp_kind") or "") == "ctc_forced_alignment"
+        if _has_measured_word_timestamp(word)
     ]
-    if len(words) < 2:
-        return {}
+    if not words:
+        return {}, {}, False, 0
 
     positions: dict[int, float] = {}
+    previous_word_ends: dict[int, float] = {}
     cursor = 0
     for index, word in enumerate(words):
         token = str(word.get("word") or "")
         if not token:
-            continue
+            return {}, {}, False, len(words)
         found = text.find(token, cursor)
-        if found < 0:
-            # The cue text is not the concatenation of these words (translation,
-            # normalisation, an earlier split). Without a reliable mapping a
-            # position here would attach a real time to the wrong character.
-            continue
+        if found < 0 or text[cursor:found].strip():
+            # Measured timings may never be silently attached to a different
+            # piece of text. The aligned production path is expected to be a
+            # complete map; returning it as incomplete keeps the caller from
+            # laundering this mismatch through proportional timing.
+            return {}, {}, False, len(words)
         cursor = found + len(token)
         if index == 0:
             continue
         if 0 < found < len(text):
             positions[found] = float(word["start"])
-    return positions
+            previous_word_ends[found] = float(words[index - 1]["end"])
+    if text[cursor:].strip():
+        return {}, {}, False, len(words)
+    previous_word_ends[len(text)] = float(words[-1]["end"])
+    return positions, previous_word_ends, True, len(words)
+
+
 def _candidate_text_positions_for_dp(
     text: str,
     *,
@@ -434,10 +484,19 @@ def _candidate_text_positions_for_dp(
     raw = str(text or "")
     if len(raw) <= 1:
         return []
+    # A measured text/time map is authoritative. Mixing its word positions with
+    # punctuation and ratio-only positions lets the DP choose the right piece
+    # of text at a time invented from the whole block's character ratio. That
+    # is catastrophic when speech density is uneven: a word measured at 20.8s
+    # can be rendered from 15.7s even though forced alignment got it right.
+    # Fall back to text-only positions only when no measured mapping exists.
+    if word_positions:
+        return sorted(
+            position
+            for position in word_positions
+            if _is_valid_subtitle_text_boundary(raw, position)
+        )
     positions = set(_candidate_text_boundaries(raw))
-    positions.update(
-        position for position in (word_positions or {}) if 0 < position < len(raw)
-    )
     for index in range(1, max(1, split_count) + 1):
         position = _fallback_text_position(raw, index / float(split_count + 1))
         if 0 < position < len(raw):
@@ -489,7 +548,23 @@ def _long_display_dp_plan(
     split_count = max(1, int(math.ceil(duration / max_display_s)) - 1)
     # Character offsets that correspond to a measured word start, so the DP can
     # break where a word begins rather than where the character count says.
-    word_positions = _word_boundary_text_positions(block, text)
+    (
+        word_positions,
+        previous_word_ends,
+        measured_map_complete,
+        measured_word_count,
+    ) = _measured_word_text_map(block, text)
+    if measured_word_count and not measured_map_complete:
+        # A successful CTC/Grok word-timestamp path must map the complete source
+        # text. Do not turn a data-integrity error into plausible-looking
+        # proportional subtitles; leave the block intact for the duration guard
+        # and expose the problem in tests/logged artifacts instead.
+        return None
+    if measured_word_count and not word_positions:
+        # A complete measured map with no internal word boundary (for example,
+        # one provider token covering the whole cue) cannot be split without
+        # inventing a time inside that token. Keep it intact instead.
+        return None
     positions = _candidate_text_positions_for_dp(
         text,
         split_count=split_count,
@@ -511,6 +586,7 @@ def _long_display_dp_plan(
             "time_s": start,
             "ratio": 0.0,
             "source": "start",
+            "previous_word_end_s": start,
             "anchor_strength": 0.0,
             "snap_distance_s": 0.0,
         }
@@ -518,17 +594,29 @@ def _long_display_dp_plan(
     for position in positions:
         ratio = ratios_by_position.get(position, 0.0)
         target = start + duration * ratio
-        time_s, source, strength, distance = _choose_anchor_for_target(
-            anchors,
-            target=target,
-            snap_window_s=snap_window_s,
-        )
+        measured_word_start = word_positions.get(position)
+        if measured_word_start is not None:
+            # Text position and time come from the same measured word. A
+            # separate word-gap node may still mark this as a preferable text
+            # break, but both use the same next-word onset. A non-silence
+            # fallback must never detach the two again.
+            time_s = float(measured_word_start)
+            source = "measured_word_start"
+            strength = 0.0
+            distance = abs(time_s - target)
+        else:
+            time_s, source, strength, distance = _choose_anchor_for_target(
+                anchors,
+                target=target,
+                snap_window_s=snap_window_s,
+            )
         nodes.append(
             {
                 "position": position,
                 "time_s": max(start, min(end, time_s)),
                 "ratio": ratio,
                 "source": source,
+                "previous_word_end_s": previous_word_ends.get(position, time_s),
                 "anchor_strength": strength,
                 "snap_distance_s": distance,
             }
@@ -553,7 +641,7 @@ def _long_display_dp_plan(
             )
         else:
             position = _fallback_text_position(text, anchor_ratio)
-        if not 0 < position < len(text):
+        if not _is_valid_subtitle_text_boundary(text, position):
             continue
         target = start + duration * ratios_by_position.get(position, anchor_ratio)
         nodes.append(
@@ -562,6 +650,10 @@ def _long_display_dp_plan(
                 "time_s": float(anchor["time_s"]),
                 "ratio": ratios_by_position.get(position, anchor_ratio),
                 "source": str(anchor["anchor_type"]),
+                "previous_word_end_s": previous_word_ends.get(
+                    position,
+                    float(anchor["time_s"]),
+                ),
                 "anchor_source": str(anchor.get("anchor_source") or ""),
                 "anchor_strength": float(anchor.get("strength") or anchor.get("score") or 0.0),
                 "snap_distance_s": 0.0
@@ -575,6 +667,7 @@ def _long_display_dp_plan(
             "time_s": end,
             "ratio": 1.0,
             "source": "end",
+            "previous_word_end_s": previous_word_ends.get(len(text), end),
             "anchor_strength": 0.0,
             "snap_distance_s": 0.0,
         }
@@ -592,7 +685,16 @@ def _long_display_dp_plan(
             piece_end = float(nodes[j]["time_s"])
             if piece_end <= piece_start:
                 continue
-            piece_duration = piece_end - piece_start
+            # A long CTC blank may sit between the last word in this piece and
+            # the first word in the next. It is not display content. Enforce the
+            # 7s ceiling against measured speech extent; the previous cue can
+            # end after its last word while the next still enters at its own
+            # onset, leaving the blank genuinely subtitle-free.
+            piece_content_end = max(
+                piece_start,
+                float(nodes[j].get("previous_word_end_s", piece_end)),
+            )
+            piece_duration = piece_content_end - piece_start
             if piece_duration > max_display_s + 1e-6:
                 continue
             piece_text = text[int(nodes[i]["position"]) : int(nodes[j]["position"])].strip()
@@ -681,7 +783,20 @@ def _split_long_display_block(
         return [dict(block)]
     plan = _long_display_dp_plan(block, options=options)
     if plan is None:
-        return [dict(block)]
+        item = dict(block)
+        _, _, measured_map_complete, measured_word_count = _measured_word_text_map(
+            block,
+            timing_text,
+        )
+        if measured_word_count and not measured_map_complete:
+            item["subtitle_layout_split_skipped"] = (
+                "measured_word_text_map_incomplete"
+            )
+        elif measured_word_count:
+            item["subtitle_layout_split_skipped"] = (
+                "measured_word_boundaries_unavailable"
+            )
+        return [item]
     nodes = list(plan["nodes"])
     timing_positions = [int(node["position"]) for node in nodes[1:-1]]
     split_times = [float(node["time_s"]) for node in nodes[1:-1]]
@@ -693,10 +808,16 @@ def _split_long_display_block(
     ]
     split_sources = [str(node["source"]) for node in nodes[1:-1]]
     split_anchor_sources = [str(node.get("anchor_source") or "") for node in nodes[1:-1]]
-    if any(source == "word_gap" for source in split_anchor_sources):
+    has_word_gap = any(source == "word_gap" for source in split_anchor_sources)
+    has_measured_word = any(source == "measured_word_start" for source in split_sources)
+    if has_word_gap and has_measured_word:
+        split_source = "word_gap_and_measured_word_dp"
+    elif has_word_gap:
         # Split at a measured silence between two words, which is the only
         # source here that cannot land mid-word.
         split_source = "word_gap_dp"
+    elif has_measured_word:
+        split_source = "measured_word_dp"
     elif any(source in {"primary_cut", "weak_cut"} for source in split_sources):
         split_source = "acoustic_anchor_dp"
     else:
@@ -720,19 +841,33 @@ def _split_long_display_block(
         item = dict(block)
         item["start"] = piece_start
         item["end"] = max(piece_start + 0.05, piece_end)
-        item["acoustic_start"] = piece_start
-        item["acoustic_end"] = max(piece_start + 0.05, piece_end)
-        item["acoustic_duration"] = max(0.0, item["acoustic_end"] - item["acoustic_start"])
+        piece_words = [
+            word
+            for word in _timed_words(block)
+            if piece_start <= float(word.get("start", piece_start)) < piece_end
+        ]
+        measured_piece_words = [
+            word for word in piece_words if _has_measured_word_timestamp(word)
+        ]
+        if measured_piece_words:
+            item["acoustic_start"] = float(measured_piece_words[0]["start"])
+            item["acoustic_end"] = max(
+                item["acoustic_start"] + 0.05,
+                float(measured_piece_words[-1]["end"]),
+            )
+        else:
+            item["acoustic_start"] = piece_start
+            item["acoustic_end"] = max(piece_start + 0.05, piece_end)
+        item["acoustic_duration"] = max(
+            0.0,
+            item["acoustic_end"] - item["acoustic_start"],
+        )
         item["display_start"] = item["start"]
         item["display_end"] = item["end"]
         item["display_duration"] = max(0.0, item["display_end"] - item["display_start"])
         for key, pieces in text_fields.items():
             item[key] = pieces[index] if index < len(pieces) else ""
-        item["words"] = [
-            word
-            for word in _timed_words(block)
-            if piece_start <= float(word.get("start", piece_start)) < piece_end
-        ]
+        item["words"] = piece_words
         item["primary_cut_candidates"] = _filter_candidates_for_window(
             list(block.get("primary_cut_candidates") or []),
             start=piece_start,
@@ -770,7 +905,11 @@ def _split_long_display_block(
         boundary_anchor_source = (
             str(boundary_node.get("anchor_source") or "") if boundary_node else ""
         )
-        item["anchor_used"] = boundary_source in {"primary_cut", "weak_cut"}
+        item["anchor_used"] = boundary_source in {
+            "primary_cut",
+            "weak_cut",
+            "measured_word_start",
+        }
         item["anchor_type"] = boundary_source if item["anchor_used"] else ""
         item["anchor_score"] = 0.0 if boundary_node is None else float(boundary_node.get("anchor_strength") or 0.0)
         item["snap_distance_s"] = 0.0 if boundary_node is None else float(boundary_node.get("snap_distance_s") or 0.0)
@@ -779,6 +918,8 @@ def _split_long_display_block(
         item["text_break_type"] = (
             "word_gap_boundary"
             if boundary_anchor_source == "word_gap"
+            else "measured_word_boundary"
+            if boundary_source == "measured_word_start"
             else "dp_text_boundary"
         )
         item["proportional_fallback_used"] = not item["anchor_used"]

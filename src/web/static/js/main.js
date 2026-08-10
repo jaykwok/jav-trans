@@ -13,6 +13,7 @@ import {
   loadSettings,
   installSettingsPanel,
   syncSettingsFromFormForSubmit,
+  updateSubtitleModeLabels,
 } from './settings.js';
 
 // Install all event listeners before any async work
@@ -30,6 +31,7 @@ startJobPolling();
 await loadConfig();
 await loadSettings();
 applyFormMemory();
+updateSubtitleModeLabels();
 if (state.activePreset !== 'custom') applyPreset(state.activePreset);
 else setActivePreset('custom');
 updateSkipTransState();

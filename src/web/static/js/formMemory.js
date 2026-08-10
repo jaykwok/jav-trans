@@ -1,7 +1,25 @@
 import { state } from './state.js';
 
 const FORM_MEMORY_KEY = 'jav-trans.formMemory.v3';
-const FORM_MEMORY_EXCLUDED = new Set(['api-key']);
+// These controls are owned by /api/settings and persisted in .env. Keeping a
+// second copy in localStorage used to overwrite the freshly loaded backend
+// value at the end of page startup, then write that stale browser value back
+// to .env on the next job submission. Form memory is only for per-job UI state.
+const FORM_MEMORY_EXCLUDED = new Set([
+  'api-key',
+  'translation-backend',
+  'api-base-url',
+  'api-model',
+  'api-reasoning-effort',
+  'api-format',
+  'api-target-lang',
+  'api-glossary',
+  'llamacpp-server-path',
+  'proxy-enabled',
+  'proxy-protocol',
+  'proxy-host',
+  'proxy-port',
+]);
 const FORM_MEMORY_SELECTOR = 'input[id], select[id], textarea[id]';
 
 export function loadFormMemory() {
@@ -19,6 +37,7 @@ export function loadFormMemory() {
 
 export function saveFormMemory() {
   const data = loadFormMemory();
+  for (const id of FORM_MEMORY_EXCLUDED) delete data.controls[id];
   for (const el of document.querySelectorAll(FORM_MEMORY_SELECTOR)) {
     const type = (el.type || '').toLowerCase();
     if (FORM_MEMORY_EXCLUDED.has(el.id)) continue;

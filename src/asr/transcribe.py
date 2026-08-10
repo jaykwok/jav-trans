@@ -244,6 +244,7 @@ def _transcribe_asr_chunks_text_only(
         on_stage(f"ASR 缓存命中 {len(text_results_by_index)}/{len(chunks)} 个块")
 
     text_started = time.perf_counter()
+    max_observed_batch_size = 0
 
     def _store_text_results(batch_chunks: list[dict], batch_text_results: list[dict]) -> None:
         if len(batch_text_results) != len(batch_chunks):
@@ -282,6 +283,7 @@ def _transcribe_asr_chunks_text_only(
         if not pending_chunks:
             continue
 
+        max_observed_batch_size = max(max_observed_batch_size, len(pending_chunks))
         batch_text_results = _transcribe_batch(pending_chunks)
         _enforce_vram_budget(
             f"{text_stage_label}_batch_{batch_number}",
@@ -314,7 +316,14 @@ def _transcribe_asr_chunks_text_only(
     ]
 
     text_elapsed = time.perf_counter() - text_started
-    return text_results, {"text_transcribe_s": text_elapsed}
+    return text_results, {
+        "text_transcribe_s": text_elapsed,
+        # The configured request batch is only a ceiling. A short job, or one
+        # mostly served from the per-chunk result cache, may never exercise it.
+        # GPU profile learning must distinguish "asked for 11" from "actually
+        # allocated 11 rows" or a two-row smoke can promote an untested batch.
+        "asr_text_max_observed_batch_size": max_observed_batch_size,
+    }
 
 
 def _delete_path_for_cleanup(path: Path) -> None:

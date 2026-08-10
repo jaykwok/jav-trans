@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from utils.model_paths import resolve_model_spec
+from asr import alignment_shadow
 from asr.backends.qwen import (
     active_qwen_asr_model_id,
     active_qwen_asr_model_path,
@@ -390,6 +391,10 @@ class LocalAsrBackend:
         # set. `False` means "not looked at yet"; `None` means "looked, absent",
         # which stops a missing checkpoint from being re-probed per chunk.
         self._alignment_head: AlignmentHead | None | bool = False
+        # The shadow head is observation-only. It consumes the same cached
+        # encoder frames as the production head and can never replace the words
+        # returned by finalize_text_results.
+        self._shadow_alignment_head: AlignmentHead | None | bool = False
         # Seconds spent inside load(), summed over every load this backend has
         # done. The pipeline no longer loads eagerly, so this is how the stage
         # timings still report what the weights actually cost - and report zero
@@ -779,6 +784,24 @@ class LocalAsrBackend:
                 timing_start,
                 timing_end,
             )
+        shadow_head = self._resolve_shadow_alignment_head(log)
+        if shadow_head is not None and alignment_mode == "ctc_forced_alignment":
+            shadow = alignment_shadow.compare_alignment_heads(
+                primary_words=word_dicts,
+                primary_timing_meta=timing_meta,
+                shadow_head=shadow_head,
+                features=cached_features,
+                text=text,
+                window_start=timing_start,
+                window_end=timing_end,
+            )
+            timing_meta = {**timing_meta, "alignment_shadow": shadow}
+            if shadow.get("status") == "ok":
+                log.append(
+                    "Subtitle timing shadow: "
+                    f"onset={float(shadow['onset_delta_ms']):+.1f}ms "
+                    f"end={float(shadow['end_delta_ms']):+.1f}ms"
+                )
         return self._build_finalize_output(
             word_dicts=normalize_word_dicts(word_dicts),
             master_text=master_text,
@@ -803,6 +826,26 @@ class LocalAsrBackend:
             log.append(f"Subtitle timing: alignment head unavailable ({error})")
             self._alignment_head = None
         return self._alignment_head or None
+
+    def _resolve_shadow_alignment_head(self, log: list[str]) -> AlignmentHead | None:
+        if self._shadow_alignment_head is not False:
+            return self._shadow_alignment_head or None
+        reference = alignment_shadow.shadow_head_reference()
+        if not reference:
+            self._shadow_alignment_head = None
+            return None
+        try:
+            self._shadow_alignment_head = AlignmentHead.load(
+                reference,
+                device=self.device,
+            )
+        except Exception as error:  # noqa: BLE001
+            # Shadow instrumentation is never allowed to degrade official
+            # subtitle timing, even when its checkpoint is missing or broken.
+            logger.warning("alignment shadow head unavailable: %s", error)
+            log.append(f"Subtitle timing shadow unavailable ({error})")
+            self._shadow_alignment_head = None
+        return self._shadow_alignment_head or None
 
     def _align_characters(
         self,
@@ -1010,7 +1053,10 @@ class LocalAsrBackend:
         # blocks. 4 is where the speed-up has saturated anyway.
         batch_size = max(1, _env_int("ASR_ALIGN_BATCH_SIZE", "4"))
         head_available = (
-            self._resolve_alignment_head([]) is not None
+            (
+                self._resolve_alignment_head([]) is not None
+                or self._resolve_shadow_alignment_head([]) is not None
+            )
             and self.model is not None
             and self.processor is not None
         )

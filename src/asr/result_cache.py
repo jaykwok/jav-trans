@@ -282,8 +282,8 @@ _ALIGNED_FINALIZE_MODE = "ctc_forced_alignment"
 _HEAD_DIGEST_CACHE: dict[tuple[str, int, int], str] = {}
 
 
-def _alignment_head_digest() -> str | None:
-    raw_path = (os.environ.get("ASR_ALIGNMENT_HEAD_PATH") or "").strip()
+def _checkpoint_digest(raw_path: str) -> str | None:
+    raw_path = str(raw_path or "").strip()
     if not raw_path:
         return None
     try:
@@ -310,6 +310,10 @@ def _alignment_head_digest() -> str | None:
         return None
 
 
+def _alignment_head_digest() -> str | None:
+    return _checkpoint_digest(os.environ.get("ASR_ALIGNMENT_HEAD_PATH") or "")
+
+
 def finalize_signature() -> dict | None:
     head_digest = _alignment_head_digest()
     if head_digest is None:
@@ -317,6 +321,14 @@ def finalize_signature() -> dict | None:
     signature = model_signature()
     signature["stage"] = "final"
     signature["alignment_head"] = {"sha256": head_digest}
+    shadow_reference = (os.environ.get("ASR_ALIGNMENT_SHADOW_HEAD_PATH") or "").strip()
+    if shadow_reference:
+        shadow_digest = _checkpoint_digest(shadow_reference)
+        if shadow_digest is None:
+            # Never serve a primary-only cached result while shadow collection
+            # is requested; that would silently produce no observations.
+            return None
+        signature["alignment_shadow_head"] = {"sha256": shadow_digest}
     return signature
 
 

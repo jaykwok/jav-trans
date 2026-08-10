@@ -12,6 +12,14 @@ from utils.subprocess_tools import no_window_subprocess_kwargs
 _AUDIO_SAMPLE_RATE = max(8000, int(os.getenv("AUDIO_SAMPLE_RATE", "16000")))
 _AUDIO_CHANNELS = max(1, int(os.getenv("AUDIO_CHANNELS", "1")))
 _AUDIO_BASE_FILTER = os.getenv("AUDIO_FILTER", "highpass=f=70,lowpass=f=7600").strip()
+# PCM WAV has no discontinuous timestamp axis. Without async resampling, ffmpeg
+# concatenates decoded packets across edit-list / PTS gaps and silently shortens
+# the ASR audio. Every CTC timestamp after such a gap then becomes early against
+# the source video. Fill/drop samples against input PTS before any other audio
+# processing so sample index / sample_rate remains the video's time coordinate.
+_AUDIO_TIMELINE_FILTER = (
+    f"aresample={_AUDIO_SAMPLE_RATE}:async=1000:first_pts=0"
+)
 _AUDIO_CACHE_SAMPLE_BYTES = 4 * 1024 * 1024
 _AUDIO_DYNAUDNORM_FILTER = "agate=threshold=0.01,dynaudnorm=f=250:g=15"
 _DEFAULT_AUDIO_EXTRACT_TIMEOUT_S = 3600.0
@@ -39,7 +47,7 @@ def build_audio_filter_chain() -> str:
         "1" if _AUDIO_USE_LOUDNORM else "0",
     ).strip().lower() in {"1", "true", "yes", "on"}
 
-    filters = []
+    filters = [_AUDIO_TIMELINE_FILTER]
     if _AUDIO_BASE_FILTER:
         filters.append(_AUDIO_BASE_FILTER)
     if dynaudnorm_enabled:

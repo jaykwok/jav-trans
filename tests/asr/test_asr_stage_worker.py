@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import main
 import pytest
@@ -188,6 +189,133 @@ def test_auto_vram_budget_and_batch_scale_from_physical_memory(monkeypatch):
     assert allocator_calls[0][0] == pytest.approx(0.95)
     assert allocator_calls[0][1] == 0
     assert tuning["asr_batch_source"] == "auto_scaled_from_vram"
+
+
+def test_gpu_profile_identity_distinguishes_same_model_cards_by_uuid():
+    class _Cuda:
+        uuid = "71339454-9251-d059-72b3-118778b30f38"
+
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def current_device():
+            return 0
+
+        @classmethod
+        def get_device_properties(cls, _index):
+            return SimpleNamespace(
+                uuid=cls.uuid,
+                major=8,
+                minor=9,
+                pci_domain_id=0,
+                pci_bus_id=43,
+                pci_device_id=0,
+            )
+
+    class _Torch:
+        cuda = _Cuda()
+
+    first = gpu_worker._gpu_hardware_identity(
+        _Torch(),
+        device_name="NVIDIA GeForce RTX 4060 Ti",
+        total_mb=8187.5,
+    )
+    _Cuda.uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    second = gpu_worker._gpu_hardware_identity(
+        _Torch(),
+        device_name="NVIDIA GeForce RTX 4060 Ti",
+        total_mb=8187.5,
+    )
+
+    assert first["fingerprint_source"] == "cuda_uuid"
+    assert first["fingerprint"].startswith("sha256:")
+    assert first["fingerprint"] != second["fingerprint"]
+    assert "71339454" not in str(first)
+
+
+def test_gpu_profile_identity_falls_back_to_pci_without_persisting_location():
+    class _Cuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def current_device():
+            return 0
+
+        @staticmethod
+        def get_device_properties(_index):
+            return SimpleNamespace(
+                major=8,
+                minor=9,
+                pci_domain_id=0,
+                pci_bus_id=43,
+                pci_device_id=0,
+            )
+
+    class _Torch:
+        cuda = _Cuda()
+
+    identity = gpu_worker._gpu_hardware_identity(
+        _Torch(),
+        device_name="NVIDIA GeForce RTX 4060 Ti",
+        total_mb=8187.5,
+    )
+
+    assert identity["fingerprint_source"] == "pci_location"
+    assert identity["compute_capability"] == "8.9"
+    assert "43" not in identity["fingerprint"]
+
+
+def test_short_task_does_not_validate_unobserved_configured_batch(monkeypatch, tmp_path):
+    monkeypatch.setenv("GPU_BATCH_PROFILE_PATH", str(tmp_path / "profiles.json"))
+    runtime_tuning = {
+        "vram_budget_mb": 6000,
+        "batch_profiles": {
+            "ASR_BATCH_SIZE": {
+                "active": True,
+                "stage": "asr_text_transcribe",
+                "identity": {"hardware": {"fingerprint": "test"}, "workload": {}},
+                "batch_size": 11,
+                "max_batch": 16,
+            }
+        },
+    }
+
+    learned = gpu_worker._record_profile_successes(
+        runtime_tuning,
+        {"asr_text_transcribe": 3000.0},
+        {"stage_timings": {"asr_text_max_observed_batch_size": 4}},
+    )
+
+    assert learned == {}
+    assert not (tmp_path / "profiles.json").exists()
+
+
+def test_full_observed_batch_updates_profile(monkeypatch, tmp_path):
+    monkeypatch.setenv("GPU_BATCH_PROFILE_PATH", str(tmp_path / "profiles.json"))
+    runtime_tuning = {
+        "vram_budget_mb": 6000,
+        "batch_profiles": {
+            "ASR_BATCH_SIZE": {
+                "active": True,
+                "stage": "asr_text_transcribe",
+                "identity": {"hardware": {"fingerprint": "test"}, "workload": {}},
+                "batch_size": 11,
+                "max_batch": 16,
+            }
+        },
+    }
+
+    learned = gpu_worker._record_profile_successes(
+        runtime_tuning,
+        {"asr_text_transcribe": 5000.0},
+        {"stage_timings": {"asr_text_max_observed_batch_size": 11}},
+    )
+
+    assert learned["ASR_BATCH_SIZE"]["safe_batch"] == 11
 
 
 @pytest.mark.parametrize(

@@ -53,13 +53,19 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # CTC alignment head over the ASR encoder: word-level subtitle timing and
     # pause-aware chunk cuts. The head is encoder-specific (trained on the
     # 1.7B SFT encoder); clear this to fall back to proportional timing and
-    # fixed-length chunks. Accuracy validated on clean speech; real-domain
-    # onset accuracy still under audit.
+    # fixed-length chunks. The current checkpoint combines clean Galgame CTC
+    # with sparse Grok frame supervision and has been blind-audited on real JAV.
     # `hf:<repo>@<sha>#<file>` downloads once into the HF cache and is offline
     # afterwards; a plain path still works as a local override. The sha is
     # pinned deliberately - under a moving branch a retrained head would change
     # every subtitle's timing with nothing in the run saying so.
-    "ASR_ALIGNMENT_HEAD_PATH": "hf:jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf@2d46a169b71232ff08800472c457fdc092084bdf#ctc_aligner.pt",
+    "ASR_ALIGNMENT_HEAD_PATH": "hf:jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf@68baee74dbed3bf98ba0545988278da8cff0e713#ctc_aligner.pt",
+    # Optional observation-only candidate. It reuses the production encoder
+    # frames, records boundary disagreements under tmp/cache, and never changes
+    # the words or timestamps returned to the subtitle pipeline.
+    "ASR_ALIGNMENT_SHADOW_HEAD_PATH": "",
+    "ASR_ALIGNMENT_SHADOW_ROOT": "./tmp/cache/alignment_shadow",
+    "ASR_ALIGNMENT_SHADOW_MIN_DELTA_MS": "20.0",
 
     # --- ASR Language & Generation ---
     # Source audio language hint passed to ASR.
@@ -92,6 +98,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # records the unsafe bound.
     "GPU_BATCH_PROFILE_ENABLED": "1",
     "GPU_BATCH_PROFILE_GROWTH_THRESHOLD": "0.80",
+    "GPU_BATCH_PROFILE_MAX_ENTRIES": "16",
     "GPU_BATCH_PROFILE_PATH": "./tmp/cache/gpu_batch_profiles.json",
     # Persistent-worker idle self-exit to shed CUDA state on long Web sessions:
     # the worker self-exits after this many seconds with no inbound request (0 =
@@ -151,7 +158,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SUBTITLE_BILINGUAL_SECONDARY_WEIGHT": "0.4",
 
     # --- LLM Translation Settings ---
-    # Translation backend type: openai (OpenAI-compatible API) | local (本地模型)
+    # Translation backend type: openai (OpenAI-compatible API) | llamacpp
+    # (fixed Hy-MT2-1.8B Q8_0 GGUF served by llama.cpp).
     "TRANSLATION_BACKEND": "openai",
     # Base URL for providers that expose an OpenAI-compatible API; DeepSeek by default.
     "OPENAI_COMPATIBILITY_BASE_URL": "https://api.deepseek.com",
@@ -171,7 +179,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "TRANSLATION_BATCH_SIZE": "64",
     # Final subtitle language.
     "TARGET_LANG": "简体中文",
-    # Comma-separated Japanese-to-Chinese term mapping injected into translation prompts.
+    # Comma-separated Japanese-to-target-language term mapping injected into API prompts.
     "TRANSLATION_GLOSSARY": "ちんぽ-肉棒, チンポ-肉棒, おちんちん-肉棒, チンポコ-肉棒",
 
     # --- llama.cpp GGUF Settings (when TRANSLATION_BACKEND=llamacpp) ---

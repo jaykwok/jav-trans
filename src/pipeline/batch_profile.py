@@ -11,7 +11,7 @@ from typing import Any, Mapping
 from utils.runtime_paths import runtime_path
 
 
-PROFILE_SCHEMA = "gpu_inference_batch_profiles_v2"
+PROFILE_SCHEMA = "gpu_inference_batch_profiles_v3"
 # v3 adds chunk geometry to the identity (see gpu_worker._profile_identity).
 # Bumped rather than migrated: a v2 entry's safe_batch was measured under an
 # unknown chunk length, so it is not a claim about any v3 identity.
@@ -26,8 +26,18 @@ PROFILE_SCHEMA = "gpu_inference_batch_profiles_v2"
 # `duration x ASR_DECODE_TOKENS_PER_SECOND`, which at 30s chunks is 316 rather
 # than 128 tokens of KV cache per sequence. A v4 `safe_batch` was measured
 # against a quarter of that and would OOM.
-PROFILE_VERSION = 5
+#
+# v6 separates physical hardware identity from workload identity and keys the
+# former by a hashed CUDA UUID (with PCI/fallback identities when unavailable).
+# Old profiles are intentionally not migrated: they cannot distinguish two
+# cards with the same model and VRAM.
+#
+# v7 requires evidence that the configured batch was actually exercised. A
+# short/cache-heavy task previously recorded the configured ceiling as safe and
+# used the artificially low peak to recommend an untested larger batch.
+PROFILE_VERSION = 7
 _LOCK = threading.RLock()
+_DEFAULT_MAX_ENTRIES = 16
 
 
 def enabled() -> bool:
@@ -45,6 +55,14 @@ def growth_threshold() -> float:
     except (TypeError, ValueError):
         value = 0.80
     return min(0.95, max(0.10, value))
+
+
+def max_entries() -> int:
+    try:
+        value = int(float(os.getenv("GPU_BATCH_PROFILE_MAX_ENTRIES", "16")))
+    except (TypeError, ValueError):
+        value = _DEFAULT_MAX_ENTRIES
+    return max(1, value)
 
 
 def profile_path() -> Path:
@@ -106,6 +124,36 @@ def _write_payload(payload: dict[str, Any], path: Path | None = None) -> None:
     tmp.replace(target)
 
 
+def _prune_profiles(payload: dict[str, Any]) -> None:
+    profiles = payload.get("profiles")
+    if not isinstance(profiles, dict) or len(profiles) <= max_entries():
+        return
+
+    def recency(item: tuple[str, Any]) -> tuple[float, str]:
+        key, entry = item
+        if not isinstance(entry, dict):
+            return (0.0, key)
+        try:
+            updated = float(
+                entry.get("last_used_ts") or entry.get("updated_ts") or 0.0
+            )
+        except (TypeError, ValueError):
+            updated = 0.0
+        return (updated, key)
+
+    keep = {
+        key
+        for key, _entry in sorted(
+            profiles.items(),
+            key=recency,
+            reverse=True,
+        )[: max_entries()]
+    }
+    payload["profiles"] = {
+        key: entry for key, entry in profiles.items() if key in keep
+    }
+
+
 def recommendation(
     identity: Mapping[str, Any],
     *,
@@ -118,7 +166,13 @@ def recommendation(
         return heuristic, {}
     with _LOCK:
         payload = _load_payload()
-        entry = payload["profiles"].get(identity_key(identity))
+        key = identity_key(identity)
+        entry = payload["profiles"].get(key)
+        if isinstance(entry, dict):
+            entry = dict(entry)
+            entry["last_used_ts"] = round(time.time(), 3)
+            payload["profiles"][key] = entry
+            _write_payload(payload)
     if not isinstance(entry, dict):
         return heuristic, {}
     try:
@@ -166,6 +220,7 @@ def record_success(
         if unsafe_batch is not None:
             recommended = min(recommended, max(1, unsafe_batch - 1))
         recommended = max(1, min(maximum, recommended))
+        now = round(time.time(), 3)
         entry.update(
             {
                 "identity": dict(identity),
@@ -177,10 +232,12 @@ def record_success(
                 "last_budget_mb": round(budget, 1),
                 "last_utilization": round(utilization, 4),
                 "last_result": "success",
-                "updated_ts": round(time.time(), 3),
+                "updated_ts": now,
+                "last_used_ts": now,
             }
         )
         payload["profiles"][key] = entry
+        _prune_profiles(payload)
         _write_payload(payload)
     return dict(entry)
 
@@ -222,6 +279,7 @@ def record_oom(
         else:
             recommended = max(1, batch // 2)
         recommended = min(recommended, max(1, unsafe_batch - 1), maximum)
+        now = round(time.time(), 3)
         entry.update(
             {
                 "identity": dict(identity),
@@ -230,9 +288,11 @@ def record_oom(
                 "recommended_batch": max(1, recommended),
                 "last_batch": batch,
                 "last_result": "oom",
-                "updated_ts": round(time.time(), 3),
+                "updated_ts": now,
+                "last_used_ts": now,
             }
         )
         payload["profiles"][key] = entry
+        _prune_profiles(payload)
         _write_payload(payload)
     return dict(entry)

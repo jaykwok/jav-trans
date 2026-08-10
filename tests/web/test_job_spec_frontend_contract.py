@@ -74,7 +74,6 @@ def test_translation_backend_choice_stays_out_of_the_job_body() -> None:
     body_keys = _job_body_keys()
     for settings_only in (
         "translation_backend",
-        "llamacpp_gguf_path",
         "llamacpp_server_path",
         "api_key",
         "base_url",
@@ -115,3 +114,13 @@ def test_job_spec_accepts_a_full_browser_payload() -> None:
 def test_spec_with_a_settings_only_key_is_rejected() -> None:
     with pytest.raises(ValueError):
         JobSpec(video_paths=["sample.mp4"], translation_backend="openai")
+
+
+def test_open_folder_failure_is_not_silently_ignored() -> None:
+    jobs_render = (JS / "jobsRender.js").read_text(encoding="utf-8")
+    handler = jobs_render[jobs_render.index("const folder = e.target.closest('[data-folder]')") :]
+    handler = handler[: handler.index("const retry = e.target.closest('[data-retry]')")]
+
+    assert "const r = await fetch(`/api/open-folder" in handler
+    assert "if (!r.ok) alert('打开文件夹失败：'" in handler
+    assert "catch (error)" in handler

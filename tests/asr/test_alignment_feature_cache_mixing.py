@@ -25,7 +25,15 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-from tools.align.train_ctc_aligner import FeatureCache  # noqa: E402
+from tools.align.train_ctc_aligner import (  # noqa: E402
+    FeatureCache,
+    _cap_empty_train_rows,
+    _collate,
+)
+from tools.align.build_alignment_features import (  # noqa: E402
+    _assign_partitions,
+    _is_held_out,
+)
 
 FEATURE_DIM = 4
 
@@ -140,6 +148,80 @@ def test_single_cache_still_works_without_repeats(caches):
     cache = FeatureCache([galgame])
     assert len(cache.rows) == 2
     assert all(row["cache_index"] == 0 for row in cache.rows)
+
+
+def test_empty_target_cap_is_per_domain_and_deterministic() -> None:
+    rows = [
+        {"audio_id": f"positive-{index}", "domain": "real", "text": "あ"}
+        for index in range(7)
+    ] + [
+        {"audio_id": f"blank-{index}", "domain": "real", "text": ""}
+        for index in range(20)
+    ] + [
+        {"audio_id": "gal-positive", "domain": "galgame", "text": "あ"}
+    ]
+
+    first, report = _cap_empty_train_rows(rows, maximum_fraction=0.30, seed=5)
+    second, _ = _cap_empty_train_rows(rows, maximum_fraction=0.30, seed=5)
+
+    assert [row["audio_id"] for row in first] == [row["audio_id"] for row in second]
+    assert report["real"]["empty_kept"] == 3
+    assert report["real"]["empty_fraction"] == pytest.approx(0.3)
+    assert report["galgame"]["empty_kept"] == 0
+
+
+def test_collate_accepts_a_batch_whose_targets_are_all_empty() -> None:
+    torch = pytest.importorskip("torch")
+    batch = [
+        (np.ones((3, FEATURE_DIM), dtype=np.float32), []),
+        (np.ones((2, FEATURE_DIM), dtype=np.float32), []),
+    ]
+
+    _, targets, _, target_lengths = _collate(batch, torch)
+
+    assert targets.numel() == 0
+    assert target_lengths.tolist() == [0, 0]
+
+
+def test_feature_builder_preserves_fixed_group_partitions() -> None:
+    rows = [
+        {"audio_id": "a", "group": "game-a", "partition": "train"},
+        {"audio_id": "b", "group": "game-a", "partition": "train"},
+        {"audio_id": "c", "group": "game-b", "partition": "val"},
+    ]
+
+    report = _assign_partitions(
+        rows, val_fraction=0.5, rng=np.random.default_rng(123)
+    )
+
+    assert [row["partition"] for row in rows] == ["train", "train", "val"]
+    assert report["fixed_manifest_partitions"] is True
+    assert report["groups_val"] == 1
+
+
+def test_feature_builder_rejects_a_group_crossing_fixed_partitions() -> None:
+    rows = [
+        {"audio_id": "a", "group": "game-a", "partition": "train"},
+        {"audio_id": "b", "group": "game-a", "partition": "val"},
+    ]
+
+    with pytest.raises(SystemExit, match="crosses train/val"):
+        _assign_partitions(rows, val_fraction=0.5, rng=np.random.default_rng(123))
+
+
+def test_feature_builder_holdout_matches_teacher_source_identity() -> None:
+    held_out = {"original-galgame-id"}
+
+    assert _is_held_out(
+        {
+            "audio_id": "original-galgame-id-full",
+            "source_id": "original-galgame-id",
+        },
+        held_out,
+    )
+    assert not _is_held_out(
+        {"audio_id": "other-full", "source_id": "other"}, held_out
+    )
 
 
 class TestOneFeasibilityJudgment:

@@ -14,7 +14,7 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 ![网页控制台主界面](docs/images/ui-web-console.png)
 
-任务提交、翻译后端选择（API / 本地 GGUF）、实时阶段进度、显存与耗时监控、质量报告都在本地网页控制台完成。更多截图放在 `docs/images/`。
+任务提交、翻译后端选择（OpenAI 兼容 API / 本地 Hy-MT2）、实时阶段进度、显存与耗时监控、质量报告都在本地网页控制台完成。更多截图放在 `docs/images/`。
 
 ---
 
@@ -131,6 +131,8 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 视频输入
   -> 任务上下文 / 配置解析
   -> 音频抽取与标准化
+     - async resample 保留源视频 PTS / edit-list 间隙，WAV 样本位置始终对应视频时间
+     - 时间轴滤镜属于音频缓存键；规则变化会自动失效旧 WAV 与下游结果
   -> 切分（asr.chunking.cut_at_pauses）
      - ASR encoder 前向 -> CTC 对齐头 -> 每帧 blank 后验
      - 连续 blank 游程即停顿，切点落在停顿中央
@@ -165,7 +167,8 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声。
 - 字幕行的起止**不取单个首字或末字**，用稳健分位数。
-- 超长 cue 的**拆分点取对齐头量出的词间静音**（≥0.12s 才算间隙，≥0.60s 视为完整停顿，切点落在静音中央），文本切点取该静音之后那个词的真实起点。只有 `ctc_forced_alignment` 的词参与；没有真实停顿可用时退回按字数比例切分。
+- CTC blank / 词间静音是**可安全断句的证据**，不是下一条字幕的显示起点：音频 chunk 仍可切在 blank 中点，字幕上一条按前词结束、下一条严格从后词的实测起点出现，中间长 blank 保持无字幕。
+- 成功的 `ctc_forced_alignment` 词时间会与原文字符位置完整绑定，Subtitle Layout 不再混入按字数比例推算的时间；映射不完整或只有一个不可再分的实测 token 时保留原 cue 并显式标记，不伪造切点。只有对齐不可用、词时间明确标为 `synthetic_proportional` 时才允许比例退化。诊断工具产生的 `grok_stt_word` 遵守相同 measured-timestamp 合同。
 - 后置闸的 `min_alignment_score` 保持关闭，因为该阈值尚未标定。
 - 对齐头**默认启用**：`ASR_ALIGNMENT_HEAD_PATH` 默认指向 HF 上的 `ctc_aligner.pt`。置空可回退到定长切分 + 比例时间轴。checkpoint 缺失、下载失败或损坏都只 warn 一次并降级，不会让转写失败。
 - allocated/reserved/shared VRAM 只写运行诊断，不参与功能判断；显式 CUDA 请求不可用时直接报错，不回退 CPU。
@@ -188,7 +191,7 @@ ASR encoder 输出 2048 维 @13fps（76.9 ms/帧）
 
 - **上采样 x2 不是可选项**：CTC 每个输出 token 至少要一帧，而日语语速在 13fps 下每 mora 仅 1.6~2.2 帧。
 - **CTC 目标是「字」不是 kana**，因此不需要 g2p 依赖。
-- **训练数据是** `(音频, ASR 文本)` 配对：ASR 转写自己的音频，输出即目标。
+- **当前生产头**以切好的 Galgame `(音频, 参考文本)` 做字符 CTC，并用 Grok 词时间戳提供稀疏的 speech / blank 帧辅助监督；ASR encoder 始终冻结。
 - **同一份输出有两个读法**：与文本对齐得到时间轴，blank 游程用来选切点。两个读法都不丢音频。
 
 `forced_align` 在 `src/asr/alignment.py` 内自己实现，不依赖 `torchaudio`（本项目 Python 3.14，torch 所在索引上没有匹配的 torchaudio wheel）。正确性由穷举所有合法 CTC 路径的参照实现验证（`tests/asr/test_asr_alignment_head.py`）。
@@ -203,6 +206,28 @@ hf:<repo>@<commit sha>#<文件名>   # 默认；首次运行下载进 HF 缓存�
 默认值**钉死 commit sha 而不是 `main`**，换头是显式改配置的动作。
 
 首次运行下载到 **`models/ctc_aligner.pt`**（14.7MB，与 ASR 权重同目录，走项目代理设置），之后完全离线；打包版直接内置在同一位置，不下载。同名的 `models/ctc_aligner.pt.revision` 记录这份文件对应哪个 sha，改了默认 sha 会重新下载。`ctc_aligner.pt` 的字节内容参与 ASR finalize 缓存签名，换头会自动让旧的对齐结果失效。
+
+### CTC 影子评测
+
+新对齐头通过人工 A/B 前可以旁路运行：正式头仍生成字幕，影子头只复用同一份 encoder 特征计算边界差异，不会改写任何输出时间轴。配置示例：
+
+```env
+ASR_ALIGNMENT_SHADOW_HEAD_PATH=./models/ctc_aligner.shadow.pt
+ASR_ALIGNMENT_SHADOW_ROOT=./tmp/cache/alignment_shadow
+ASR_ALIGNMENT_SHADOW_MIN_DELTA_MS=20
+```
+
+正常运行真实 JAV 任务后，每个任务的结构化观察记录会持久化到 `tmp/cache/alignment_shadow/`。只有达到最小边界差值的片段才进入候选池；可按起点/终点分层生成等长、盲化的 A/B 审计页：
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+uv run python tools\audits\generate_ctc_alignment_shadow_audit.py `
+  --observations tmp\cache\alignment_shadow `
+  --output-dir agents\temp\<timestamp>_ctc-alignment-shadow-audit\audit `
+  --per-boundary 25
+```
+
+`ASR_ALIGNMENT_SHADOW_HEAD_PATH` 置空即关闭。影子 checkpoint 的字节内容参与 finalize 缓存签名；影子加载或比较失败只会留下状态记录，不会使正式转写失败。
 
 ---
 
@@ -233,6 +258,7 @@ ASR_STAGE_WORKER_HEARTBEAT_S=10
 ASR_STAGE_WORKER_OOM_RETRY_LIMIT=6
 GPU_BATCH_PROFILE_ENABLED=1
 GPU_BATCH_PROFILE_GROWTH_THRESHOLD=0.80
+GPU_BATCH_PROFILE_MAX_ENTRIES=16
 ASR_CHUNK_MAX_S=30.0
 ASR_CHUNK_MIN_S=2.0
 ASR_CHUNK_MIN_PAUSE_S=0.6
@@ -283,6 +309,7 @@ auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、显存预算、�
 - `tmp/jobs/<job_id>/`：Web / pipeline 单次任务临时目录；`JOB_TEMP_DIR` 默认是 `./tmp/jobs`。
 - `tmp/chunks/`：ASR wav chunk 的一次性运行目录。
 - `tmp/asr_cache/`：跨任务 ASR 结果缓存；按内容寻址，任务删除时保留。
+- `tmp/cache/alignment_shadow/`：可选 CTC 影子头的跨任务边界分歧记录；任务删除时保留。
 - `tmp/cache/torch/`：torch 运行缓存。（Hugging Face 下载缓存在 `models/hub`、`models/xet`，属于模型权重，删掉要重下。）
 - `tmp/log/<job_id>/`：默认启用的本地诊断目录；包含 `.run.log` 和持久化 `.timings.json`。
 - `datasets/`：本地训练、验证、测试数据归档，默认 ignored；不进入 GitHub 源码仓库。
@@ -388,15 +415,18 @@ uv run python -m <module> --help
 - `tools.workflows.run_full_workflow`：命令行完整工作流 smoke。
 - `tools.workflows.promote_torch_checkpoint`：晋升生产 checkpoint。
 - `tools.web.smoke.start_server` / `submit_job` / `poll_job` / `summarize_job`：Web 服务 smoke 和任务汇总。
-- `tools.align.*`：CTC 对齐头训练链——`build_alignment_features`（encoder 特征抽取）、`build_real_alignment_manifest` / `build_real_alignment_lines`（真实数据 manifest）、`train_ctc_aligner`（训练）、`evaluate_alignment_geometry` / `evaluate_pregate_loss` / `measure_pregate_dropped_audio`（几何与切分评估）。
+- `tools.align.*`：CTC 对齐头训练链——`build_alignment_features`（encoder 特征抽取）、`build_real_alignment_manifest` / `build_real_alignment_lines`（真实数据 manifest）、`run_grok_ctc_teacher` / `select_galgame_ctc_teacher_pilot` / `expand_galgame_ctc_teacher_pilot` / `frame_teacher_supervision`（Grok 词时间与稀疏帧监督）、`train_ctc_aligner`（训练）、`evaluate_alignment_geometry` / `evaluate_ctc_cache` / `evaluate_pregate_loss` / `measure_pregate_dropped_audio`（几何、缓存与切分评估）。
 - `tools.audits.audit_nav` / `serve_audits.ps1`：审计页导航与 Windows 本地服务。
 - `tools.audits.review_page_core` / `audit_prompt` / `binary_clip_audit`：人工审计页共享 Core（`MM:SS.mmm` 区间显示与播放器、状态、完成度、保存 API）与可复用提示配置；任务特有布局与 verdict 组合由 Adapter 提供。设计合同见 [Human Audit Page Core](docs/audits/20260723_human-audit-page-core-v1.md)。
 - `tools.audits.select_alignment_onset_audit` / `generate_alignment_onset_audit_html` / `evaluate_alignment_onset_audit`：对齐头起止点人工审计的抽样、页面生成与统计。
+- `tools.audits.generate_ctc_alignment_shadow_audit`：从正常真实 JAV 任务留下的影子分歧记录中，按起点/终点分层抽样并生成盲化 A/B 审计页。
+- `tools.audits.generate_ctc_alignment_ab_audit` / `evaluate_ctc_alignment_ab_audit`：为两版 CTC 头生成真实音频盲化 A/B 页面并统计人工裁决；`generate_galgame_ctc_teacher_audit_html` 用于 Galgame 教师词时间审计。
 - `tools.audits.generate_subtitle_ab_compare_audit_html`：两版字幕的 A/B 对照审计页。
 - `tools.datasets.label_drop_spans_words` / `apply_drop_span_relabels` / `cut_long_drop_span_clips`：drop-span 逐词 Teacher 标注、复核回写与长片段切分。
 - `tools.audits.build_word_definition_calibration` / `evaluate_word_teacher_calibration`：逐词 Teacher 的「什么算词」校准集与一致性评估。
 - `tools.omni.run_audio_teacher` / `audio_teacher_batch`：离线音频 Teacher Core；统一处理 `--prompt/--prompt-file`、`--folder/--file/--manifest`、provider-safe 并发、进度、续跑和主线程串行化落盘。
 - `tools.omni.audio_teacher_transport`：Qwen、OpenRouter、Google AI Studio 三个 provider Adapter 的唯一分派入口；`--env-file qwen|openrouter|gemini` 只接受这三个已知 profile（`~/.config/omni/` 下的隔离配置），请求与响应协议互不冒充。
+- `tools.omni.speech_to_text_transport` / `run_grok_stt_fullfilm` / `build_grok_stt_srt`：Grok STT Adapter、可续跑的整片分段转写与生产 Subtitle Layout SRT。整片工具默认 `x-ai/grok-stt-1.0`、diarization、5 分钟块 + 5 秒 overlap、$10 预检上限；分段音频用 async resample 保留视频 PTS 间隙，换人只在相邻发言不重叠时形成切点。
 - `tools.omni.gemini_native` / `inspect_gemini_quota`：Google AI Studio 原生 Interactions 音频 Adapter；内联音频、结构化输出、多 Key 轮换与保守的本地滚动配额账本（多 Key 只增加配额轮换槽，不增加并发；`inspect_gemini_quota` 不发请求，只显示脱敏状态）。
 - `tools.omni.timestamp_contract`：Teacher 时间坐标的严格 `MM:SS.mmm` wire schema、格式化、解析和 source-bound 校验；不提供数字秒兼容或时间猜测。
 - `tools.sft.*`：Qwen3-ASR SFT 自训链路——数据集准备、云端训练资产与训练脚本；线上 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf` 即该链路的发布产物。

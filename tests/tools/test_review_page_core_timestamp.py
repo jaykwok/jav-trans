@@ -22,3 +22,10 @@ def test_audit_core_clamps_exact_span_end_with_high_frequency_fallbacks() -> Non
     assert "setTimeout(finishAtEnd,remainingMilliseconds)" in AUDIO_SPAN_PLAYER_JS
     assert "stop(safeEnd)" in AUDIO_SPAN_PLAYER_JS
     assert "activeAudio.currentTime=finalTime" in AUDIO_SPAN_PLAYER_JS
+
+
+def test_audit_core_downloads_labels_when_opened_as_a_local_file() -> None:
+    assert "location.protocol==='file:'" in AUDIT_REVIEW_CORE_JS
+    assert "new Blob([content]" in AUDIT_REVIEW_CORE_JS
+    assert "link.download=filename" in AUDIT_REVIEW_CORE_JS
+    assert "link.click()" in AUDIT_REVIEW_CORE_JS

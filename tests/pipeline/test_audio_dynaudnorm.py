@@ -23,6 +23,7 @@ def test_extract_audio_uses_dynaudnorm_by_default(monkeypatch, tmp_path):
 
     assert calls
     filter_chain = _extract_filter_arg(calls[0])
+    assert filter_chain.startswith("aresample=16000:async=1000:first_pts=0,")
     assert "agate=threshold=0.01" in filter_chain
     assert "dynaudnorm=f=250:g=15" in filter_chain
 
@@ -43,6 +44,7 @@ def test_extract_audio_can_disable_dynaudnorm(monkeypatch, tmp_path):
 
     assert calls
     filter_chain = _extract_filter_arg(calls[0])
+    assert filter_chain.startswith("aresample=16000:async=1000:first_pts=0,")
     assert "dynaudnorm" not in filter_chain
 
 

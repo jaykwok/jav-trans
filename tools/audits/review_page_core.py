@@ -188,13 +188,31 @@ function createAuditReviewCore(config){
     document.getElementById('status').textContent=(message?message+' · ':'')+`${config.statusLabel} ${completedCount()}/${config.entries.length}${extra?' · '+extra:''}`;
   }
   function persist(){localStorage.setItem(config.storageKey,JSON.stringify(annotations));updateStatus();}
+  function download(content,filename){
+    const blob=new Blob([content],{type:'application/x-ndjson;charset=utf-8'});
+    const url=URL.createObjectURL(blob);
+    const link=document.createElement('a');
+    link.href=url;
+    link.download=filename;
+    link.style.display='none';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),0);
+    updateStatus('已下载 '+filename);
+  }
   async function save(){
     const entries=config.entries.filter(entry=>!config.shouldSerialize||config.shouldSerialize(ensure(entry),entry));
     try{
       const serialized=await Promise.all(entries.map(entry=>Promise.resolve(config.serialize(entry,ensure(entry)))));
       const lines=serialized.map(value=>JSON.stringify(value));
       const content=lines.length?lines.join('\n')+'\n':'';
-      const response=await fetch('/__audit_api__/save-labels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({href:location.pathname,filename:config.filename||'manual_verdicts.jsonl',content})});
+      const filename=config.filename||'manual_verdicts.jsonl';
+      if(location.protocol==='file:'){
+        download(content,filename);
+        return;
+      }
+      const response=await fetch('/__audit_api__/save-labels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({href:location.pathname,filename,content})});
       const result=await response.json();
       updateStatus(response.ok&&result.ok?'已保存到 '+result.path:'保存失败: '+(result.error||response.status));
     }catch(error){updateStatus('保存失败: '+error.message);}

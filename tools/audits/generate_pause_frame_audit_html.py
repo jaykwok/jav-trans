@@ -22,6 +22,16 @@ would make the editor unusable; so gaps are allowed as an intermediate state and
 `unsure` span covering everything, which is the honest prior: nothing has been
 decided yet, and a default of `silence` would let an unreviewed window serialize
 as a real answer.
+
+**Splitting has its own strip, above the segments.** The first version put the
+split handler on the segment strip itself, which could never fire: the segments
+are absolutely positioned buttons that tile the strip end to end and stop their
+own clicks so that clicking one auditions it, so every click was swallowed
+before it reached the split. With one `unsure` span covering the window by
+construction, that made the editor incapable of ever producing a second
+interval. The two gestures are now on two elements, and a boundary can also be
+dropped at the playhead - which is how an ear actually finds one: play, hear the
+word start, cut there.
 """
 from __future__ import annotations
 
@@ -78,9 +88,26 @@ C 静音 —— 没有人声。环境底噪、器械声、房间音都算静音�
 INTRO_HTML = (
     "<p>每段音频 8 秒，来自真实素材。把它切成连续区间并逐段标注；"
     "区间边界自动对齐到 38.5ms 一帧（对齐头的输出分辨率）。</p>"
+    "<p><b>不是整条打一个标</b>——要的就是词从哪一帧到哪一帧。"
+    "整条一个判定正是现有标注做过而用不了的事：span 中位数 7.47 秒，"
+    "闸门却在 38.5ms 上做决定。</p>"
+    "<p>操作：播放 → 听到边界按<b>「在播放位置切分」</b>（或点色块上方的<b>切分条</b>）"
+    "→ 点色块试听那一段 → 选 A/B/C/?。一条窗口通常会切成好几段。</p>"
     "<p>页面<b>不显示任何模型输出</b>——切点、blank 游程都不显示。"
     "先有不受影响的标注，比较放在另一个页面做。</p>"
 )
+
+# Editor-only; the review page reuses the shared partition CSS but has no ruler
+# and must stay unable to edit anything.
+EDITOR_CSS = """
+.pause-ruler{position:relative;height:22px;margin:8px 0 0;border:1px dashed #93a6b6;
+  border-bottom:0;border-radius:5px 5px 0 0;cursor:crosshair;background:#eef3f7;
+  display:flex;align-items:center;justify-content:center}
+.pause-ruler:hover{background:#dfeaf3}
+.pause-ruler-hint{font-size:11px;color:#5b6b7a;pointer-events:none;user-select:none}
+.pause-playhead{position:absolute;top:0;height:100%;width:2px;background:#d64545;pointer-events:none}
+.pause-card .pause-strip{margin-top:0;border-radius:0 0 5px 5px}
+"""
 
 EDITOR_JS = r"""
 const state=createAuditReviewCore({
@@ -160,7 +187,10 @@ function splitAt(entry,fraction){
   const frame=Math.min(entry.frame_count-1,Math.max(1,Math.round(fraction*entry.frame_count)));
   const segments=segmentsFor(entry);
   const target=segments.find(segment=>segment.start_frame<frame&&segment.end_frame>frame);
-  if(!target)return;
+  const error=document.getElementById(`card-${entry.row_id}`).querySelector('.pause-error');
+  // Silence here used to look identical to the handler never firing at all,
+  // which is how the dead split survived. Say which one happened.
+  if(!target){error.textContent='这里已经是一条边界了，换个位置切';return;}
   const tail={id:`segment-${Date.now()}`,label:target.label,start_frame:frame,end_frame:target.end_frame,category:'',reason:''};
   target.end_frame=frame;
   segments.push(tail);
@@ -197,11 +227,31 @@ function resetWindow(entry){
 
 for(const entry of WINDOWS){
   const card=document.getElementById(`card-${entry.row_id}`);
-  const strip=card.querySelector('.pause-strip');
-  strip.onclick=event=>{
-    const box=strip.getBoundingClientRect();
+  const audio=card.querySelector('audio');
+  const ruler=card.querySelector('.pause-ruler');
+  const playhead=card.querySelector('.pause-playhead');
+  const totalSeconds=entry.frame_count*PAUSE_FRAME_HOP_S;
+  // The split lives on the ruler, NOT on the segment strip: the segments tile
+  // the strip end to end and stopPropagation so a click auditions them, so a
+  // split handler down there is unreachable by construction.
+  ruler.onclick=event=>{
+    const box=ruler.getBoundingClientRect();
     splitAt(entry,(event.clientX-box.left)/box.width);
   };
+  // How an ear actually places a boundary: play, hear the word begin, cut at
+  // the point you are hearing rather than at a point you are looking at.
+  card.querySelector('[data-action="cut-here"]').onclick=()=>{
+    splitAt(entry,(Number(audio.currentTime)||0)/totalSeconds);
+  };
+  const followPlayhead=()=>{
+    const fraction=(Number(audio.currentTime)||0)/totalSeconds;
+    playhead.style.left=`${Math.max(0,Math.min(100,100*fraction))}%`;
+    if(!audio.paused)requestAnimationFrame(followPlayhead);
+  };
+  audio.addEventListener('play',()=>requestAnimationFrame(followPlayhead));
+  audio.addEventListener('timeupdate',followPlayhead);
+  audio.addEventListener('seeked',followPlayhead);
+  followPlayhead();
   card.querySelectorAll('[data-label]').forEach(button=>{
     button.onclick=()=>assign(entry,button.dataset.label);
   });
@@ -229,12 +279,16 @@ def _card_html(row: dict) -> str:
         f'<section class="pause-card" id="card-{row_id}">'
         f"<h3>{row_id}</h3>"
         f'<audio controls preload="none" src="{row["audio"]}"></audio>'
+        f'<div class="pause-ruler"><span class="pause-ruler-hint">↓ 点这一条切分（红线是播放位置）</span>'
+        f'<i class="pause-playhead"></i></div>'
         f'<div class="pause-strip"></div>'
         f'<div class="pause-tools">{buttons}'
+        f'<button type="button" data-action="cut-here">在播放位置切分</button>'
         f'<button type="button" data-action="merge">合并到右侧</button>'
         f'<button type="button" data-action="reset">重置</button></div>'
         f'<div class="pause-error"></div>'
-        f'<div><small>点条带切分，点区间试听，选标签归类。</small></div>'
+        f'<div><small>播放 → 听到边界按「在播放位置切分」（或点切分条）→ '
+        f'点色块试听那一段 → 选 A/B/C/?。一条窗口通常有好几段。</small></div>'
         f'<textarea rows="2" style="width:100%" placeholder="备注（可空）"></textarea>'
         f"</section>"
     )
@@ -270,7 +324,7 @@ def build(manifest_path: Path, output_dir: Path, prompt: str) -> dict:
             title=TITLE,
             intro_html=INTRO_HTML,
             body_html=body,
-            adapter_css=PARTITION_EDITOR_CSS,
+            adapter_css=PARTITION_EDITOR_CSS + EDITOR_CSS,
             adapter_js=adapter_js,
         )
     )

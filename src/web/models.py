@@ -70,24 +70,20 @@ class SettingsRead(BaseModel):
     target_lang: str = "简体中文"
     translation_backend: Literal["openai", "llamacpp"] = "openai"
     llamacpp_server_path: str = ""
-    llamacpp_model_repo: str = ""
-    llamacpp_model_file: str = ""
-    llamacpp_gguf_path: str = ""
 
 
 class SettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     api_key: str | None = None
     base_url: str | None = None
     model: str | None = None
     proxy_protocol: Literal["http", "https", "socks5"] | None = None
     proxy_host: str | None = Field(default=None, max_length=255)
     proxy_port: int | None = Field(default=None, ge=1, le=65535)
-    translation_glossary: str | None = None
+    translation_glossary: str | None = Field(default=None, max_length=20000)
     llm_api_format: Literal["chat", "responses"] | None = None
     llm_reasoning_effort: Literal["none", "medium", "max"] | None = None
-    target_lang: str | None = None
+    target_lang: str | None = Field(default=None, max_length=64)
     translation_backend: Literal["openai", "llamacpp"] | None = None
-    llamacpp_server_path: str | None = None
-    llamacpp_model_repo: str | None = None
-    llamacpp_model_file: str | None = None
-    llamacpp_gguf_path: str | None = None
+    llamacpp_server_path: str | None = Field(default=None, max_length=4096)

@@ -7,10 +7,10 @@ whole reason this route is affordable where the abandoned force-aligner was not:
 the domain adaptation was already paid for by the ASR's SFT, so what remains is
 a ~10M parameter head over features that never change.
 
-CTC loss is the only objective. There is no alignment supervision anywhere in
-this loop - no frame-level labels exist, and inventing them would mean inventing
-the thing being measured. Alignment emerges from CTC's marginalisation over
-paths, and is evaluated separately against geometry the training never saw.
+Full-clip CTC remains the canonical text objective.  An optional sparse frame
+teacher may add a blank-vs-speech auxiliary loss from audited word timestamps:
+word islands are positive, only long distant gaps are negative, and uncertain
+frames are ignored.  The auxiliary target never replaces dataset text.
 """
 from __future__ import annotations
 
@@ -39,6 +39,12 @@ from asr.alignment import (  # noqa: E402
     minimum_ctc_frames,
 )
 from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
+from tools.align.frame_teacher_supervision import (  # noqa: E402
+    IGNORE_LABEL,
+    balanced_sparse_frame_loss,
+    compile_sparse_frame_targets,
+    load_accepted_frame_teachers,
+)
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -119,6 +125,56 @@ def _collate(batch: list[tuple[np.ndarray, list[int]]], torch):
     )
 
 
+def _cap_empty_train_rows(
+    rows: list[dict], *, maximum_fraction: float, seed: int
+) -> tuple[list[dict], dict[str, dict[str, int | float]]]:
+    """Cap empty targets within each domain, deterministically.
+
+    A global cap is ineffective when 29k galgame positives hide an overly
+    blank real-domain arm.  Per-domain capping keeps the supervision mixture
+    honest even when that smaller cache is oversampled with ``--cache-repeat``.
+    """
+
+    if not 0.0 <= maximum_fraction < 1.0:
+        raise ValueError("maximum empty target fraction must be in [0, 1)")
+    by_domain: dict[str, list[dict]] = {}
+    for row in rows:
+        by_domain.setdefault(str(row.get("domain") or ""), []).append(row)
+    kept: list[dict] = []
+    report: dict[str, dict[str, int | float]] = {}
+    rng = np.random.default_rng(seed)
+    for domain in sorted(by_domain):
+        domain_rows = by_domain[domain]
+        nonempty = [row for row in domain_rows if str(row.get("text") or "")]
+        empty = [row for row in domain_rows if not str(row.get("text") or "")]
+        maximum_empty = (
+            int(math.floor(maximum_fraction * len(nonempty) / (1.0 - maximum_fraction)))
+            if nonempty
+            else 0
+        )
+        keep_count = min(len(empty), maximum_empty)
+        if keep_count < len(empty):
+            chosen = sorted(
+                int(index)
+                for index in rng.choice(len(empty), size=keep_count, replace=False)
+            )
+            kept_empty = [empty[index] for index in chosen]
+        else:
+            kept_empty = empty
+        selected = nonempty + kept_empty
+        kept.extend(selected)
+        report[domain] = {
+            "nonempty": len(nonempty),
+            "empty_available": len(empty),
+            "empty_kept": len(kept_empty),
+            "empty_dropped": len(empty) - len(kept_empty),
+            "empty_fraction": round(len(kept_empty) / len(selected), 6)
+            if selected
+            else 0.0,
+        }
+    return kept, report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -148,6 +204,17 @@ def main() -> None:
         help="pick the best checkpoint on this domain's val loss instead of the "
         "pooled one; the pooled number is dominated by whichever cache is larger",
     )
+    parser.add_argument(
+        "--include-empty-targets",
+        action="store_true",
+        help="train explicit blank-only cache rows instead of dropping them",
+    )
+    parser.add_argument(
+        "--max-empty-train-fraction",
+        type=float,
+        default=0.30,
+        help="per-domain cap applied after cache repeats (default: 0.30)",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--upsample", type=int, default=2)
     parser.add_argument("--hidden-dim", type=int, default=512)
@@ -155,6 +222,12 @@ def main() -> None:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--vocab-max-size", type=int, default=3000)
     parser.add_argument("--vocab-min-count", type=int, default=2)
+    parser.add_argument(
+        "--vocab-checkpoint",
+        default="",
+        help="reuse the exact vocabulary from an existing checkpoint so a "
+        "data A/B does not also change the output classes",
+    )
     parser.add_argument(
         "--acoustic-targets",
         action="store_true",
@@ -167,8 +240,46 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument(
+        "--frame-teacher-results",
+        default="",
+        help="Grok result JSONL containing word timestamps. Requires the strict "
+        "accepted manifest; rejected results are never used.",
+    )
+    parser.add_argument(
+        "--frame-teacher-manifest",
+        default="",
+        help="strict accepted teacher manifest that quality-gates result rows",
+    )
+    parser.add_argument(
+        "--frame-teacher-domain",
+        default="",
+        help="only this cache domain must carry frame supervision; empty means all",
+    )
+    parser.add_argument("--frame-loss-weight", type=float, default=0.0)
+    parser.add_argument("--frame-positive-merge-gap-s", type=float, default=0.15)
+    parser.add_argument("--frame-boundary-ignore-s", type=float, default=0.10)
+    parser.add_argument("--frame-negative-min-s", type=float, default=0.50)
     parser.add_argument("--seed", type=int, default=20260731)
     args = parser.parse_args()
+
+    teacher_args = [args.frame_teacher_results, args.frame_teacher_manifest]
+    if any(teacher_args) != all(teacher_args):
+        raise SystemExit(
+            "--frame-teacher-results and --frame-teacher-manifest must be given together"
+        )
+    if args.frame_loss_weight < 0.0:
+        raise SystemExit("--frame-loss-weight must be non-negative")
+    if all(teacher_args) != (args.frame_loss_weight > 0.0):
+        raise SystemExit(
+            "a positive --frame-loss-weight and both frame teacher files are required together"
+        )
+    if min(
+        args.frame_positive_merge_gap_s,
+        args.frame_boundary_ignore_s,
+        args.frame_negative_min_s,
+    ) < 0.0:
+        raise SystemExit("frame supervision durations must be non-negative")
 
     import torch
     from torch import nn
@@ -183,6 +294,20 @@ def main() -> None:
     )
     train_rows = [r for r in cache.rows if r["partition"] == "train"]
     val_rows = [r for r in cache.rows if r["partition"] == "val"]
+    empty_excluded = Counter()
+    empty_cap_report: dict[str, dict[str, int | float]] = {}
+    if args.include_empty_targets:
+        train_rows, empty_cap_report = _cap_empty_train_rows(
+            train_rows,
+            maximum_fraction=float(args.max_empty_train_fraction),
+            seed=args.seed,
+        )
+    else:
+        for row in train_rows + val_rows:
+            if not str(row.get("text") or ""):
+                empty_excluded[str(row.get("partition") or "train")] += 1
+        train_rows = [row for row in train_rows if str(row.get("text") or "")]
+        val_rows = [row for row in val_rows if str(row.get("text") or "")]
     if not train_rows:
         raise SystemExit("feature cache has no training rows")
     mix = Counter(row["domain"] for row in train_rows)
@@ -191,12 +316,22 @@ def main() -> None:
     counts: Counter[str] = Counter()
     for row in train_rows:
         counts.update(row["text"])
-    vocab = AlignmentVocab.from_counts(
-        counts,
-        max_size=args.vocab_max_size,
-        min_count=args.vocab_min_count,
-        acoustic_only=args.acoustic_targets,
-    )
+    if args.vocab_checkpoint:
+        vocab_payload = torch.load(
+            args.vocab_checkpoint, map_location="cpu", weights_only=False
+        )
+        vocab = AlignmentVocab.from_payload(vocab_payload["vocab"])
+        if bool(vocab.acoustic_only) != bool(args.acoustic_targets):
+            raise SystemExit(
+                "--acoustic-targets must match the vocabulary checkpoint"
+            )
+    else:
+        vocab = AlignmentVocab.from_counts(
+            counts,
+            max_size=args.vocab_max_size,
+            min_count=args.vocab_min_count,
+            acoustic_only=args.acoustic_targets,
+        )
     covered = sum(counts[ch] for ch in vocab.chars)
     total = sum(counts.values())
     # Coverage is over ALL counted characters, so on the acoustic arm it reads
@@ -242,6 +377,72 @@ def main() -> None:
 
     def _key(row: dict) -> tuple[int, str]:
         return int(row.get("cache_index") or 0), row["audio_id"]
+
+    frame_labels: dict[tuple[int, str], np.ndarray] = {}
+    frame_teacher_summary: dict[str, object] = {}
+    if args.frame_teacher_results:
+        if args.frame_teacher_domain and args.frame_teacher_domain not in mix:
+            raise SystemExit(
+                f"--frame-teacher-domain {args.frame_teacher_domain!r} has no train rows; "
+                f"available: {sorted(mix)}"
+            )
+        teachers, teacher_load_summary = load_accepted_frame_teachers(
+            Path(args.frame_teacher_results), Path(args.frame_teacher_manifest)
+        )
+        eligible: dict[tuple[int, str], dict] = {}
+        for row in train_rows:
+            if args.frame_teacher_domain and row["domain"] != args.frame_teacher_domain:
+                continue
+            eligible.setdefault(_key(row), row)
+        missing = sorted(
+            str(row.get("source_id") or row["audio_id"])
+            for row in eligible.values()
+            if str(row.get("source_id") or row["audio_id"]) not in teachers
+        )
+        if missing:
+            raise SystemExit(
+                f"{len(missing)} eligible training rows lack an accepted frame teacher; "
+                f"first={missing[0]}"
+            )
+        blank_frames = 0
+        speech_frames = 0
+        ignored_frames = 0
+        supervised_rows = 0
+        for key, row in eligible.items():
+            source_id = str(row.get("source_id") or row["audio_id"])
+            labels = compile_sparse_frame_targets(
+                teachers[source_id],
+                output_frames=int(row["frames"]) * args.upsample,
+                upsample=args.upsample,
+                positive_merge_gap_s=args.frame_positive_merge_gap_s,
+                boundary_ignore_s=args.frame_boundary_ignore_s,
+                negative_minimum_s=args.frame_negative_min_s,
+            )
+            frame_labels[key] = labels
+            blank_frames += int(np.sum(labels == 0))
+            speech_frames += int(np.sum(labels == 1))
+            ignored_frames += int(np.sum(labels == IGNORE_LABEL))
+            supervised_rows += int(np.any(labels != IGNORE_LABEL))
+        if not supervised_rows or not speech_frames or not blank_frames:
+            raise SystemExit(
+                "frame teacher produced no usable balanced supervision "
+                f"(rows={supervised_rows}, speech={speech_frames}, blank={blank_frames})"
+            )
+        frame_teacher_summary = {
+            **teacher_load_summary,
+            "domain": args.frame_teacher_domain or "*",
+            "eligible_unique_train_rows": len(eligible),
+            "supervised_unique_train_rows": supervised_rows,
+            "blank_frames": blank_frames,
+            "speech_frames": speech_frames,
+            "ignored_frames": ignored_frames,
+            "labelled_frame_share": round(
+                (blank_frames + speech_frames)
+                / max(1, blank_frames + speech_frames + ignored_frames),
+                6,
+            ),
+        }
+        print(f"frame teacher: {frame_teacher_summary}", flush=True)
 
     # What `zero_infinity` is actually hiding. A row whose frames cannot hold its
     # targets contributes a zero loss, not an error: it trains on nothing while
@@ -292,16 +493,19 @@ def main() -> None:
         for group in groups:
             chunk = [rows[i] for i in group]
             items = [(cache.features(r), encoded[_key(r)]) for r in chunk]
-            items = [item for item in items if item[1]]
             if items:
-                yield _collate(items, torch)
+                yield chunk, _collate(items, torch)
 
-    def run_epoch(rows: list[dict], *, train: bool) -> tuple[float, int]:
+    def run_epoch(
+        rows: list[dict], *, train: bool
+    ) -> tuple[float, int, float, float | None]:
         head.train(train)
-        total_loss, seen = 0.0, 0
-        for features, targets, frame_lengths, target_lengths in batches(
+        total_loss, total_ctc_loss, seen = 0.0, 0.0, 0
+        total_frame_loss, frame_seen = 0.0, 0
+        for chunk, packed in batches(
             rows, shuffle=train
         ):
+            features, targets, frame_lengths, target_lengths = packed
             features = features.to(device, non_blocking=True)
             targets = targets.to(device)
             input_lengths = frame_lengths * args.upsample
@@ -313,11 +517,34 @@ def main() -> None:
                 # clips arrive one at a time.
                 log_probs = head(features, frame_lengths)
                 # CTCLoss wants (T, B, V).
-                loss = criterion(
+                ctc_loss = criterion(
                     log_probs.transpose(0, 1),
                     targets,
                     input_lengths.to(device),
                     target_lengths.to(device),
+                )
+                frame_loss = None
+                if train and frame_labels:
+                    label_array = np.full(
+                        tuple(log_probs.shape[:2]), IGNORE_LABEL, dtype=np.int8
+                    )
+                    for index, row in enumerate(chunk):
+                        labels = frame_labels.get(_key(row))
+                        if labels is not None:
+                            label_array[index, : len(labels)] = labels
+                    label_tensor = torch.from_numpy(label_array).to(device)
+                    frame_loss, frame_counts = balanced_sparse_frame_loss(
+                        log_probs, label_tensor, torch
+                    )
+                    if frame_counts["blank_frames"] + frame_counts["speech_frames"]:
+                        frame_seen += features.shape[0]
+                        total_frame_loss += (
+                            float(frame_loss.detach().item()) * features.shape[0]
+                        )
+                loss = ctc_loss + (
+                    args.frame_loss_weight * frame_loss
+                    if frame_loss is not None
+                    else 0.0
                 )
             if train:
                 nonlocal step
@@ -329,8 +556,14 @@ def main() -> None:
                 optimizer.step()
                 step += 1
             total_loss += float(loss.item()) * features.shape[0]
+            total_ctc_loss += float(ctc_loss.item()) * features.shape[0]
             seen += features.shape[0]
-        return total_loss / max(1, seen), seen
+        return (
+            total_loss / max(1, seen),
+            seen,
+            total_ctc_loss / max(1, seen),
+            total_frame_loss / frame_seen if frame_seen else None,
+        )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -355,16 +588,39 @@ def main() -> None:
         domain: [row for row in val_rows if row["domain"] == domain]
         for domain in val_domains
     }
+    val_by_domain_and_kind = {
+        domain: {
+            kind: [
+                row
+                for row in rows
+                if ("text" if str(row.get("text") or "") else "blank") == kind
+            ]
+            for kind in ("text", "blank")
+            if any(
+                ("text" if str(row.get("text") or "") else "blank") == kind
+                for row in rows
+            )
+        }
+        for domain, rows in val_by_domain.items()
+    }
 
     for epoch in range(args.epochs):
-        train_loss, _ = run_epoch(train_rows, train=True)
+        train_loss, _, train_ctc_loss, train_frame_loss = run_epoch(
+            train_rows, train=True
+        )
         per_domain: dict[str, float] = {}
         pooled_total, pooled_seen = 0.0, 0
         for domain, rows in val_by_domain.items():
-            loss, seen = run_epoch(rows, train=False)
+            loss, seen, _, _ = run_epoch(rows, train=False)
             per_domain[domain] = round(loss, 4)
             pooled_total += loss * seen
             pooled_seen += seen
+        per_domain_and_kind: dict[str, dict[str, float]] = {}
+        for domain, by_kind in val_by_domain_and_kind.items():
+            per_domain_and_kind[domain] = {}
+            for kind, rows in by_kind.items():
+                kind_loss, _, _, _ = run_epoch(rows, train=False)
+                per_domain_and_kind[domain][kind] = round(kind_loss, 4)
         val_loss = pooled_total / pooled_seen if pooled_seen else float("nan")
         selected = per_domain.get(args.select_domain, val_loss) if args.select_domain else val_loss
         elapsed = time.perf_counter() - started
@@ -372,15 +628,27 @@ def main() -> None:
             {
                 "epoch": epoch,
                 "train_loss": round(train_loss, 4),
+                "train_ctc_loss": round(train_ctc_loss, 4),
+                "train_frame_loss": (
+                    round(train_frame_loss, 4)
+                    if train_frame_loss is not None
+                    else None
+                ),
                 "val_loss": round(val_loss, 4),
                 "val_loss_by_domain": dict(per_domain),
+                "val_loss_by_domain_and_target_kind": per_domain_and_kind,
                 "elapsed_s": round(elapsed, 1),
             }
         )
         detail = "  ".join(f"{name} {value:.4f}" for name, value in per_domain.items())
+        frame_detail = (
+            f" ctc {train_ctc_loss:.4f} frame {train_frame_loss:.4f}"
+            if train_frame_loss is not None
+            else ""
+        )
         print(
-            f"epoch {epoch:3d}  train {train_loss:.4f}  val {val_loss:.4f}  "
-            f"[{detail}]  {elapsed:.0f}s",
+            f"epoch {epoch:3d}  train {train_loss:.4f}{frame_detail}  "
+            f"val {val_loss:.4f}  [{detail}]  {elapsed:.0f}s",
             flush=True,
         )
         if not math.isnan(selected) and selected < best_val:
@@ -398,6 +666,8 @@ def main() -> None:
                     "val_loss": val_loss,
                     "val_loss_by_domain": dict(per_domain),
                     "selection_domain": args.select_domain or "",
+                    "frame_teacher": frame_teacher_summary,
+                    "frame_loss_weight": float(args.frame_loss_weight),
                 },
                 checkpoint_path,
             )
@@ -408,6 +678,19 @@ def main() -> None:
         "cache_repeat": list(args.cache_repeat or []),
         "cache_domain": list(args.cache_domain or []),
         "select_domain": args.select_domain or "",
+        "include_empty_targets": bool(args.include_empty_targets),
+        "max_empty_train_fraction": float(args.max_empty_train_fraction),
+        "empty_target_cap_by_domain": empty_cap_report,
+        "empty_targets_excluded": dict(empty_excluded),
+        "vocab_checkpoint": str(args.vocab_checkpoint or ""),
+        "frame_teacher_results": str(args.frame_teacher_results or ""),
+        "frame_teacher_manifest": str(args.frame_teacher_manifest or ""),
+        "frame_teacher_domain": str(args.frame_teacher_domain or ""),
+        "frame_loss_weight": float(args.frame_loss_weight),
+        "frame_positive_merge_gap_s": float(args.frame_positive_merge_gap_s),
+        "frame_boundary_ignore_s": float(args.frame_boundary_ignore_s),
+        "frame_negative_min_s": float(args.frame_negative_min_s),
+        "frame_teacher_summary": frame_teacher_summary,
         "train_rows_by_domain": dict(Counter(row["domain"] for row in train_rows)),
         "cached_seconds_by_domain": {
             domain: round(seconds, 1)

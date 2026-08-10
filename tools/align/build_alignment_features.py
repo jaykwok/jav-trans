@@ -76,6 +76,20 @@ def _held_out_ids(composite_manifest: Path | None) -> set[str]:
     return ids
 
 
+def _is_held_out(row: dict, held_out_ids: set[str]) -> bool:
+    """Match evaluation cores through either the derived or source identity.
+
+    Teacher-generated manifests assign a new ``audio_id`` to each view (full
+    clip versus word-timestamp crop) and retain the original Galgame clip ID in
+    ``source_id``.  Checking only ``audio_id`` therefore misses precisely the
+    rows that the holdout is meant to exclude.
+    """
+    return any(
+        str(row.get(field) or "") in held_out_ids
+        for field in ("audio_id", "source_id")
+    )
+
+
 def _group_key(row: dict, position: int, *, field: str, block: int) -> str:
     """Which held-out group a clip belongs to.
 
@@ -116,6 +130,32 @@ def _assign_partitions(rows: list[dict], *, val_fraction: float, rng) -> dict:
     the last group taken usually overshoots - which is the price of the split
     meaning something.
     """
+    fixed = [str(row.get("partition") or "") for row in rows]
+    if any(fixed):
+        if any(partition not in {"train", "val"} for partition in fixed):
+            raise SystemExit(
+                "manifest partitions must be present on every row and be train/val"
+            )
+        group_partitions: dict[str, str] = {}
+        for row in rows:
+            group = str(row["group"])
+            partition = str(row["partition"])
+            previous = group_partitions.setdefault(group, partition)
+            if previous != partition:
+                raise SystemExit(
+                    f"manifest group {group!r} crosses train/val partitions"
+                )
+        val_rows = sum(1 for row in rows if row["partition"] == "val")
+        return {
+            "fixed_manifest_partitions": True,
+            "groups_total": len(group_partitions),
+            "groups_val": sum(
+                1 for partition in group_partitions.values() if partition == "val"
+            ),
+            "val_rows": val_rows,
+            "val_fraction_actual": round(val_rows / len(rows), 5) if rows else 0.0,
+        }
+
     groups: dict[str, list[dict]] = {}
     for row in rows:
         groups.setdefault(row["group"], []).append(row)
@@ -133,6 +173,7 @@ def _assign_partitions(rows: list[dict], *, val_fraction: float, rng) -> dict:
     for row in rows:
         row.setdefault("partition", "train")
     return {
+        "fixed_manifest_partitions": False,
         "groups_total": len(groups),
         "groups_val": val_groups,
         "val_rows": val_rows,
@@ -154,6 +195,11 @@ def main() -> None:
     parser.add_argument("--shard-rows", type=int, default=2000)
     parser.add_argument("--min-seconds", type=float, default=0.5)
     parser.add_argument("--max-seconds", type=float, default=25.0)
+    parser.add_argument(
+        "--allow-empty-text",
+        action="store_true",
+        help="cache empty-target rows as explicit CTC blank supervision",
+    )
     parser.add_argument("--model-path", default="")
     parser.add_argument("--val-fraction", type=float, default=0.02)
     parser.add_argument(
@@ -186,12 +232,26 @@ def main() -> None:
     for position, row in enumerate(rows):
         audio_id = str(row.get("audio_id") or "")
         text = normalize_text(str(row.get("text") or ""))
-        duration = float(row.get("duration_s") or 0.0)
-        if audio_id in held_out:
+        source_start_s = float(row.get("source_start_s") or 0.0)
+        source_end_value = row.get("source_end_s")
+        source_end_s = (
+            float(source_end_value) if source_end_value is not None else None
+        )
+        duration = (
+            source_end_s - source_start_s
+            if source_end_s is not None
+            else float(row.get("duration_s") or 0.0)
+        )
+        if _is_held_out(row, held_out):
             skipped["held_out_for_evaluation"] += 1
             continue
-        if not text:
+        if not text and not args.allow_empty_text:
             skipped["empty_text"] += 1
+            continue
+        if source_start_s < 0.0 or (
+            source_end_s is not None and source_end_s <= source_start_s
+        ):
+            skipped["invalid_source_crop"] += 1
             continue
         if not args.min_seconds <= duration <= args.max_seconds:
             skipped["duration_out_of_range"] += 1
@@ -203,14 +263,28 @@ def main() -> None:
         if minimum_ctc_frames(text) > duration * ENCODER_FPS:
             skipped["text_denser_than_frame_rate"] += 1
             continue
-        eligible.append({"audio_id": audio_id, "audio": row["audio"], "text": text,
-                         "duration_s": duration,
-                         "group": _group_key(
-                             row,
-                             position,
-                             field=args.group_field,
-                             block=args.group_block,
-                         )})
+        entry = {
+            "audio_id": audio_id,
+            "audio": row["audio"],
+            "text": text,
+            "duration_s": duration,
+            "source_start_s": source_start_s,
+            "source_end_s": source_end_s,
+            "target_kind": str(
+                row.get("target_kind") or ("text" if text else "blank")
+            ),
+            "source_id": str(row.get("source_id") or audio_id),
+            "source_label": str(row.get("source_label") or ""),
+            "group": _group_key(
+                row,
+                position,
+                field=args.group_field,
+                block=args.group_block,
+            ),
+        }
+        if str(row.get("partition") or ""):
+            entry["partition"] = str(row["partition"])
+        eligible.append(entry)
 
     if not eligible:
         raise SystemExit("no eligible clips after filtering")
@@ -273,6 +347,18 @@ def main() -> None:
                 if rate != SAMPLE_RATE:
                     failures += 1
                     continue
+                crop_start = int(round(float(row["source_start_s"]) * SAMPLE_RATE))
+                crop_end = (
+                    int(round(float(row["source_end_s"]) * SAMPLE_RATE))
+                    if row["source_end_s"] is not None
+                    else len(audio)
+                )
+                crop_start = max(0, min(len(audio), crop_start))
+                crop_end = max(crop_start, min(len(audio), crop_end))
+                audio = audio[crop_start:crop_end]
+                if not len(audio):
+                    skipped["empty_source_crop"] += 1
+                    continue
                 audios.append(np.asarray(audio, dtype=np.float32))
                 kept.append(row)
             if not audios:
@@ -290,6 +376,15 @@ def main() -> None:
                             "schema": SHARD_SCHEMA,
                             "audio_id": row["audio_id"],
                             "text": row["text"],
+                            "target_kind": row["target_kind"],
+                            "source_id": row["source_id"],
+                            "source_label": row["source_label"],
+                            "source_start_s": round(row["source_start_s"], 6),
+                            "source_end_s": (
+                                round(row["source_end_s"], 6)
+                                if row["source_end_s"] is not None
+                                else None
+                            ),
                             "partition": row["partition"],
                             # Carried into the cache so a later run can regroup
                             # or audit the split without the manifest, which is
@@ -338,15 +433,24 @@ def main() -> None:
         # lower for that reason alone.
         "split": {
             "mode": (
-                f"field:{args.group_field}"
-                if args.group_field
-                else (f"block:{args.group_block}" if args.group_block > 0 else "clip")
+                "manifest:partition"
+                if split.get("fixed_manifest_partitions")
+                else (
+                    f"field:{args.group_field}"
+                    if args.group_field
+                    else (
+                        f"block:{args.group_block}" if args.group_block > 0 else "clip"
+                    )
+                )
             ),
             **split,
         },
         "audio_hours": round(audio_seconds / 3600.0, 3),
         "distinct_characters": len(counts),
         "total_characters": int(sum(counts.values())),
+        "empty_target_clips": sum(
+            1 for row in _read_jsonl(index_path) if not row["text"]
+        ),
         "chars_per_second": round(sum(counts.values()) / audio_seconds, 3)
         if audio_seconds
         else 0.0,

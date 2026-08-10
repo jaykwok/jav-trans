@@ -14,6 +14,7 @@ from core import events
 from core import stage_errors
 from core.config import load_config
 from core.job_context import JobContext
+from asr import alignment_shadow as alignment_shadow_module
 from asr import noise as asr_noise_module
 from pipeline import aligned_cache as aligned_cache_module
 from pipeline import audio as audio_module
@@ -134,6 +135,7 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_STAGE_WORKER_HEARTBEAT_S",
     "GPU_BATCH_PROFILE_ENABLED",
     "GPU_BATCH_PROFILE_GROWTH_THRESHOLD",
+    "GPU_BATCH_PROFILE_MAX_ENTRIES",
     "GPU_BATCH_PROFILE_PATH",
     "ASR_LANGUAGE",
     "ASR_FORCE_LANGUAGE",
@@ -180,6 +182,7 @@ _ASR_STAGE_CACHE_NEUTRAL_KEYS = {
     "ASR_STAGE_WORKER_HEARTBEAT_S",
     "GPU_BATCH_PROFILE_ENABLED",
     "GPU_BATCH_PROFILE_GROWTH_THRESHOLD",
+    "GPU_BATCH_PROFILE_MAX_ENTRIES",
     "GPU_BATCH_PROFILE_PATH",
     "ASR_CHUNK_ROOT",
     "KEEP_ASR_CHUNKS",
@@ -188,6 +191,8 @@ _ASR_STAGE_CACHE_NEUTRAL_KEYS = {
     "TRANSCRIPTION_TIMEOUT_S",
     "ASR_ALIGN_BATCH_SIZE",
     "ASR_FEATURE_BATCH_SIZE",
+    "ASR_ALIGNMENT_SHADOW_ROOT",
+    "ASR_ALIGNMENT_SHADOW_MIN_DELTA_MS",
     "ASR_STAGE_WORKER_MAX_IDLE_S",
     "ASR_SHARED_VRAM_SPILL_TOLERANCE_MB",
 }
@@ -1244,6 +1249,25 @@ def _run_asr_alignment_impl(
             if device == "auto":
                 device = str(asr_details.get("device") or "cache")
 
+        shadow_observation_path = alignment_shadow_module.persist_shadow_run(
+            run_details=(
+                asr_details.get("alignment_shadow")
+                if isinstance(asr_details, dict)
+                else None
+            ),
+            video_path=video_path,
+            video_duration_s=video_duration_s,
+            job_id=job_id,
+            audio_cache_key=audio_cache_key,
+        )
+        if shadow_observation_path is not None:
+            relative_shadow_path = _project_relative(shadow_observation_path)
+            asr_log.append(f"CTC 影子分歧记录: {relative_shadow_path}")
+            _log_stage(
+                logger,
+                f"alignment_shadow_written path={relative_shadow_path}",
+            )
+
     _raise_if_cancelled(cancel_event)
     asr_details.setdefault("pipeline_cuda_memory", pipeline_cuda_memory)
     console.print(f"[dim]ASR backend: {backend_label}[/dim]")
@@ -1332,7 +1356,16 @@ def run_translation_and_write(
             cancel_event=cancel_event,
         )
     finally:
-        _close_artifacts_logger(artifacts)
+        try:
+            # A local model is task-scoped, not Web-session-scoped. Reset by
+            # explicit name rather than by the currently selected backend: the
+            # settings panel may change while a job is draining, and cleanup
+            # must still close a llama.cpp instance that this task started.
+            # This also covers cancellation, translation failure, output-write
+            # failure, empty-ASR and retry paths.
+            llm_backends.reset_backend("llamacpp")
+        finally:
+            _close_artifacts_logger(artifacts)
 
 
 def _run_translation_and_write_impl(
@@ -1810,31 +1843,24 @@ def _run_translation_and_write_impl(
                     completed=int(evt.get("expected", len(translation_segments))),
                 )
 
-        try:
-            (
-                zh_texts,
-                translation_request_timings,
-                translation_api_retry_events,
-            ) = translator_module.translate_segments(
-                translation_segments,
-                global_context=global_context,
-                target_lang=ctx.target_lang,
-                glossary=ctx.translation_glossary,
-                character_reference="",
-                max_workers=ctx.translation_max_workers,
-                reasoning_effort=ctx.llm_reasoning_effort,
-                api_format=ctx.llm_api_format,
-                cache_path=translation_cache_path,
-                on_batch_done=_on_translation_done,
-                on_progress=_on_translation_progress,
-                cancel_event=cancel_event,
-            )
-        finally:
-            # The managed llama-server holds several GB of VRAM; the next video
-            # in this job starts with an ASR stage that needs it back. The
-            # server respawns lazily (mmap reload) on the next translation.
-            if llm_backends.selected_backend_name() == "llamacpp":
-                llm_backends.reset_backend("llamacpp")
+        (
+            zh_texts,
+            translation_request_timings,
+            translation_api_retry_events,
+        ) = translator_module.translate_segments(
+            translation_segments,
+            global_context=global_context,
+            target_lang=ctx.target_lang,
+            glossary=ctx.translation_glossary,
+            character_reference="",
+            max_workers=ctx.translation_max_workers,
+            reasoning_effort=ctx.llm_reasoning_effort,
+            api_format=ctx.llm_api_format,
+            cache_path=translation_cache_path,
+            on_batch_done=_on_translation_done,
+            on_progress=_on_translation_progress,
+            cancel_event=cancel_event,
+        )
         _raise_if_cancelled(cancel_event)
 
     srt_blocks = [

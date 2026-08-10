@@ -3,7 +3,38 @@ import { $, escHtml, showToast } from './util.js';
 import { loadFormMemory, saveFormMemory, applyFormMemory } from './formMemory.js';
 import { setActivePreset } from './presets.js';
 
-const _SUBTITLE_MODE_LABELS = { zh: '中文字幕', bilingual: '中日双语' };
+const _SUBTITLE_MODE_LABELS = {
+  '简体中文': {
+    zh: '简体中文字幕（仅译文）',
+    bilingual: '中日双语字幕（简体）',
+  },
+  '繁體中文': {
+    zh: '繁體中文字幕（仅译文）',
+    bilingual: '中日双语字幕（繁體）',
+  },
+  English: {
+    zh: '英文字幕（仅译文）',
+    bilingual: '英日双语字幕',
+  },
+};
+
+export function subtitleModeLabel(mode, targetLang) {
+  const labels = _SUBTITLE_MODE_LABELS[targetLang];
+  if (labels?.[mode]) return labels[mode];
+  const language = String(targetLang || '目标语言').trim() || '目标语言';
+  return mode === 'bilingual'
+    ? `${language}／日文双语字幕`
+    : `${language}字幕（仅译文）`;
+}
+
+export function updateSubtitleModeLabels() {
+  const modeSel = $('r-mode');
+  if (!modeSel) return;
+  const targetLang = $('api-target-lang')?.value || '简体中文';
+  for (const option of modeSel.options) {
+    option.textContent = subtitleModeLabel(option.value, targetLang);
+  }
+}
 
 let _modelRequirementsRequestSeq = 0;
 let _modelRequirementsTimer = null;
@@ -103,7 +134,7 @@ export async function loadConfig() {
     for (const m of (cfg.subtitle_modes || [])) {
       const opt = document.createElement('option');
       opt.value = m;
-      opt.textContent = _SUBTITLE_MODE_LABELS[m] || m;
+      opt.textContent = subtitleModeLabel(m, $('api-target-lang')?.value);
       modeSel.appendChild(opt);
     }
     if (cfg.defaults?.subtitle_mode) modeSel.value = cfg.defaults.subtitle_mode;
@@ -112,6 +143,7 @@ export async function loadConfig() {
     if (d.translation_max_workers   != null) $('t-translation-max-workers').value = d.translation_max_workers;
     if (d.skip_translation          != null) $('r-skip-translation').checked      = !!d.skip_translation;
     applyFormMemory();
+    updateSubtitleModeLabels();
     setActivePreset(state.activePreset);
     refreshModelRequirements();
   } catch {}
@@ -146,10 +178,8 @@ export async function loadSettings() {
       $('api-model-preview').textContent = '当前：' + s.model;
     }
 
-    // llama.cpp (local GGUF) backend fields. There is no model picker: one
-    // built-in model ships, and an empty path means "use it".
-    const lcPath = $('llamacpp-gguf-path');
-    if (lcPath) lcPath.value = s.llamacpp_gguf_path || '';
+    // llama.cpp backend. Hy-MT2 is fixed; only the server executable may be
+    // overridden so users can point at a faster CUDA build.
     const lcServer = $('llamacpp-server-path');
     if (lcServer && s.llamacpp_server_path) lcServer.value = s.llamacpp_server_path;
 
@@ -173,6 +203,7 @@ export async function loadSettings() {
     if (apiFormat) apiFormat.value = s.llm_api_format || 'chat';
     const targetLang = $('api-target-lang');
     if (targetLang) targetLang.value = s.target_lang || '简体中文';
+    updateSubtitleModeLabels();
     const glossary = $('api-glossary');
     if (glossary) {
       glossary.value = (s.translation_glossary || '')
@@ -219,10 +250,6 @@ export function readTranslationSettingsFromForm() {
   };
 
   if (backend === 'llamacpp') {
-    // Only the override travels. repo/file are left alone so clearing the box
-    // falls back to the shipped default rather than pinning whatever this
-    // build happened to name.
-    body.llamacpp_gguf_path = $('llamacpp-gguf-path')?.value?.trim() || '';
     body.llamacpp_server_path = $('llamacpp-server-path')?.value?.trim() || '';
   }
 
@@ -431,13 +458,28 @@ export function installSettingsPanel() {
     }
   });
 
-  // Translation backend switcher
-  $('translation-backend')?.addEventListener('change', () => {
+  const updateTranslationBackendFields = () => {
     const backend = $('translation-backend').value;
     const openaiFields = $('openai-backend-fields');
     const llamacppFields = $('llamacpp-backend-fields');
+    const glossaryField = $('translation-glossary-field');
     if (openaiFields) openaiFields.style.display = backend === 'openai' ? '' : 'none';
     if (llamacppFields) llamacppFields.style.display = backend === 'llamacpp' ? '' : 'none';
+    if (glossaryField) glossaryField.style.display = backend === 'openai' ? '' : 'none';
+  };
+  $('translation-backend')?.addEventListener('change', updateTranslationBackendFields);
+
+  $('api-target-lang')?.addEventListener('change', updateSubtitleModeLabels);
+
+  $('btn-save-translation')?.addEventListener('click', async () => {
+    try {
+      await saveSettingsBody(buildSettingsBodyFromForm({ includeConnection: true }));
+      saveFormMemory();
+      await loadSettings();
+      showToast('翻译设置已保存到 .env');
+    } catch (e) {
+      showToast('保存翻译设置失败：' + e.message);
+    }
   });
 
 }

@@ -327,6 +327,22 @@ def test_finalize_cache_key_changes_with_head_digest(monkeypatch, tmp_path):
     assert result_cache.finalize_lookup(wav, text="テスト") is None
 
 
+def test_finalize_cache_key_includes_observation_only_shadow_head(monkeypatch, tmp_path):
+    _setup_cache_env(monkeypatch, tmp_path)
+    _setup_head_env(monkeypatch, tmp_path)
+    shadow = tmp_path / "shadow.pt"
+    shadow.write_bytes(b"shadow-v1")
+    monkeypatch.setenv("ASR_ALIGNMENT_SHADOW_HEAD_PATH", str(shadow))
+    wav = tmp_path / "chunk.wav"
+    _write_wav(wav, value=7)
+
+    result_cache.finalize_store(wav, text="テスト", result=_aligned_result(), log=[])
+    assert result_cache.finalize_lookup(wav, text="テスト") is not None
+
+    shadow.write_bytes(b"shadow-v2")
+    assert result_cache.finalize_lookup(wav, text="テスト") is None
+
+
 def test_align_results_second_pass_served_from_finalize_cache(monkeypatch, tmp_path):
     _setup_cache_env(monkeypatch, tmp_path)
     _setup_head_env(monkeypatch, tmp_path)

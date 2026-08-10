@@ -115,3 +115,68 @@ def test_a_stale_version_is_not_silently_migrated(monkeypatch, tmp_path):
 
     assert recommended == 5
     assert entry == {}
+
+
+def test_profiles_are_pruned_to_most_recent_identities(monkeypatch, tmp_path):
+    profile_path = tmp_path / "profiles.json"
+    monkeypatch.setenv("GPU_BATCH_PROFILE_PATH", str(profile_path))
+    monkeypatch.setenv("GPU_BATCH_PROFILE_MAX_ENTRIES", "3")
+
+    timestamps = iter(float(index) for index in range(20))
+    monkeypatch.setattr(batch_profile.time, "time", lambda: next(timestamps))
+    for index in range(5):
+        batch_profile.record_success(
+            {"hardware": {"fingerprint": f"gpu-{index}"}, "workload": {}},
+            batch_size=index + 1,
+            peak_allocated_mb=1000,
+            budget_mb=6000,
+            max_batch=16,
+        )
+
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert len(payload["profiles"]) == 3
+    kept = {
+        entry["identity"]["hardware"]["fingerprint"]
+        for entry in payload["profiles"].values()
+    }
+    assert kept == {"gpu-2", "gpu-3", "gpu-4"}
+
+
+def test_recommendation_refreshes_lru_recency(monkeypatch, tmp_path):
+    profile_path = tmp_path / "profiles.json"
+    monkeypatch.setenv("GPU_BATCH_PROFILE_PATH", str(profile_path))
+    monkeypatch.setenv("GPU_BATCH_PROFILE_MAX_ENTRIES", "2")
+    clock = iter(float(index) for index in range(1, 20))
+    monkeypatch.setattr(batch_profile.time, "time", lambda: next(clock))
+    identities = [
+        {"hardware": {"fingerprint": f"gpu-{index}"}, "workload": {}}
+        for index in range(3)
+    ]
+    for identity in identities[:2]:
+        batch_profile.record_success(
+            identity,
+            batch_size=4,
+            peak_allocated_mb=3000,
+            budget_mb=6000,
+            max_batch=16,
+        )
+
+    batch_profile.recommendation(
+        identities[0],
+        heuristic_batch=4,
+        max_batch=16,
+    )
+    batch_profile.record_success(
+        identities[2],
+        batch_size=4,
+        peak_allocated_mb=3000,
+        budget_mb=6000,
+        max_batch=16,
+    )
+
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    kept = {
+        entry["identity"]["hardware"]["fingerprint"]
+        for entry in payload["profiles"].values()
+    }
+    assert kept == {"gpu-0", "gpu-2"}

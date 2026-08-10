@@ -330,8 +330,11 @@ export function installJobAreaHandlers(fetchAllJobs, syncSettings = null) {
       const card = folder.closest('.job-card');
       const jobId = card?.dataset?.id || '';
       try {
-        await fetch(`/api/open-folder?job_id=${encodeURIComponent(jobId)}&path=${encodeURIComponent(folder.dataset.folder)}`, { method: 'POST' });
-      } catch {}
+        const r = await fetch(`/api/open-folder?job_id=${encodeURIComponent(jobId)}&path=${encodeURIComponent(folder.dataset.folder)}`, { method: 'POST' });
+        if (!r.ok) alert('打开文件夹失败：' + await readErrorDetail(r));
+      } catch (error) {
+        alert('打开文件夹失败：' + error.message);
+      }
       return;
     }
     const retry = e.target.closest('[data-retry]');
