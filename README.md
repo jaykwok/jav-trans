@@ -191,7 +191,7 @@ ASR encoder 输出 2048 维 @13fps（76.9 ms/帧）
 
 - **上采样 x2 不是可选项**：CTC 每个输出 token 至少要一帧，而日语语速在 13fps 下每 mora 仅 1.6~2.2 帧。
 - **CTC 目标是「字」不是 kana**，因此不需要 g2p 依赖。
-- **当前生产头**以切好的 Galgame `(音频, 参考文本)` 做字符 CTC，并用 Grok 词时间戳提供稀疏的 speech / blank 帧辅助监督；ASR encoder 始终冻结。
+- **当前生产头**以切好的 Galgame `(音频, 参考文本)` 做字符 CTC，并用 Grok 词时间戳提供稀疏的 speech / blank 帧辅助监督；ASR encoder 始终冻结。训练输入、教师原始响应、筛选 manifest 与重建说明归档于 `datasets/train/galgame-grok-ctc-teacher-20k-v1/`（本地数据目录，不随 Git 分发）。
 - **同一份输出有两个读法**：与文本对齐得到时间轴，blank 游程用来选切点。两个读法都不丢音频。
 
 `forced_align` 在 `src/asr/alignment.py` 内自己实现，不依赖 `torchaudio`（本项目 Python 3.14，torch 所在索引上没有匹配的 torchaudio wheel）。正确性由穷举所有合法 CTC 路径的参照实现验证（`tests/asr/test_asr_alignment_head.py`）。
