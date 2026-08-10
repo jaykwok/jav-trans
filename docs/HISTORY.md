@@ -8,7 +8,15 @@
 
 ## 当前有效状态
 
+- 2026-08-10 **真实 JAV 教师沉默必须先过准入闸；已归档两片中 sample-c 被否决为 blank 来源**。新增 `tools/align/audit_teacher_silence_against_head.py`：拿生产头在同一段音频上的 forced alignment 反查「Grok 沉默」。sample-c 教师词只覆盖全片 2.42%，`>=0.8s` 规则会把 96.7%（2.09 小时）判成 blank 并**吞掉生产头 88.7% 的高置信语音**，拒绝；sample-v 前 90 秒同规则只吞 1.35%，通过。判据刻意不用「争议占 blank 的比例」（sample-c 上仅 4.6%，规则越保守越小），而用「吞掉生产头多少自有语音」。单部坏片即可贡献 2.09 小时 blank，超过现役 galgame 帧教师全部 blank（3.82 小时）的一半，因此**影片准入不是细节而是主要风险**。闸单向：能否决不能认证。全量 **1380 passed / 1 skipped**。
+
+- 2026-08-10 **闸门余量已由干净 galgame 上的能量拆分自动测出，60 窗口人工标注因此取消并结案**。新增 `tools/align/measure_blank_class_separation.py`：在被接受片段内部把 Grok 无词区按「相对峰值 + 绝对 dBFS 地板」拆成 `voiced_wordless` 与 `silent`，与 `word` 一起读头在冻结 feature cache 上的 argmax blank。1,204 条 held-out clip、0 跳过、帧 38.46ms：word 3833.2s / **67.34%**、voiced_wordless 692.9s / **90.68%**、silent 1378.6s / **98.59%**（−35dB），**`margin_vs_non_semantic_pp` = 23.34pp**（逐 clip 中位 23.80pp），`silence_over_voiced_pp` = 7.91pp；−30/−35/−40dB 与「仅 ≥0.5s 长空隙」两组约束下结论不变。按 2026-08-05 自定的判据即「余量宽 ⇒ 信号在」，且类别排序 word < voiced_wordless < silent 正是闸门需要的方向——`cut_at_pauses` 要避免的是切进词里，切在呻吟上不丢内容。**边界**：能量不是呻吟检测器（呼吸/底噪/SFX 同样触发），逐帧类别非真值，可读的是余量；且域为干净 galgame，是必要条件不是真实域答案，真实域可复用 08-10 两部长片的 Grok 全片词时间，仍不需人工标注。全量 **1366 passed / 1 skipped**。
+
+- 2026-08-10 **Subtitle Layout 自诊断已从“只写字段、无人汇总”改为生产可观测，shadow-only 与 batch-profile 两处审计缺口同步收口**。`subtitle_cue_summary_v1` 现在汇总 `subtitle_layout_split_skipped` / `subtitle_layout_split_source` 分布，以及 `display_clamped_to_max` / `proportional_fallback_used` / `duration_violation` 计数；诊断进入 aligned/timings、运行日志，翻译后重建 sidecar block 时也不再丢字段。measured-word 文本映射继续全有或全无：任何 token 对不上都拒绝把真实时间贴到别的文本上，也绝不静默回退比例切分；新增 local backend → cue plan 跨模块合同测试。GPU batch `recommendation()` 的写盘明确为 LRU touch，并在 touch 时同步裁到上限；只配置 shadow、主头不可用时不再提取 encoder 特征，并只告警一次。长 blank 的两阶段策略保持：DP 按上一词声学结束判断内容时长，timeline polish 再按 `acoustic_end + 0.5s` 收尾；默认行为已有精确回归测试。全量 **1358 passed / 1 skipped**。
+
 - 2026-08-10 **Grok STT 全片教师转写已接入既有 Omni Core + Adapter，并能按生产 subtitle layer 生成中日双语 SRT**。新增 `tools/omni/speech_to_text_transport.py`：从命名 Omni profile 读取 OpenRouter 配置，调用 `x-ai/grok-stt-1.0` 的词时间与 diarization，并把“请求了 diarization 但响应静默丢 speaker”作为合同失败；实测 provider option slug 必须使用 `xai`，`x-ai` 会返回词时间但没有 speaker。两部真实长片分成 **53 个 5 分钟请求**（5 秒 overlap、8 并发），去重后 **9713 个词时间、212 个非重叠说话人切点**，无失败；OpenRouter usage 实收 **$0.5355**，高于按媒体时长估算的 $0.4532，原因是部分响应的计费 duration 高估 60–180 秒，词时间本身仍落在真实音频范围，不能按 usage duration 缩放。新增 `tools/omni/build_grok_stt_srt.py`：说话人切换只在相邻发言不重叠时切，重叠发言不切；停顿、句末和请求边界先形成 utterance，7 秒上限、词间静音断点、两帧间隔、timeline polish 与双语排版全部复用生产 subtitle layer。Grok 时间使用独立的 `grok_stt_word` measured timestamp 类型，不伪装成 CTC；一个仅 20ms、无法同时满足 50ms SRT 最小时长和不重叠约束的单字 cue 被丢弃。两片经当前 OpenAI-compatible DeepSeek 配置翻译后分别写出 **105 / 849 条**中日双语 cue，0 空译文、0 时间重叠、最长 6.649s / 7.000s。
+
+- 2026-08-10 **两部真实 JAV 的 Grok 全片教师已整理为正式本地数据归档**：`datasets/train/jav-grok-stt-frame-teacher-v1/` 保存 53 个付费原始响应、9,713 个源 PTS 词时间、212 个非重叠换人切点、影片/请求块清单、逐文件 SHA-256 和音频重建入口。两片均参与过时间轴诊断，因此分区固定为 `diagnostic`、`evaluation_eligible=false`，不能冒充新 held-out；当前只声明 `frame_only_candidate`，且在训练器实现 frame-only CTC loss mask 前保持 `training_ready=false`，禁止用空文本把整段训练成 blank。源影片及派生 MP3 不重复复制，归档记录完整源 SHA-256，重建脚本验哈希后按 300 秒块 + 5 秒 overlap 重建且不调用 Grok。新增 `tools/align/archive_grok_fullfilm_teacher.py`，归档器测试 **3 passed**，归档 63 个文件哈希复核 **0 mismatch**。
 
 - 2026-08-10 **GPU 动态 batch profile 已按实体硬件与工作负载分层，本地翻译任务结束后会关闭其管理的 llama-server**。显卡身份优先取 CUDA UUID 的截断 SHA-256，依次降级到 PCI 信息和“型号 + 显存 + compute capability”；模型、dtype、attention、chunk 几何属于独立 workload identity。profile schema 直接升级，不迁移旧数据，最多保留 16 组 LRU；换卡会保守重学，切回旧卡会命中原记录。只有任务确实跑到所配置的 batch 才允许提升观测上限，避免短任务或缓存命中把未经实跑的 batch 误记为安全。本地翻译在成功、失败、取消、空输出及写盘失败后都会 reset `llamacpp` backend 并退出自己管理的 llama-server；pytest 强制使用远端 mock 路径，防止继承本机 `.env` 而额外启动模型。全量 **1333 passed / 1 skipped**，测试结束后 llama-server 进程数为 0。
 
@@ -215,6 +223,42 @@
 - **不可替代数据已从实验目录提炼为正式归档**：`datasets/train/galgame-grok-ctc-teacher-20k-v1/` 保存 20k 选择清单、`x-ai/grok-stt-1.0` 付费原始响应、严格筛选后的 full/crop manifest、52 条自动抽样审核页、两组 seed 的训练/几何汇总和逐文件 SHA-256。归档约 128.6 MiB，不重复复制音频；所有音频引用都指向 `datasets/train/boundary-sources/galgame-asr-100k-ogg/` 的原始切分 Galgame 语音，**不是 held-out 合成数据集，也不是 JAV**。
 - **held-out 的角色只是防止训练泄漏**：Grok 对完整 20k 原始音频做了标注。随后构建 cache 时，以合成评测集使用过的 core ID 作为排除清单，从 13,308 条通过质量门的原始来源中排除 678 条；因此现役头训练用的 12,630 条 cache 不包含这些评估 core。归档的 `rebuild/heldout_sources.jsonl` 固定这 678 个 ID，即使原 4,096 条 composite manifest 不在当前入口，也能复现实际训练边界。
 - **现有 encoder feature cache 不移动、不删除，可直接复用**：full cache 位于 `agents/temp/20260808_211314_galgame-grok-ctc-expanded20000/cache_full/`，12 文件 / 3,764,581,642 bytes（3.506 GiB），12,630 clips（train 11,426 / val 1,204），19.551 小时，`index.jsonl` SHA256 `05E879BAE60E792E1E2A640BB95E059CAFDCC0C0A3C9243C0B2415901F9CF41B`；crop cache 位于同目录的 `cache_crop/`，7 文件 / 1,686,776,062 bytes（1.571 GiB），同为 12,630 clips，8.725 小时，`index.jsonl` SHA256 `EE2BE4D2FB95B2E93F2B20E87B8439C8274979C0ACB07B6B2B5598329C70416D`。二者是冻结 encoder 的 fp16 派生特征，不是教师真值；归档保留各自 summary、输入 manifest、排除清单和 `rebuild_encoder_cache.ps1`，所以未来清理后仍可重建。
+
+### Subtitle Layout 审计整改
+
+- **F1 接受并修复**：审计指出 writer 写出的 `subtitle_layout_split_skipped`、`display_clamped_to_max`、`proportional_fallback_used`、`duration_violation` 和 split source 没有运行时消费者；翻译路径还会在重建 `srt_blocks` 时丢掉这些字段。现在 cue summary 汇总原因/来源分布及计数，进入 `asr_details.subtitle_cue_plan.layout_diagnostics`，随 aligned/timings 持久化并逐次写运行日志；详细字段也保留到翻译后的 bilingual sidecar。`display_clamped_to_max=1` 与 `duration_violation=0` 可以同时成立：前者说明 30s acoustic span 被显示策略钳成 7s，后者说明钳制后的 display timeline 已满足上限，两者不再互相掩盖。
+- **F2 保留 fail-closed、补合同与可观测性**：`_measured_word_text_map` 的整块全有或全无不是误伤，而是 measured timestamp 的可信边界。只要一个 token 无法映射，部分映射就可能把“真实时间”挂到错误字符上；退回 ratio 则会把已知的数据完整性错误伪装成正常字幕。因此运行时仍返回 `measured_word_text_map_incomplete` 并保持原块，最终 7s display clamp 只限制显示窗、不伪造文本时间。新增 local backend 生成 CTC words、main 搬运文本、Subtitle Layout 完整映射并按长 blank 分成两 cue 的跨模块测试；断裂路径同时验证 summary 必须报告 skip + clamp。
+- **F3 部分接受**：`recommendation()` 写盘不是副作用事故，而是真 LRU 的 access touch；换卡后切回旧卡时，刚用过的硬件/工作负载组合必须刷新 recency，既有测试也明确锁定该合同。实际缺口是 touch 写路径此前没调用 `_prune_profiles`，在用户调低上限或手工留下超额文件时不会立即收敛；现已补齐裁剪并增加 overfull 现存文件测试，函数 docstring 明示它不是 pure read。
+- **F4 接受并修复**：shadow 是与生产主头比较边界的观察器，不是备用主头。没有主头时 `alignment_mode` 不可能为 `ctc_forced_alignment`，所以以前的 shadow-only encoder 提取确实不会产生观察记录。现在 batch feature cache 只由主头可用性启用；检测到 shadow 已配置但主头不可用时只告警一次，不加载无用特征。
+- **F5 不改生产语义，但把现有测试收紧为精确合同**：长 blank 无字幕由 dual timeline 两阶段共同保证是刻意设计。DP 用 `previous_word_end_s` 判断前段实际显示内容是否超过 7s，分段边界仍放在下一 measured word onset；随后 timeline polish 将前 cue 结束钳到 `acoustic_end + SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_END_S`。该环境项本来就是允许字幕在声学结束后 linger 的显式产品旋钮，调大它会有意扩大 linger，并非静默算法回归。既有测试已覆盖 14.5s blank；本轮把弱断言“end < 下一词起点”收紧为“end 精确等于上一词 end + 默认 0.5s”，并明确断言没有 display clamp。这条与“禁止比例回退”是两个相邻但不同的合同：禁止比例回退属于 F2，blank 无字幕属于 F5。
+
+### 用能量拆分替代 60 窗口人工标注，闸门余量测出来了
+
+- **用户裁决不做那 60 个窗口的人工标注**，理由是 Grok STT 已能给词级时间轴、JAV 噪声太大不适合当标注源、工作量与收益不成比例。裁决成立，但它留下一个缺口必须补：**Grok 对呻吟和静音同样沉默**，所以 Grok 标签天然把「有声但无词」和「静音」压成一类，而这正是 08-05 那份审计要拆开的那一类。缺口的后果具体：`evaluate_ctc_cache.py` 的 `blank_probability_margin` 分不出「头学会识别非词发声」和「头只学会识别静音」。
+- **缺口由能量拆分自动补上，不需要人耳**：新增 `tools/align/measure_blank_class_separation.py`。在被接受的干净 galgame 片段内部，把 Grok 无词区按能量分成 `voiced_wordless` 与 `silent`，与 `word` 一起构成三类，直接读头在冻结 feature cache 上的 argmax blank 与 blank 后验。阈值取每条 clip 自身峰值的相对值并加绝对 dBFS 地板（沿用 `measure_core_leading_silence.py` 的判据），词边界各 0.10s 不归任何一类。**只测 val 分区**：train 行的 ≥0.5s 空隙本来就被用作 blank 帧监督，在那里测 blank 行为是循环论证。
+- **结果（1,204 条 held-out clip，0 跳过，帧 38.46ms，`models/ctc_aligner.pt`）**：word 3833.2s / argmax blank **67.34%**，voiced_wordless 692.9s / **90.68%**，silent 1378.6s / **98.59%**（阈值 −35dB）。**`margin_vs_non_semantic_pp` = 23.34pp（逐 clip 中位 23.80pp）**，`margin_vs_silence_pp` = 31.25pp，`silence_over_voiced_pp` = 7.91pp。−30/−35/−40dB 三档扫描下三个余量分别只动 0.9/0.8/0.1pp，限制到 ≥0.5s 长空隙（即 blank 标签实际训练过的区间）后同样稳定。
+- **按 08-05 自己定的判据读：余量宽，信号在**。类别排序是 word 67.3% < voiced_wordless 90.7% < silent 98.6%，即头不是纯静音检测器，但非语义发声离静音（7.9pp）远比离词（23.3pp）近。**对闸门而言这正是需要的方向**：`cut_at_pauses` 要避免的是切进词里，切在呻吟上不丢内容，所以要读的是 word 与其余两类的距离，而不是后两类之间的距离。
+- **word 类 67.34% 的 blank 率不是缺陷**，是收敛 CTC 的尖峰性质——一个字只占一两帧非 blank。可读的量是类间余量，不是绝对率。
+- **诚实的边界**：能量不是呻吟检测器，它对呼吸、房间底噪、点击和 SFX 一样响，所以逐帧类别不是真值；使其可用的是偏置属于音频而非被测的头，A/B 两臂完全相同，且报的是余量。另外**这条结论的域是干净 galgame，不是真实 JAV**——它是必要条件不是完整答案。补完整答案同样不需要人工标注：08-10 两部真实长片的 Grok 全片词时间（9,713 个词时间、已按源 PTS 校正）就是现成的真实域词标签，把同一工具接到那份产物上即可，属于后续工作。
+- **60 窗口审计因此结案**：`agents/audits/20260805_190000_pause-frame-audit/` 的 8,888 帧不再需要人工标注，它要产出的量已由 1,204 条 held-out clip 上的 6,000 余秒空隙帧给出。标注页与审计页保留，作为将来需要人耳裁决时的设施。
+- **同时给扩标注定下预声明判据**：若要花约 $11 把本地 galgame 100k 剩余 80k 补标，赢的定义为 `margin_vs_non_semantic_pp`（当前 23.34pp）与逐字起点 p90（当前 174.1ms）任一显著改善；两者都能在 held-out 上自动重算，无边际成本。没有预声明判据不要开跑——当前余量已小于测量噪声之外的可解释范围。
+- 新增测试 8 项（帧内取峰不取均、纯噪声 clip 拒绝给阈值、相对阈与地板、词边界不归类、三类互斥、长空隙子集、纯静音检测器必须表现为近零非语义余量、缺类报 None 而不是 0）。全量 **1366 passed / 1 skipped**。报告在 `agents/temp/20260810_184020_grok-gap-blank-feasibility/blank_class_separation_val.json`。
+
+### 真实 JAV Grok STT 教师正式归档
+
+- **不可替代教师数据已离开单次实验目录**：`datasets/train/jav-grok-stt-frame-teacher-v1/` 保存两部真实长片的 53 个付费原始响应、9,713 个按源 PTS 去重的词时间、212 个请求内非重叠换人切点、原始分块 manifest 与 provider 费用汇总。`compiled/films.jsonl` 固定影片级身份与词/切点行范围，`compiled/chunks.jsonl` 固定每个请求块的源区间、响应路径和重建音频路径。
+- **没有制造数据泄漏或伪监督**：两部影片此前都用于定位时间轴问题和人工查看，故统一标为 `partition=diagnostic`、`evaluation_eligible=false`，不声称是未观察 held-out。它们也没有可核验的 canonical CTC 文本；归档只声明 `supervision_mode=frame_only_candidate`。当前训练器尚无“只算帧辅助 loss、跳过 CTC loss”的行级 mask，因此全体保持 `training_ready=false`；禁止把无文本行直接作为 zero-length CTC target 训练，以免整块被推向 blank。
+- **源媒体和派生缓存可重建、不重复保存**：两部源影片共 4.391 小时、约 7.52GB，只记录归档时的绝对路径、字节数和完整 SHA-256。`rebuild/rebuild_audio.ps1` 默认先验源哈希，再调用现有 `tools.omni.run_grok_stt_fullfilm --prepare-only` 按 300 秒块、5 秒 overlap 重建 MP3，全程不调用 Grok，并拒绝覆盖已有输出。`archive_manifest.json` 为 63 个归档文件记录大小与 SHA-256，复核为 0 mismatch。
+- **归档动作参数化**：新增 `tools/align/archive_grok_fullfilm_teacher.py`，在复制前验证 film/chunk/response 一一对应、词时间不越出影片、summary 计数一致、accepted cut 合法且 provider error 为空；已有目标目录时 fail closed。新增 3 项测试覆盖完整归档、响应错配拒绝和覆盖拒绝。
+
+### 真实 JAV 教师沉默的准入闸：sample-c 不能作为 blank 来源
+
+- **动机**：`datasets/train/jav-grok-stt-frame-teacher-v1/` 归档两部真实 JAV 全片的 Grok 词时间与 diarization 后，下一步路线是「足够长的无词区间 ⇒ blank 负样本」。该规则的前提是「Grok 沉默 = 没人说话」，而 Grok 的 diarization 只给被转写词附加 speaker、VAD 会跳过轻声，前提未必成立。
+- **零成本核对**：两片都有生产头的整片/前 90 秒 forced alignment 产物，直接比对同一批秒。**sample-c 必须用 PTS 修复后的重跑**（`agents/temp/20260810_170140_audio-pts-drift/jobs/fjin-059-pts-fixed-full/`）；`agents/rm/20260810_174504_timeline-diagnostics-archive/` 里那份是修复前的 compact-time job，其词时间相对源 PTS 逐渐提前最多 42.6s，拿它比对会把已修复的 bug 变成假分歧。sample-v 自身 PTS 与包时长只差 35.8ms，前 90 秒探针无需修正。
+- **结果**：sample-c 教师词只覆盖全片 **2.42%**（1,132 个词 token / 0.146 个每秒），`>=0.8s` 规则会把 **96.7%（2.09 小时）** 判成 blank；生产头在同一片上有 394.0s 高置信语音，其中 **88.7% 会被这条规则改判成 blank**。sample-v 反之：教师覆盖 19.5%，前 90 秒里 `>=0.8s` 只提出 4.5s blank，仅吞掉生产头语音的 **1.35%**。**两片不是一个数据集**。
+- **判据的选择本身是结论的一部分**：「争议占提出 blank 的比例」在 sample-c 上只有 4.6%，看起来无害——因为分母是整部片子，规则越保守这个数越小。真正决定的是反向的量「**会吞掉生产头多少自有语音**」，它在同一片上是 88.7%。工具默认报两个，但只用后者判决。
+- **规模上的额外理由**：sample-c 一片就会贡献 2.09 小时 blank，而现役 galgame 帧教师全部 blank 才 357,379 帧 ≈ 3.82 小时。**单部坏片足以支配整个 blank 类**，这正是 07-31「剂量依赖单调恶化」和 08-08 四臂里两条 blank 臂被拒的同一失效通道。
+- **落地**：新增 `tools/align/audit_teacher_silence_against_head.py`，默认 `--minimum-blank-s 0.8`、`--max-swallowed-share 0.10`，拒绝时退出码 2。**闸是单向的**：能否决影片，不能认证影片——生产头在本域会幻听，重叠只证明两个教师不一致，不证明有语音；生产头零语音时同样拒绝，因为那是「无从核对」不是「一致」。新增测试 11 项。全量 **1380 passed / 1 skipped**。报告在 `agents/temp/20260810_205448_jav-grok-silence-audit/`。
 
 ## 2026-08-08
 

@@ -415,13 +415,20 @@ uv run python -m <module> --help
 - `tools.workflows.run_full_workflow`：命令行完整工作流 smoke。
 - `tools.workflows.promote_torch_checkpoint`：晋升生产 checkpoint。
 - `tools.web.smoke.start_server` / `submit_job` / `poll_job` / `summarize_job`：Web 服务 smoke 和任务汇总。
-- `tools.align.*`：CTC 对齐头训练链——`build_alignment_features`（encoder 特征抽取）、`build_real_alignment_manifest` / `build_real_alignment_lines`（真实数据 manifest）、`run_grok_ctc_teacher` / `select_galgame_ctc_teacher_pilot` / `expand_galgame_ctc_teacher_pilot` / `frame_teacher_supervision`（Grok 词时间与稀疏帧监督）、`train_ctc_aligner`（训练）、`evaluate_alignment_geometry` / `evaluate_ctc_cache` / `evaluate_pregate_loss` / `measure_pregate_dropped_audio`（几何、缓存与切分评估）。
-- `tools.audits.audit_nav` / `serve_audits.ps1`：审计页导航与 Windows 本地服务。
+- `tools.align.*`：CTC 对齐头训练链。
+  - 数据与训练：`build_alignment_features`（encoder 特征抽取）、`build_real_alignment_manifest` / `build_real_alignment_lines`（真实数据 manifest）、`run_grok_ctc_teacher` / `select_galgame_ctc_teacher_pilot` / `expand_galgame_ctc_teacher_pilot` / `frame_teacher_supervision`（Grok 词时间与稀疏帧监督）、`train_ctc_aligner`（训练）。
+  - 评估：`evaluate_alignment_geometry` / `evaluate_ctc_cache`（几何与冻结缓存）、`evaluate_pregate_loss` / `measure_pregate_dropped_audio`（切分与丢弃音频）、`build_ctc_ab_jav_predictions`（固定文本与声学窗口，只让两版头产生边界差，供盲化 A/B）。
+  - 测量：`measure_blank_class_separation`（在干净 galgame 的 Grok 无词区按能量拆出 `voiced_wordless` 与 `silent`，与 `word` 一起给出闸门余量 `margin_vs_non_semantic_pp`；默认只跑 val，因为 train 的长空隙本身就是 blank 监督）、`measure_core_leading_silence`（clip 自带前导静音，用于把它从起点误差里减掉）、`sweep_blank_bias`（Viterbi blank bias 扫描，实测无可用工作点，默认 0.0）。
+  - 真实域教师归档与准入：`archive_grok_fullfilm_teacher`（把整片 Grok STT 运行归档成训练数据源，保留付费响应与绝对词时间，不复制源视频）、`audit_teacher_silence_against_head`（**用作 blank 负样本前的准入闸**：拿生产头同一段音频的 `aligned_segments` 反查「教师沉默」，判据是**会吞掉生产头多少自有语音**而不是「争议占 blank 多少」；只能否决影片，不能认证影片，退出码 2 表示拒绝）。
+  - 已退役但保留可测：`pregate_reference`（被证伪的前置闸读法，留着继续被度量，不在转写路径上）。
+- `tools.audits.audit_nav` / `serve_audits.ps1`：审计页导航与 Windows 本地服务（脚本实际拉起的是 `tools.audits.serve_static`，需要直接调用时用它）。
 - `tools.audits.review_page_core` / `audit_prompt` / `binary_clip_audit`：人工审计页共享 Core（`MM:SS.mmm` 区间显示与播放器、状态、完成度、保存 API）与可复用提示配置；任务特有布局与 verdict 组合由 Adapter 提供。设计合同见 [Human Audit Page Core](docs/audits/20260723_human-audit-page-core-v1.md)。
 - `tools.audits.select_alignment_onset_audit` / `generate_alignment_onset_audit_html` / `evaluate_alignment_onset_audit`：对齐头起止点人工审计的抽样、页面生成与统计。
 - `tools.audits.generate_ctc_alignment_shadow_audit`：从正常真实 JAV 任务留下的影子分歧记录中，按起点/终点分层抽样并生成盲化 A/B 审计页。
 - `tools.audits.generate_ctc_alignment_ab_audit` / `evaluate_ctc_alignment_ab_audit`：为两版 CTC 头生成真实音频盲化 A/B 页面并统计人工裁决；`generate_galgame_ctc_teacher_audit_html` 用于 Galgame 教师词时间审计。
 - `tools.audits.generate_subtitle_ab_compare_audit_html`：两版字幕的 A/B 对照审计页。
+- `tools.audits.select_pause_frame_audit` / `pause_frame_audit` / `generate_pause_frame_audit_html` / `generate_pause_frame_review_html`：真实域 safe-cut 帧标注的抽样、标签合同与只读复核页。标注页刻意不显示任何模型输出（blank 游程摆在问题旁会制造一致性）。**该问题现已由 `tools.align.measure_blank_class_separation` 在干净 galgame 上自动回答，页面保留作为将来确需人耳裁决时的设施**。
+- `tools.audits.grok_stt_smoke_audit`：小批量 Grok STT 词时间审计；OpenRouter 默认响应只有 `text`/`usage`，必须显式请求 `verbose_json` 与 `timestamp_granularities=["word"]` 才有词时间。
 - `tools.datasets.label_drop_spans_words` / `apply_drop_span_relabels` / `cut_long_drop_span_clips`：drop-span 逐词 Teacher 标注、复核回写与长片段切分。
 - `tools.audits.build_word_definition_calibration` / `evaluate_word_teacher_calibration`：逐词 Teacher 的「什么算词」校准集与一致性评估。
 - `tools.omni.run_audio_teacher` / `audio_teacher_batch`：离线音频 Teacher Core；统一处理 `--prompt/--prompt-file`、`--folder/--file/--manifest`、provider-safe 并发、进度、续跑和主线程串行化落盘。
@@ -430,7 +437,8 @@ uv run python -m <module> --help
 - `tools.omni.gemini_native` / `inspect_gemini_quota`：Google AI Studio 原生 Interactions 音频 Adapter；内联音频、结构化输出、多 Key 轮换与保守的本地滚动配额账本（多 Key 只增加配额轮换槽，不增加并发；`inspect_gemini_quota` 不发请求，只显示脱敏状态）。
 - `tools.omni.timestamp_contract`：Teacher 时间坐标的严格 `MM:SS.mmm` wire schema、格式化、解析和 source-bound 校验；不提供数字秒兼容或时间猜测。
 - `tools.sft.*`：Qwen3-ASR SFT 自训链路——数据集准备、云端训练资产与训练脚本；线上 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf` 即该链路的发布产物。
-- `tools.asr.convert_qwen3_asr_to_hf`：把 Qwen3-ASR 权重转换为 HF 布局。
+- `tools.asr.convert_qwen3_asr_to_hf`：把 Qwen3-ASR 权重转换为 HF 布局；`tools.asr.measure_repetition_budget` 测量解码预算与重复率，用于标定重复守卫的阈值。
+- `tools.omni.openai_compat`：内联音频的流式 chat-completions 共享层（env-file 加载、从散文里抽 JSON、ffmpeg 切片），由上面各 omni Teacher 复用。
 
 命令行完整工作流 smoke：
 
