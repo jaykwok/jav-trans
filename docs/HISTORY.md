@@ -8,7 +8,7 @@
 
 ## 当前有效状态
 
-- 2026-08-10 **真实 JAV 教师沉默必须先过准入闸；已归档两片中 sample-c 被否决为 blank 来源**。新增 `tools/align/audit_teacher_silence_against_head.py`：拿生产头在同一段音频上的 forced alignment 反查「Grok 沉默」。sample-c 教师词只覆盖全片 2.42%，`>=0.8s` 规则会把 96.7%（2.09 小时）判成 blank 并**吞掉生产头 88.7% 的高置信语音**，拒绝；sample-v 前 90 秒同规则只吞 1.35%，通过。判据刻意不用「争议占 blank 的比例」（sample-c 上仅 4.6%，规则越保守越小），而用「吞掉生产头多少自有语音」。单部坏片即可贡献 2.09 小时 blank，超过现役 galgame 帧教师全部 blank（3.82 小时）的一半，因此**影片准入不是细节而是主要风险**。闸单向：能否决不能认证。全量 **1380 passed / 1 skipped**。
+- 2026-08-10 **真实 JAV 教师沉默必须先过准入闸；已归档两片中 稀疏对白样片 被否决为 blank 来源**。新增 `tools/align/audit_teacher_silence_against_head.py`：拿生产头在同一段音频上的 forced alignment 反查「Grok 沉默」。稀疏对白样片 教师词只覆盖全片 2.42%，`>=0.8s` 规则会把 96.7%（2.09 小时）判成 blank 并**吞掉生产头 88.7% 的高置信语音**，判 `full_film_reject`；连续对白样片只有前 90 秒有生产头产物，同规则吞 1.35%，判 `prefix_no_conflict_observed`，**整片 blank 资格仍待审**。判据刻意不用「争议占 blank 的比例」（稀疏对白样片 上仅 4.6%，规则越保守越小），而用「吞掉生产头多少自有语音」。单部坏片即可贡献 2.09 小时 blank，超过现役 galgame 帧教师全部 blank（3.82 小时）的一半，因此**影片准入不是细节而是主要风险**。裁决为三态 `reject` / `no_conflict_observed` / `inconclusive` 并附 `scope`，**没有「通过」这一态**：干净结果只表示「在实际比较过的那些秒里没发现冲突」。全量 **1383 passed / 1 skipped**。
 
 - 2026-08-10 **闸门余量已由干净 galgame 上的能量拆分自动测出，60 窗口人工标注因此取消并结案**。新增 `tools/align/measure_blank_class_separation.py`：在被接受片段内部把 Grok 无词区按「相对峰值 + 绝对 dBFS 地板」拆成 `voiced_wordless` 与 `silent`，与 `word` 一起读头在冻结 feature cache 上的 argmax blank。1,204 条 held-out clip、0 跳过、帧 38.46ms：word 3833.2s / **67.34%**、voiced_wordless 692.9s / **90.68%**、silent 1378.6s / **98.59%**（−35dB），**`margin_vs_non_semantic_pp` = 23.34pp**（逐 clip 中位 23.80pp），`silence_over_voiced_pp` = 7.91pp；−30/−35/−40dB 与「仅 ≥0.5s 长空隙」两组约束下结论不变。按 2026-08-05 自定的判据即「余量宽 ⇒ 信号在」，且类别排序 word < voiced_wordless < silent 正是闸门需要的方向——`cut_at_pauses` 要避免的是切进词里，切在呻吟上不丢内容。**边界**：能量不是呻吟检测器（呼吸/底噪/SFX 同样触发），逐帧类别非真值，可读的是余量；且域为干净 galgame，是必要条件不是真实域答案，真实域可复用 08-10 两部长片的 Grok 全片词时间，仍不需人工标注。全量 **1366 passed / 1 skipped**。
 
@@ -251,14 +251,16 @@
 - **源媒体和派生缓存可重建、不重复保存**：两部源影片共 4.391 小时、约 7.52GB，只记录归档时的绝对路径、字节数和完整 SHA-256。`rebuild/rebuild_audio.ps1` 默认先验源哈希，再调用现有 `tools.omni.run_grok_stt_fullfilm --prepare-only` 按 300 秒块、5 秒 overlap 重建 MP3，全程不调用 Grok，并拒绝覆盖已有输出。`archive_manifest.json` 为 63 个归档文件记录大小与 SHA-256，复核为 0 mismatch。
 - **归档动作参数化**：新增 `tools/align/archive_grok_fullfilm_teacher.py`，在复制前验证 film/chunk/response 一一对应、词时间不越出影片、summary 计数一致、accepted cut 合法且 provider error 为空；已有目标目录时 fail closed。新增 3 项测试覆盖完整归档、响应错配拒绝和覆盖拒绝。
 
-### 真实 JAV 教师沉默的准入闸：sample-c 不能作为 blank 来源
+### 真实 JAV 教师沉默的准入闸：稀疏对白样片 不能作为 blank 来源
 
 - **动机**：`datasets/train/jav-grok-stt-frame-teacher-v1/` 归档两部真实 JAV 全片的 Grok 词时间与 diarization 后，下一步路线是「足够长的无词区间 ⇒ blank 负样本」。该规则的前提是「Grok 沉默 = 没人说话」，而 Grok 的 diarization 只给被转写词附加 speaker、VAD 会跳过轻声，前提未必成立。
-- **零成本核对**：两片都有生产头的整片/前 90 秒 forced alignment 产物，直接比对同一批秒。**sample-c 必须用 PTS 修复后的重跑**（`agents/temp/20260810_170140_audio-pts-drift/jobs/fjin-059-pts-fixed-full/`）；`agents/rm/20260810_174504_timeline-diagnostics-archive/` 里那份是修复前的 compact-time job，其词时间相对源 PTS 逐渐提前最多 42.6s，拿它比对会把已修复的 bug 变成假分歧。sample-v 自身 PTS 与包时长只差 35.8ms，前 90 秒探针无需修正。
-- **结果**：sample-c 教师词只覆盖全片 **2.42%**（1,132 个词 token / 0.146 个每秒），`>=0.8s` 规则会把 **96.7%（2.09 小时）** 判成 blank；生产头在同一片上有 394.0s 高置信语音，其中 **88.7% 会被这条规则改判成 blank**。sample-v 反之：教师覆盖 19.5%，前 90 秒里 `>=0.8s` 只提出 4.5s blank，仅吞掉生产头语音的 **1.35%**。**两片不是一个数据集**。
-- **判据的选择本身是结论的一部分**：「争议占提出 blank 的比例」在 sample-c 上只有 4.6%，看起来无害——因为分母是整部片子，规则越保守这个数越小。真正决定的是反向的量「**会吞掉生产头多少自有语音**」，它在同一片上是 88.7%。工具默认报两个，但只用后者判决。
-- **规模上的额外理由**：sample-c 一片就会贡献 2.09 小时 blank，而现役 galgame 帧教师全部 blank 才 357,379 帧 ≈ 3.82 小时。**单部坏片足以支配整个 blank 类**，这正是 07-31「剂量依赖单调恶化」和 08-08 四臂里两条 blank 臂被拒的同一失效通道。
-- **落地**：新增 `tools/align/audit_teacher_silence_against_head.py`，默认 `--minimum-blank-s 0.8`、`--max-swallowed-share 0.10`，拒绝时退出码 2。**闸是单向的**：能否决影片，不能认证影片——生产头在本域会幻听，重叠只证明两个教师不一致，不证明有语音；生产头零语音时同样拒绝，因为那是「无从核对」不是「一致」。新增测试 11 项。全量 **1380 passed / 1 skipped**。报告在 `agents/temp/20260810_205448_jav-grok-silence-audit/`。
+- **零成本核对**：两片都有生产头的整片/前 90 秒 forced alignment 产物，直接比对同一批秒。**稀疏对白样片 必须用 PTS 修复后的重跑**（`agents/temp/20260810_170140_audio-pts-drift/jobs/&lt;稀疏对白样片&gt;-pts-fixed-full/`）；`agents/rm/20260810_174504_timeline-diagnostics-archive/` 里那份是修复前的 compact-time job，其词时间相对源 PTS 逐渐提前最多 42.6s，拿它比对会把已修复的 bug 变成假分歧。连续对白样片 自身 PTS 与包时长只差 35.8ms，前 90 秒探针无需修正。
+- **结果**：稀疏对白样片 教师词只覆盖全片 **2.42%**（1,132 个词 token / 0.146 个每秒），`>=0.8s` 规则会把 **96.7%（2.09 小时）** 判成 blank；生产头在同一片上有 394.0s 高置信语音，其中 **88.7% 会被这条规则改判成 blank** ⇒ `full_film_reject`。连续对白样片只有前 90 秒有生产头产物，该窗口内 `>=0.8s` 只提出 4.5s blank、吞掉生产头语音的 **1.35%** ⇒ `prefix_no_conflict_observed`，**不是整片结论**。**两片可以同属一个归档，但不能共用同一种 blank 监督策略**。
+- **统计范围口径修正（v1 的实现缺陷）**：v1 把教师覆盖率按全片算、把 blank/争议/生产头语音按窗口算，两个分母混在一张表里。修正后所有量都按实际比较的秒数计，并同时保留显式命名的全片值。修完立刻暴露一件事：连续对白样片**前 90 秒的教师覆盖率是 67.1%，而全片只有 19.5%**——这个前缀比全片稠密三倍多，本身就说明它不能代表整片，全片审计是必需项而非补充项。
+- **判据的选择本身是结论的一部分**：「争议占提出 blank 的比例」在 稀疏对白样片 上只有 4.6%，看起来无害——因为分母是整部片子，规则越保守这个数越小。真正决定的是反向的量「**会吞掉生产头多少自有语音**」，它在同一片上是 88.7%。工具默认报两个，但只用后者判决。
+- **规模上的额外理由**：稀疏对白样片 一片就会贡献 2.09 小时 blank，而现役 galgame 帧教师全部 blank 才 357,379 帧 ≈ 3.82 小时。**单部坏片足以支配整个 blank 类**，这正是 07-31「剂量依赖单调恶化」和 08-08 四臂里两条 blank 臂被拒的同一失效通道。
+- **落地**：新增 `tools/align/audit_teacher_silence_against_head.py`，默认 `--minimum-blank-s 0.8`、`--max-swallowed-share 0.10`。**裁决是三态且带 scope**，没有「通过」这一态：`reject`（退出码 2）/ `no_conflict_observed`（0）/ `inconclusive`（3）。生产头在本域会幻听，重叠只证明两个教师不一致、不证明有语音，所以干净结果只能说成「在比较过的那些秒里没发现冲突」；生产头零语音或窗口内没有提出任何 blank 都记 `inconclusive` 而不是 reject——那是「无从核对」，既不是反对也不是支持。`verdict_id` 把 scope 和裁决拼在一起（`prefix_no_conflict_observed`），使前缀结论无法被当成全片结论引用。新增测试 14 项。全量 **1383 passed / 1 skipped**。报告在 `agents/temp/20260810_205448_jav-grok-silence-audit/`。
+- **两片的监督定位**：稀疏对白样片全片 `blank_source=rejected`，其 Grok 词区间仍可作 `positive_only` 候选；连续对白样片记 `prefix_90s_no_conflict_observed`、整片 blank 资格 `pending_full_audit`。两片继续 `training_ready=false`，训练器暂不改动。后续顺序：先给归档影片清单写入上述定位 → 对连续对白样片做一次完整且 PTS 正确的生产头运行再审全片 → 即便过闸也要加每片 blank 配额与 film-balanced sampling，防单片支配 → 最终先做「真实域 positive-only」与「小剂量、过闸的 positive+blank」两臂，不直接上大规模真实域 blank。
 
 ## 2026-08-08
 

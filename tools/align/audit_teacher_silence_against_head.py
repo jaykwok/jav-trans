@@ -21,8 +21,17 @@ like a rounding error.
 
 **Local ASR is not ground truth.** It hallucinates in this domain, which is why
 the post-gate exists. Overlap therefore means the two teachers disagree, not that
-speech is definitely present. The gate is deliberately one-directional: it can
-reject a film, never certify one.
+speech is definitely present.
+
+**The verdict is one-directional and scoped.** There is no "admitted" state: a
+clean result is `no_conflict_observed`, which is the absence of evidence against
+the film over the seconds that were actually compared. `scope` says whether that
+was the whole film or a prefix, and every reported quantity is computed over the
+same window - a prefix run reporting whole-film teacher coverage next to
+prefix-window disagreement invites reading one as context for the other when they
+do not share a denominator. `inconclusive` is separate from `reject`: a reference
+run with no speech in it, or a window that proposes no blank at all, has measured
+nothing rather than measured agreement.
 
 **Timeline correctness is a precondition.** Both readings must be on the source
 PTS timeline. An alignment produced before the 2026-08-10 audio-PTS fix runs
@@ -42,8 +51,16 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-SCHEMA = "asr_teacher_silence_admission_v1"
+SCHEMA = "asr_teacher_silence_admission_v2"
 ALIGNED_KIND = "ctc_forced_alignment"
+
+REJECT = "reject"
+NO_CONFLICT_OBSERVED = "no_conflict_observed"
+INCONCLUSIVE = "inconclusive"
+
+# Exit codes keep the one-directional meaning usable from a shell: only a
+# rejection is a hard stop, and "nothing was measured" must not look like a pass.
+EXIT_CODES = {NO_CONFLICT_OBSERVED: 0, REJECT: 2, INCONCLUSIVE: 3}
 
 
 def resolve_repo_path(path_text: str) -> Path:
@@ -155,10 +172,17 @@ def evaluate_film(
     minimum_blank_s: float,
     max_swallowed_share: float,
 ) -> dict:
-    compare_s = window_s or duration_s
+    compare_s = min(window_s, duration_s) if window_s is not None else duration_s
+    scope = "prefix" if compare_s < duration_s - 1e-9 else "full_film"
+
     teacher = merge(teacher_words, gap_s=merge_gap_s)
-    teacher_speech_s = sum(b - a for a, b in teacher)
-    head_speech_s = sum(b - a for a, b in head_spans)
+    teacher_full_s = sum(b - a for a, b in teacher)
+    # Every reported quantity is computed over the compared seconds. Reporting
+    # whole-film teacher coverage beside prefix-window disagreement puts two
+    # different denominators in one table and invites reading them together.
+    window = [(0.0, compare_s)]
+    teacher_speech_s = overlap_s(teacher, window)
+    head_speech_s = overlap_s(head_spans, window)
 
     runs = silent_runs(
         teacher,
@@ -166,37 +190,56 @@ def evaluate_film(
         margin_s=boundary_ignore_s,
         minimum_s=minimum_blank_s,
     )
-    if window_s is not None:
-        runs = [(a, min(b, window_s)) for a, b in runs if a < window_s]
-        runs = [(a, b) for a, b in runs if b > a]
-    proposed_s = sum(b - a for a, b in runs)
-    swallowed_s = overlap_s(head_spans, runs)
+    runs_in_window = [
+        (a, b)
+        for a, b in ((a, min(b, compare_s)) for a, b in runs if a < compare_s)
+        if b > a
+    ]
+    proposed_s = sum(b - a for a, b in runs_in_window)
+    swallowed_s = overlap_s(head_spans, runs_in_window)
     swallowed_share = swallowed_s / head_speech_s if head_speech_s > 0 else None
 
-    if swallowed_share is None:
-        admitted = False
+    if head_speech_s <= 0.0:
+        verdict = INCONCLUSIVE
         reason = "head_found_no_speech_to_check_against"
-    elif swallowed_share > max_swallowed_share:
-        admitted = False
+    elif proposed_s <= 0.0:
+        verdict = INCONCLUSIVE
+        reason = "no_blank_proposed_in_window"
+    elif swallowed_share is not None and swallowed_share > max_swallowed_share:
+        verdict = REJECT
         reason = "teacher_silence_swallows_head_speech"
     else:
-        admitted = True
+        verdict = NO_CONFLICT_OBSERVED
         reason = ""
 
     return {
+        "verdict": verdict,
+        # Combined so a stored result cannot be quoted without its scope. A
+        # prefix result is never a statement about the whole film.
+        "verdict_id": f"{scope}_{verdict}",
+        "verdict_reason": reason,
+        "scope": scope,
         "duration_s": round(duration_s, 3),
         "comparison_window_s": round(compare_s, 3),
-        "teacher_speech_s": round(teacher_speech_s, 3),
-        "teacher_speech_share": round(teacher_speech_s / max(duration_s, 1e-9), 6),
-        "head_speech_s": round(head_speech_s, 3),
-        "head_speech_share": round(head_speech_s / max(compare_s, 1e-9), 6),
+        "teacher_speech_s_in_window": round(teacher_speech_s, 3),
+        "teacher_speech_share_in_window": round(
+            teacher_speech_s / max(compare_s, 1e-9), 6
+        ),
+        "teacher_speech_s_full_film": round(teacher_full_s, 3),
+        "teacher_speech_share_full_film": round(
+            teacher_full_s / max(duration_s, 1e-9), 6
+        ),
+        "head_speech_s_in_window": round(head_speech_s, 3),
+        "head_speech_share_in_window": round(
+            head_speech_s / max(compare_s, 1e-9), 6
+        ),
         "minimum_blank_s": minimum_blank_s,
-        "proposed_blank_runs": len(runs),
-        "proposed_blank_s": round(proposed_s, 3),
+        "proposed_blank_runs": len(runs_in_window),
+        "proposed_blank_s_in_window": round(proposed_s, 3),
         "proposed_blank_share_of_window": round(
             proposed_s / max(compare_s, 1e-9), 6
         ),
-        "disputed_s": round(swallowed_s, 3),
+        "disputed_s_in_window": round(swallowed_s, 3),
         # Reported because it is the number people reach for first, and it is
         # the misleading one: it shrinks as the rule gets more conservative
         # precisely because the denominator grows.
@@ -205,8 +248,6 @@ def evaluate_film(
             None if swallowed_share is None else round(swallowed_share, 6)
         ),
         "max_swallowed_share": max_swallowed_share,
-        "admitted_as_blank_source": admitted,
-        "rejection_reason": reason,
     }
 
 
@@ -283,7 +324,7 @@ def main() -> None:
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    raise SystemExit(0 if result["admitted_as_blank_source"] else 2)
+    raise SystemExit(EXIT_CODES[result["verdict"]])
 
 
 if __name__ == "__main__":

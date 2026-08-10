@@ -12,6 +12,10 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
         sys.path.insert(0, str(root))
 
 from tools.align.audit_teacher_silence_against_head import (  # noqa: E402
+    EXIT_CODES,
+    INCONCLUSIVE,
+    NO_CONFLICT_OBSERVED,
+    REJECT,
     acoustic,
     evaluate_film,
     head_speech_spans,
@@ -108,15 +112,16 @@ def test_a_film_the_teacher_mostly_missed_is_rejected():
         max_swallowed_share=0.10,
     )
 
-    assert result["admitted_as_blank_source"] is False
-    assert result["rejection_reason"] == "teacher_silence_swallows_head_speech"
+    assert result["verdict"] == REJECT
+    assert result["verdict_id"] == "full_film_reject"
+    assert result["verdict_reason"] == "teacher_silence_swallows_head_speech"
     assert result["head_speech_swallowed_share"] == pytest.approx(38.0 / 40.0, rel=1e-3)
     # The share people reach for first stays small, which is exactly why it
     # cannot be the gate.
     assert result["disputed_share_of_blank"] < 0.40
 
 
-def test_a_film_the_two_readings_agree_on_is_admitted():
+def test_agreement_is_reported_as_absence_of_conflict_not_as_approval():
     result = evaluate_film(
         teacher_words=[(0.0, 40.0)],
         head_spans=[(0.0, 39.0)],
@@ -128,14 +133,16 @@ def test_a_film_the_two_readings_agree_on_is_admitted():
         max_swallowed_share=0.10,
     )
 
-    assert result["admitted_as_blank_source"] is True
-    assert result["rejection_reason"] == ""
-    assert result["proposed_blank_s"] == pytest.approx(59.9, rel=1e-3)
+    assert result["verdict"] == NO_CONFLICT_OBSERVED
+    assert result["verdict_reason"] == ""
+    assert result["proposed_blank_s_in_window"] == pytest.approx(59.9, rel=1e-3)
+    # There is deliberately no key that reads as a pass.
+    assert "admitted_as_blank_source" not in result
 
 
-def test_a_head_that_found_nothing_cannot_certify_a_film():
-    # No speech on the reference side is not agreement; there is nothing to
-    # check the teacher against, so the film must not be admitted by default.
+def test_a_head_that_found_nothing_is_inconclusive_not_a_rejection():
+    # No speech on the reference side has measured nothing. That is neither
+    # evidence against the film nor evidence for it.
     result = evaluate_film(
         teacher_words=[(0.0, 1.0)],
         head_spans=[],
@@ -147,9 +154,57 @@ def test_a_head_that_found_nothing_cannot_certify_a_film():
         max_swallowed_share=0.10,
     )
 
-    assert result["admitted_as_blank_source"] is False
-    assert result["rejection_reason"] == "head_found_no_speech_to_check_against"
+    assert result["verdict"] == INCONCLUSIVE
+    assert result["verdict_reason"] == "head_found_no_speech_to_check_against"
     assert result["head_speech_swallowed_share"] is None
+
+
+def test_a_window_with_no_proposed_blank_is_inconclusive():
+    # Zero swallowed out of zero proposed is not agreement about the rule.
+    result = evaluate_film(
+        teacher_words=[(0.0, 100.0)],
+        head_spans=[(0.0, 100.0)],
+        duration_s=100.0,
+        window_s=None,
+        merge_gap_s=0.15,
+        boundary_ignore_s=0.1,
+        minimum_blank_s=0.8,
+        max_swallowed_share=0.10,
+    )
+
+    assert result["verdict"] == INCONCLUSIVE
+    assert result["verdict_reason"] == "no_blank_proposed_in_window"
+
+
+def test_prefix_scope_reports_every_quantity_over_the_same_window():
+    # The teacher speaks for 40 s of a 1000 s film, but only the first 100 s
+    # were run through the head. Whole-film teacher coverage (4%) must not be
+    # reported next to prefix-window disagreement as if they shared a
+    # denominator; in-window coverage here is 40%.
+    result = evaluate_film(
+        teacher_words=[(0.0, 40.0)],
+        head_spans=[(0.0, 39.0)],
+        duration_s=1000.0,
+        window_s=100.0,
+        merge_gap_s=0.15,
+        boundary_ignore_s=0.1,
+        minimum_blank_s=0.8,
+        max_swallowed_share=0.10,
+    )
+
+    assert result["scope"] == "prefix"
+    assert result["verdict_id"] == "prefix_no_conflict_observed"
+    assert result["comparison_window_s"] == pytest.approx(100.0)
+    assert result["teacher_speech_s_in_window"] == pytest.approx(40.0)
+    assert result["teacher_speech_share_in_window"] == pytest.approx(0.40)
+    assert result["teacher_speech_share_full_film"] == pytest.approx(0.04)
+    assert result["proposed_blank_s_in_window"] == pytest.approx(59.9, rel=1e-3)
+
+
+def test_exit_codes_keep_only_rejection_hard_and_never_pass_inconclusive():
+    assert EXIT_CODES[NO_CONFLICT_OBSERVED] == 0
+    assert EXIT_CODES[REJECT] == 2
+    assert EXIT_CODES[INCONCLUSIVE] == 3
 
 
 def test_merge_joins_within_the_gap_only():
