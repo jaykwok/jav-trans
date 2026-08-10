@@ -180,3 +180,46 @@ def test_recommendation_refreshes_lru_recency(monkeypatch, tmp_path):
         for entry in payload["profiles"].values()
     }
     assert kept == {"gpu-0", "gpu-2"}
+
+
+def test_recommendation_touch_prunes_an_overfull_existing_file(monkeypatch, tmp_path):
+    profile_path = tmp_path / "profiles.json"
+    monkeypatch.setenv("GPU_BATCH_PROFILE_PATH", str(profile_path))
+    monkeypatch.setenv("GPU_BATCH_PROFILE_MAX_ENTRIES", "2")
+    identities = [
+        {"hardware": {"fingerprint": f"gpu-{index}"}, "workload": {}}
+        for index in range(3)
+    ]
+    profiles = {}
+    for index, identity in enumerate(identities):
+        profiles[batch_profile.identity_key(identity)] = {
+            "identity": identity,
+            "recommended_batch": 4,
+            "updated_ts": float(index + 1),
+            "last_used_ts": float(index + 1),
+        }
+    profile_path.write_text(
+        json.dumps(
+            {
+                "schema": batch_profile.PROFILE_SCHEMA,
+                "version": batch_profile.PROFILE_VERSION,
+                "profiles": profiles,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(batch_profile.time, "time", lambda: 10.0)
+
+    recommended, _entry = batch_profile.recommendation(
+        identities[0],
+        heuristic_batch=2,
+        max_batch=16,
+    )
+
+    assert recommended == 4
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    kept = {
+        entry["identity"]["hardware"]["fingerprint"]
+        for entry in payload["profiles"].values()
+    }
+    assert kept == {"gpu-0", "gpu-2"}

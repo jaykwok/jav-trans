@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import numpy as np
 import pytest
@@ -140,3 +141,42 @@ def test_shadow_run_persists_outside_disposable_job_dir(monkeypatch, tmp_path) -
     assert payload["source_video_path"] == str(video.resolve())
     assert payload["source_video_duration_s"] == 12.5
     assert "/" not in path.name
+
+
+def test_shadow_without_primary_does_not_encode_features(monkeypatch, caplog) -> None:
+    backend = LocalAsrBackend("cpu")
+    backend.model = object()
+    backend.processor = object()
+    encoded: list[list[str]] = []
+    monkeypatch.setattr(backend, "_resolve_alignment_head", lambda _log: None)
+    monkeypatch.setattr(alignment_shadow, "shadow_enabled", lambda: True)
+    monkeypatch.setattr(
+        backend,
+        "_encode_chunk_features",
+        lambda paths: encoded.append(paths) or {},
+    )
+    monkeypatch.setattr(
+        backend,
+        "_finalize_group",
+        lambda group, _cache: [({}, []) for _item in group],
+    )
+    text_results = [
+        {
+            "text": "あ",
+            "normalized_path": "unused.wav",
+        }
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="asr.local_backend"):
+        backend.finalize_text_results(text_results)
+        backend.finalize_text_results(text_results)
+
+    assert encoded == []
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "alignment shadow disabled" in record.getMessage()
+    ]
+    assert messages == [
+        "alignment shadow disabled: primary alignment head is unavailable"
+    ]

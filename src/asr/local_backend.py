@@ -395,6 +395,7 @@ class LocalAsrBackend:
         # encoder frames as the production head and can never replace the words
         # returned by finalize_text_results.
         self._shadow_alignment_head: AlignmentHead | None | bool = False
+        self._shadow_without_primary_warned = False
         # Seconds spent inside load(), summed over every load this backend has
         # done. The pipeline no longer loads eagerly, so this is how the stage
         # timings still report what the weights actually cost - and report zero
@@ -1052,11 +1053,22 @@ class LocalAsrBackend:
         # right after decoding, so the allocator is already holding fragmented
         # blocks. 4 is where the speed-up has saturated anyway.
         batch_size = max(1, _env_int("ASR_ALIGN_BATCH_SIZE", "4"))
-        head_available = (
-            (
-                self._resolve_alignment_head([]) is not None
-                or self._resolve_shadow_alignment_head([]) is not None
+        primary_head = self._resolve_alignment_head([])
+        if (
+            primary_head is None
+            and alignment_shadow.shadow_enabled()
+            and not self._shadow_without_primary_warned
+        ):
+            logger.warning(
+                "alignment shadow disabled: primary alignment head is unavailable"
             )
+            self._shadow_without_primary_warned = True
+        # A shadow head is a comparator, not an alternative primary. Without a
+        # successful primary alignment there is no official boundary to compare
+        # against, so encoding features for a shadow-only configuration is pure
+        # GPU work with no observation output.
+        head_available = (
+            primary_head is not None
             and self.model is not None
             and self.processor is not None
         )

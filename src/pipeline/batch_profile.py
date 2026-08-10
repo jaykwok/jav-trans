@@ -160,6 +160,12 @@ def recommendation(
     heuristic_batch: int,
     max_batch: int,
 ) -> tuple[int, dict[str, Any]]:
+    """Return the learned batch and persist an LRU access touch.
+
+    This is intentionally not a pure read: changing GPU/workload combinations
+    and later returning to an old one must keep the recently reused profile
+    ahead of stale identities when the bounded profile store is pruned.
+    """
     heuristic = max(1, int(heuristic_batch))
     maximum = max(heuristic, int(max_batch))
     if not enabled():
@@ -172,6 +178,11 @@ def recommendation(
             entry = dict(entry)
             entry["last_used_ts"] = round(time.time(), 3)
             payload["profiles"][key] = entry
+            # A recommendation is an LRU touch, so it intentionally persists
+            # recency. Apply the same cap here as learning writes as well: this
+            # handles a lowered max-entry setting or a previously hand-edited
+            # file without waiting for the next success/OOM observation.
+            _prune_profiles(payload)
             _write_payload(payload)
     if not isinstance(entry, dict):
         return heuristic, {}

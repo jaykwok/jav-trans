@@ -3,7 +3,9 @@ import logging
 import time
 import sys
 import hashlib
+import json
 import shutil
+from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -834,11 +836,34 @@ def _prepare_translation_cues(
         if "source_segment_ids" not in item:
             item["source_segment_ids"] = [cue_id]
         normalized.append(item)
+    split_skipped = Counter(
+        str(cue.get("subtitle_layout_split_skipped") or "").strip()
+        for cue in normalized
+        if str(cue.get("subtitle_layout_split_skipped") or "").strip()
+    )
+    split_sources = Counter(
+        str(cue.get("subtitle_layout_split_source") or "").strip()
+        for cue in normalized
+        if str(cue.get("subtitle_layout_split_source") or "").strip()
+    )
     return normalized, {
         "schema": "subtitle_cue_summary_v1",
         "cues_before": len(cues),
         "cues_after": len(normalized),
         "counts": {"keep": len(normalized)},
+        "layout_diagnostics": {
+            "subtitle_layout_split_skipped": dict(sorted(split_skipped.items())),
+            "subtitle_layout_split_source": dict(sorted(split_sources.items())),
+            "display_clamped_to_max": sum(
+                bool(cue.get("display_clamped_to_max")) for cue in normalized
+            ),
+            "proportional_fallback_used": sum(
+                bool(cue.get("proportional_fallback_used")) for cue in normalized
+            ),
+            "duration_violation": sum(
+                bool(cue.get("duration_violation")) for cue in normalized
+            ),
+        },
     }
 
 
@@ -849,12 +874,23 @@ def _subtitle_cue_plan_summary(
     cue_summary: dict,
 ) -> dict:
     return {
+        "schema": str(cue_summary.get("schema") or "subtitle_cue_summary_v1"),
         "segments_before": segments_before,
         "cues_before": int(cue_summary.get("cues_before", 0)),
         "cues_after": int(cue_summary.get("cues_after", 0)),
+        "layout_diagnostics": dict(cue_summary.get("layout_diagnostics") or {}),
         "mode": mode,
         "stage": "pre_translation",
     }
+
+
+def _log_subtitle_cue_diagnostics(logger, cue_summary: dict) -> None:
+    diagnostics = dict(cue_summary.get("layout_diagnostics") or {})
+    _log_stage(
+        logger,
+        "subtitle_cue_plan_diagnostics "
+        + json.dumps(diagnostics, ensure_ascii=False, sort_keys=True),
+    )
 
 
 def _print_timing_summary(stage_timings: dict, asr_details: dict) -> None:
@@ -1600,6 +1636,7 @@ def _run_translation_and_write_impl(
             mode="srt",
             cue_summary=cue_summary,
         )
+        _log_subtitle_cue_diagnostics(logger, cue_summary)
 
         write_started = time.perf_counter()
         _log_stage(logger, "stage_start write_output")
@@ -1754,6 +1791,7 @@ def _run_translation_and_write_impl(
         mode="bilingual" if bilingual else "srt",
         cue_summary=cue_summary,
     )
+    _log_subtitle_cue_diagnostics(logger, cue_summary)
     _log_stage(
         logger,
         "subtitle_cue_plan "
@@ -1883,6 +1921,18 @@ def _run_translation_and_write_impl(
             "raw_texts": list(seg.get("raw_texts") or []),
             "primary_cut_candidates": list(seg.get("primary_cut_candidates") or []),
             "weak_cut_candidates": list(seg.get("weak_cut_candidates") or []),
+            **{
+                key: seg[key]
+                for key in (
+                    "subtitle_layout_split",
+                    "subtitle_layout_split_source",
+                    "subtitle_layout_split_skipped",
+                    "display_clamped_to_max",
+                    "proportional_fallback_used",
+                    "duration_violation",
+                )
+                if key in seg
+            },
         }
         for seg, zh_text in zip(translation_segments, zh_texts)
     ]

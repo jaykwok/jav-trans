@@ -4,6 +4,8 @@ from pathlib import Path
 import pytest
 
 import main
+from asr import alignment
+from asr.local_backend import LocalAsrBackend
 from helpers import make_job_context
 from pipeline.artifacts import AsrArtifacts
 from subtitles.options import SubtitleOptions
@@ -101,6 +103,7 @@ def test_translation_uses_pre_normalized_cues(monkeypatch, tmp_path):
     )
     assert sidecar["blocks"][0]["end"] == pytest.approx(expected_end)
     assert sidecar["blocks"][0]["zh_text"] == "zh-0"
+    assert sidecar["blocks"][0]["display_clamped_to_max"] is False
 
     timings = json.loads(
         (tmp_path / "jobs" / "clip" / "clip.timings.json").read_text(encoding="utf-8")
@@ -108,6 +111,9 @@ def test_translation_uses_pre_normalized_cues(monkeypatch, tmp_path):
     assert timings["counts"]["segments"] == 2
     assert timings["counts"]["translation_cues"] == 2
     assert timings["asr_details"]["subtitle_cue_plan"]["stage"] == "pre_translation"
+    assert timings["asr_details"]["subtitle_cue_plan"]["layout_diagnostics"][
+        "display_clamped_to_max"
+    ] == 0
 
 
 
@@ -155,3 +161,106 @@ def test_pretranslation_cue_plan_preserves_model_routed_cues(monkeypatch, tmp_pa
     assert plan["segments_before"] == 4
     assert plan["cues_before"] == 4
     assert plan["cues_after"] == 4
+
+
+def test_cue_summary_exposes_measured_map_skip_and_display_clamp():
+    text = "この文字列は十分に長いので表示時間による分割が必要になります"
+    measured_text = text.replace("文字", "")
+    words = [
+        {
+            "word": char,
+            "start": index * 0.5,
+            "end": index * 0.5 + 0.4,
+            "timestamp_kind": "ctc_forced_alignment",
+        }
+        for index, char in enumerate(measured_text)
+    ]
+
+    cues, summary = main._prepare_translation_cues(
+        [{"start": 0.0, "end": 20.0, "text": text, "words": words}],
+        subtitle_options=SubtitleOptions(),
+        bilingual=True,
+    )
+
+    assert len(cues) == 1
+    diagnostics = summary["layout_diagnostics"]
+    assert diagnostics["subtitle_layout_split_skipped"] == {
+        "measured_word_text_map_incomplete": 1
+    }
+    assert diagnostics["display_clamped_to_max"] == 1
+    # Clamp is a successful enforcement of the display contract, not a
+    # post-finalize duration violation; both facts must remain visible.
+    assert diagnostics["duration_violation"] == 0
+    plan = main._subtitle_cue_plan_summary(
+        segments_before=1,
+        mode="bilingual",
+        cue_summary=summary,
+    )
+    assert plan["schema"] == "subtitle_cue_summary_v1"
+    assert plan["layout_diagnostics"] == diagnostics
+
+
+def test_local_ctc_words_stay_completely_mapped_through_cue_planning(monkeypatch):
+    backend = LocalAsrBackend("cpu")
+    spans = [
+        alignment.CharSpan(
+            char="先",
+            index=0,
+            start_frame=0,
+            end_frame=1,
+            start_s=0.0,
+            end_s=0.5,
+            score=-0.1,
+        ),
+        alignment.CharSpan(
+            char="後",
+            index=1,
+            start_frame=390,
+            end_frame=391,
+            start_s=15.0,
+            end_s=15.5,
+            score=-0.1,
+        ),
+    ]
+    monkeypatch.setattr(
+        backend,
+        "_align_characters",
+        lambda *_args, **_kwargs: (spans, (0.0, 15.5)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_resolve_shadow_alignment_head",
+        lambda _log: None,
+    )
+    result, _log = backend._use_boundary_timing_result(
+        master_text="先後",
+        raw_master_text="先後",
+        duration=15.5,
+        detected_language="Japanese",
+        normalized_path="unused.wav",
+        timing_start=0.0,
+        timing_end=15.5,
+        timing_window_source="chunk",
+        log=[],
+    )
+    assert result["alignment_mode"] == "ctc_forced_alignment"
+    assert "".join(word["word"] for word in result["words"]) == result["text"]
+
+    cues, summary = main._prepare_translation_cues(
+        [
+            {
+                "start": 0.0,
+                "end": 15.5,
+                "text": result["text"],
+                "words": result["words"],
+            }
+        ],
+        subtitle_options=SubtitleOptions(),
+        bilingual=True,
+    )
+
+    assert [cue["ja_text"] for cue in cues] == ["先", "後"]
+    assert summary["layout_diagnostics"]["subtitle_layout_split_skipped"] == {}
+    assert summary["layout_diagnostics"]["subtitle_layout_split_source"] == {
+        "word_gap_dp": 2
+    }

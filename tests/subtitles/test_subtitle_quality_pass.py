@@ -895,7 +895,12 @@ def test_long_blank_is_a_real_gap_between_independent_cue_edges():
     pieces = subtitle.prepare_srt_blocks([block], options=SubtitleOptions())
 
     assert [piece["ja_text"] for piece in pieces] == ["先", "後"]
-    assert pieces[0]["end"] < 15.0
+    # The DP treats the blank as non-content, then timeline polish applies the
+    # explicit display-linger policy to the previous measured acoustic edge.
+    # This is deliberately not a proportional split inside the 14.5s blank.
+    assert pieces[0]["end"] == pytest.approx(
+        words[0]["end"] + SubtitleOptions().max_display_shift_from_acoustic_end_s
+    )
     assert pieces[1]["start"] == pytest.approx(15.0)
     assert not any(piece["display_clamped_to_max"] for piece in pieces)
 
