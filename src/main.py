@@ -325,12 +325,22 @@ def _aligned_cache_signature_for_ctx(
     subtitle_signature["frame_duration_s"] = options.frame_duration_s
     subtitle_signature["frame_gap_s"] = options.frame_gap_s
     subtitle_signature["frame_min_duration_s"] = options.frame_min_duration_s
+    # The head path reaches this through `asr_stage_config`, but only as the
+    # configured REFERENCE. The edge caps are source constants, so nothing here
+    # saw them at all until version 10 - retuning one left every job's cached
+    # aligned segments serving the previous boundaries.
+    from asr.alignment import CODA_EXTEND_MAX_S, ONSET_BACKOFF_MAX_S
+
     return {
-        "version": 9,
+        "version": 10,
         "backend_label": backend_label,
         "asr": asr_signature,
         "asr_stage_config": _asr_stage_config_signature_for_env(),
         "subtitle": subtitle_signature,
+        "alignment_edge_caps": {
+            "onset_backoff_max_s": round(float(ONSET_BACKOFF_MAX_S), 6),
+            "coda_extend_max_s": round(float(CODA_EXTEND_MAX_S), 6),
+        },
     }
 
 

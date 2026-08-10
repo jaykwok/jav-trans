@@ -321,6 +321,19 @@ def finalize_signature() -> dict | None:
     signature = model_signature()
     signature["stage"] = "final"
     signature["alignment_head"] = {"sha256": head_digest}
+    # The head checkpoint is not the only thing that decides the stored word
+    # times: `speech_extent` walks both edges outward afterwards, capped by these
+    # two constants, and both were retuned on 2026-08-10. Without them in the key
+    # a cap change is invisible to the cache - old entries keep serving the old
+    # boundaries indefinitely, and the only symptom is subtitles that quietly
+    # disagree with the code that supposedly produced them. Same reasoning that
+    # put the audio filter chain into `get_audio_cache_key`.
+    from asr.alignment import CODA_EXTEND_MAX_S, ONSET_BACKOFF_MAX_S
+
+    signature["edge_caps"] = {
+        "onset_backoff_max_s": round(float(ONSET_BACKOFF_MAX_S), 6),
+        "coda_extend_max_s": round(float(CODA_EXTEND_MAX_S), 6),
+    }
     shadow_reference = (os.environ.get("ASR_ALIGNMENT_SHADOW_HEAD_PATH") or "").strip()
     if shadow_reference:
         shadow_digest = _checkpoint_digest(shadow_reference)

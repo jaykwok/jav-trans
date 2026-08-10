@@ -64,6 +64,45 @@ def test_aligned_cache_signature_uses_full_subtitle_options(
     assert "dense_cue_merge_enabled" not in expected["subtitle"]
 
 
+def test_retuning_an_edge_cap_invalidates_the_aligned_segments_cache(
+    monkeypatch, tmp_path
+):
+    """The caps decide the word boundaries this cache stores.
+
+    They are source constants rather than settings, so nothing in the signature
+    saw them before version 10: retuning one left every job restoring the
+    previous run's boundaries, with the artifact still claiming to be current.
+    The audio has not changed, so no other key can catch it.
+    """
+    from asr import alignment
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"fake-video")
+    ctx = make_job_context(
+        video_path,
+        tmp_path / "out",
+        tmp_path / "jobs",
+        skip_translation=True,
+        keep_temp_files=True,
+    )
+    _configure(monkeypatch)
+
+    before = _cache_signature(ctx)
+    assert before["alignment_edge_caps"] == {
+        "onset_backoff_max_s": alignment.ONSET_BACKOFF_MAX_S,
+        "coda_extend_max_s": alignment.CODA_EXTEND_MAX_S,
+    }
+
+    monkeypatch.setattr(alignment, "ONSET_BACKOFF_MAX_S", 0.35)
+    after = _cache_signature(ctx)
+
+    assert after != before
+    assert after["alignment_edge_caps"]["onset_backoff_max_s"] == 0.35
+    # Nothing else moved, so the caps are genuinely what invalidated it.
+    assert after["subtitle"] == before["subtitle"]
+    assert after["asr_stage_config"] == before["asr_stage_config"]
+
+
 def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"fake-video")
@@ -122,7 +161,7 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
     assert payload["backend"] == "mock_asr"
     assert payload["audio_cache_key"]
     assert payload["cache_stage"] == "ready"
-    assert payload["cache_signature"]["version"] == 9
+    assert payload["cache_signature"]["version"] == 10
     assert payload["cache_signature"]["subtitle"]["timeline_mode"] == "alignment"
 
     assert payload["segments"] == [{"start": 0.0, "end": 1.0, "text": "こんにちは"}]
@@ -234,7 +273,7 @@ def test_asr_alignment_stage_writes_resume_signature_e2e(monkeypatch, tmp_path):
         write for write in aligned_writes if write["cache_stage"] == "asr_alignment"
     )
     assert isinstance(asr_stage_write["cache_signature"], dict)
-    assert asr_stage_write["cache_signature"]["version"] == 9
+    assert asr_stage_write["cache_signature"]["version"] == 10
 
 
 def test_aligned_cache_signature_ignores_retired_display_policy_env(monkeypatch, tmp_path):

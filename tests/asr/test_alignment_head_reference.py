@@ -216,6 +216,38 @@ def test_finalize_signature_keys_off_the_resolved_bytes(monkeypatch, tmp_path):
     }
 
 
+def test_retuning_an_edge_cap_invalidates_cached_word_timings(monkeypatch, tmp_path):
+    """The caps decide the stored boundaries, so they have to be in the key.
+
+    `speech_extent` walks both edges outward after the head has run, capped by
+    `ONSET_BACKOFF_MAX_S` and `CODA_EXTEND_MAX_S`. A cap change that left the key
+    untouched would keep serving the previous boundaries with nothing in the run
+    saying so - the failure is silent and survives every rerun.
+    """
+    from asr import result_cache
+
+    head = tmp_path / "ctc_aligner.pt"
+    head.write_bytes(b"weights")
+    monkeypatch.setenv("ASR_ALIGNMENT_HEAD_PATH", DEFAULT_REFERENCE)
+    monkeypatch.setattr(
+        alignment, "resolve_alignment_head_path", lambda ref, download=True: str(head)
+    )
+
+    before = result_cache.finalize_signature()
+    assert before["edge_caps"] == {
+        "onset_backoff_max_s": alignment.ONSET_BACKOFF_MAX_S,
+        "coda_extend_max_s": alignment.CODA_EXTEND_MAX_S,
+    }
+
+    monkeypatch.setattr(alignment, "CODA_EXTEND_MAX_S", 0.25)
+    after = result_cache.finalize_signature()
+
+    assert after != before
+    assert after["edge_caps"]["coda_extend_max_s"] == 0.25
+    # The head is untouched, so only the caps may have moved.
+    assert after["alignment_head"] == before["alignment_head"]
+
+
 def test_unresolvable_reference_disables_the_finalize_cache(monkeypatch):
     """No head on disk yet means no signature - not a crash, and not a stale key."""
     from asr import result_cache
