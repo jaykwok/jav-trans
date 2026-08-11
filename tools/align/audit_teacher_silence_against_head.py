@@ -19,6 +19,20 @@ production head itself found would be relabelled blank**. On a film where Grok
 mostly failed, that number is close to 1 while the disputed share still looks
 like a rounding error.
 
+**"Speech" here means something was said, not that a character was emitted.**
+The head's words come from forced alignment, so they include the kana the local
+ASR writes for moaning, which Grok drops on purpose. Counting that as head
+speech reads agreement as conflict, and it does so in proportion to how much
+vocalisation a film has - so the gate was hardest on exactly the films whose
+vocalisation is the thing worth learning. Islands of pure non-semantic
+vocalisation are therefore excluded from the head side before the comparison;
+`--count-vocalisation-as-speech` restores the v2 reading for audit.
+
+**The two teachers' text is never compared.** Two transcribers word the same
+seconds differently, so a cross-teacher text match would manufacture
+disagreement out of vocabulary. Only time is compared. Text is read on the head
+side alone, and only to answer "is the head claiming something was said here".
+
 **Local ASR is not ground truth.** It hallucinates in this domain, which is why
 the post-gate exists. Overlap therefore means the two teachers disagree, not that
 speech is definitely present.
@@ -51,7 +65,9 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-SCHEMA = "asr_teacher_silence_admission_v2"
+from subtitles.vocalisation import is_non_semantic_vocalisation  # noqa: E402
+
+SCHEMA = "asr_teacher_silence_admission_v3"
 ALIGNED_KIND = "ctc_forced_alignment"
 
 REJECT = "reject"
@@ -134,20 +150,48 @@ def head_speech_spans(
     *,
     window_s: float | None = None,
     confident_only: bool = True,
+    semantic_only: bool = True,
+    island_gap_s: float = 0.15,
 ) -> list[tuple[float, float]]:
+    """The head's own speech, by default only where something was *said*.
+
+    **Why `semantic_only` is the default.** The head's words come from forced
+    alignment, so they contain every character the local ASR emitted - including
+    the kana it writes for moaning. Grok discards non-semantic vocalisation on
+    purpose. Counting it as head speech makes the two teachers look like they
+    disagree in exactly the places where they agree about what was said, and it
+    does so hardest on the films with the most vocalisation - which are the
+    films this supervision is wanted from. Measured on one real film, the
+    swallowed population is 51.7% core kana against 30.3% in the kept
+    population, and 7.0% kanji against 17.5%.
+
+    **The unit is an island, not a character.** Words here are single
+    characters, so `あたし` would lose its `あ` to a per-character test while
+    keeping the rest - eroding real speech to no purpose. Characters are grouped
+    into islands at `island_gap_s`, and an island is excluded only when the
+    whole of its text is non-semantic vocalisation, which is the same question
+    `subtitles.vocalisation` answers for cues and the same answer.
+
+    **Text is never compared between the two teachers.** Two transcribers will
+    word the same seconds differently, so any cross-teacher text match would
+    manufacture disagreement out of vocabulary. Only time is compared; the text
+    is read on one side only, to decide whether the head is claiming that
+    something was said there at all.
+    """
     segments = (
         aligned_segments
         if isinstance(aligned_segments, list)
         else aligned_segments.get("segments") or []
     )
-    spans: list[tuple[float, float]] = []
+    words: list[tuple[float, float, str]] = []
     for segment in segments:
         for word in segment.get("words") or []:
             if str(word.get("timestamp_kind") or "") != ALIGNED_KIND:
                 continue
             if confident_only and str(word.get("alignment_quality") or "") != "aligned":
                 continue
-            if not acoustic(word.get("word") or ""):
+            text = acoustic(word.get("word") or "")
+            if not text:
                 continue
             start = float(word["start"])
             end = float(word["end"])
@@ -157,7 +201,26 @@ def head_speech_spans(
                 if start >= window_s:
                     continue
                 end = min(end, window_s)
-            spans.append((start, end))
+            words.append((start, end, text))
+
+    words.sort()
+    if not semantic_only:
+        return merge([(start, end) for start, end, _ in words], gap_s=0.0)
+
+    islands: list[list] = []
+    for start, end, text in words:
+        if islands and start - islands[-1][1] <= island_gap_s:
+            islands[-1][1] = max(islands[-1][1], end)
+            islands[-1][2] += text
+            islands[-1][3].append((start, end))
+        else:
+            islands.append([start, end, text, [(start, end)]])
+
+    spans: list[tuple[float, float]] = []
+    for _, _, text, members in islands:
+        if is_non_semantic_vocalisation(text):
+            continue
+        spans.extend(members)
     return merge(spans, gap_s=0.0)
 
 
@@ -293,6 +356,13 @@ def main() -> None:
         "share of the head's own high-confidence speech",
     )
     parser.add_argument("--include-unaligned", action="store_true")
+    parser.add_argument(
+        "--count-vocalisation-as-speech",
+        action="store_true",
+        help="the v2 reading: count every aligned character as head speech, "
+        "including the kana written for moaning that Grok drops on purpose",
+    )
+    parser.add_argument("--island-gap-s", type=float, default=0.15)
     parser.add_argument("--output", default="")
     args = parser.parse_args()
 
@@ -300,23 +370,53 @@ def main() -> None:
         resolve_repo_path(args.aligned_segments).read_text(encoding="utf-8")
     )
     window_s = args.window_s if args.window_s > 0 else None
-    result = evaluate_film(
-        teacher_words=_load_teacher_words(
-            resolve_repo_path(args.teacher_words), args.film_id
-        ),
-        head_spans=head_speech_spans(
-            aligned,
-            window_s=window_s,
-            confident_only=not args.include_unaligned,
-        ),
-        duration_s=float(args.duration_s),
-        window_s=window_s,
-        merge_gap_s=float(args.merge_gap_s),
-        boundary_ignore_s=float(args.boundary_ignore_s),
-        minimum_blank_s=float(args.minimum_blank_s),
-        max_swallowed_share=float(args.max_swallowed_share),
+    teacher_words = _load_teacher_words(
+        resolve_repo_path(args.teacher_words), args.film_id
     )
-    payload = {"schema": SCHEMA, "film_id": args.film_id, **result}
+    semantic_only = not args.count_vocalisation_as_speech
+
+    def evaluate(*, semantic: bool) -> dict:
+        return evaluate_film(
+            teacher_words=teacher_words,
+            head_spans=head_speech_spans(
+                aligned,
+                window_s=window_s,
+                confident_only=not args.include_unaligned,
+                semantic_only=semantic,
+                island_gap_s=float(args.island_gap_s),
+            ),
+            duration_s=float(args.duration_s),
+            window_s=window_s,
+            merge_gap_s=float(args.merge_gap_s),
+            boundary_ignore_s=float(args.boundary_ignore_s),
+            minimum_blank_s=float(args.minimum_blank_s),
+            max_swallowed_share=float(args.max_swallowed_share),
+        )
+
+    result = evaluate(semantic=semantic_only)
+    # The v2 reading is reported alongside whenever it is not the one deciding,
+    # because a stored verdict that changed when the definition of head speech
+    # changed must carry both numbers or nobody can tell which rule produced it.
+    counted_vocalisation = evaluate(semantic=False) if semantic_only else None
+    payload = {
+        "schema": SCHEMA,
+        "film_id": args.film_id,
+        "head_speech_counts_vocalisation": not semantic_only,
+        **result,
+        "if_vocalisation_counted_as_speech": (
+            None
+            if counted_vocalisation is None
+            else {
+                "verdict_id": counted_vocalisation["verdict_id"],
+                "head_speech_s_in_window": counted_vocalisation[
+                    "head_speech_s_in_window"
+                ],
+                "head_speech_swallowed_share": counted_vocalisation[
+                    "head_speech_swallowed_share"
+                ],
+            }
+        ),
+    }
     if args.output:
         out = resolve_repo_path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)

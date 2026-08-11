@@ -25,7 +25,13 @@ from tools.align.audit_teacher_silence_against_head import (  # noqa: E402
 )
 
 
-def _word(start: float, end: float, text: str = "あ", quality: str = "aligned") -> dict:
+def _word(start: float, end: float, text: str = "私", quality: str = "aligned") -> dict:
+    """One aligned character. The filler is kanji on purpose.
+
+    Head speech is counted only where the head claims something was *said*, so a
+    kana filler like `あ` would be read as vocalisation and dropped before any of
+    these tests got to what they are actually about.
+    """
     return {
         "start": start,
         "end": end,
@@ -35,11 +41,70 @@ def _word(start: float, end: float, text: str = "あ", quality: str = "aligned")
     }
 
 
+def _island(start: float, text: str, *, step: float = 0.1) -> list[dict]:
+    """Characters close enough to form one island, as the head emits them."""
+    return [
+        _word(start + index * step, start + index * step + 0.05, char)
+        for index, char in enumerate(text)
+    ]
+
+
+def test_vocalisation_is_not_counted_as_head_speech():
+    """The defect this gate had: forced alignment cannot refuse the kana the ASR
+    writes for moaning, and Grok drops that on purpose. Counting it made the two
+    teachers look like they disagreed exactly where they agreed about what was
+    said - and worst on the films with the most vocalisation, which are the ones
+    this supervision is wanted from."""
+    segments = [{"words": _island(0.0, "あぁん") + _island(10.0, "私は")}]
+
+    # The spans stay per-character: grouping decides admission, not geometry.
+    assert [start for start, _ in head_speech_spans(segments)] == pytest.approx(
+        [10.0, 10.1]
+    )
+    assert len(head_speech_spans(segments, semantic_only=False)) == 5
+
+
+def test_a_word_is_not_eroded_character_by_character():
+    """The unit is the island, not the character.
+
+    Words here are single characters, so a per-character test would strip the
+    `あ` out of `あたし` and leave a shortened span for no gain. An island counts
+    as speech as soon as any part of it was said.
+    """
+    segments = [{"words": _island(0.0, "あたし")}]
+
+    spans = head_speech_spans(segments)
+
+    assert spans[0][0] == pytest.approx(0.0), "the leading あ must survive"
+    assert spans[-1][1] == pytest.approx(0.25)
+
+
+def test_a_reply_is_speech_even_though_it_is_spelled_like_a_moan():
+    # `うん` and `んん` differ by meaning, not by sound class. The allow-list in
+    # subtitles.vocalisation is what separates them, and the gate reuses it
+    # rather than keeping a second, drifting copy.
+    assert head_speech_spans([{"words": _island(0.0, "うん")}])
+    assert not head_speech_spans([{"words": _island(0.0, "んん")}])
+
+
+def test_islands_are_split_by_the_gap_not_by_the_segment():
+    """Moaning next to dialogue must not launder itself into speech.
+
+    Both are in one segment; only the gap decides. If the whole segment were one
+    island, any dialogue anywhere in it would admit every moan in it too.
+    """
+    segments = [{"words": _island(0.0, "あぁん") + _island(5.0, "私は")}]
+
+    spans = head_speech_spans(segments, island_gap_s=0.15)
+
+    assert [start for start, _ in spans] == pytest.approx([5.0, 5.1])
+
+
 def test_punctuation_is_not_evidence_of_speech():
     # CTC assigns a frame to `。` like any other target, but a frame of
     # punctuation must not count as the head having heard something.
     spans = head_speech_spans(
-        [{"words": [_word(0.0, 0.1, "。"), _word(1.0, 1.2, "あ")]}]
+        [{"words": [_word(0.0, 0.1, "。"), _word(1.0, 1.2, "私")]}]
     )
 
     assert spans == [(1.0, 1.2)]
@@ -53,7 +118,7 @@ def test_synthetic_timestamps_are_ignored():
                     {
                         "start": 0.0,
                         "end": 5.0,
-                        "word": "あ",
+                        "word": "私",
                         "timestamp_kind": "synthetic_proportional",
                     },
                     _word(6.0, 6.2),
