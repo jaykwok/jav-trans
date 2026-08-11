@@ -5,6 +5,13 @@ import pytest
 from subtitles.options import BASE_FPS, SubtitleOptions
 from subtitles import writer as subtitle
 
+# The one-character filler in these fixtures is kanji (私 / 君 / 僕), not kana.
+# These tests are about timing and layout, but `prepare_srt_blocks` also drops
+# runs of vocalisation-only cues by default, and two adjacent `あ` / `い` cues
+# are exactly such a run - the filter deleted the fixtures out from under 16 of
+# these tests. Kanji is lexical by construction and one character wide, so the
+# reading-window and duration arithmetic they assert on is unchanged.
+
 
 def _word(text: str, start: float, end: float) -> dict:
     return {"word": text, "start": start, "end": end}
@@ -87,8 +94,8 @@ def test_bilingual_drops_a_cue_only_when_both_lines_are_empty(tmp_path):
 def test_write_bilingual_srt_does_not_normalize_unprepared_blocks(tmp_path):
     path = tmp_path / "raw.srt"
     blocks = [
-        {"start": 0.0, "end": 1.2, "ja_text": "あ", "zh_text": "甲"},
-        {"start": 1.0, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
+        {"start": 0.0, "end": 1.2, "ja_text": "私", "zh_text": "甲"},
+        {"start": 1.0, "end": 2.0, "ja_text": "君", "zh_text": "乙"},
     ]
 
     written = subtitle.write_bilingual_srt(blocks, str(path), options=SubtitleOptions())
@@ -111,7 +118,7 @@ def test_write_srt_returned_blocks_match_min_written_duration(tmp_path):
 def test_write_bilingual_srt_returned_blocks_match_min_written_duration(tmp_path):
     path = tmp_path / "min-duration-bilingual.srt"
     written = subtitle.write_bilingual_srt(
-        [{"start": 2.0, "end": 2.0, "ja_text": "あ", "zh_text": "啊"}],
+        [{"start": 2.0, "end": 2.0, "ja_text": "私", "zh_text": "啊"}],
         str(path),
     )
 
@@ -127,8 +134,8 @@ def test_wrap_subtitle_line_uses_hiragana_kanji_boundary():
 
 def test_alignment_window_extends_min_duration_without_overlapping_next():
     blocks = [
-        {"start": 0.0, "end": 0.1, "ja_text": "あ", "zh_text": "啊"},
-        {"start": 0.7, "end": 1.0, "ja_text": "い", "zh_text": "咿"},
+        {"start": 0.0, "end": 0.1, "ja_text": "私", "zh_text": "啊"},
+        {"start": 0.7, "end": 1.0, "ja_text": "君", "zh_text": "咿"},
     ]
 
     start, end = subtitle._resolve_subtitle_window(blocks, 1)
@@ -139,8 +146,8 @@ def test_alignment_window_extends_min_duration_without_overlapping_next():
 
 def test_alignment_window_extends_micro_cue_to_fixed_frame_floor():
     blocks = [
-        {"start": 0.0, "end": 0.1, "ja_text": "あ", "zh_text": "啊"},
-        {"start": 2.0, "end": 2.5, "ja_text": "い", "zh_text": "咿"},
+        {"start": 0.0, "end": 0.1, "ja_text": "私", "zh_text": "啊"},
+        {"start": 2.0, "end": 2.5, "ja_text": "君", "zh_text": "咿"},
     ]
     options = SubtitleOptions()
 
@@ -152,8 +159,8 @@ def test_alignment_window_extends_micro_cue_to_fixed_frame_floor():
 
 def test_alignment_window_uses_fixed_two_frame_gap():
     blocks = [
-        {"start": 0.0, "end": 1.0, "ja_text": "あ", "zh_text": "啊"},
-        {"start": 1.0, "end": 2.0, "ja_text": "い", "zh_text": "咿"},
+        {"start": 0.0, "end": 1.0, "ja_text": "私", "zh_text": "啊"},
+        {"start": 1.0, "end": 2.0, "ja_text": "君", "zh_text": "咿"},
     ]
     options = SubtitleOptions()
 
@@ -164,14 +171,14 @@ def test_alignment_window_uses_fixed_two_frame_gap():
 
 def test_prepare_srt_blocks_sorts_and_removes_overlap_with_frame_gap():
     blocks = [
-        {"start": 1.0, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
-        {"start": 0.0, "end": 1.2, "ja_text": "あ", "zh_text": "甲"},
+        {"start": 1.0, "end": 2.0, "ja_text": "君", "zh_text": "乙"},
+        {"start": 0.0, "end": 1.2, "ja_text": "私", "zh_text": "甲"},
     ]
     options = SubtitleOptions()
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
 
-    assert [block["ja_text"] for block in prepared] == ["あ", "い"]
+    assert [block["ja_text"] for block in prepared] == ["私", "君"]
     assert prepared[0]["end"] == pytest.approx(1.0 - options.frame_gap_s)
     assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
 
@@ -281,8 +288,8 @@ def test_prepare_srt_blocks_preserves_earliest_word_start_anchor_without_merge()
 
 def test_prepare_srt_blocks_final_normalize_guards_reading_window_overlap(monkeypatch):
     blocks = [
-        {"start": 0.0, "end": 1.0, "ja_text": "あ", "zh_text": "甲"},
-        {"start": 1.2, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
+        {"start": 0.0, "end": 1.0, "ja_text": "私", "zh_text": "甲"},
+        {"start": 1.2, "end": 2.0, "ja_text": "君", "zh_text": "乙"},
     ]
     options = SubtitleOptions()
     original_resolve = subtitle._resolve_subtitle_window
@@ -302,8 +309,8 @@ def test_prepare_srt_blocks_final_normalize_guards_reading_window_overlap(monkey
 
 def test_timing_polish_collapses_short_gap_to_two_frames():
     blocks = [
-        {"start": 0.0, "end": 1.0, "ja_text": "あ", "zh_text": "甲"},
-        {"start": 1.2, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
+        {"start": 0.0, "end": 1.0, "ja_text": "私", "zh_text": "甲"},
+        {"start": 1.2, "end": 2.0, "ja_text": "君", "zh_text": "乙"},
     ]
     options = SubtitleOptions(
         timing_polish_enabled=True,
@@ -319,8 +326,8 @@ def test_timing_polish_collapses_short_gap_to_two_frames():
 
 def test_timing_polish_preserves_natural_pause():
     blocks = [
-        {"start": 0.0, "end": 1.0, "ja_text": "あ", "zh_text": "甲"},
-        {"start": 1.8, "end": 2.5, "ja_text": "い", "zh_text": "乙"},
+        {"start": 0.0, "end": 1.0, "ja_text": "私", "zh_text": "甲"},
+        {"start": 1.8, "end": 2.5, "ja_text": "君", "zh_text": "乙"},
     ]
     options = SubtitleOptions(
         timing_polish_enabled=True,
@@ -338,8 +345,8 @@ def test_timing_polish_preserves_natural_pause():
 
 def test_timing_polish_disabled_keeps_existing_alignment_end():
     blocks = [
-        {"start": 0.0, "end": 1.0, "ja_text": "あ", "zh_text": "甲"},
-        {"start": 1.2, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
+        {"start": 0.0, "end": 1.0, "ja_text": "私", "zh_text": "甲"},
+        {"start": 1.2, "end": 2.0, "ja_text": "君", "zh_text": "乙"},
     ]
     options = SubtitleOptions(
         timing_polish_enabled=False,
@@ -405,8 +412,8 @@ def test_long_display_cue_falls_back_to_proportional_text_split():
 
 def test_short_cues_are_not_merged():
     blocks = [
-        {"start": 0.0, "end": 0.35, "ja_text": "あ", "zh_text": "啊"},
-        {"start": 0.42, "end": 0.80, "ja_text": "ん", "zh_text": "嗯"},
+        {"start": 0.0, "end": 0.35, "ja_text": "私", "zh_text": "啊"},
+        {"start": 0.42, "end": 0.80, "ja_text": "僕", "zh_text": "嗯"},
         {"start": 1.40, "end": 1.80, "ja_text": "いい", "zh_text": "舒服"},
     ]
     options = SubtitleOptions()
@@ -414,13 +421,13 @@ def test_short_cues_are_not_merged():
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
 
     assert len(prepared) == 3
-    assert [item["ja_text"] for item in prepared] == ["あ", "ん", "いい"]
+    assert [item["ja_text"] for item in prepared] == ["私", "僕", "いい"]
 
 
 def test_close_short_cues_remain_separate():
     blocks = [
-        {"start": 0.0, "end": 0.35, "ja_text": "あ", "zh_text": "啊"},
-        {"start": 0.42, "end": 0.80, "ja_text": "ん", "zh_text": "嗯"},
+        {"start": 0.0, "end": 0.35, "ja_text": "私", "zh_text": "啊"},
+        {"start": 0.42, "end": 0.80, "ja_text": "僕", "zh_text": "嗯"},
     ]
 
     prepared = subtitle.prepare_srt_blocks(
@@ -434,8 +441,8 @@ def test_close_short_cues_remain_separate():
 
 def test_short_cues_ignore_acoustic_metadata_without_merge():
     blocks = [
-        {"start": 0.0, "end": 0.35, "ja_text": "あ", "zh_text": "啊"},
-        {"start": 0.42, "end": 0.80, "ja_text": "ん", "zh_text": "嗯"},
+        {"start": 0.0, "end": 0.35, "ja_text": "私", "zh_text": "啊"},
+        {"start": 0.42, "end": 0.80, "ja_text": "僕", "zh_text": "嗯"},
     ]
     options = SubtitleOptions()
 
@@ -446,8 +453,8 @@ def test_short_cues_ignore_acoustic_metadata_without_merge():
 
 def test_prepare_srt_blocks_has_same_no_merge_behavior_for_japanese_only():
     blocks = [
-        {"start": 0.0, "end": 0.40, "ja_text": "あ", "zh_text": "あ"},
-        {"start": 0.46, "end": 0.90, "ja_text": "ん", "zh_text": "ん"},
+        {"start": 0.0, "end": 0.40, "ja_text": "私", "zh_text": "私"},
+        {"start": 0.46, "end": 0.90, "ja_text": "僕", "zh_text": "僕"},
     ]
 
     merged = subtitle.prepare_srt_blocks(
@@ -467,8 +474,8 @@ def test_prepare_srt_blocks_has_same_no_merge_behavior_for_japanese_only():
 
 def test_timing_polish_does_not_merge_after_collapsing_gap():
     blocks = [
-        {"start": 0.0, "end": 0.40, "ja_text": "あ", "zh_text": "あ"},
-        {"start": 0.90, "end": 1.30, "ja_text": "ん", "zh_text": "ん"},
+        {"start": 0.0, "end": 0.40, "ja_text": "私", "zh_text": "私"},
+        {"start": 0.90, "end": 1.30, "ja_text": "僕", "zh_text": "僕"},
     ]
     options = SubtitleOptions(
         timing_polish_enabled=True,
@@ -483,8 +490,8 @@ def test_timing_polish_does_not_merge_after_collapsing_gap():
 
 def test_timing_polish_keeps_short_cues_separate():
     blocks = [
-        {"start": 0.0, "end": 0.40, "ja_text": "あ", "zh_text": "あ"},
-        {"start": 0.90, "end": 1.30, "ja_text": "ん", "zh_text": "ん"},
+        {"start": 0.0, "end": 0.40, "ja_text": "私", "zh_text": "私"},
+        {"start": 0.90, "end": 1.30, "ja_text": "僕", "zh_text": "僕"},
     ]
     options = SubtitleOptions(
         timing_polish_enabled=True,
@@ -502,13 +509,13 @@ def test_prepare_srt_blocks_merges_overlap_when_too_tight():
         {
             "start": 1.0,
             "end": 1.2,
-            "ja_text": "あ",
+            "ja_text": "私",
             "zh_text": "甲",
         },
         {
             "start": 1.05,
             "end": 1.4,
-            "ja_text": "い",
+            "ja_text": "君",
             "zh_text": "乙",
         },
     ]
@@ -576,8 +583,8 @@ def test_too_close_cues_keep_two_frame_gap_and_report_min_display_violation():
 def test_write_bilingual_srt_returns_normalized_blocks(tmp_path):
     path = tmp_path / "normalized.srt"
     blocks = [
-        {"start": 0.0, "end": 1.2, "ja_text": "あ", "zh_text": "甲"},
-        {"start": 1.0, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
+        {"start": 0.0, "end": 1.2, "ja_text": "私", "zh_text": "甲"},
+        {"start": 1.0, "end": 2.0, "ja_text": "君", "zh_text": "乙"},
     ]
     options = SubtitleOptions()
 

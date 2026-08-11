@@ -40,6 +40,14 @@ class SubtitleOptions:
     weak_cut_snap_normal_s: float = 0.40
     weak_cut_snap_long_s: float = 0.60
     max_display_shift_from_acoustic_end_s: float = 0.5
+    # Local ASR transcribes moaning as text and forced alignment cannot refuse
+    # it, so whole cues of nothing but vocalisation are dropped here. Only runs
+    # are dropped: an isolated one between two lines of dialogue is far more
+    # likely to be a real reaction than part of a moaning passage, and on a real
+    # film requiring a run of 2 leaves 125 such cues alone while still removing
+    # 224 of 1983 cues (11.3%).
+    drop_vocalisation_only_cues: bool = True
+    vocalisation_min_run: int = 2
 
     @property
     def frame_duration_s(self) -> float:
@@ -104,6 +112,12 @@ class SubtitleOptions:
             max_display_shift_from_acoustic_end_s=max(
                 0.0,
                 float(os.getenv("SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_END_S", "0.5")),
+            ),
+            drop_vocalisation_only_cues=_env_bool(
+                "SUBTITLE_DROP_VOCALISATION_ONLY_CUES", True
+            ),
+            vocalisation_min_run=max(
+                1, int(os.getenv("SUBTITLE_VOCALISATION_MIN_RUN", "2"))
             ),
         )
 

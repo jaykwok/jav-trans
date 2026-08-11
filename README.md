@@ -297,6 +297,7 @@ auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、显存预算、�
 - ASR 文本会做 Unicode NFKC、空白归一、换行折叠和展示安全处理。
 - Qwen3-ASR runtime 始终使用 Transformers 官方 `apply_transcription_request(audio=..., language=...)` 路径，不提供演员名 / 人名 context 提示分支。
 - 字幕时间轴来自 CTC 强制对齐的逐字时间戳；对齐头未配置时退化为按字数比例摊开。
+- **整条都是非语义人声、且连续出现的 cue 会被丢弃**（默认开启）。ASR 会把呻吟转写成假名，强制对齐无法拒绝已经给定的文本，所以只能在成句之后按文本过滤。判定是「拆解」而不是「字符集」：整条 cue 必须能被无词义假名加一份显式的拟声词表完全消耗，剩下任何一个字就保留，因此 `ちんぽ`、`イッちゃう` 这类与呻吟共用假名的词不会被误删；`うん` / `はい` / `ふふ` 等应答与笑声另有白名单。**只删连续的**：孤立一条夹在对白中间更可能是真实反应，词表无法分辨，所以用上下文代替词表。实测一部真实影片 1983 条中命中 349 条、删掉 224 条（11.3%），其余 125 条因孤立而保留。`SUBTITLE_DROP_VOCALISATION_ONLY_CUES=0` 关闭，`SUBTITLE_VOCALISATION_MIN_RUN` 改连续条数阈值（设 1 即命中就删）。
 - LLM 翻译前会先固定 cue plan，翻译不会重排时间轴。
 - 最终中文输出遵循 Netflix Chinese (Simplified) TTSG：每行 ≤16 全角单位、最多 2 行（下宽金字塔）、时长 5/6s–7s、2 帧最小间隔、语音结束后出点约 +0.5s；不用逗号句号（句中停顿为单个空格）、省略号为单个 U+2026、全角？！且不连用、半角数字、无斜体。标点归一化与折行在 `src/subtitles/zh_style.py` 的写盘层完成，翻译缓存保留 LLM 原文；质量报告以 `spec_*` 指标核查全部硬指标。`SRT_LINE_MAX_CHARS` 默认 16。
 

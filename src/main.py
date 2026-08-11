@@ -823,11 +823,13 @@ def _prepare_translation_cues(
 ) -> tuple[list[dict], dict]:
     source_blocks = _build_japanese_srt_blocks(segments)
     mode = "bilingual" if bilingual else "srt"
+    prepare_diagnostics: dict = {}
     cues = subtitle_module.prepare_srt_blocks(
         source_blocks,
         options=subtitle_options,
         mode=mode,
         on_stage=on_stage,
+        diagnostics=prepare_diagnostics,
     )
     normalized: list[dict] = []
     for cue_id, cue in enumerate(cues):
@@ -862,6 +864,7 @@ def _prepare_translation_cues(
         "cues_after": len(normalized),
         "counts": {"keep": len(normalized)},
         "layout_diagnostics": {
+            **prepare_diagnostics,
             "subtitle_layout_split_skipped": dict(sorted(split_skipped.items())),
             "subtitle_layout_split_source": dict(sorted(split_sources.items())),
             "display_clamped_to_max": sum(

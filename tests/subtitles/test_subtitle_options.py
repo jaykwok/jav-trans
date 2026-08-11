@@ -83,8 +83,8 @@ def test_prepare_bilingual_keeps_adjacent_cues_separate(tmp_path):
     options = SubtitleOptions()
     blocks = subtitle.prepare_srt_blocks(
         [
-            {"start": 0.0, "end": 1.0, "ja_text": "あ", "zh_text": "甲"},
-            {"start": 1.05, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
+            {"start": 0.0, "end": 1.0, "ja_text": "私", "zh_text": "甲"},
+            {"start": 1.05, "end": 2.0, "ja_text": "君", "zh_text": "乙"},
         ],
         options=options,
         mode="bilingual",

@@ -54,14 +54,14 @@ def test_translation_uses_pre_normalized_cues(monkeypatch, tmp_path):
         {
             "start": 0.0,
             "end": 1.2,
-            "text": "あ",
-            "words": [{"word": "あ", "start": 0.0, "end": 1.2}],
+            "text": "私",
+            "words": [{"word": "私", "start": 0.0, "end": 1.2}],
         },
         {
             "start": 1.0,
             "end": 2.0,
-            "text": "い",
-            "words": [{"word": "い", "start": 1.0, "end": 2.0}],
+            "text": "君",
+            "words": [{"word": "君", "start": 1.0, "end": 2.0}],
         },
     ]
     artifacts = _artifacts(tmp_path, segments)
@@ -92,8 +92,8 @@ def test_translation_uses_pre_normalized_cues(monkeypatch, tmp_path):
     expected_end = translated[1]["start"] - SubtitleOptions().frame_gap_s
     assert translated[0]["end"] == pytest.approx(expected_end)
     assert translated[0]["end"] + SubtitleOptions().frame_gap_s <= translated[1]["start"]
-    assert translated[0]["text"] == "あ"
-    assert translated[1]["text"] == "い"
+    assert translated[0]["text"] == "私"
+    assert translated[1]["text"] == "君"
 
     srt_content = (tmp_path / "out" / "clip.srt").read_text(encoding="utf-8")
     assert "00:00:00,000 --> 00:00:00,916" in srt_content
@@ -121,9 +121,9 @@ def test_pretranslation_cue_plan_preserves_model_routed_cues(monkeypatch, tmp_pa
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"fake-video")
     segments = [
-        {"start": 0.0, "end": 0.4, "text": "あ", "words": [{"word": "あ", "start": 0.0, "end": 0.4}]},
-        {"start": 0.5, "end": 0.9, "text": "あ", "words": [{"word": "あ", "start": 0.5, "end": 0.9}]},
-        {"start": 1.0, "end": 1.4, "text": "あ", "words": [{"word": "あ", "start": 1.0, "end": 1.4}]},
+        {"start": 0.0, "end": 0.4, "text": "私", "words": [{"word": "私", "start": 0.0, "end": 0.4}]},
+        {"start": 0.5, "end": 0.9, "text": "私", "words": [{"word": "私", "start": 0.5, "end": 0.9}]},
+        {"start": 1.0, "end": 1.4, "text": "私", "words": [{"word": "私", "start": 1.0, "end": 1.4}]},
         {"start": 2.0, "end": 3.0, "text": "今日はいい天気ですね", "words": [{"word": "今日はいい天気ですね", "start": 2.0, "end": 3.0}]},
     ]
     artifacts = _artifacts(tmp_path, segments)
@@ -151,7 +151,7 @@ def test_pretranslation_cue_plan_preserves_model_routed_cues(monkeypatch, tmp_pa
 
     translated = seen["items"]
     assert len(translated) == 4
-    assert [item["text"] for item in translated] == ["あ", "あ", "あ", "今日はいい天気ですね"]
+    assert [item["text"] for item in translated] == ["私", "私", "私", "今日はいい天気ですね"]
 
     aligned_payload = json.loads(
         (tmp_path / "jobs" / "clip" / "clip.aligned_segments.json").read_text(encoding="utf-8")

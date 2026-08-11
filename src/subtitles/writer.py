@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from subtitles.options import SubtitleOptions
+from subtitles.vocalisation import drop_vocalisation_runs
 from subtitles.zh_style import normalize_zh_subtitle_text, wrap_zh_subtitle_text
 
 logger = logging.getLogger(__name__)
@@ -1176,6 +1177,7 @@ def _prepare_subtitle_blocks(
     *,
     options: SubtitleOptions | None = None,
     on_stage: Callable[[str, int, int], None] | None = None,
+    diagnostics: dict | None = None,
 ) -> list[dict]:
     options = _coerce_options(options)
     def stage(name: str, current: int, total: int) -> None:
@@ -1210,6 +1212,18 @@ def _prepare_subtitle_blocks(
             progress=lambda current, total: stage("layout_dp_pass2", current, total),
         )
     )
+    # Only now are these the cues a viewer will see. Filtering earlier looks
+    # cheaper but measures the wrong thing: before the DP runs, a "block" is a
+    # whole ASR segment, and a segment mixing dialogue with moaning is not pure
+    # vocalisation - on a real film that placement dropped nothing at all while
+    # 398 of the 1983 finished cues qualified. Translation happens after this
+    # function returns, so a cue dropped here still never reaches the translator.
+    if options.drop_vocalisation_only_cues:
+        prepared, vocalisation_diagnostics = drop_vocalisation_runs(
+            prepared, min_run=options.vocalisation_min_run
+        )
+        if diagnostics is not None:
+            diagnostics.update(vocalisation_diagnostics)
     # Reading-duration expansion can push a cue back into the next cue window.
     # Keep this final pass as the hard no-overlap, frame-gap guard for the cue plan.
     prepared = _normalize_subtitle_timeline(prepared, options=options)
@@ -1224,14 +1238,21 @@ def prepare_srt_blocks(
     options: SubtitleOptions | None = None,
     mode: Literal["srt", "bilingual"] = "srt",
     on_stage: Callable[[str, int, int], None] | None = None,
+    diagnostics: dict | None = None,
 ) -> list[dict]:
-    """Return the stable cue plan to translate and write as SRT."""
+    """Return the stable cue plan to translate and write as SRT.
+
+    `diagnostics`, when given, is filled with counts for anything this stage
+    removed. Cues dropped here never reach the caller, so without it the only
+    evidence would be a smaller list.
+    """
     options = _coerce_options(options)
     del mode
     return _prepare_subtitle_blocks(
         blocks,
         options=options,
         on_stage=on_stage,
+        diagnostics=diagnostics,
     )
 
 
