@@ -21,8 +21,13 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class SubtitleOptions:
-    layout_engine: str = "anchor_aware_dp_v2"
-    timing_model: str = "acoustic_display_dual_timeline_v1"
+    layout_engine: str = "measured_safe_boundary_dp_v3"
+    timing_model: str = "measured_lexical_extent_v2"
+    # Japanese source-text target for one translated cue. This and the 7s
+    # duration target are deliberately soft: measured character/word timings
+    # are authoritative, so an unsplittable cue remains over the target rather
+    # than receiving an invented boundary.
+    max_source_chars: int = 20
     max_display_duration_s: float = 7.0
     min_duration: float = 0.6
     reading_cps: float = 7.0
@@ -67,11 +72,22 @@ class SubtitleOptions:
     @classmethod
     def from_env(cls) -> "SubtitleOptions":
         return cls(
-            layout_engine=os.getenv("SUBTITLE_LAYOUT_ENGINE", "anchor_aware_dp_v2").strip(),
+            layout_engine=os.getenv(
+                "SUBTITLE_LAYOUT_ENGINE",
+                "measured_safe_boundary_dp_v3",
+            ).strip(),
             timing_model=os.getenv(
                 "SUBTITLE_TIMING_MODEL",
-                "acoustic_display_dual_timeline_v1",
+                "measured_lexical_extent_v2",
             ).strip(),
+            max_source_chars=max(
+                1,
+                int(os.getenv("SUBTITLE_MAX_SOURCE_CHARS", "20")),
+            ),
+            max_display_duration_s=max(
+                0.0,
+                float(os.getenv("SUBTITLE_MAX_DISPLAY_DURATION_S", "7.0")),
+            ),
             min_duration=float(
                 os.getenv(
                     "SUBTITLE_MIN_DURATION",

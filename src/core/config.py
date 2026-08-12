@@ -52,14 +52,15 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_ATTENTION": "sdpa",
     # CTC alignment head over the ASR encoder: word-level subtitle timing and
     # pause-aware chunk cuts. The head is encoder-specific (trained on the
-    # 1.7B SFT encoder); clear this to fall back to proportional timing and
-    # fixed-length chunks. The current checkpoint combines clean Galgame CTC
-    # with sparse Grok frame supervision and has been blind-audited on real JAV.
+    # 1.7B SFT encoder); clear this to fall back to coarse timing and fixed-
+    # length chunks. This project selects the separate JAV/non-semantic-
+    # vocalisation variant. The original general `ctc_aligner.pt` remains in
+    # the same HF repo and can be selected explicitly; it was not overwritten.
     # `hf:<repo>@<sha>#<file>` downloads once into the HF cache and is offline
     # afterwards; a plain path still works as a local override. The sha is
     # pinned deliberately - under a moving branch a retrained head would change
     # every subtitle's timing with nothing in the run saying so.
-    "ASR_ALIGNMENT_HEAD_PATH": "hf:jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf@68baee74dbed3bf98ba0545988278da8cff0e713#ctc_aligner.pt",
+    "ASR_ALIGNMENT_HEAD_PATH": "hf:jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf@5a6a789ceb2f22d2b8606743b13a8159af218362#ctc_aligner_jav_vocalisation_v2.pt",
     # Optional observation-only candidate. It reuses the production encoder
     # frames, records boundary disagreements under tmp/cache, and never changes
     # the words or timestamps returned to the subtitle pipeline.
@@ -144,6 +145,13 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_CHUNK_MIN_PAUSE_S": "0.6",
 
     # --- Subtitle Timings ---
+    # Best-effort Japanese source-character target per cue. Only punctuation or
+    # measured >=120ms word gaps are eligible boundaries; when none exists the
+    # cue remains longer instead of inventing a proportional timestamp.
+    "SUBTITLE_MAX_SOURCE_CHARS": "20",
+    # Best-effort lexical-duration target paired with the source-character
+    # target above. A measured safe boundary always outranks this value.
+    "SUBTITLE_MAX_DISPLAY_DURATION_S": "7.0",
     # Minimum displayed subtitle duration in seconds.
     "MIN_SUBTITLE_DURATION": "0.6",
     # Estimated Chinese reading speed in characters per second.

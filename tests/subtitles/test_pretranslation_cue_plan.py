@@ -163,7 +163,7 @@ def test_pretranslation_cue_plan_preserves_model_routed_cues(monkeypatch, tmp_pa
     assert plan["cues_after"] == 4
 
 
-def test_cue_summary_exposes_measured_map_skip_and_display_clamp():
+def test_cue_summary_exposes_measured_map_skip_without_display_clamp():
     text = "この文字列は十分に長いので表示時間による分割が必要になります"
     measured_text = text.replace("文字", "")
     words = [
@@ -187,16 +187,17 @@ def test_cue_summary_exposes_measured_map_skip_and_display_clamp():
     assert diagnostics["subtitle_layout_split_skipped"] == {
         "measured_word_text_map_incomplete": 1
     }
-    assert diagnostics["display_clamped_to_max"] == 1
-    # Clamp is a successful enforcement of the display contract, not a
-    # post-finalize duration violation; both facts must remain visible.
-    assert diagnostics["duration_violation"] == 0
+    assert diagnostics["display_clamped_to_max"] == 0
+    assert diagnostics["proportional_fallback_used"] == 0
+    # The soft limit remains visible, but the source timeline is untouched.
+    assert diagnostics["duration_soft_cap_violation"] == 1
+    assert diagnostics["duration_violation"] == 1
     plan = main._subtitle_cue_plan_summary(
         segments_before=1,
         mode="bilingual",
         cue_summary=summary,
     )
-    assert plan["schema"] == "subtitle_cue_summary_v1"
+    assert plan["schema"] == "subtitle_cue_summary_v2"
     assert plan["layout_diagnostics"] == diagnostics
 
 
@@ -262,5 +263,5 @@ def test_local_ctc_words_stay_completely_mapped_through_cue_planning(monkeypatch
     assert [cue["ja_text"] for cue in cues] == ["先", "後"]
     assert summary["layout_diagnostics"]["subtitle_layout_split_skipped"] == {}
     assert summary["layout_diagnostics"]["subtitle_layout_split_source"] == {
-        "word_gap_dp": 2
+        "measured_safe_boundary_dp": 2
     }

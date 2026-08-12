@@ -611,19 +611,36 @@ def _spans_for_full_text(
     return spans
 
 
-def blank_runs(log_probs, *, upsample: int = 2, min_seconds: float = 0.0):
+def blank_runs(
+    log_probs,
+    *,
+    upsample: int = 2,
+    min_seconds: float = 0.0,
+    silent_classes: frozenset[int] | None = None,
+):
     """Stretches the head covers entirely with blank, as (start_s, end_s).
 
     This is the gate reading of the same tensor the alignment uses: a run of
     blank is a run with no character evidence in it. It is deliberately computed
     from the argmax rather than a tuned threshold, so the pre-gate has no free
     parameter beyond the minimum run length.
+
+    `silent_classes` widens what counts as "no sound" beyond blank itself. A
+    punctuated vocabulary can spend a frame on `。` or `、` in the middle of a
+    silence, and one such frame ends the run - `cut_at_pauses` then sees two
+    short pauses where there was one long one, and below its floor it sees no
+    cut at all. Measured on four real films, that hides 27-303 silences per film
+    from the chunker (`tools/align/measure_pause_structure.py`). Punctuation has
+    no sound to be evidence of, so counting it as silence is a correction to the
+    reading, not a tuning knob: the alternative is a head that must never emit
+    punctuation, which costs the whole punctuated vocabulary.
     """
+    silent = {BLANK_INDEX} | set(silent_classes or ())
     predicted = log_probs.argmax(dim=-1).detach().cpu().tolist()
     runs: list[tuple[float, float]] = []
     start: int | None = None
     for frame, token in enumerate(list(predicted) + [-1]):
-        if token == BLANK_INDEX:
+        if token in silent:
             if start is None:
                 start = frame
             continue
@@ -946,6 +963,25 @@ class AlignmentHead:
     @property
     def context_seconds(self) -> float:
         return self.context_frames * ENCODER_FRAME_S
+
+    @property
+    def silent_classes(self) -> frozenset[int]:
+        """Classes this head can emit that stand for no sound.
+
+        Empty for an acoustic-only vocabulary, which has no such class by
+        construction - so passing this to `blank_runs` is a no-op there and a
+        correction on a punctuated head, without the caller having to know which
+        kind of head it loaded.
+        """
+        cached = getattr(self, "_silent_classes", None)
+        if cached is None:
+            cached = frozenset(
+                index
+                for index in range(2, self.vocab.size)
+                if not is_acoustic_char(self.vocab.char_at(index))
+            )
+            self._silent_classes = cached
+        return cached
 
     @classmethod
     def load(cls, checkpoint_path: str, *, device=None, blank_bias=None) -> "AlignmentHead":

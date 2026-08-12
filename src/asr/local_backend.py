@@ -16,6 +16,7 @@ from asr.backends.qwen import (
     current_qwen_asr_backend,
     qwen_asr_default_batch_size,
 )
+from asr import alignment
 from asr.alignment import AlignmentHead
 from asr.decode_guard import (
     DEFAULT_BUDGET_SECONDS,
@@ -348,10 +349,20 @@ def normalize_word_dicts(words: list[dict]) -> list[dict]:
         start = float(word.get("start", 0.0))
         end = float(word.get("end", 0.0))
         if end <= start:
-            # Drop zero-width / inverted words (floating-point drift in
-            # proportional timing can produce them); downstream renderers
-            # already ignore words without a positive span.
-            continue
+            # Zero width means two different things, and only one of them is a
+            # defect. Proportional timing can drift into a degenerate span for a
+            # token that was actually spoken - drop those. But an acoustic-only
+            # head gives every unpronounced character a zero-width span *on
+            # purpose* (`alignment._spans_for_full_text`: a comma occupies no
+            # audio, so taking width for it would steal width from a character
+            # that was spoken). Dropping those deleted every comma and ellipsis
+            # from the subtitle, because `transcribe._group_words_to_segments`
+            # rebuilds the segment text by joining these tokens - and with the
+            # punctuation went the boundaries that the vocalisation filter and
+            # the layout DP both read.
+            if any(alignment.is_acoustic_char(char) for char in token):
+                continue
+            end = start
         item = {"start": start, "end": end, "word": token}
         timestamp_kind = str(word.get("timestamp_kind") or "").strip()
         if timestamp_kind:

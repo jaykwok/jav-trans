@@ -29,6 +29,7 @@ from tools.align.train_ctc_aligner import (  # noqa: E402
     FeatureCache,
     _cap_empty_train_rows,
     _collate,
+    compile_frame_labels_by_cache,
 )
 from tools.align.build_alignment_features import (  # noqa: E402
     _assign_partitions,
@@ -222,6 +223,153 @@ def test_feature_builder_holdout_matches_teacher_source_identity() -> None:
     assert not _is_held_out(
         {"audio_id": "other-full", "source_id": "other"}, held_out
     )
+
+
+class TestFrameTeachersAreScopedToACache:
+    """Which rows a teacher archive is claimed to cover.
+
+    The selector used to be the cache *domain*, and a domain is a mixture label -
+    it gathers whatever should be balanced together. Once the galgame domain held
+    timed teacher clips, clips recovered by a local decode (text, no clock) and
+    blank-only rows (no words to time at all), "every row of this domain must
+    have a teacher" was unsatisfiable. Splitting the domain to satisfy it would
+    have deformed the mixture for an unrelated reason, and the per-domain blank
+    cap would then have dropped most of the blank rows - the exact supervision
+    the split was meant to protect.
+
+    So the archive names a **cache**, which is what it actually covers, and the
+    guard survives intact: a cache that declares a teacher must be covered whole.
+    """
+
+    @staticmethod
+    def _archive(tmp_path: Path, name: str, sources: list[str]) -> tuple[str, str]:
+        results = tmp_path / f"{name}-results.jsonl"
+        manifest = tmp_path / f"{name}-manifest.jsonl"
+        with results.open("w", encoding="utf-8") as handle:
+            for source_id in sources:
+                handle.write(
+                    json.dumps(
+                        {
+                            "source_id": source_id,
+                            "source_duration_s": 4.0,
+                            "response": {
+                                "words": [
+                                    {"text": "私", "start_s": 0.1, "end_s": 0.5},
+                                    {"text": "本", "start_s": 3.4, "end_s": 3.9},
+                                ]
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+        with manifest.open("w", encoding="utf-8") as handle:
+            for source_id in sources:
+                handle.write(json.dumps({"source_id": source_id}) + "\n")
+        return str(results), str(manifest)
+
+    @staticmethod
+    def _rows(cache_index: int, ids: list[str], domain: str) -> list[dict]:
+        return [
+            {
+                "audio_id": source_id,
+                "source_id": source_id,
+                "cache_index": cache_index,
+                "domain": domain,
+                "frames": 52,
+                "text": "私",
+            }
+            for source_id in ids
+        ]
+
+    def test_a_cache_without_an_archive_simply_gets_no_frame_labels(
+        self, tmp_path: Path
+    ) -> None:
+        results, manifest = self._archive(tmp_path, "teacher", ["t0", "t1"])
+        rows = self._rows(0, ["t0", "t1"], "galgame") + self._rows(
+            1, ["blank0"], "galgame"
+        )
+
+        labels, summary = compile_frame_labels_by_cache(
+            rows,
+            ["galgame-teacher", "galgame-vocal-blank"],
+            results=[results],
+            manifests=[manifest],
+            caches=["galgame-teacher"],
+            upsample=2,
+            positive_merge_gap_s=0.15,
+            boundary_ignore_s=0.10,
+            negative_minimum_s=0.50,
+        )
+
+        # The blank-only cache shares the domain but has no words to time.
+        assert set(labels) == {(0, "t0"), (0, "t1")}
+        assert summary["train_rows_without_frame_supervision"] == 1
+        assert summary["archives"][0]["cache"] == "galgame-teacher"
+        assert summary["archives"][0]["domain"] == "galgame"
+        assert summary["blank_frames"] > 0 and summary["speech_frames"] > 0
+
+    def test_a_declared_cache_must_be_covered_whole(self, tmp_path: Path) -> None:
+        """The guard the domain selector was carrying, kept: a stale archive or
+        a mistyped path shows up as a stop, not as a weaker auxiliary loss."""
+        results, manifest = self._archive(tmp_path, "teacher", ["t0"])
+        rows = self._rows(0, ["t0", "t1"], "galgame")
+
+        with pytest.raises(SystemExit, match="lack an accepted frame teacher"):
+            compile_frame_labels_by_cache(
+                rows,
+                ["galgame-teacher"],
+                results=[results],
+                manifests=[manifest],
+                caches=["galgame-teacher"],
+                upsample=2,
+                positive_merge_gap_s=0.15,
+                boundary_ignore_s=0.10,
+                negative_minimum_s=0.50,
+            )
+
+    def test_several_archives_each_cover_their_own_cache(self, tmp_path: Path) -> None:
+        galgame = self._archive(tmp_path, "galgame", ["g0"])
+        anime = self._archive(tmp_path, "anime", ["a0", "a1"])
+        rows = self._rows(0, ["g0"], "galgame") + self._rows(1, ["a0", "a1"], "anime-sfw")
+
+        labels, summary = compile_frame_labels_by_cache(
+            rows,
+            ["galgame-teacher", "anime-sfw"],
+            results=[galgame[0], anime[0]],
+            manifests=[galgame[1], anime[1]],
+            caches=["galgame-teacher", "anime-sfw"],
+            upsample=2,
+            positive_merge_gap_s=0.15,
+            boundary_ignore_s=0.10,
+            negative_minimum_s=0.50,
+        )
+
+        assert set(labels) == {(0, "g0"), (1, "a0"), (1, "a1")}
+        assert [archive["cache"] for archive in summary["archives"]] == [
+            "galgame-teacher",
+            "anime-sfw",
+        ]
+        assert [archive["domain"] for archive in summary["archives"]] == [
+            "galgame",
+            "anime-sfw",
+        ]
+        assert summary["train_rows_without_frame_supervision"] == 0
+
+    def test_an_unknown_cache_name_is_refused(self, tmp_path: Path) -> None:
+        results, manifest = self._archive(tmp_path, "teacher", ["t0"])
+
+        with pytest.raises(SystemExit, match="not one of the"):
+            compile_frame_labels_by_cache(
+                self._rows(0, ["t0"], "galgame"),
+                ["galgame-teacher"],
+                results=[results],
+                manifests=[manifest],
+                caches=["typo-cache"],
+                upsample=2,
+                positive_merge_gap_s=0.15,
+                boundary_ignore_s=0.10,
+                negative_minimum_s=0.50,
+            )
 
 
 class TestOneFeasibilityJudgment:

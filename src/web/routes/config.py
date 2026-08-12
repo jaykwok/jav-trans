@@ -119,7 +119,7 @@ def _initial_env_template_lines() -> list[str]:
         "# set an empty ASR_ALIGNMENT_HEAD_PATH= to fall back to proportional\n",
         "# timing and fixed-length chunks. Nothing is dropped either way.\n",
         "# It downloads once from the HF repo; a local path overrides that.\n",
-        "# ASR_ALIGNMENT_HEAD_PATH=./models/ctc_aligner.pt\n",
+        "# ASR_ALIGNMENT_HEAD_PATH=./models/ctc_aligner_jav_vocalisation_v2.pt\n",
         "# Optional observation-only candidate; it never changes subtitle output.\n",
         "# ASR_ALIGNMENT_SHADOW_HEAD_PATH=./models/ctc_aligner.shadow.pt\n",
         "# ASR_ALIGNMENT_SHADOW_ROOT=./tmp/cache/alignment_shadow\n",

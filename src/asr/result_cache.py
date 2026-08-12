@@ -334,6 +334,13 @@ def finalize_signature() -> dict | None:
         "onset_backoff_max_s": round(float(ONSET_BACKOFF_MAX_S), 6),
         "coda_extend_max_s": round(float(CODA_EXTEND_MAX_S), 6),
     }
+    # Bump when the code that turns spans into words changes what it stores, for
+    # the same reason the caps are here: the head and the text are unchanged, so
+    # nothing else in this key can notice. Version 2 stopped dropping the
+    # zero-width spans an acoustic-only head gives punctuation. This was found
+    # the hard way - the fixed pipeline re-ran and returned byte-identical
+    # output, because every chunk was served from entries written before it.
+    signature["word_build_version"] = 2
     shadow_reference = (os.environ.get("ASR_ALIGNMENT_SHADOW_HEAD_PATH") or "").strip()
     if shadow_reference:
         shadow_digest = _checkpoint_digest(shadow_reference)

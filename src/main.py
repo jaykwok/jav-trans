@@ -253,6 +253,8 @@ def _asr_stage_env_snapshot_for_ctx(ctx: JobContext) -> dict[str, str]:
 _SUBTITLE_OPTION_KEYS = {
     "SUBTITLE_LAYOUT_ENGINE",
     "SUBTITLE_TIMING_MODEL",
+    "SUBTITLE_MAX_SOURCE_CHARS",
+    "SUBTITLE_MAX_DISPLAY_DURATION_S",
     "MIN_SUBTITLE_DURATION",
     "SUBTITLE_MIN_DURATION",
     "SUBTITLE_READING_CPS",
@@ -331,8 +333,14 @@ def _aligned_cache_signature_for_ctx(
     # aligned segments serving the previous boundaries.
     from asr.alignment import CODA_EXTEND_MAX_S, ONSET_BACKOFF_MAX_S
 
+    # Version 11: `normalize_word_dicts` stopped dropping the zero-width spans an
+    # acoustic-only head gives punctuation, so the words - and the segment text
+    # rebuilt from them - now keep their commas. Same failure mode as the edge
+    # caps above: the change lives in source, not in anything the signature read,
+    # so without the bump a fixed pipeline keeps serving pre-fix segments. It was
+    # caught because the re-run came back byte-identical.
     return {
-        "version": 10,
+        "version": 11,
         "backend_label": backend_label,
         "asr": asr_signature,
         "asr_stage_config": _asr_stage_config_signature_for_env(),
@@ -859,7 +867,7 @@ def _prepare_translation_cues(
         if str(cue.get("subtitle_layout_split_source") or "").strip()
     )
     return normalized, {
-        "schema": "subtitle_cue_summary_v1",
+        "schema": "subtitle_cue_summary_v2",
         "cues_before": len(cues),
         "cues_after": len(normalized),
         "counts": {"keep": len(normalized)},
@@ -876,6 +884,15 @@ def _prepare_translation_cues(
             "duration_violation": sum(
                 bool(cue.get("duration_violation")) for cue in normalized
             ),
+            "source_char_violation": sum(
+                bool(cue.get("source_char_violation")) for cue in normalized
+            ),
+            "duration_soft_cap_violation": sum(
+                bool(cue.get("duration_soft_cap_violation")) for cue in normalized
+            ),
+            "exact_measured_timeline": sum(
+                bool(cue.get("exact_measured_timeline")) for cue in normalized
+            ),
         },
     }
 
@@ -887,7 +904,7 @@ def _subtitle_cue_plan_summary(
     cue_summary: dict,
 ) -> dict:
     return {
-        "schema": str(cue_summary.get("schema") or "subtitle_cue_summary_v1"),
+        "schema": str(cue_summary.get("schema") or "subtitle_cue_summary_v2"),
         "segments_before": segments_before,
         "cues_before": int(cue_summary.get("cues_before", 0)),
         "cues_after": int(cue_summary.get("cues_after", 0)),
@@ -1943,6 +1960,10 @@ def _run_translation_and_write_impl(
                     "display_clamped_to_max",
                     "proportional_fallback_used",
                     "duration_violation",
+                    "source_char_count",
+                    "source_char_violation",
+                    "duration_soft_cap_violation",
+                    "exact_measured_timeline",
                 )
                 if key in seg
             },

@@ -184,6 +184,9 @@ class TestWindowSeams:
         class _Head:
             upsample = 2
             context_frames = 15
+            # Matches `AlignmentHead.silent_classes`; empty is what an
+            # acoustic-only vocabulary reports, so the reading is unchanged.
+            silent_classes = frozenset()
 
             @classmethod
             def from_env(cls):
@@ -196,8 +199,9 @@ class TestWindowSeams:
 
         captured: dict = {}
 
-        def _blank_runs(log_probs, *, upsample, min_seconds):
+        def _blank_runs(log_probs, *, upsample, min_seconds, silent_classes=None):
             captured["log_probs"] = log_probs
+            captured["silent_classes"] = silent_classes
             return [(1.0, 2.0)]
 
         monkeypatch.setattr(qwen_native, "prepare_transcription_inputs", _prepare)

@@ -7,9 +7,9 @@ translator then sees two independent lines and closes each one off as a complete
 utterance, which is where "…想要你插到" / "更里面" turns into two sentences that
 do not join.
 
-Two things have to hold for the fix to work at all: the flags have to survive
-being split a second time (the layout pass runs twice), and they have to reach
-the prompt. Both are pinned here.
+Two things have to hold for the fix to work at all: inherited continuation flags
+must survive a later exact split, and they have to reach the prompt. Both are
+pinned here.
 """
 
 from __future__ import annotations
@@ -32,13 +32,27 @@ from subtitles.options import SubtitleOptions  # noqa: E402
 
 def _long_cue(*, start: float = 0.0, end: float = 30.0, text: str = "") -> dict:
     text = text or "こんにちは" * 20
+    words = []
+    cursor = start
+    for index, char in enumerate(text):
+        if index and index % 10 == 0:
+            cursor += 0.20
+        words.append(
+            {
+                "word": char,
+                "start": cursor,
+                "end": cursor + 0.20,
+                "timestamp_kind": "ctc_forced_alignment",
+            }
+        )
+        cursor += 0.20
     return {
         "start": start,
         "end": end,
         "text": text,
         "ja_text": text,
         "zh_text": text,
-        "words": [],
+        "words": words,
     }
 
 
@@ -72,10 +86,8 @@ class TestFlagsOnASplitCue:
             assert piece["continues_into_next"] is True
 
 
-class TestSplittingTwice:
-    """`_split_long_display_blocks` runs twice, before and after the timeline
-    polish. A piece that is split again must not forget that its outer edge was
-    already a continuation."""
+class TestInheritedContinuation:
+    """A later exact split must not forget the parent's outer-edge state."""
 
     def test_a_second_split_keeps_the_inherited_left_edge(self) -> None:
         already_continued = _long_cue()

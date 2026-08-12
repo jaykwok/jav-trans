@@ -476,6 +476,216 @@ def _measured_word_text_map(
     return positions, previous_word_ends, True, len(words)
 
 
+_SENTENCE_END_CHARS = frozenset("。！？!?…")
+_CLAUSE_END_CHARS = frozenset("、，,；;")
+_EXACT_CLOSING_CHARS = frozenset("。！？!?…、，,；;）」』】〉》〕］｝”’")
+_EXACT_OPENING_CHARS = frozenset("（「『【〈《〔［｛“‘")
+
+
+def _compact_source_length(text: str) -> int:
+    return len(_COMPACT_SPACE_RE.sub("", str(text or "")))
+
+
+def _exact_layout_words(block: dict, text: str) -> tuple[list[dict], str]:
+    """Return a complete measured text/time map or a reason it is unusable.
+
+    The layout planner is allowed to leave a cue too long; it is never allowed
+    to repair a partial map with character-ratio timing. Requiring the measured
+    tokens to reconstruct the source text exactly makes that distinction
+    mechanical and auditable.
+    """
+    words = [
+        word
+        for word in _timed_words(block)
+        if _has_measured_word_timestamp(word) and str(word.get("word") or "")
+    ]
+    if not words:
+        return [], "measured_word_timestamps_unavailable"
+    if "".join(str(word["word"]) for word in words) != text:
+        return [], "measured_word_text_map_incomplete"
+    return words, "complete"
+
+
+def _exact_boundary_kind(words: list[dict], index: int) -> tuple[str, float]:
+    left = words[index - 1]
+    right = words[index]
+    left_text = str(left.get("word") or "")
+    gap = max(0.0, float(right["start"]) - float(left["end"]))
+    if left_text[-1] in _SENTENCE_END_CHARS:
+        return "sentence_punctuation", gap
+    if gap >= WORD_GAP_STRONG_S:
+        return "strong_gap", gap
+    if left_text[-1] in _CLAUSE_END_CHARS:
+        return "clause_punctuation", gap
+    if gap >= WORD_GAP_MIN_S:
+        return "word_gap", gap
+    return "measured_character", gap
+
+
+def _is_exact_safe_boundary(words: list[dict], index: int) -> bool:
+    if not 0 < index < len(words):
+        return False
+    left_text = str(words[index - 1].get("word") or "")
+    right_text = str(words[index].get("word") or "")
+    if not left_text or not right_text:
+        return False
+    if right_text[0] in _EXACT_CLOSING_CHARS or left_text[-1] in _EXACT_OPENING_CHARS:
+        return False
+    return _exact_boundary_kind(words, index)[0] != "measured_character"
+
+
+def _exact_lexical_extent(
+    words: list[dict],
+    start_index: int,
+    end_index: int,
+) -> tuple[float, float] | None:
+    # Acoustic-only vocabularies intentionally return zero-width punctuation.
+    # Such tokens remain in the text slice but cannot define a spoken edge.
+    lexical = [
+        word
+        for word in words[start_index:end_index]
+        if float(word["end"]) > float(word["start"])
+    ]
+    if not lexical:
+        return None
+    return float(lexical[0]["start"]), float(lexical[-1]["end"])
+
+
+def _exact_safe_dp_plan(
+    block: dict,
+    *,
+    options: SubtitleOptions,
+) -> dict | None:
+    """Jointly optimize source length and lexical duration on exact boundaries.
+
+    Both caps are best-effort. The only hard constraints are a complete measured
+    text map and safe candidate boundaries: punctuation, or a measured gap of at
+    least 120ms. A direct start-to-end edge always exists, so an unsplittable
+    segment is retained intact and its overflow remains visible in diagnostics.
+    """
+    text = _text_for_timing(block)
+    if not text.strip():
+        return None
+    words, map_status = _exact_layout_words(block, text)
+    if not words:
+        return {"pieces": [], "reason": map_status, "score": 0.0}
+
+    word_count = len(words)
+    candidates = [0, word_count]
+    candidates.extend(
+        index
+        for index in range(1, word_count)
+        if _is_exact_safe_boundary(words, index)
+    )
+    candidates = sorted(set(candidates))
+
+    char_prefix = [0]
+    text_prefix = [0]
+    for word in words:
+        token = str(word["word"])
+        char_prefix.append(char_prefix[-1] + _compact_source_length(token))
+        text_prefix.append(text_prefix[-1] + len(token))
+
+    char_cap = max(1, int(options.max_source_chars))
+    duration_cap_s = _subtitle_max_display_duration_s(options)
+    boundary_penalty = {
+        "sentence_punctuation": 0.0,
+        "strong_gap": 0.05,
+        "clause_punctuation": 0.10,
+        "word_gap": 0.20,
+        "end": 0.0,
+    }
+    best: dict[int, tuple[float, int | None]] = {0: (0.0, None)}
+    for end_index in candidates[1:]:
+        best_cost = float("inf")
+        best_start: int | None = None
+        for start_index in candidates:
+            if start_index >= end_index or start_index not in best:
+                continue
+            extent = _exact_lexical_extent(words, start_index, end_index)
+            if extent is None:
+                continue
+            length = char_prefix[end_index] - char_prefix[start_index]
+            duration_s = max(0.0, extent[1] - extent[0])
+            char_overflow = max(0, length - char_cap)
+            duration_overflow = (
+                max(0.0, duration_s - duration_cap_s)
+                if duration_cap_s > 0.0
+                else 0.0
+            )
+            underfill = max(
+                0.0,
+                (char_cap * 0.35 - length) / max(1.0, float(char_cap)),
+            )
+            kind = (
+                "end"
+                if end_index == word_count
+                else _exact_boundary_kind(words, end_index)[0]
+            )
+            cost = (
+                best[start_index][0]
+                + 1.0
+                + boundary_penalty[kind]
+                + underfill * 0.25
+                + float(char_overflow * char_overflow) * 25.0
+                + float(duration_overflow * duration_overflow) * 25.0
+            )
+            if cost < best_cost:
+                best_cost = cost
+                best_start = start_index
+        if best_start is not None:
+            best[end_index] = (best_cost, best_start)
+
+    if word_count not in best:
+        return {"pieces": [], "reason": "no_complete_safe_path", "score": 0.0}
+    path = [word_count]
+    cursor = word_count
+    while cursor:
+        previous = best[cursor][1]
+        if previous is None:
+            return {"pieces": [], "reason": "broken_safe_path", "score": 0.0}
+        path.append(previous)
+        cursor = previous
+    path.reverse()
+
+    pieces: list[dict] = []
+    for start_index, end_index in zip(path, path[1:]):
+        extent = _exact_lexical_extent(words, start_index, end_index)
+        if extent is None:
+            return {"pieces": [], "reason": "punctuation_only_piece", "score": 0.0}
+        end_kind = (
+            "end"
+            if end_index == word_count
+            else _exact_boundary_kind(words, end_index)[0]
+        )
+        pieces.append(
+            {
+                "word_start": start_index,
+                "word_end": end_index,
+                "text_start": text_prefix[start_index],
+                "text_end": text_prefix[end_index],
+                "start": extent[0],
+                "end": extent[1],
+                "end_boundary_kind": end_kind,
+                "source_char_count": (
+                    char_prefix[end_index] - char_prefix[start_index]
+                ),
+            }
+        )
+    if "".join(
+        text[int(piece["text_start"]):int(piece["text_end"])] for piece in pieces
+    ) != text:
+        return {"pieces": [], "reason": "text_not_preserved", "score": 0.0}
+    return {
+        "pieces": pieces,
+        "reason": "split" if len(pieces) > 1 else "kept_as_one",
+        "score": best[word_count][0],
+        "internal_safe_boundary_count": max(0, len(candidates) - 2),
+        "words": words,
+        "text": text,
+    }
+
+
 def _candidate_text_positions_for_dp(
     text: str,
     *,
@@ -769,7 +979,7 @@ def _filter_candidates_for_window(
     return filtered
 
 
-def _split_long_display_block(
+def _split_long_display_block_legacy(
     block: dict,
     *,
     options: SubtitleOptions,
@@ -928,6 +1138,140 @@ def _split_long_display_block(
     return split_blocks
 
 
+def _split_long_display_block(
+    block: dict,
+    *,
+    options: SubtitleOptions,
+) -> list[dict]:
+    """Split one source segment only at exact, measured, safe boundaries."""
+    timing_text = _text_for_timing(block)
+    if not timing_text.strip():
+        return [dict(block)]
+    plan = _exact_safe_dp_plan(block, options=options)
+    if plan is None:
+        return [dict(block)]
+    pieces = list(plan.get("pieces") or [])
+    if not pieces:
+        item = dict(block)
+        item["subtitle_layout_split_skipped"] = str(
+            plan.get("reason") or "measured_safe_boundaries_unavailable"
+        )
+        item["proportional_fallback_used"] = False
+        item["exact_measured_timeline"] = False
+        return [item]
+
+    words = list(plan["words"])
+    timing_total_units = max(_count_text_units(timing_text), 1e-6)
+    timing_positions = [int(piece["text_end"]) for piece in pieces[:-1]]
+    ratios = [
+        _count_text_units(timing_text[:position]) / timing_total_units
+        for position in timing_positions
+    ]
+    text_fields: dict[str, list[str]] = {}
+    for key in ("ja_text", "zh_text", "text"):
+        value = block.get(key)
+        if value is None:
+            continue
+        if str(value) == timing_text:
+            text_fields[key] = _split_text_by_positions(
+                str(value),
+                timing_positions,
+            )
+        else:
+            # This only distributes an already translated secondary text field.
+            # Cue timestamps still come exclusively from measured source words.
+            text_fields[key] = _split_text_by_ratios(str(value), ratios)
+
+    split_blocks: list[dict] = []
+    for index, piece in enumerate(pieces):
+        piece_start = float(piece["start"])
+        piece_end = float(piece["end"])
+        word_start = int(piece["word_start"])
+        word_end = int(piece["word_end"])
+        piece_words = [dict(word) for word in words[word_start:word_end]]
+        item = dict(block)
+        item["start"] = piece_start
+        item["end"] = piece_end
+        item["acoustic_start"] = piece_start
+        item["acoustic_end"] = piece_end
+        item["acoustic_duration"] = max(0.0, piece_end - piece_start)
+        item["display_start"] = piece_start
+        item["display_end"] = piece_end
+        item["display_duration"] = max(0.0, piece_end - piece_start)
+        for key, values in text_fields.items():
+            item[key] = values[index] if index < len(values) else ""
+        item["words"] = piece_words
+        item["primary_cut_candidates"] = _filter_candidates_for_window(
+            list(block.get("primary_cut_candidates") or []),
+            start=piece_start,
+            end=piece_end,
+        )
+        item["weak_cut_candidates"] = _filter_candidates_for_window(
+            list(block.get("weak_cut_candidates") or []),
+            start=piece_start,
+            end=piece_end,
+        )
+
+        previous_boundary_kind = (
+            str(pieces[index - 1]["end_boundary_kind"])
+            if index > 0
+            else "start"
+        )
+        end_boundary_kind = str(piece["end_boundary_kind"])
+        item["continues_from_previous"] = (
+            bool(block.get("continues_from_previous"))
+            if index == 0
+            else previous_boundary_kind != "sentence_punctuation"
+        )
+        item["continues_into_next"] = (
+            bool(block.get("continues_into_next"))
+            if index == len(pieces) - 1
+            else end_boundary_kind != "sentence_punctuation"
+        )
+        if len(pieces) > 1:
+            item["subtitle_layout_split"] = "source_char_or_duration_soft_cap"
+            item["subtitle_layout_split_source"] = "measured_safe_boundary_dp"
+            item.pop("subtitle_layout_split_skipped", None)
+        elif (
+            int(plan.get("internal_safe_boundary_count") or 0) == 0
+            and (
+                int(piece["source_char_count"]) > int(options.max_source_chars)
+                or (
+                    _subtitle_max_display_duration_s(options) > 0.0
+                    and piece_end - piece_start
+                    > _subtitle_max_display_duration_s(options) + 1e-9
+                )
+            )
+        ):
+            item["subtitle_layout_split_skipped"] = (
+                "measured_safe_boundaries_unavailable"
+            )
+        item["layout_engine"] = options.layout_engine
+        item["layout_version"] = "subtitle_layout_v3"
+        item["timing_model"] = options.timing_model
+        item["exact_measured_timeline"] = True
+        item["layout_timeline_locked"] = True
+        item["source_char_count"] = int(piece["source_char_count"])
+        item["source_char_violation"] = (
+            int(piece["source_char_count"]) > int(options.max_source_chars)
+        )
+        item["duration_soft_cap_violation"] = (
+            _subtitle_max_display_duration_s(options) > 0.0
+            and piece_end - piece_start
+            > _subtitle_max_display_duration_s(options) + 1e-9
+        )
+        item["anchor_used"] = end_boundary_kind != "end"
+        item["anchor_type"] = end_boundary_kind if item["anchor_used"] else ""
+        item["anchor_score"] = 0.0
+        item["snap_distance_s"] = 0.0
+        item["snap_reason"] = "measured_safe_boundary_dp_v3"
+        item["layout_score"] = float(plan.get("score") or 0.0)
+        item["text_break_type"] = end_boundary_kind
+        item["proportional_fallback_used"] = False
+        split_blocks.append(item)
+    return split_blocks
+
+
 def _split_long_display_blocks(
     blocks: list[dict],
     *,
@@ -1051,6 +1395,13 @@ def _normalize_subtitle_timeline(
         current["end"] = current_end
         nxt["end"] = next_end
 
+        if bool(current.get("layout_timeline_locked")):
+            current["display_start"] = current_start
+            current["display_end"] = current_end
+            current["display_duration"] = max(0.0, current_end - current_start)
+            index += 1
+            continue
+
         if current_end + gap_s <= next_start:
             current["display_start"] = current_start
             current["display_end"] = current_end
@@ -1085,6 +1436,8 @@ def _polish_subtitle_timeline(
     linger_s = max(0.0, float(options.linger_s))
 
     for index, block in enumerate(polished):
+        if bool(block.get("layout_timeline_locked")):
+            continue
         start = float(block["start"])
         end = max(start + 0.05, float(block["end"]))
 
@@ -1129,14 +1482,12 @@ def _finalize_layout_fields(
         display_end = max(display_start, _safe_float(item.get("end"), display_start))
         acoustic_start = _safe_float(item.get("acoustic_start"), display_start)
         acoustic_end = max(acoustic_start, _safe_float(item.get("acoustic_end"), display_end))
-        # Hard 7s ceiling. The two DP passes split everything splittable; what
-        # reaches this point unsplit (single-character moans over a 30s span)
-        # gets its display window clamped while the acoustic span stays intact
-        # as provenance.
+        # The source-character and duration targets are soft. If measured safe
+        # boundaries cannot satisfy them, retain the exact lexical extent and
+        # expose the violation; never clamp the display window to an invented
+        # time. `display_clamped_to_max` remains in the schema so old/new runs
+        # can be compared mechanically, but v3 always writes false.
         item["display_clamped_to_max"] = False
-        if max_display_s > 0.0 and display_end - display_start > max_display_s:
-            display_end = display_start + max_display_s
-            item["display_clamped_to_max"] = True
         item["start"] = display_start
         item["end"] = display_end
         item["display_start"] = display_start
@@ -1152,11 +1503,20 @@ def _finalize_layout_fields(
             display_end - acoustic_end,
         )
         item.setdefault("layout_engine", options.layout_engine)
-        item.setdefault("layout_version", "subtitle_layout_v2")
+        item.setdefault("layout_version", "subtitle_layout_v3")
         item.setdefault("timing_model", options.timing_model)
+        item["duration_soft_cap_violation"] = bool(
+            max_display_s > 0.0 and item["display_duration"] > max_display_s
+        )
+        item["source_char_count"] = int(
+            item.get("source_char_count", _compact_source_length(_text_for_timing(item)))
+        )
+        item["source_char_violation"] = bool(
+            item["source_char_count"] > max(1, int(options.max_source_chars))
+        )
         item["duration_violation"] = bool(
             item["display_duration"] < min_duration_s
-            or (max_display_s > 0.0 and item["display_duration"] > max_display_s)
+            or item["duration_soft_cap_violation"]
         )
         item["gap_violation"] = False
         item["proportional_fallback_used"] = bool(item.get("proportional_fallback_used", False))
@@ -1186,6 +1546,9 @@ def _prepare_subtitle_blocks(
 
     stage("timeline_normalize", 0, 1)
     prepared = _copy_sorted_blocks(blocks)
+    # Preserve the legacy display policy for inputs without measured word
+    # timing. Exact pieces created below overwrite these provisional windows
+    # with their lexical edges and are then exempt from later polish/normalize.
     prepared = _normalize_subtitle_timeline(prepared, options=options)
     for idx in range(1, len(prepared) + 1):
         start, end = _resolve_subtitle_window(prepared, idx, options=options)
@@ -1205,13 +1568,10 @@ def _prepare_subtitle_blocks(
     stage("timeline_polish", 0, 1)
     prepared = _polish_subtitle_timeline(prepared, options=options)
     stage("timeline_polish", 1, 1)
-    prepared = _copy_sorted_blocks(
-        _split_long_display_blocks(
-            prepared,
-            options=options,
-            progress=lambda current, total: stage("layout_dp_pass2", current, total),
-        )
-    )
+    # v3 jointly plans source length and lexical duration in one pass. Running
+    # it twice can only repeat work; more importantly, a later pass must not
+    # reinterpret an exact piece as permission to introduce a new boundary.
+    stage("layout_dp_pass2", 1, 1)
     # Only now are these the cues a viewer will see. Filtering earlier looks
     # cheaper but measures the wrong thing: before the DP runs, a "block" is a
     # whole ASR segment, and a segment mixing dialogue with moaning is not pure
@@ -1224,8 +1584,6 @@ def _prepare_subtitle_blocks(
         )
         if diagnostics is not None:
             diagnostics.update(vocalisation_diagnostics)
-    # Reading-duration expansion can push a cue back into the next cue window.
-    # Keep this final pass as the hard no-overlap, frame-gap guard for the cue plan.
     prepared = _normalize_subtitle_timeline(prepared, options=options)
     prepared = _finalize_layout_fields(prepared, options=options)
     stage("layout_finalize", 1, 1)
@@ -1276,7 +1634,12 @@ def write_srt(
     with path_obj.open("w", encoding="utf-8-sig") as f:
         for block in blocks:
             start = _safe_float(block.get("display_start", block.get("start")), 0.0)
-            end = max(start + 0.05, _safe_float(block.get("display_end", block.get("end")), start))
+            measured_exact = bool(block.get("exact_measured_timeline"))
+            minimum_end = start if measured_exact else start + 0.05
+            end = max(
+                minimum_end,
+                _safe_float(block.get("display_end", block.get("end")), start),
+            )
             block["start"] = start
             block["end"] = end
             block["display_start"] = start
@@ -1319,7 +1682,12 @@ def write_bilingual_srt(
     with open(path, "w", encoding="utf-8-sig") as f:
         for block in blocks:
             start = _safe_float(block.get("display_start", block.get("start")), 0.0)
-            end = max(start + 0.05, _safe_float(block.get("display_end", block.get("end")), start))
+            measured_exact = bool(block.get("exact_measured_timeline"))
+            minimum_end = start if measured_exact else start + 0.05
+            end = max(
+                minimum_end,
+                _safe_float(block.get("display_end", block.get("end")), start),
+            )
             block["start"] = start
             block["end"] = end
             block["display_start"] = start

@@ -181,7 +181,34 @@ class TestFilterRunsOnFinishedCues:
         from subtitles import writer
 
         segment_text = "本当にそうなんですか、あっ、あっ、んっ、それで大丈夫ですね"
-        blocks = [{"ja_text": segment_text, "start": 0.0, "end": 24.0}]
+        words = []
+        cursor = 0.0
+        for char in segment_text:
+            if char == "、":
+                words.append(
+                    {
+                        "word": char,
+                        "start": cursor,
+                        "end": cursor,
+                        "timestamp_kind": "ctc_forced_alignment",
+                    }
+                )
+                continue
+            words.append(
+                {
+                    "word": char,
+                    "start": cursor,
+                    "end": cursor + 0.6,
+                    "timestamp_kind": "ctc_forced_alignment",
+                }
+            )
+            cursor += 0.6
+        blocks = [{
+            "ja_text": segment_text,
+            "start": 0.0,
+            "end": cursor,
+            "words": words,
+        }]
 
         options = SubtitleOptions()
         assert not is_non_semantic_vocalisation(segment_text)

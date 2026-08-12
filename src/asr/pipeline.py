@@ -333,6 +333,9 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
             log_probs,
             upsample=head.upsample,
             min_seconds=_chunking_config()["min_blank_s"],
+            # A punctuation frame inside a silence is not evidence of sound, and
+            # letting it end the run hides the pause from the cut search below.
+            silent_classes=head.silent_classes,
         )
         return runs, duration_s, "alignment_head_blank_runs"
     except Exception as error:  # noqa: BLE001

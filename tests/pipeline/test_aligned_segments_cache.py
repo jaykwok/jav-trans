@@ -161,7 +161,7 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
     assert payload["backend"] == "mock_asr"
     assert payload["audio_cache_key"]
     assert payload["cache_stage"] == "ready"
-    assert payload["cache_signature"]["version"] == 10
+    assert payload["cache_signature"]["version"] == 11
     assert payload["cache_signature"]["subtitle"]["timeline_mode"] == "alignment"
 
     assert payload["segments"] == [{"start": 0.0, "end": 1.0, "text": "こんにちは"}]
@@ -273,7 +273,7 @@ def test_asr_alignment_stage_writes_resume_signature_e2e(monkeypatch, tmp_path):
         write for write in aligned_writes if write["cache_stage"] == "asr_alignment"
     )
     assert isinstance(asr_stage_write["cache_signature"], dict)
-    assert asr_stage_write["cache_signature"]["version"] == 10
+    assert asr_stage_write["cache_signature"]["version"] == 11
 
 
 def test_aligned_cache_signature_ignores_retired_display_policy_env(monkeypatch, tmp_path):

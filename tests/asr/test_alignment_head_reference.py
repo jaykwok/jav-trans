@@ -51,7 +51,7 @@ def test_default_is_a_pinned_hf_reference():
     repo, revision, filename = alignment._parse_hf_reference(DEFAULT_REFERENCE)
 
     assert repo == DEFAULT_SETTINGS["ASR_BACKEND"], "head must track its own encoder"
-    assert filename == "ctc_aligner.pt"
+    assert filename == "ctc_aligner_jav_vocalisation_v2.pt"
     assert len(revision) == 40 and set(revision) <= set("0123456789abcdef"), (
         f"revision must be a commit sha, not a branch: {revision!r}"
     )
@@ -97,7 +97,8 @@ def test_plain_path_is_returned_untouched(no_network, tmp_path):
 
 
 def _write_head(models_root, revision: str | None) -> "object":
-    head = models_root / "ctc_aligner.pt"
+    _, _, filename = alignment._parse_hf_reference(DEFAULT_REFERENCE)
+    head = models_root / filename
     head.write_bytes(b"weights")
     if revision is not None:
         alignment._revision_marker(head).write_text(revision, encoding="utf-8")
@@ -120,7 +121,7 @@ def test_head_from_a_different_revision_is_refetched(monkeypatch, models_root):
 
     def _download(**kwargs):
         calls.append(kwargs)
-        return str(models_root / "ctc_aligner.pt")
+        return str(models_root / kwargs["filename"])
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", _download)
 
@@ -136,7 +137,7 @@ def test_head_without_a_revision_marker_is_refetched(monkeypatch, models_root):
     monkeypatch.setattr(
         huggingface_hub,
         "hf_hub_download",
-        lambda **kw: calls.append(kw) or str(models_root / "ctc_aligner.pt"),
+        lambda **kw: calls.append(kw) or str(models_root / kw["filename"]),
     )
 
     alignment.resolve_alignment_head_path(DEFAULT_REFERENCE)

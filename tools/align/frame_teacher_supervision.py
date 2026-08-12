@@ -120,8 +120,17 @@ def compile_sparse_frame_targets(
     positive_minimum_s: float | None = None,
     boundary_ignore_s: float = 0.10,
     negative_minimum_s: float = 0.50,
+    start_offset_s: float = 0.0,
 ) -> np.ndarray:
-    """Return ``speech=1``, ``blank=0``, and ``ignore=-1`` output labels."""
+    """Return ``speech=1``, ``blank=0``, and ``ignore=-1`` output labels.
+
+    ``start_offset_s`` is where these frames begin inside the clip the teacher
+    timed. Word timestamps are absolute to the source clip, while frame 0 is
+    whatever the cached row starts at - so a row cropped to a sub-span needs the
+    offset or every label lands early by exactly that much. Nothing raises when
+    it is wrong: the loss simply teaches the head that speech happens somewhere
+    other than where it does.
+    """
 
     if output_frames < 1:
         raise ValueError("output_frames must be positive")
@@ -129,18 +138,29 @@ def compile_sparse_frame_targets(
         raise ValueError("upsample must be positive")
     if min(positive_merge_gap_s, boundary_ignore_s, negative_minimum_s) < 0.0:
         raise ValueError("frame teacher durations must be non-negative")
+    if start_offset_s < 0.0:
+        raise ValueError("start_offset_s must be non-negative")
     frame_s = ENCODER_FRAME_S / float(upsample)
     minimum_s = (
         2.0 * frame_s if positive_minimum_s is None else positive_minimum_s
     )
     if minimum_s < 0.0:
         raise ValueError("positive_minimum_s must be non-negative")
-    duration_s = min(float(teacher["duration_s"]), output_frames * frame_s)
+    # Everything below works in row time: 0.0 is this row's first frame.
+    duration_s = min(
+        float(teacher["duration_s"]) - start_offset_s, output_frames * frame_s
+    )
+    if duration_s <= 0.0:
+        raise ValueError("start_offset_s is past the end of the teacher clip")
     centers = (np.arange(output_frames, dtype=np.float64) + 0.5) * frame_s
     labels = np.full(output_frames, IGNORE_LABEL, dtype=np.int8)
 
     islands = merge_intervals(
-        teacher.get("lexical_intervals") or (), maximum_gap_s=positive_merge_gap_s
+        (
+            (start - start_offset_s, end - start_offset_s)
+            for start, end in (teacher.get("lexical_intervals") or ())
+        ),
+        maximum_gap_s=positive_merge_gap_s,
     )
     islands = [
         (max(0.0, start), min(duration_s, end))

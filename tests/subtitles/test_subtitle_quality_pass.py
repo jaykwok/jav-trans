@@ -359,7 +359,7 @@ def test_timing_polish_disabled_keeps_existing_alignment_end():
     assert prepared[0]["end"] == pytest.approx(1.0)
 
 
-def test_long_display_cue_splits_at_weak_cut_candidate():
+def test_unmeasured_weak_cut_candidate_is_not_used_as_a_timeline():
     blocks = [
         {
             "start": 0.0,
@@ -380,19 +380,22 @@ def test_long_display_cue_splits_at_weak_cut_candidate():
         }
     ]
     options = SubtitleOptions(
-        timing_polish_enabled=True,
+        timing_polish_enabled=False,
         linger_s=0.45,
     )
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
 
-    assert len(prepared) == 2
-    assert prepared[1]["start"] == pytest.approx(4.2)
-    assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
-    assert max(item["end"] - item["start"] for item in prepared) <= 7.0
+    assert len(prepared) == 1
+    assert prepared[0]["start"] == pytest.approx(0.0)
+    assert prepared[0]["end"] == pytest.approx(9.0)
+    assert prepared[0]["subtitle_layout_split_skipped"] == (
+        "measured_word_timestamps_unavailable"
+    )
+    assert prepared[0]["proportional_fallback_used"] is False
 
 
-def test_long_display_cue_falls_back_to_proportional_text_split():
+def test_long_display_cue_never_falls_back_to_proportional_text_split():
     blocks = [
         {
             "start": 0.0,
@@ -405,9 +408,11 @@ def test_long_display_cue_falls_back_to_proportional_text_split():
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
 
-    assert len(prepared) == 2
-    assert prepared[1]["start"] == pytest.approx(5.294117647058823)
-    assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
+    assert len(prepared) == 1
+    assert prepared[0]["proportional_fallback_used"] is False
+    assert prepared[0]["subtitle_layout_split_skipped"] == (
+        "measured_word_timestamps_unavailable"
+    )
 
 
 def test_short_cues_are_not_merged():
@@ -652,25 +657,43 @@ def test_write_bilingual_srt_does_not_emit_acoustic_prefix(tmp_path):
     assert "过来" in content
 
 
-def test_unsplittable_long_block_display_clamped_to_seven_seconds():
-    # A near-textless 30s span (long moan) gives the split DP no usable break
-    # positions; the display window must still respect the 7s ceiling while the
-    # acoustic span survives as provenance.
-    blocks = [{"start": 0.0, "end": 30.0, "ja_text": "んっ", "zh_text": "嗯"}]
+def test_unsplittable_long_block_keeps_its_timeline_instead_of_clamping():
+    # Without a measured safe boundary, the 7s target loses to timeline truth.
+    blocks = [{
+        "start": 0.0,
+        "end": 30.0,
+        "ja_text": "んっ",
+        "zh_text": "嗯",
+        "words": [{
+            "word": "んっ",
+            "start": 0.0,
+            "end": 30.0,
+            "timestamp_kind": "grok_stt_word",
+        }],
+    }]
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=SubtitleOptions())
 
     assert len(prepared) == 1
     cue = prepared[0]
-    assert cue["display_end"] - cue["display_start"] == pytest.approx(7.0)
-    assert cue["display_clamped_to_max"] is True
+    assert cue["display_end"] - cue["display_start"] == pytest.approx(30.0)
+    assert cue["display_clamped_to_max"] is False
     assert cue["acoustic_end"] == pytest.approx(30.0)
-    assert cue["duration_violation"] is False
+    assert cue["duration_soft_cap_violation"] is True
+    assert cue["duration_violation"] is True
+    assert cue["proportional_fallback_used"] is False
 
 
-def test_splittable_long_block_is_not_clamped():
+def test_punctuation_splits_are_exact_when_word_times_are_measured():
     text = "今日は本当にいい天気ですね。散歩に行きましょう。公園でお弁当を食べたいです。"
-    blocks = [{"start": 0.0, "end": 20.0, "ja_text": text, "zh_text": text}]
+    words = _aligned_words(text, 0.0, 0.25)
+    blocks = [{
+        "start": 0.0,
+        "end": words[-1]["end"],
+        "ja_text": text,
+        "zh_text": text,
+        "words": words,
+    }]
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=SubtitleOptions())
 
@@ -678,6 +701,8 @@ def test_splittable_long_block_is_not_clamped():
     for cue in prepared:
         assert cue["display_end"] - cue["display_start"] <= 7.0 + 1e-6
         assert cue["display_clamped_to_max"] is False
+        assert cue["exact_measured_timeline"] is True
+        assert cue["proportional_fallback_used"] is False
 
 
 def _aligned_words(text: str, start: float, char_s: float) -> list[dict]:
@@ -694,6 +719,80 @@ def _aligned_words(text: str, start: float, char_s: float) -> list[dict]:
         )
         cursor += char_s
     return words
+
+
+def test_source_char_target_uses_the_only_later_measured_safe_point():
+    text = "あ" * 26
+    words = _aligned_words(text, 0.0, 0.20)
+    for word in words[23:]:
+        word["start"] += 0.20
+        word["end"] += 0.20
+    block = {
+        "start": 0.0,
+        "end": words[-1]["end"],
+        "ja_text": text,
+        "zh_text": text,
+        "words": words,
+    }
+
+    pieces = subtitle.prepare_srt_blocks(
+        [block],
+        options=SubtitleOptions(drop_vocalisation_only_cues=False),
+    )
+
+    assert [len(piece["ja_text"]) for piece in pieces] == [23, 3]
+    assert pieces[0]["source_char_violation"] is True
+    assert pieces[1]["start"] == pytest.approx(words[23]["start"])
+    assert pieces[0]["end"] == pytest.approx(words[22]["end"])
+
+
+def test_source_char_target_does_not_invent_a_boundary_when_none_is_safe():
+    text = "あ" * 25
+    words = _aligned_words(text, 0.0, 0.20)
+    block = {
+        "start": 0.0,
+        "end": words[-1]["end"],
+        "ja_text": text,
+        "zh_text": text,
+        "words": words,
+    }
+
+    pieces = subtitle.prepare_srt_blocks(
+        [block],
+        options=SubtitleOptions(drop_vocalisation_only_cues=False),
+    )
+
+    assert len(pieces) == 1
+    assert pieces[0]["source_char_violation"] is True
+    assert pieces[0]["subtitle_layout_split_skipped"] == (
+        "measured_safe_boundaries_unavailable"
+    )
+    assert pieces[0]["proportional_fallback_used"] is False
+
+
+def test_duration_target_uses_the_same_measured_safe_boundary_dp():
+    text = "あ" * 12
+    words = _aligned_words(text, 0.0, 0.70)
+    for word in words[6:]:
+        word["start"] += 0.20
+        word["end"] += 0.20
+    block = {
+        "start": 0.0,
+        "end": words[-1]["end"],
+        "ja_text": text,
+        "zh_text": text,
+        "words": words,
+    }
+
+    pieces = subtitle.prepare_srt_blocks(
+        [block],
+        options=SubtitleOptions(drop_vocalisation_only_cues=False),
+    )
+
+    assert [piece["ja_text"] for piece in pieces] == ["あ" * 6, "あ" * 6]
+    assert all(piece["duration_soft_cap_violation"] is False for piece in pieces)
+    assert pieces[0]["end"] == pytest.approx(words[5]["end"])
+    assert pieces[1]["start"] == pytest.approx(words[6]["start"])
 
 
 def test_long_cue_splits_at_measured_word_gap_not_mid_word():
@@ -722,8 +821,10 @@ def test_long_cue_splits_at_measured_word_gap_not_mid_word():
     # Blank says the text boundary is safe; the next cue enters exactly with
     # its first measured word, not halfway through the preceding silence.
     assert prepared[1]["start"] == pytest.approx(gap_start + 0.8)
-    assert prepared[0]["subtitle_layout_split_source"] == "word_gap_dp"
-    assert prepared[0]["text_break_type"] == "word_gap_boundary"
+    assert prepared[0]["subtitle_layout_split_source"] == (
+        "measured_safe_boundary_dp"
+    )
+    assert prepared[0]["text_break_type"] == "strong_gap"
 
 
 def test_long_grok_cue_splits_at_measured_word_gap_not_mid_word():
@@ -748,7 +849,9 @@ def test_long_grok_cue_splits_at_measured_word_gap_not_mid_word():
     assert prepared[0]["ja_text"] == first
     assert prepared[1]["ja_text"] == second
     assert prepared[1]["start"] == pytest.approx(gap_start + 0.8)
-    assert prepared[0]["subtitle_layout_split_source"] == "word_gap_dp"
+    assert prepared[0]["subtitle_layout_split_source"] == (
+        "measured_safe_boundary_dp"
+    )
 
 
 def test_long_cue_ratio_fallback_keeps_text_bound_to_measured_word_time():
@@ -845,7 +948,7 @@ def test_single_measured_token_never_gets_split_at_an_invented_time():
 
     assert len(pieces) == 1
     assert pieces[0]["subtitle_layout_split_skipped"] == (
-        "measured_word_boundaries_unavailable"
+        "measured_safe_boundaries_unavailable"
     )
     assert "subtitle_layout_split_source" not in pieces[0]
 
@@ -902,17 +1005,14 @@ def test_long_blank_is_a_real_gap_between_independent_cue_edges():
     pieces = subtitle.prepare_srt_blocks([block], options=SubtitleOptions())
 
     assert [piece["ja_text"] for piece in pieces] == ["先", "後"]
-    # The DP treats the blank as non-content, then timeline polish applies the
-    # explicit display-linger policy to the previous measured acoustic edge.
-    # This is deliberately not a proportional split inside the 14.5s blank.
-    assert pieces[0]["end"] == pytest.approx(
-        words[0]["end"] + SubtitleOptions().max_display_shift_from_acoustic_end_s
-    )
+    # Both edges remain exactly on their measured lexical words. The 14.5s
+    # blank is genuinely subtitle-free; no display linger is added.
+    assert pieces[0]["end"] == pytest.approx(words[0]["end"])
     assert pieces[1]["start"] == pytest.approx(15.0)
     assert not any(piece["display_clamped_to_max"] for piece in pieces)
 
 
-def test_long_cue_split_ignores_synthetic_word_timings():
+def test_long_cue_with_only_synthetic_word_timings_remains_unsplit():
     # Proportional timings are a restatement of the character ratio the DP
     # already has. Treating them as measured evidence would launder a guess
     # into an acoustic anchor.
@@ -933,10 +1033,11 @@ def test_long_cue_split_ignores_synthetic_word_timings():
 
     prepared = subtitle.prepare_srt_blocks([block], options=SubtitleOptions())
 
-    assert all(
-        cue["subtitle_layout_split_source"] == "proportional_text_dp"
-        for cue in prepared
+    assert len(prepared) == 1
+    assert prepared[0]["subtitle_layout_split_skipped"] == (
+        "measured_word_timestamps_unavailable"
     )
+    assert prepared[0]["proportional_fallback_used"] is False
 
 
 def test_word_gap_anchors_ignore_within_word_spacing():

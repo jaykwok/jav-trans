@@ -12,22 +12,28 @@ def test_subtitle_options_from_env(monkeypatch):
     monkeypatch.setenv("SUBTITLE_TIMING_POLISH_ENABLED", "0")
     monkeypatch.setenv("SUBTITLE_SHORT_GAP_COLLAPSE_S", "0.4")
     monkeypatch.setenv("SUBTITLE_LINGER_S", "0.3")
+    monkeypatch.setenv("SUBTITLE_MAX_SOURCE_CHARS", "19")
+    monkeypatch.setenv("SUBTITLE_MAX_DISPLAY_DURATION_S", "6.5")
 
     options = SubtitleOptions.from_env()
 
-    assert options.max_display_duration_s == 7.0
     assert options.timeline_mode == "reading"
     assert options.reading_cps == 10
     assert options.line_max_chars == 18
     assert options.timing_polish_enabled is False
     assert options.short_gap_collapse_s == 0.4
     assert options.linger_s == 0.3
+    assert options.max_source_chars == 19
+    assert options.max_display_duration_s == 6.5
 
 
 def test_subtitle_options_defaults_are_conservative():
     options = SubtitleOptions.from_env()
 
     assert options.max_display_duration_s == 7.0
+    assert options.max_source_chars == 20
+    assert options.layout_engine == "measured_safe_boundary_dp_v3"
+    assert options.timing_model == "measured_lexical_extent_v2"
     assert options.frame_duration_s == pytest.approx(1 / BASE_FPS)
     assert options.frame_gap_s == pytest.approx(2 / BASE_FPS)
     assert options.frame_min_duration_s == pytest.approx(20 / BASE_FPS)

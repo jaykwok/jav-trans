@@ -59,6 +59,38 @@ def test_sparse_targets_keep_boundaries_and_short_gaps_ignored() -> None:
     assert labels[60] == BLANK_LABEL
 
 
+def test_a_cropped_row_shifts_its_labels_by_its_own_start() -> None:
+    """Word timestamps are absolute to the source clip; frame 0 is not.
+
+    A crop row starting at 1.0 s sees the same speech at 0.0-0.5 s of *its own*
+    frames. Without the offset the labels land a full second early and nothing
+    raises - the auxiliary loss just teaches the head the wrong place.
+    """
+    teacher = {"duration_s": 3.0, "lexical_intervals": [(1.0, 1.5)]}
+
+    whole = compile_sparse_frame_targets(teacher, output_frames=78, upsample=2)
+    cropped = compile_sparse_frame_targets(
+        teacher, output_frames=52, upsample=2, start_offset_s=1.0
+    )
+
+    frame_s = 3.0 / 78
+    # Same speech, addressed in each row's own time base.
+    assert whole[int(1.25 / frame_s)] == SPEECH_LABEL
+    assert cropped[int(0.25 / frame_s)] == SPEECH_LABEL
+    # And the crop must not still claim speech where the whole clip had it.
+    assert cropped[int(1.25 / frame_s)] == BLANK_LABEL
+
+
+def test_an_offset_past_the_clip_is_refused() -> None:
+    with pytest.raises(ValueError, match="past the end"):
+        compile_sparse_frame_targets(
+            {"duration_s": 3.0, "lexical_intervals": [(1.0, 1.5)]},
+            output_frames=26,
+            upsample=2,
+            start_offset_s=3.5,
+        )
+
+
 def test_sub_resolution_island_does_not_invent_a_positive() -> None:
     labels = compile_sparse_frame_targets(
         {"duration_s": 1.0, "lexical_intervals": [(0.4, 0.42)]},

@@ -30,7 +30,7 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 - **ASR 解码**输出日文文本。
 - **CTC 强制对齐**把文本逐字对回音频，产出真实字级时间戳与对齐分数。
 - **后置闸**（`src/asr/postgate.py`）只对已有文本**打标不删除**：失控重复、不可能的语速、与邻块重复等。标记写进 ASR 产物和 segment，**目前没有任何阶段按它过滤**——它是可观测性，不是过滤器（`min_alignment_score` 未标定，那一项默认关闭）。
-- **字幕 layout** 只处理显示规则，不反向修改 ASR chunk 语义。
+- **字幕 layout** 只在完整的实测字/词时间轴上选择安全边界，不反向修改 ASR chunk 语义，也不为了版面目标伪造时间。
 
 设计演进、实验记录和失败路线见 [docs/HISTORY.md](docs/HISTORY.md)。
 
@@ -150,11 +150,11 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
   -> 后置闸（asr.postgate）
      - 失控重复 / 语速不可能 / 与邻块重复 等只打标，不删除
      - 标记随 chunk 下发到 segment，只落在产物里，当前不参与任何删除决策
-  -> Subtitle Layout v2
-     - acoustic/display 双时间轴
-     - 20-frame 最小显示时间（固定 `24000/1001` 基准）
-     - 2-frame 最小间隔（固定 `24000/1001` 基准）
-     - 7s 最大显示 soft guard
+  -> Subtitle Layout v3
+     - 20 个日文源字符与 7s 词语跨度联合软约束（一次 DP，不是先后硬切）
+     - 候选仅来自句末/分句标点、>=0.6s 强停顿、0.12-0.6s 实测词间隙
+     - 每条严格从首个实测发音字开始、在最后一个实测发音字结束
+     - 没有安全点就保留超限 cue；不按比例造切点、不截断到 7s、不向 blank 中点延展
   -> 可选 LLM 翻译
   -> SRT / bilingual JSON / quality report / logs
 ```
@@ -163,14 +163,13 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 
 - **ASR 之前不做丢弃式判断。** 切分只决定边界，输出铺满整个文件。
 - 内部 cut 是一个共享绝对时间戳，不允许左右 chunk 各自修边。
-- `20 / (24000/1001)` 是字幕最短显示和 micro chunk 风险线，不是 runtime duration-only drop 阈值。
-- 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
+- 20 字和 7 秒都是字幕 layout 的**软目标**，不是 ASR chunk 上限；实测时间轴是硬约束。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声。
-- 字幕行的起止**不取单个首字或末字**，用稳健分位数。
+- 有完整实测映射时，字幕行严格取本行首个发音字的起点与最后一个发音字的终点；零宽标点留在文字里，但不偷取发音字符的时间。
 - CTC blank / 词间静音是**可安全断句的证据**，不是下一条字幕的显示起点：音频 chunk 仍可切在 blank 中点，字幕上一条按前词结束、下一条严格从后词的实测起点出现，中间长 blank 保持无字幕。
-- 成功的 `ctc_forced_alignment` 词时间会与原文字符位置完整绑定，Subtitle Layout 不再混入按字数比例推算的时间；映射不完整或只有一个不可再分的实测 token 时保留原 cue 并显式标记，不伪造切点。只有对齐不可用、词时间明确标为 `synthetic_proportional` 时才允许比例退化。诊断工具产生的 `grok_stt_word` 遵守相同 measured-timestamp 合同。
+- 成功的 `ctc_forced_alignment` 词时间会与原文字符位置完整绑定。映射不完整、只有一个不可再分的实测 token，或只有 `synthetic_proportional` 时间时，保留上游整段并显式标记；Subtitle Layout 不再使用比例退化。诊断工具产生的 `grok_stt_word` 遵守相同 measured-timestamp 合同。
 - 后置闸的 `min_alignment_score` 保持关闭，因为该阈值尚未标定。
-- 对齐头**默认启用**：`ASR_ALIGNMENT_HEAD_PATH` 默认指向 HF 上的 `ctc_aligner.pt`。置空可回退到定长切分 + 比例时间轴。checkpoint 缺失、下载失败或损坏都只 warn 一次并降级，不会让转写失败。
+- 对齐头**默认启用**：本项目默认指向 HF 上的 JAV 非语义人声变体 `ctc_aligner_jav_vocalisation_v2.pt`。置空会回退到定长切分与上游粗时间轴；checkpoint 缺失、下载失败或损坏都只 warn 一次并降级，不会让转写失败。
 - allocated/reserved/shared VRAM 只写运行诊断，不参与功能判断；显式 CUDA 请求不可用时直接报错，不回退 CPU。
 
 ---
@@ -191,7 +190,8 @@ ASR encoder 输出 2048 维 @13fps（76.9 ms/帧）
 
 - **上采样 x2 不是可选项**：CTC 每个输出 token 至少要一帧，而日语语速在 13fps 下每 mora 仅 1.6~2.2 帧。
 - **CTC 目标是「字」不是 kana**，因此不需要 g2p 依赖。
-- **当前生产头**以切好的 Galgame `(音频, 参考文本)` 做字符 CTC，并用 Grok 词时间戳提供稀疏的 speech / blank 帧辅助监督；ASR encoder 始终冻结。训练输入、教师原始响应、筛选 manifest 与重建说明归档于 `datasets/train/galgame-grok-ctc-teacher-20k-v1/`（本地数据目录，不随 Git 分发）。
+- **当前项目默认头**是 `ctc_aligner_jav_vocalisation_v2.pt`：混合 Galgame、anime SFW 与 anime NSFW/JAV 域，纯声学词表不含标点类；训练目标会剥离纯非语义人声片段，并加入 blank-only 样本，因此呻吟帧被训练成 blank。ASR encoder 始终冻结。标点仍由 ASR 文本保留，并作为零宽字符穿过强制对齐与字幕层。
+- HF 同仓库继续保留原 `ctc_aligner.pt`：它主要由 Galgame 字符 CTC + Grok 稀疏帧监督训练，带标点词表，适合希望保持原训练域和原输出刻度的用户。JAV 变体是并列工件，不会覆盖或改义这个原文件。
 - **同一份输出有两个读法**：与文本对齐得到时间轴，blank 游程用来选切点。两个读法都不丢音频。
 
 `forced_align` 在 `src/asr/alignment.py` 内自己实现，不依赖 `torchaudio`（本项目 Python 3.14，torch 所在索引上没有匹配的 torchaudio wheel）。正确性由穷举所有合法 CTC 路径的参照实现验证（`tests/asr/test_asr_alignment_head.py`）。
@@ -200,12 +200,46 @@ ASR encoder 输出 2048 维 @13fps（76.9 ms/帧）
 
 ```text
 hf:<repo>@<commit sha>#<文件名>   # 默认；首次运行下载进 HF 缓存，之后离线
-./path/to/ctc_aligner.pt          # 本地文件，覆盖默认值
+./path/to/ctc_aligner_jav_vocalisation_v2.pt  # 本地文件，覆盖默认值
 ```
 
 默认值**钉死 commit sha 而不是 `main`**，换头是显式改配置的动作。
 
-首次运行下载到 **`models/ctc_aligner.pt`**（14.7MB，与 ASR 权重同目录，走项目代理设置），之后完全离线；打包版直接内置在同一位置，不下载。同名的 `models/ctc_aligner.pt.revision` 记录这份文件对应哪个 sha，改了默认 sha 会重新下载。`ctc_aligner.pt` 的字节内容参与 ASR finalize 缓存签名，换头会自动让旧的对齐结果失效。
+首次运行把默认变体下载到 **`models/ctc_aligner_jav_vocalisation_v2.pt`**（约 15.2MB，与 ASR 权重同目录，走项目代理设置），之后完全离线；对应的 `.revision` 文件记录 commit sha。checkpoint 的字节内容参与 ASR finalize 缓存签名，换头会自动让旧的对齐结果失效。
+
+### 两个 CTC 头怎么选
+
+| 用途 | JAV 非语义人声变体（本项目默认） | 原通用头（保留） |
+|---|---|---|
+| HF 文件 | `ctc_aligner_jav_vocalisation_v2.pt` | `ctc_aligner.pt` |
+| 训练域 | Galgame + anime SFW + anime NSFW/JAV，约 151.5h | Galgame，含 Grok 稀疏帧监督 |
+| 词表 | 纯声学字符，标点不占输出类 | 带标点字符 |
+| 非语义人声 | 剥离目标 + blank-only 样本，专门压制呻吟转写 | 没有这轮 JAV 专项目标 |
+| 推荐场景 | JAV、呻吟密集、需要稳定 blank 停顿结构 | Galgame/anime 通用对齐、复现旧结果 |
+
+八片真实影片的同头验收中，JAV 变体相对原头的 blank AUC 为 `0.9609 vs 0.9384`，同等约 5% 误伤下的非语义人声召回为 `90.5% vs 72.9%`；起终点中位误差维持同量级。残余风险是它把 86 条词义候选判成 `blank=1.000`，其中 6 条被独立 Grok 时间轴证实为误伤，其余是无人反驳而不是已洗清。因此默认选择针对本项目成立，不代表它应替换所有场景的原通用头。
+
+源码运行时可在 `.env` 显式切换：
+
+```env
+# 本项目默认：JAV / 非语义人声优化变体
+ASR_ALIGNMENT_HEAD_PATH=hf:jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf@5a6a789ceb2f22d2b8606743b13a8159af218362#ctc_aligner_jav_vocalisation_v2.pt
+
+# 回到原通用头（原发布 commit 保持不变）
+# ASR_ALIGNMENT_HEAD_PATH=hf:jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf@68baee74dbed3bf98ba0545988278da8cff0e713#ctc_aligner.pt
+
+# 本地 checkpoint 也可以
+# ASR_ALIGNMENT_HEAD_PATH=./models/ctc_aligner_jav_vocalisation_v2.pt
+```
+
+字幕拆分默认同时使用 `20` 字与 `7.0` 秒软目标。两者只改变如何在已有实测边界中选点；调小会增加 cue 数，调大则减少 cue 数，都不会允许比例时间：
+
+```env
+SUBTITLE_MAX_SOURCE_CHARS=20
+SUBTITLE_MAX_DISPLAY_DURATION_S=7.0
+```
+
+例如第 20 字附近没有安全点而第 23 字后有实测停顿，允许保留 23 字再切；整段没有安全点则整段不切。`SRT_LINE_MAX_CHARS` 只是单条字幕内部的换行宽度，和上述 cue 拆分目标不是同一个参数。
 
 ### CTC 影子评测
 
@@ -284,7 +318,7 @@ GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长�
 
 auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、显存预算、模型、精度、attention 实现、chunk 时长和解码预算跨任务学习。profile 记录已验证安全 batch 与 OOM 不安全上界：阶段 peak allocated 低于预算 `80%` 时，在两者之间二分探测；尚无 OOM 上界时则向当前阶段上限折半推进，OOM 后本次任务仍先减半恢复，同时把安全值压到不安全值以下。chunk 时长是 profile 身份的一部分，因此不同显存和不同 chunk 几何各自学各自的上限，不需要手动配置。当前只覆盖 ASR chunk batch；显式数字 batch 不参与 profile 学习。
 
-推理只需要 ASR Hugging Face 模型本身；同一份权重会被加载两处，切分阶段短暂加载一次取 encoder 特征（算完即卸，不与解码模型同驻），解码阶段再加载一次并一直用到对齐 pass 结束。**权重按需加载**：需要它的阶段自己加载，所以整片命中缓存的续跑完全不会加载模型。源码运行时如果本地没有模型，会按需下载到 `models/`。对齐头（14.7MB）默认从同一个 HF repo 按固定 commit sha 取，落在 `models/ctc_aligner.pt`；置空则**不报错**，切分退化为定长、字幕时间轴退化为按字数比例摊开。
+推理只需要 ASR Hugging Face 模型本身；同一份权重会被加载两处，切分阶段短暂加载一次取 encoder 特征（算完即卸，不与解码模型同驻），解码阶段再加载一次并一直用到对齐 pass 结束。**权重按需加载**：需要它的阶段自己加载，所以整片命中缓存的续跑完全不会加载模型。源码运行时如果本地没有模型，会按需下载到 `models/`。JAV 对齐头（约 15.2MB）默认从同一个 HF repo 按固定 commit sha 取，落在 `models/ctc_aligner_jav_vocalisation_v2.pt`；置空则**不报错**，切分退化为定长，Subtitle Layout 保留上游粗时间窗口且不再按比例新增切点。
 
 阶段耗时表的各行严格加总为总计。ASR 在独立的 GPU owner 进程里运行，进程启动、环境传递与结果回传单列为「ASR Worker 启动与传输」；未归入任何具名阶段的剩余时间落在「其他」。
 
@@ -417,8 +451,10 @@ uv run python -m <module> --help
 - `tools.workflows.promote_torch_checkpoint`：晋升生产 checkpoint。
 - `tools.web.smoke.start_server` / `submit_job` / `poll_job` / `summarize_job`：Web 服务 smoke 和任务汇总。
 - `tools.align.*`：CTC 对齐头训练链。
-  - 数据与训练：`build_alignment_features`（encoder 特征抽取）、`build_real_alignment_manifest` / `build_real_alignment_lines`（真实数据 manifest）、`run_grok_ctc_teacher` / `select_galgame_ctc_teacher_pilot` / `expand_galgame_ctc_teacher_pilot` / `frame_teacher_supervision`（Grok 词时间与稀疏帧监督）、`train_ctc_aligner`（训练）。
+  - 数据与训练：`build_alignment_features`（encoder 特征抽取）、`build_real_alignment_manifest` / `build_real_alignment_lines`（真实数据 manifest）、`run_grok_ctc_teacher` / `select_galgame_ctc_teacher_pilot` / `expand_galgame_ctc_teacher_pilot` / `frame_teacher_supervision`（Grok 词时间与稀疏帧监督；`compile_sparse_frame_targets` 的 `start_offset_s` 说明这批帧从 clip 的哪里开始，crop 行不给就会整体前移且不报错）、`train_ctc_aligner`（训练。帧教师按 **`--frame-teacher-cache`** 声明、可重复：归档覆盖的是一个缓存，而域是损失配比标签、会同时容纳有时间轴的行与本就没有时间轴的空白行；被声明的缓存必须整份被覆盖，否则直接停，未声明的缓存只带 CTC 文本损失并在 summary 里显式报数）。
+  - 语料构造：`build_vocalisation_stripped_manifest`（把脚本按标点切块、丢掉纯非语义人声块，只留语义部分作 CTC 目标——呻吟帧因此只能被解释成 blank；剥离方向是安全的那一侧，分类器拆不开的一律保留）、`audit_stripped_fragments`（审剥离掉的是什么：带汉字的移除数应为 0，并用本地 ASR 独立读回作旁证）、`build_vocalisation_blank_manifest`（脚本本身就是纯人声的片子直接作 blank-only 行，**文本必须清空**，否则是在训练头去对齐呻吟）、`prepare_alignment_cache_manifests`（每个缓存一份 manifest，不跨运行合并——各运行的组编号独立，合并会让同名组跨 train/val）、`build_alignment_caches_v2.sh` / `train_ctc_aligner_v2.sh`（现役特征缓存与训练的复现脚本）。
   - 评估：`evaluate_alignment_geometry` / `evaluate_ctc_cache`（几何与冻结缓存）、`evaluate_pregate_loss` / `measure_pregate_dropped_audio`（切分与丢弃音频）、`build_ctc_ab_jav_predictions`（固定文本与声学窗口，只让两版头产生边界差，供盲化 A/B）。
+  - 换头验收（一次编码、多头同测，所以比的是头不是数值环境）：`compare_heads_on_film`（真实片上按 cue 读自由跑 argmax 的 blank 占比，给出人声 vs 词义对白的 AUC、各阈值召回/误伤，并导出逐 cue 配对值——组中位数只说刻度动了，配对值才说某条是不是变坏了）、`aggregate_head_acceptance`（多片合并；AUC 在合并后的 cue 上重算而不是按片平均，同时保留逐片表，因为「合并赢」和「每片都赢」是两种结论）、`adjudicate_silent_cues`（头判 100% blank 的词义对白条，用 Grok 词级时间轴独立裁决——**本域不能默认「ASR 写了汉字就是真话」**，`気持ちいい` 是 JAV 上 ASR 最可能吐出的词；该片没有任何 Grok 词义词时直接报错，不报 0 条误伤）、`realign_segments_with_head`（冻结转写只换头重对齐，供时间轴对比；不复现生产的边缘外扩，故绝对值与生产不同，但两头同等处理）、`compare_head_to_teacher`（与 Grok 按语音岛比边界，只取互唯一重叠对）、`measure_pause_structure`（标点类会不会把 `blank_runs` 的停顿劈碎：同一份 argmax 读两遍，严格口径只认 blank、宽松口径把标点也当 blank，报「因碎片化而低于 `ASR_CHUNK_MIN_PAUSE_S`、切分器彻底看不见的停顿」；纯声学词表的头两口径恒等，正好当对照）。
   - 测量：`measure_blank_class_separation`（在干净 galgame 的 Grok 无词区按能量拆出 `voiced_wordless` 与 `silent`，与 `word` 一起给出闸门余量 `margin_vs_non_semantic_pp`；默认只跑 val，因为 train 的长空隙本身就是 blank 监督）、`measure_core_leading_silence`（clip **两端**自带的静音，用于把它从起止点误差里减掉；两端都向「语音更长」取整，所以「走到语音外面」的份额一律是上界，而「切掉语音」不会被它虚报）、`sweep_edge_caps`（**用实测语音起止点选 `ONSET_BACKOFF_MAX_S` 与 `CODA_EXTEND_MAX_S`**：一次前向、两端各自扫，因此各档之间没有采样噪声。起点找拐点，因为提前近乎免费；终点用双边夹逼，因为两个方向都要钱——下界看「结束落在语音内」，上界看 `share_past_core_end`，后者不需要检测器，因为超过 `core_end_s` 就已证明走出了 clip）、`sweep_blank_bias`（Viterbi blank bias 扫描，实测无可用工作点，默认 0.0）。
   - 真实域教师归档与准入：`archive_grok_fullfilm_teacher`（把整片 Grok STT 运行归档成训练数据源，保留付费响应与绝对词时间，不复制源视频）、`audit_teacher_silence_against_head`（**用作 blank 负样本前的准入闸**：拿生产头同一段音频的 `aligned_segments` 反查「教师沉默」，判据是**会吞掉生产头多少自有语音**而不是「争议占 blank 多少」。**「语音」按「说了什么」计，不按「吐了字符」计**：强制对齐无法拒绝 ASR 为呻吟写的假名，而教师是有意丢弃它的，所以纯非语义人声的语音岛在比较前先从头这一侧排除，`--count-vocalisation-as-speech` 可还原 v2 读法审计。**两侧文本从不互相比对**——不同转写器对同一段音频用词必然不同，跨教师比文本等于凭词汇制造分歧；只比时间，文本只在头这一侧读，且只用来判断「头是否声称这里说了话」。裁决三态且带 `scope`，没有「通过」这一态——`reject` 退出码 2、`no_conflict_observed` 0、`inconclusive` 3；所有统计量都按实际比较的秒数计算，前缀结论不能当整片结论引用）。
   - 已退役但保留可测：`pregate_reference`（被证伪的前置闸读法，留着继续被度量，不在转写路径上）。
@@ -428,6 +464,7 @@ uv run python -m <module> --help
 - `tools.audits.generate_ctc_alignment_shadow_audit`：从正常真实 JAV 任务留下的影子分歧记录中，按起点/终点分层抽样并生成盲化 A/B 审计页。
 - `tools.audits.generate_ctc_alignment_ab_audit` / `evaluate_ctc_alignment_ab_audit`：为两版 CTC 头生成真实音频盲化 A/B 页面并统计人工裁决；`generate_galgame_ctc_teacher_audit_html` 用于 Galgame 教师词时间审计。
 - `tools.audits.generate_subtitle_ab_compare_audit_html`：两版字幕的 A/B 对照审计页。
+- `tools.subtitles.build_dual_track_ass`：把两份 SRT 叠成一个 ASS，旧的贴顶、新的贴底，供直接挂在片源上实听对比。**两条轨道刻意不配对**——各自保留原时间轴作为独立事件流，否则「谁在什么时候出现」这个最该看的差异会被配对逻辑抹平。同时报出各自的 cue 数、在屏秒数与字符数。
 - `tools.audits.select_pause_frame_audit` / `pause_frame_audit` / `generate_pause_frame_audit_html` / `generate_pause_frame_review_html`：真实域 safe-cut 帧标注的抽样、标签合同与只读复核页。标注页刻意不显示任何模型输出（blank 游程摆在问题旁会制造一致性）。**该问题现已由 `tools.align.measure_blank_class_separation` 在干净 galgame 上自动回答，页面保留作为将来确需人耳裁决时的设施**。
 - `tools.audits.grok_stt_smoke_audit`：小批量 Grok STT 词时间审计；OpenRouter 默认响应只有 `text`/`usage`，必须显式请求 `verbose_json` 与 `timestamp_granularities=["word"]` 才有词时间。
 - `tools.datasets.label_drop_spans_words` / `apply_drop_span_relabels` / `cut_long_drop_span_clips`：drop-span 逐词 Teacher 标注、复核回写与长片段切分。

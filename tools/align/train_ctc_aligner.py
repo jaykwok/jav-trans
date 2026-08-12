@@ -11,6 +11,11 @@ Full-clip CTC remains the canonical text objective.  An optional sparse frame
 teacher may add a blank-vs-speech auxiliary loss from audited word timestamps:
 word islands are positive, only long distant gaps are negative, and uncertain
 frames are ignored.  The auxiliary target never replaces dataset text.
+
+Frame teachers are declared per **cache**, not per domain, and repeatably. Not
+every source of training text has word timings - blank-only rows have no words
+to time, and clips recovered by a local decode have text but no clock - so those
+caches simply carry no frame supervision, which the run summary states outright.
 """
 from __future__ import annotations
 
@@ -175,6 +180,129 @@ def _cap_empty_train_rows(
     return kept, report
 
 
+def _row_key(row: dict) -> tuple[int, str]:
+    """Keyed by cache as well as id: the corpora name their clips
+    independently, and a collision would hand one clip's features another's
+    text without any error - the same failure the shard key guards against."""
+    return int(row.get("cache_index") or 0), row["audio_id"]
+
+
+def compile_frame_labels_by_cache(
+    train_rows: list[dict],
+    cache_names: list[str],
+    *,
+    results: list[str],
+    manifests: list[str],
+    caches: list[str],
+    upsample: int,
+    positive_merge_gap_s: float,
+    boundary_ignore_s: float,
+    negative_minimum_s: float,
+) -> tuple[dict[tuple[int, str], np.ndarray], dict[str, object]]:
+    """Frame supervision for the caches that declared a teacher archive.
+
+    The guard that matters is per archive: **every** train row of the cache it
+    names must have an accepted teacher, or the run stops. That is what catches a
+    stale archive or a mistyped path, which would otherwise show up only as a
+    quietly weaker auxiliary loss.
+
+    Rows in caches with no declared archive get no frame labels, by design -
+    blank-only rows have no words to time, and clips recovered by a local decode
+    have text but no clock. The count of those rows is reported rather than left
+    implicit, so a mixture that lost supervision cannot pass for one that never
+    asked for it.
+    """
+    cache_index_by_name = {name: index for index, name in enumerate(cache_names)}
+    frame_labels: dict[tuple[int, str], np.ndarray] = {}
+    archives: list[dict[str, object]] = []
+    blank_frames = speech_frames = ignored_frames = supervised_rows = 0
+
+    for result_path, manifest_path, cache_name in zip(results, manifests, caches):
+        if cache_name not in cache_index_by_name:
+            raise SystemExit(
+                f"--frame-teacher-cache {cache_name!r} is not one of the "
+                f"--cache-dir names; available: {sorted(cache_index_by_name)}"
+            )
+        cache_index = cache_index_by_name[cache_name]
+        teachers, load_summary = load_accepted_frame_teachers(
+            Path(result_path), Path(manifest_path)
+        )
+        eligible: dict[tuple[int, str], dict] = {}
+        for row in train_rows:
+            if int(row.get("cache_index") or 0) == cache_index:
+                eligible.setdefault(_row_key(row), row)
+        missing = sorted(
+            str(row.get("source_id") or row["audio_id"])
+            for row in eligible.values()
+            if str(row.get("source_id") or row["audio_id"]) not in teachers
+        )
+        if missing:
+            raise SystemExit(
+                f"{len(missing)} training rows in cache {cache_name!r} lack an "
+                f"accepted frame teacher; first={missing[0]}"
+            )
+        archive_blank = archive_speech = archive_ignored = archive_rows = 0
+        for key, row in eligible.items():
+            labels = compile_sparse_frame_targets(
+                teachers[str(row.get("source_id") or row["audio_id"])],
+                output_frames=int(row["frames"]) * upsample,
+                upsample=upsample,
+                positive_merge_gap_s=positive_merge_gap_s,
+                boundary_ignore_s=boundary_ignore_s,
+                negative_minimum_s=negative_minimum_s,
+                # Crop rows and full-clip rows of the same source sit in one
+                # cache; without this the crops' labels are shifted by their
+                # own start time and nothing says so.
+                start_offset_s=float(row.get("source_start_s") or 0.0),
+            )
+            frame_labels[key] = labels
+            archive_blank += int(np.sum(labels == 0))
+            archive_speech += int(np.sum(labels == 1))
+            archive_ignored += int(np.sum(labels == IGNORE_LABEL))
+            archive_rows += int(np.any(labels != IGNORE_LABEL))
+        archives.append(
+            {
+                **load_summary,
+                "cache": cache_name,
+                "domain": next(
+                    (str(row.get("domain") or "") for row in eligible.values()), ""
+                ),
+                "eligible_unique_train_rows": len(eligible),
+                "supervised_unique_train_rows": archive_rows,
+                "blank_frames": archive_blank,
+                "speech_frames": archive_speech,
+                "ignored_frames": archive_ignored,
+            }
+        )
+        blank_frames += archive_blank
+        speech_frames += archive_speech
+        ignored_frames += archive_ignored
+        supervised_rows += archive_rows
+
+    if not supervised_rows or not speech_frames or not blank_frames:
+        raise SystemExit(
+            "frame teacher produced no usable balanced supervision "
+            f"(rows={supervised_rows}, speech={speech_frames}, blank={blank_frames})"
+        )
+    unsupervised = sum(
+        1 for row in train_rows if _row_key(row) not in frame_labels
+    )
+    summary = {
+        "archives": archives,
+        "supervised_unique_train_rows": supervised_rows,
+        "blank_frames": blank_frames,
+        "speech_frames": speech_frames,
+        "ignored_frames": ignored_frames,
+        "labelled_frame_share": round(
+            (blank_frames + speech_frames)
+            / max(1, blank_frames + speech_frames + ignored_frames),
+            6,
+        ),
+        "train_rows_without_frame_supervision": unsupervised,
+    }
+    return frame_labels, summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -242,19 +370,25 @@ def main() -> None:
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument(
         "--frame-teacher-results",
-        default="",
-        help="Grok result JSONL containing word timestamps. Requires the strict "
-        "accepted manifest; rejected results are never used.",
+        action="append",
+        default=None,
+        help="repeatable; Grok result JSONL containing word timestamps. Requires "
+        "the strict accepted manifest; rejected results are never used.",
     )
     parser.add_argument(
         "--frame-teacher-manifest",
-        default="",
-        help="strict accepted teacher manifest that quality-gates result rows",
+        action="append",
+        default=None,
+        help="repeatable, parallel to --frame-teacher-results; the strict "
+        "accepted teacher manifest that quality-gates its result rows",
     )
     parser.add_argument(
-        "--frame-teacher-domain",
-        default="",
-        help="only this cache domain must carry frame supervision; empty means all",
+        "--frame-teacher-cache",
+        action="append",
+        default=None,
+        help="repeatable, parallel to --frame-teacher-results. Names the "
+        "--cache-dir whose rows this archive covers, by directory name. Every "
+        "train row in that cache must have an accepted teacher or the run stops.",
     )
     parser.add_argument("--frame-loss-weight", type=float, default=0.0)
     parser.add_argument("--frame-positive-merge-gap-s", type=float, default=0.15)
@@ -263,16 +397,29 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260731)
     args = parser.parse_args()
 
-    teacher_args = [args.frame_teacher_results, args.frame_teacher_manifest]
-    if any(teacher_args) != all(teacher_args):
+    # Scoped by cache rather than by domain. A domain is a mixture label used to
+    # balance the loss, and it can legitimately gather several caches - galgame
+    # text with timings, galgame text recovered without them, and blank-only
+    # rows that have no words to time at all. A teacher archive covers exactly
+    # one of those caches, so requiring every row of a *domain* to carry
+    # supervision forced the domains to be split for a reason that has nothing to
+    # do with the mixture, and the per-domain blank cap then dropped most of the
+    # blank rows. Scoping to the cache keeps the guard - a mismatched archive
+    # still stops the run - without deforming the mixture.
+    teacher_results = list(args.frame_teacher_results or [])
+    teacher_manifests = list(args.frame_teacher_manifest or [])
+    teacher_caches = list(args.frame_teacher_cache or [])
+    if len({len(teacher_results), len(teacher_manifests), len(teacher_caches)}) != 1:
         raise SystemExit(
-            "--frame-teacher-results and --frame-teacher-manifest must be given together"
+            "--frame-teacher-results, --frame-teacher-manifest and "
+            "--frame-teacher-cache must be given the same number of times"
         )
     if args.frame_loss_weight < 0.0:
         raise SystemExit("--frame-loss-weight must be non-negative")
-    if all(teacher_args) != (args.frame_loss_weight > 0.0):
+    if bool(teacher_results) != (args.frame_loss_weight > 0.0):
         raise SystemExit(
-            "a positive --frame-loss-weight and both frame teacher files are required together"
+            "a positive --frame-loss-weight and at least one frame teacher "
+            "triple are required together"
         )
     if min(
         args.frame_positive_merge_gap_s,
@@ -367,81 +514,23 @@ def main() -> None:
         progress = (step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
         return args.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
-    # Keyed by cache as well as id: the two corpora name their clips
-    # independently, and a collision would hand one clip's features the other's
-    # text without any error - the same failure mode the shard key guards.
-    encoded = {
-        (int(row.get("cache_index") or 0), row["audio_id"]): vocab.encode(row["text"])
-        for row in cache.rows
-    }
-
-    def _key(row: dict) -> tuple[int, str]:
-        return int(row.get("cache_index") or 0), row["audio_id"]
+    encoded = {_row_key(row): vocab.encode(row["text"]) for row in cache.rows}
+    _key = _row_key
 
     frame_labels: dict[tuple[int, str], np.ndarray] = {}
     frame_teacher_summary: dict[str, object] = {}
-    if args.frame_teacher_results:
-        if args.frame_teacher_domain and args.frame_teacher_domain not in mix:
-            raise SystemExit(
-                f"--frame-teacher-domain {args.frame_teacher_domain!r} has no train rows; "
-                f"available: {sorted(mix)}"
-            )
-        teachers, teacher_load_summary = load_accepted_frame_teachers(
-            Path(args.frame_teacher_results), Path(args.frame_teacher_manifest)
+    if teacher_results:
+        frame_labels, frame_teacher_summary = compile_frame_labels_by_cache(
+            train_rows,
+            [path.name for path in cache.cache_dirs],
+            results=teacher_results,
+            manifests=teacher_manifests,
+            caches=teacher_caches,
+            upsample=args.upsample,
+            positive_merge_gap_s=args.frame_positive_merge_gap_s,
+            boundary_ignore_s=args.frame_boundary_ignore_s,
+            negative_minimum_s=args.frame_negative_min_s,
         )
-        eligible: dict[tuple[int, str], dict] = {}
-        for row in train_rows:
-            if args.frame_teacher_domain and row["domain"] != args.frame_teacher_domain:
-                continue
-            eligible.setdefault(_key(row), row)
-        missing = sorted(
-            str(row.get("source_id") or row["audio_id"])
-            for row in eligible.values()
-            if str(row.get("source_id") or row["audio_id"]) not in teachers
-        )
-        if missing:
-            raise SystemExit(
-                f"{len(missing)} eligible training rows lack an accepted frame teacher; "
-                f"first={missing[0]}"
-            )
-        blank_frames = 0
-        speech_frames = 0
-        ignored_frames = 0
-        supervised_rows = 0
-        for key, row in eligible.items():
-            source_id = str(row.get("source_id") or row["audio_id"])
-            labels = compile_sparse_frame_targets(
-                teachers[source_id],
-                output_frames=int(row["frames"]) * args.upsample,
-                upsample=args.upsample,
-                positive_merge_gap_s=args.frame_positive_merge_gap_s,
-                boundary_ignore_s=args.frame_boundary_ignore_s,
-                negative_minimum_s=args.frame_negative_min_s,
-            )
-            frame_labels[key] = labels
-            blank_frames += int(np.sum(labels == 0))
-            speech_frames += int(np.sum(labels == 1))
-            ignored_frames += int(np.sum(labels == IGNORE_LABEL))
-            supervised_rows += int(np.any(labels != IGNORE_LABEL))
-        if not supervised_rows or not speech_frames or not blank_frames:
-            raise SystemExit(
-                "frame teacher produced no usable balanced supervision "
-                f"(rows={supervised_rows}, speech={speech_frames}, blank={blank_frames})"
-            )
-        frame_teacher_summary = {
-            **teacher_load_summary,
-            "domain": args.frame_teacher_domain or "*",
-            "eligible_unique_train_rows": len(eligible),
-            "supervised_unique_train_rows": supervised_rows,
-            "blank_frames": blank_frames,
-            "speech_frames": speech_frames,
-            "ignored_frames": ignored_frames,
-            "labelled_frame_share": round(
-                (blank_frames + speech_frames)
-                / max(1, blank_frames + speech_frames + ignored_frames),
-                6,
-            ),
-        }
         print(f"frame teacher: {frame_teacher_summary}", flush=True)
 
     # What `zero_infinity` is actually hiding. A row whose frames cannot hold its
@@ -683,9 +772,9 @@ def main() -> None:
         "empty_target_cap_by_domain": empty_cap_report,
         "empty_targets_excluded": dict(empty_excluded),
         "vocab_checkpoint": str(args.vocab_checkpoint or ""),
-        "frame_teacher_results": str(args.frame_teacher_results or ""),
-        "frame_teacher_manifest": str(args.frame_teacher_manifest or ""),
-        "frame_teacher_domain": str(args.frame_teacher_domain or ""),
+        "frame_teacher_results": list(teacher_results),
+        "frame_teacher_manifest": list(teacher_manifests),
+        "frame_teacher_cache": list(teacher_caches),
         "frame_loss_weight": float(args.frame_loss_weight),
         "frame_positive_merge_gap_s": float(args.frame_positive_merge_gap_s),
         "frame_boundary_ignore_s": float(args.frame_boundary_ignore_s),
