@@ -241,6 +241,8 @@ SUBTITLE_MAX_DISPLAY_DURATION_S=7.0
 
 例如第 20 字附近没有安全点而第 23 字后有实测停顿，允许保留 23 字再切；整段没有安全点则整段不切。`SRT_LINE_MAX_CHARS` 只是单条字幕内部的换行宽度，和上述 cue 拆分目标不是同一个参数。
 
+`SUBTITLE_LAYOUT_ENGINE` 与 `SUBTITLE_TIMING_MODEL` **不是开关，是产物上的版本戳**：没有任何代码按它们分派，值只会写进每条 cue 的 `layout_engine` / `timing_model` 字段，供审计和 A/B 认出「这批字幕由哪一版布局生成」。本项目只有一套布局，所以写入未知值会**直接报错而不是照单标注**——用它做回滚是做不到的事，静默接受只会得到一份谎报自己出身的产物。
+
 ### CTC 影子评测
 
 新对齐头通过人工 A/B 前可以旁路运行：正式头仍生成字幕，影子头只复用同一份 encoder 特征计算边界差异，不会改写任何输出时间轴。配置示例：
@@ -308,7 +310,7 @@ ASR stage 固定由统一 GPU worker 持有 CUDA：切分用的 encoder 前向�
 
 `ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO` 的 `6144MiB` 是**硬下限**而不是推荐值：低于它直接拒绝启动，等于它则需要 auto batch 降到 4~6 才能跑，余量很小。检查在模型加载前完成；shared VRAM 不计入可用预算，任何正的基线增量都立即视为 soft OOM，显式放大的 worker budget 和 CPU fallback 都不能绕过。监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
 
-GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长心跳。字幕 cue plan 会单独记录 timeline normalize、两轮 anchor-aware DP、polish 和 finalize 进度。
+GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长心跳。字幕 cue plan 会单独记录 timeline normalize、measured-safe-boundary DP、polish 和 finalize 进度。
 
 对齐后的 segment 会按内容签名缓存。签名包含 ASR backend、字幕选项与参与结果的运行配置；只改输出路径一类不影响内容的设置不会让缓存失效。
 
@@ -330,10 +332,11 @@ auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、显存预算、�
 
 - ASR 文本会做 Unicode NFKC、空白归一、换行折叠和展示安全处理。
 - Qwen3-ASR runtime 始终使用 Transformers 官方 `apply_transcription_request(audio=..., language=...)` 路径，不提供演员名 / 人名 context 提示分支。
-- 字幕时间轴来自 CTC 强制对齐的逐字时间戳；对齐头未配置时退化为按字数比例摊开。
+- 字幕时间轴来自 CTC 强制对齐的逐字时间戳。对齐头未配置、或某段的实测映射不完整时，该段**整段保留上游粗时间窗口并显式标记**，不再按字数比例摊开。
 - **整条都是非语义人声、且连续出现的 cue 会被丢弃**（默认开启）。ASR 会把呻吟转写成假名，强制对齐无法拒绝已经给定的文本，所以只能在成句之后按文本过滤。判定是「拆解」而不是「字符集」：整条 cue 必须能被无词义假名加一份显式的拟声词表完全消耗，剩下任何一个字就保留，因此 `ちんぽ`、`イッちゃう` 这类与呻吟共用假名的词不会被误删；`うん` / `はい` / `ふふ` 等应答与笑声另有白名单。**只删连续的**：孤立一条夹在对白中间更可能是真实反应，词表无法分辨，所以用上下文代替词表。实测一部真实影片 1983 条中命中 349 条、删掉 224 条（11.3%），其余 125 条因孤立而保留。`SUBTITLE_DROP_VOCALISATION_ONLY_CUES=0` 关闭，`SUBTITLE_VOCALISATION_MIN_RUN` 改连续条数阈值（设 1 即命中就删）。
 - LLM 翻译前会先固定 cue plan，翻译不会重排时间轴。
-- 最终中文输出遵循 Netflix Chinese (Simplified) TTSG：每行 ≤16 全角单位、最多 2 行（下宽金字塔）、时长 5/6s–7s、2 帧最小间隔、语音结束后出点约 +0.5s；不用逗号句号（句中停顿为单个空格）、省略号为单个 U+2026、全角？！且不连用、半角数字、无斜体。标点归一化与折行在 `src/subtitles/zh_style.py` 的写盘层完成，翻译缓存保留 LLM 原文；质量报告以 `spec_*` 指标核查全部硬指标。`SRT_LINE_MAX_CHARS` 默认 16。
+- 最终中文输出遵循 Netflix Chinese (Simplified) TTSG 的**文本类**规则：每行 ≤16 全角单位、最多 2 行（下宽金字塔）、不用逗号句号（句中停顿为单个空格）、省略号为单个 U+2026、全角？！且不连用、半角数字、无斜体。标点归一化与折行在 `src/subtitles/zh_style.py` 的写盘层完成，翻译缓存保留 LLM 原文；质量报告以 `spec_*` 指标核查全部硬指标。`SRT_LINE_MAX_CHARS` 默认 16。
+- **TTSG 的时间类规则（最短 5/6s、2 帧最小间隔、语音结束后出点 +0.5s）自 Layout v3 起是被明知放弃的**，因为它们都要求把 cue 的边界移到没有语音证据的位置，而 v3 的硬约束是「起止点必须是实测发音字的边界」。八片实测：7,016 条 cue 里 493 条（7.0%）短于 5/6s，最短 0.038s（一个上采样编码帧），553 对相邻 cue 间隔小于 2 帧，**重叠 0 对**。质量报告里这两项因此**按份额告警而不是按条数**：条数随片长走（同样 5–10% 的比例，短片 21 条、长片 97 条），拿一个能放过长片的条数阈值去看短片，等于放过四倍的回归。`QC_MAX_SPEC_DURATION_UNDER_SHARE` 与 `QC_MAX_SPEC_GAP_UNDER_SHARE` 默认都是 `0.15`，高于现默认头在八片上的最高单片份额（10.6% 与 9.7%）并留出波动余量；超过就说明 cue 形状变了，而不是布局在按设计工作。**换头需要重新标定这两个数**（保留的带标点头在同样八片上 gap 份额是 12.6–23.8%）。其余 `spec_*` 仍是零容忍条数阈值，它们才是回归信号。要恢复旧的时间规则只能整体退回 v2 布局，没有单独的开关。
 
 ---
 
@@ -450,6 +453,7 @@ uv run python -m <module> --help
 - `tools.workflows.run_full_workflow`：命令行完整工作流 smoke。
 - `tools.workflows.promote_torch_checkpoint`：晋升生产 checkpoint。
 - `tools.web.smoke.start_server` / `submit_job` / `poll_job` / `summarize_job`：Web 服务 smoke 和任务汇总。
+- `tools.sft.*`：ASR 本体的自训链路（线上默认权重 `…-JA-Anime-Galgame-hf` 就是它的产物，不是退役件）。`export_qwen_asr_sft`（从物化的 HF 音频 manifest 导出可上传的音频/文本行）、`prepare_qwen_asr_sft_dataset`（Galgame ASR/SER 数据生成可复现的 SFT JSONL，`--mode smoke|full`）、`train_qwen_asr_sft_hf`（原生 Transformers 训练入口）、`probe_qwen_asr`（拿 manifest 直接跑本地权重做转写抽查）。
 - `tools.align.*`：CTC 对齐头训练链。
   - 数据与训练：`build_alignment_features`（encoder 特征抽取）、`build_real_alignment_manifest` / `build_real_alignment_lines`（真实数据 manifest）、`run_grok_ctc_teacher` / `select_galgame_ctc_teacher_pilot` / `expand_galgame_ctc_teacher_pilot` / `frame_teacher_supervision`（Grok 词时间与稀疏帧监督；`compile_sparse_frame_targets` 的 `start_offset_s` 说明这批帧从 clip 的哪里开始，crop 行不给就会整体前移且不报错）、`train_ctc_aligner`（训练。帧教师按 **`--frame-teacher-cache`** 声明、可重复：归档覆盖的是一个缓存，而域是损失配比标签、会同时容纳有时间轴的行与本就没有时间轴的空白行；被声明的缓存必须整份被覆盖，否则直接停，未声明的缓存只带 CTC 文本损失并在 summary 里显式报数）。
   - 语料构造：`build_vocalisation_stripped_manifest`（把脚本按标点切块、丢掉纯非语义人声块，只留语义部分作 CTC 目标——呻吟帧因此只能被解释成 blank；剥离方向是安全的那一侧，分类器拆不开的一律保留）、`audit_stripped_fragments`（审剥离掉的是什么：带汉字的移除数应为 0，并用本地 ASR 独立读回作旁证）、`build_vocalisation_blank_manifest`（脚本本身就是纯人声的片子直接作 blank-only 行，**文本必须清空**，否则是在训练头去对齐呻吟）、`prepare_alignment_cache_manifests`（每个缓存一份 manifest，不跨运行合并——各运行的组编号独立，合并会让同名组跨 train/val）、`build_alignment_caches_v2.sh` / `train_ctc_aligner_v2.sh`（现役特征缓存与训练的复现脚本）。

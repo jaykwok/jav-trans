@@ -152,7 +152,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Best-effort lexical-duration target paired with the source-character
     # target above. A measured safe boundary always outranks this value.
     "SUBTITLE_MAX_DISPLAY_DURATION_S": "7.0",
-    # Minimum displayed subtitle duration in seconds.
+    # Minimum displayed subtitle duration in seconds, for cues that have no
+    # measured timeline. Layout v3 never stretches a measured cue to reach it:
+    # the cue ends at the last spoken character, so 7% of real cues land under
+    # this value and QC reports them as a scale, not as a defect (README,
+    # "字幕与文本策略").
     "MIN_SUBTITLE_DURATION": "0.6",
     # Estimated Chinese reading speed in characters per second.
     "SUBTITLE_READING_CPS": "7.0",
