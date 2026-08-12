@@ -104,6 +104,12 @@ def _chunk_duration(chunk: dict) -> float:
 # pre-gate it was named after is gone.
 CHUNK_CUT_SCHEMA = "blank_run_pregate_v1"
 
+# Names the rule `cut_at_pauses` applies, so a report says which policy produced
+# the chunk shape it is describing rather than leaving the reader to infer it
+# from the build.
+CHUNK_CUT_POLICY = "latest_pause_midpoint"
+CHUNK_CUT_PROVENANCE_SCHEMA = "chunk_cut_provenance_v1"
+
 
 def _clamp_spans(
     spans: list[tuple[float, float]], total_s: float
@@ -117,13 +123,13 @@ def _clamp_spans(
     return sorted(clamped)
 
 
-def cut_at_pauses(
+def plan_chunk_cuts(
     blank_spans: list[tuple[float, float]],
     total_s: float,
     *,
     max_s: float = 30.0,
     min_s: float = 2.0,
-) -> list[tuple[float, float]]:
+) -> tuple[list[tuple[float, float]], dict]:
     """Contiguous chunks covering ALL of the audio, cut inside pauses.
 
     This is the second reading of the blank runs and the one that survived. The
@@ -154,43 +160,108 @@ def cut_at_pauses(
     went 10.5% -> 14.6%. Aiming at the ceiling instead keeps the old 30s decode
     window and still lands every boundary in a pause, which fixed-length cutting
     never did.
+
+    Returns the chunks and a provenance record of how each boundary was chosen.
+    Which boundaries fell back to a hard cut is a property of the film and not of
+    the build: on eight real films it ranges from 0.7% to 53% of cuts, so it is
+    reported rather than judged against a threshold.
     """
     total_s = max(0.0, float(total_s))
     if total_s <= 0.0:
-        return []
+        return [], _cut_provenance([], [])
     if max_s <= 0.0:
         raise ValueError("max_s must be > 0")
     if min_s > max_s:
         raise ValueError("min_s must be <= max_s")
     if total_s <= max_s:
-        return [(0.0, total_s)]
+        return [(0.0, total_s)], _cut_provenance([(0.0, total_s)], [])
 
     candidates = [
-        (begin + end) / 2.0
+        ((begin + end) / 2.0, end - begin)
         for begin, end in _clamp_spans(blank_spans, total_s)
         if 0.0 < (begin + end) / 2.0 < total_s
     ]
 
     chunks: list[tuple[float, float]] = []
+    cut_widths: list[float | None] = []
     cursor = 0.0
     while total_s - cursor > max_s:
         window = [
-            point
-            for point in candidates
+            (point, width)
+            for point, width in candidates
             if cursor + min_s <= point <= cursor + max_s
         ]
         # The last pause in the window, so the chunk is as long as `max_s`
         # permits. A hard cut at `max_s` is the fallback when the window holds no
         # pause at all - that is the fixed-length behaviour, and it is what every
         # chunk got before the head was configured.
-        cut = max(window) if window else cursor + max_s
+        if window:
+            cut, width = max(window, key=lambda item: item[0])
+        else:
+            cut, width = cursor + max_s, None
         chunks.append((cursor, cut))
+        cut_widths.append(width)
         cursor = cut
     chunks.append((cursor, total_s))
 
     if len(chunks) > 1 and chunks[-1][1] - chunks[-1][0] < min_s:
         # A sliver at the end is not worth its own decode call, and merging it
-        # backwards keeps the tiling exact.
+        # backwards keeps the tiling exact. The cut it removes was still made, so
+        # it stays in the provenance: dropping it would understate how often the
+        # search found nowhere legal to cut.
         tail = chunks.pop()
         chunks[-1] = (chunks[-1][0], tail[1])
-    return chunks
+    return chunks, _cut_provenance(chunks, cut_widths)
+
+
+def cut_at_pauses(
+    blank_spans: list[tuple[float, float]],
+    total_s: float,
+    *,
+    max_s: float = 30.0,
+    min_s: float = 2.0,
+) -> list[tuple[float, float]]:
+    """`plan_chunk_cuts` for callers that only need the spans."""
+
+    return plan_chunk_cuts(blank_spans, total_s, max_s=max_s, min_s=min_s)[0]
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _cut_provenance(
+    chunks: list[tuple[float, float]],
+    cut_widths: list[float | None],
+) -> dict:
+    """How the boundaries were chosen, for the quality report to track."""
+
+    pause_widths = [width for width in cut_widths if width is not None]
+    fallbacks = len(cut_widths) - len(pause_widths)
+    durations = [end - begin for begin, end in chunks]
+    return {
+        "schema": CHUNK_CUT_PROVENANCE_SCHEMA,
+        "policy": CHUNK_CUT_POLICY,
+        "chunk_count": len(chunks),
+        "cut_count": len(cut_widths),
+        "pause_cut_count": len(pause_widths),
+        "max_chunk_fallback_count": fallbacks,
+        "max_chunk_fallback_share": (
+            round(fallbacks / len(cut_widths), 4) if cut_widths else 0.0
+        ),
+        "cut_pause_width_median_s": (
+            round(_median(pause_widths), 3) if pause_widths else None
+        ),
+        "cut_pause_width_min_s": round(min(pause_widths), 3) if pause_widths else None,
+        "chunk_duration_median_s": (
+            round(_median(durations), 3) if durations else None
+        ),
+        "chunk_duration_min_s": round(min(durations), 3) if durations else None,
+        "chunk_duration_max_s": round(max(durations), 3) if durations else None,
+    }

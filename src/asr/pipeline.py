@@ -22,7 +22,7 @@ from asr.chunking import (
     CHUNK_CUT_SCHEMA,
     _extract_wav_chunks,
     _get_wav_duration,
-    cut_at_pauses,
+    plan_chunk_cuts,
 )
 from asr.cue_features import build_candidate as build_cue_candidate
 from asr.postgate import POSTGATE_SCHEMA, review_all as postgate_review_all
@@ -119,10 +119,21 @@ def _asr_language_for_chunking() -> str:
 # stateless and takes its geometry as arguments.
 _LAST_BOUNDARY_SIGNATURE: dict = {}
 
+# How that pass chose each boundary. Kept apart from the signature above on
+# purpose: that one is a cache key, and provenance is derivable from the cuts it
+# already digests, so folding it in would invalidate every cached job to record
+# something the key does not depend on.
+_LAST_CHUNK_CUT_PROVENANCE: dict = {}
+
 
 def _set_last_boundary_signature(signature: dict) -> None:
     global _LAST_BOUNDARY_SIGNATURE
     _LAST_BOUNDARY_SIGNATURE = dict(signature)
+
+
+def _set_last_chunk_cut_provenance(provenance: dict) -> None:
+    global _LAST_CHUNK_CUT_PROVENANCE
+    _LAST_CHUNK_CUT_PROVENANCE = dict(provenance)
 
 
 def _spans_digest(spans: list[tuple[float, float]]) -> str:
@@ -377,12 +388,13 @@ def _build_processing_spans(
         on_stage("切分 0/1")
     cfg = _chunking_config()
     runs, duration_s, source = _blank_runs_for_audio(audio_path)
-    spans = cut_at_pauses(
+    spans, cut_provenance = plan_chunk_cuts(
         runs,
         duration_s,
         max_s=cfg["max_chunk_s"],
         min_s=cfg["min_chunk_s"],
     )
+    _set_last_chunk_cut_provenance({**cut_provenance, "source": source})
     _set_last_boundary_signature(
         {
             "chunking": {
@@ -403,10 +415,11 @@ def _build_processing_spans(
         }
     )
     _pipeline_logger.info(
-        "[chunking] source=%s pauses=%d chunks=%d duration=%.2fs",
+        "[chunking] source=%s pauses=%d chunks=%d hard_cuts=%d duration=%.2fs",
         source,
         len(runs),
         len(spans),
+        int(cut_provenance.get("max_chunk_fallback_count") or 0),
         duration_s,
     )
     if on_stage is not None:
@@ -934,6 +947,7 @@ def _transcribe_and_align_local(
                 "segment_count": 0,
                 "boundary_no_speech": True,
                 "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
+                "chunk_cuts": dict(_LAST_CHUNK_CUT_PROVENANCE),
                 "postgate": _empty_postgate_report(),
             })
             return [], log, details
@@ -1219,6 +1233,7 @@ def _transcribe_and_align_local(
             "word_count": len(word_dicts),
             "segment_count": len(segments),
             "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
+            "chunk_cuts": dict(_LAST_CHUNK_CUT_PROVENANCE),
             "postgate": postgate_report,
             "decode_cap_truncations": decode_cap_truncations,
             **({"alignment_shadow": shadow_details} if shadow_details is not None else {}),

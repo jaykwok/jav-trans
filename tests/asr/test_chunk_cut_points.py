@@ -18,7 +18,7 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-from asr.chunking import cut_at_pauses  # noqa: E402
+from asr.chunking import cut_at_pauses, plan_chunk_cuts  # noqa: E402
 from tools.align.pregate_reference import (  # noqa: E402
     PreGateConfig,
     covered_seconds,
@@ -256,3 +256,64 @@ class TestLosslessCutting:
         it silently shortened every decode window. Pinned so it cannot return."""
         with pytest.raises(TypeError):
             cut_at_pauses([], 100.0, target_s=20.0, max_s=30.0)
+
+
+class TestCutProvenance:
+    """What the finished chunks cannot say about themselves.
+
+    A 30 s chunk that ends in a wide pause and one that ended at the ceiling
+    because the search found nothing look identical afterwards, and the second
+    is the one worth counting: it is the fixed-length behaviour the head was
+    configured to replace.
+    """
+
+    def test_a_pause_cut_records_the_pause_it_used(self) -> None:
+        _, provenance = plan_chunk_cuts([(28.0, 29.0)], 55.0, max_s=30.0)
+        assert provenance["pause_cut_count"] == 1
+        assert provenance["max_chunk_fallback_count"] == 0
+        assert provenance["cut_pause_width_median_s"] == pytest.approx(1.0)
+
+    def test_a_hard_cut_is_reported_as_a_fallback(self) -> None:
+        _, provenance = plan_chunk_cuts([(0.5, 0.7)], 90.0, max_s=30.0)
+        assert provenance["cut_count"] == 2
+        assert provenance["pause_cut_count"] == 0
+        assert provenance["max_chunk_fallback_count"] == 2
+        assert provenance["max_chunk_fallback_share"] == pytest.approx(1.0)
+        assert provenance["cut_pause_width_median_s"] is None
+
+    def test_the_two_kinds_of_cut_are_counted_separately(self) -> None:
+        chunks, provenance = plan_chunk_cuts(
+            [(25.0, 26.0), (80.0, 81.0)], 150.0, max_s=30.0
+        )
+        assert provenance["cut_count"] == len(chunks) - 1
+        assert (
+            provenance["pause_cut_count"] + provenance["max_chunk_fallback_count"]
+            == provenance["cut_count"]
+        )
+        assert provenance["pause_cut_count"] == 2
+
+    def test_a_merged_sliver_keeps_the_cut_that_made_it(self) -> None:
+        """The merge removes a boundary, not the search that placed it.
+
+        Forgetting it here would understate how often the film gave the chunker
+        nowhere legal to cut, which is the whole point of the record.
+        """
+        chunks, provenance = plan_chunk_cuts([], 61.0, max_s=30.0, min_s=2.0)
+        assert len(chunks) == 2
+        assert provenance["cut_count"] == 2
+        assert provenance["max_chunk_fallback_count"] == 2
+        assert provenance["chunk_duration_max_s"] == pytest.approx(31.0)
+
+    def test_audio_short_enough_to_pass_whole_reports_no_cuts(self) -> None:
+        chunks, provenance = plan_chunk_cuts([(3.0, 4.0)], 12.0, max_s=30.0)
+        assert chunks == [(0.0, 12.0)]
+        assert provenance["cut_count"] == 0
+        assert provenance["chunk_count"] == 1
+        assert provenance["max_chunk_fallback_share"] == 0.0
+
+    def test_the_policy_is_named_in_the_record(self) -> None:
+        """A report that describes chunk shape has to say which rule produced
+        it, or two runs cannot be compared after the rule changes."""
+        _, provenance = plan_chunk_cuts([(28.0, 29.0)], 55.0, max_s=30.0)
+        assert provenance["policy"] == "latest_pause_midpoint"
+        assert provenance["schema"] == "chunk_cut_provenance_v1"

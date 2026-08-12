@@ -35,7 +35,7 @@ class TestNoImportTimeReload:
     @pytest.mark.parametrize(
         "name, owner",
         [
-            ("cut_at_pauses", chunking),
+            ("plan_chunk_cuts", chunking),
             ("_get_wav_duration", chunking),
             ("_extract_wav_chunks", chunking),
             ("_transcribe_asr_chunks_text_only", transcribe),
