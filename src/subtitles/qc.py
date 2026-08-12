@@ -128,6 +128,13 @@ _SPEC_LINE_MAX_UNITS = 16.0
 _SPEC_MAX_LINES = 2
 _SPEC_MAX_ZH_CPS = 9.0
 _SPEC_MAX_DURATION_S = 7.0
+# The last two are a known, deliberate deviation, not a target. Layout v3 ends a
+# cue at the last character actually spoken, so reaching either would mean
+# moving a boundary to a time with no speech evidence behind it. Measured over
+# eight real films: 7.0% of cues are under the minimum and 553 neighbour pairs
+# are under the gap, while zero pairs overlap. Their counters below are a scale
+# to watch for movement, not a pass/fail line - the spec metrics that do act as
+# regression signals are the text ones (line units, CPS, banned punctuation).
 _SPEC_MIN_DURATION_S = 5.0 / 6.0
 _SPEC_MIN_GAP_S = 2.0 / BASE_FPS
 
@@ -211,6 +218,8 @@ def _subtitle_spec_compliance_stats(segments: list[dict]) -> dict:
         if 0.0 <= gap < _SPEC_MIN_GAP_S - 1e-6:
             gap_under_count += 1
 
+    cue_count = len(windows)
+    neighbour_count = max(0, cue_count - 1)
     return {
         "spec_zh_line_over_16_count": line_over_count,
         "spec_zh_lines_over_2_count": lines_over_count,
@@ -221,25 +230,56 @@ def _subtitle_spec_compliance_stats(segments: list[dict]) -> dict:
         "spec_duration_over_7s_count": duration_over_count,
         "spec_duration_under_min_count": duration_under_count,
         "spec_gap_under_2frames_count": gap_under_count,
+        "spec_cue_count": cue_count,
+        # Shares, because the two deviating metrics scale with film length: on
+        # eight real films the same 5-10% rate reads as 21 cues on a short film
+        # and 97 on a long one, so a count threshold that passes the long one
+        # would hide a fourfold regression on the short one.
+        "spec_duration_under_min_share": (
+            round(duration_under_count / cue_count, 4) if cue_count else 0.0
+        ),
+        "spec_gap_under_2frames_share": (
+            round(gap_under_count / neighbour_count, 4) if neighbour_count else 0.0
+        ),
         "spec_review_examples": examples,
     }
 
 
+# Counts that must stay at zero: nothing in the layout is allowed to produce
+# them, so any occurrence is a defect.
+_SPEC_COUNT_THRESHOLDS = {
+    "spec_zh_line_over_16_count": "QC_MAX_SPEC_LINE_OVER",
+    "spec_zh_lines_over_2_count": "QC_MAX_SPEC_LINES_OVER",
+    "spec_zh_banned_punct_count": "QC_MAX_SPEC_BANNED_PUNCT",
+    "spec_zh_cps_over_9_count": "QC_MAX_SPEC_CPS_OVER",
+    "spec_duration_over_7s_count": "QC_MAX_SPEC_DURATION_OVER",
+}
+
+# The two TTSG timing rules Layout v3 deliberately does not satisfy (see
+# `_SPEC_MIN_DURATION_S`). Zero is unreachable by construction, so they are
+# watched as rates instead: the defaults sit above the highest per-film rate
+# measured on the shipped head (10.6% and 9.7% over eight films) with room for
+# ordinary variation, so a warning here means the cue shape moved, not that the
+# layout is doing what it was designed to do. A head change can move the whole
+# distribution - the retained punctuated head runs 12.6-23.8% on the gap rate -
+# so these are recalibrated when the head is, not treated as universal.
+_SPEC_SHARE_THRESHOLDS = {
+    "spec_duration_under_min_share": ("QC_MAX_SPEC_DURATION_UNDER_SHARE", 0.15),
+    "spec_gap_under_2frames_share": ("QC_MAX_SPEC_GAP_UNDER_SHARE", 0.15),
+}
+
+
 def _append_spec_warnings(warnings: list[str], spec_stats: dict) -> None:
-    thresholds = {
-        "spec_zh_line_over_16_count": "QC_MAX_SPEC_LINE_OVER",
-        "spec_zh_lines_over_2_count": "QC_MAX_SPEC_LINES_OVER",
-        "spec_zh_banned_punct_count": "QC_MAX_SPEC_BANNED_PUNCT",
-        "spec_zh_cps_over_9_count": "QC_MAX_SPEC_CPS_OVER",
-        "spec_duration_over_7s_count": "QC_MAX_SPEC_DURATION_OVER",
-        "spec_duration_under_min_count": "QC_MAX_SPEC_DURATION_UNDER",
-        "spec_gap_under_2frames_count": "QC_MAX_SPEC_GAP_UNDER",
-    }
-    for key, env_name in thresholds.items():
+    for key, env_name in _SPEC_COUNT_THRESHOLDS.items():
         limit = _env_float(env_name, 0.0)
         value = spec_stats.get(key, 0)
         if value > limit:
             warnings.append(f"{key}={value} > {env_name}={limit:.0f}")
+    for key, (env_name, default) in _SPEC_SHARE_THRESHOLDS.items():
+        limit = _env_float(env_name, default)
+        value = float(spec_stats.get(key, 0.0))
+        if value > limit:
+            warnings.append(f"{key}={value:.3f} > {env_name}={limit:.3f}")
 
 
 def _subtitle_text_units(segment: dict) -> int:

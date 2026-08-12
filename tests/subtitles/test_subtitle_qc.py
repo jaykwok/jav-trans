@@ -213,9 +213,41 @@ def test_spec_compliance_flags_violations():
     assert report["spec_duration_over_7s_count"] == 1
     assert report["spec_duration_under_min_count"] == 1
     assert report["spec_gap_under_2frames_count"] == 1
+    assert report["spec_cue_count"] == 4
+    assert report["spec_duration_under_min_share"] == pytest.approx(0.25)
+    assert report["spec_gap_under_2frames_share"] == pytest.approx(1 / 3, abs=1e-4)
     assert any("spec_zh_cps_over_9_count" in w for w in report["warnings"])
     assert any("spec_duration_over_7s_count" in w for w in report["warnings"])
     assert report["spec_review_examples"]
+
+
+def test_the_two_deviating_timing_rules_warn_on_rate_not_on_count():
+    """Layout v3 ends a cue at the last spoken character, so short cues and
+    tight gaps are produced by design. A count threshold would fire on every
+    film; the rate has to move before it means anything."""
+    tight = [
+        _seg("ア", "短", 0.0, 0.5),
+        _seg("イ", "紧跟", 0.51, 2.0),
+        *[_seg("ウ", "正常一句话", 3.0 + index * 3.0, 5.0 + index * 3.0) for index in range(18)],
+    ]
+    report = compute_quality_report(tight, 120.0, [], 0, len(tight))
+
+    assert report["spec_duration_under_min_count"] == 1
+    assert report["spec_gap_under_2frames_count"] == 1
+    assert not any("spec_duration_under_min" in w for w in report["warnings"])
+    assert not any("spec_gap_under_2frames" in w for w in report["warnings"])
+
+
+def test_a_rate_above_the_threshold_still_warns(monkeypatch):
+    monkeypatch.setenv("QC_MAX_SPEC_DURATION_UNDER_SHARE", "0.10")
+    segs = [
+        _seg("ア", "短", 0.0, 0.5),
+        *[_seg("イ", "正常一句话", 2.0 + index * 3.0, 4.0 + index * 3.0) for index in range(4)],
+    ]
+    report = compute_quality_report(segs, 60.0, [], 0, len(segs))
+
+    assert report["spec_duration_under_min_share"] == pytest.approx(0.2)
+    assert any("spec_duration_under_min_share" in w for w in report["warnings"])
 
 
 def test_spec_compliance_clean_output_has_no_spec_warnings():
