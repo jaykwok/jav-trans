@@ -19,7 +19,3 @@ class RetryableTranslationError(TranslationError):
 
 class RetryableTranslationFormatError(RetryableTranslationError):
     """The model returned incomplete or invalid structured output."""
-
-
-class TranslationContextLengthError(TranslationError):
-    """The request cannot fit within the selected backend context window."""

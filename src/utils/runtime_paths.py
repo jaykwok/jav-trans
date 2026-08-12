@@ -34,10 +34,6 @@ def runtime_path(path: str | Path) -> Path:
     return (runtime_root() / candidate).resolve()
 
 
-def resource_path(*parts: str | Path) -> Path:
-    return resource_root().joinpath(*(Path(part) for part in parts)).resolve()
-
-
 def prepend_to_path(path: str | Path) -> None:
     candidate = Path(path)
     if not candidate.exists():

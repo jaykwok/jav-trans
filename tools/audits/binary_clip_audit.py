@@ -42,9 +42,6 @@ UNSURE = "unsure"
 # Fields a manifest may carry. Anything else is refused, because the reason an
 # adapter would want extra fields is to display them.
 ALLOWED_MANIFEST_FIELDS = {"schema", "row_id", "audio", "start_s", "end_s"}
-# mp3 frame padding moves the decoded length by a few tens of ms; anything past
-# this is a clip pointing at the wrong interval, not an encoder artefact.
-CLIP_DURATION_TOLERANCE_S = 0.15
 
 ADAPTER_CSS = """
 .contract,article{background:#fff;border:1px solid #ccd6df;border-radius:10px;padding:14px;margin-bottom:14px}
@@ -185,64 +182,6 @@ def render_page(spec: BinaryClipAuditSpec, rows: list[dict[str, Any]]) -> str:
             adapter_js=adapter_js,
         )
     )
-
-
-def copy_clips(
-    source_rows: list[dict[str, Any]], output_dir: Path
-) -> list[dict[str, Any]]:
-    """Serve pre-cut clips unchanged, for auditing a decision made ON them.
-
-    When the question is whether a teacher's call on a clip was right, re-cutting
-    that clip from its source introduces a difference between what the teacher
-    heard and what the human hears - and that difference lands entirely inside
-    the disagreements, which is where it does the most damage. So the bytes are
-    copied, not transcoded.
-
-    The manifest interval must still describe the clip, and is checked against
-    the file rather than trusted: a clip/label misalignment would otherwise show
-    up as an unexplained false-drop rate.
-    """
-    import shutil
-
-    from pipeline.audio import probe_video_duration_s
-
-    media_dir = output_dir / "media"
-    media_dir.mkdir(parents=True, exist_ok=True)
-    rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for source in source_rows:
-        check_manifest_row(source)
-        row_id = str(source.get("row_id") or "")
-        if not row_id or row_id in seen:
-            raise ValueError("audit row_id values must be non-empty and unique")
-        seen.add(row_id)
-        audio = Path(str(source.get("audio") or ""))
-        if not audio.is_file():
-            raise FileNotFoundError(f"audit source audio not found: {audio}")
-        start = float(source.get("start_s") or 0.0)
-        end = float(source.get("end_s") or 0.0)
-        if end <= start:
-            raise ValueError(f"audit interval must be positive: {row_id}")
-        probed = probe_video_duration_s(str(audio))
-        if probed is None:
-            raise ValueError(f"could not probe clip duration: {audio}")
-        if abs(probed - (end - start)) > CLIP_DURATION_TOLERANCE_S:
-            raise ValueError(
-                f"clip {audio.name} runs {probed:.3f}s but the label says "
-                f"{end - start:.3f}s; clip and label are not the same interval"
-            )
-        clip = media_dir / f"{safe_name(row_id)}{audio.suffix}"
-        shutil.copyfile(audio, clip)
-        rows.append(
-            {
-                "row_id": row_id,
-                "audio_src": clip.relative_to(output_dir).as_posix(),
-                "start_s": 0.0,
-                "end_s": round(probed, 6),
-                "clip_duration_s": round(probed, 6),
-            }
-        )
-    return rows
 
 
 def cut_clips(

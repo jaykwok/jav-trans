@@ -26,9 +26,6 @@ from typing import Any, Mapping, Sequence
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-DEFAULT_ENV_FILE = "~/.config/omni/.env"
-
-
 DEFAULT_API_KEY_ENV_CANDIDATES = (
     "OMNI_API_KEY",
     "DASHSCOPE_API_KEY",
@@ -127,26 +124,6 @@ def project_path(value: str | Path) -> Path:
     return raw if raw.is_absolute() else (PROJECT_ROOT / raw).resolve()
 
 
-def repo_rel(value: str | Path | None) -> str:
-    if not value:
-        return ""
-    raw = Path(value)
-    try:
-        return raw.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
-    except Exception:
-        return raw.as_posix()
-
-
-def local_timestamp() -> str:
-    return time.strftime("%Y%m%d_%H%M%S")
-
-
-def safe_stem(value: Any) -> str:
-    text = str(value or "").strip()
-    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
-    return text.strip("_") or "item"
-
-
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -170,12 +147,6 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"JSONL row must be an object: {path}:{line_number}")
             rows.append(dict(payload))
     return rows
-
-
-def append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(dict(row), ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def _parse_env_value(raw: str) -> str:
@@ -215,50 +186,6 @@ def load_env_file(path: str | Path | None) -> dict[str, str]:
         loaded[key] = parsed
         os.environ.setdefault(key, parsed)
     return loaded
-
-
-def env_names(value: str | Sequence[str]) -> list[str]:
-    if isinstance(value, str):
-        parts = value.split(",")
-    else:
-        parts = list(value)
-    return [str(item).strip() for item in parts if str(item).strip()]
-
-
-def first_env_value(value: str | Sequence[str]) -> tuple[str, str]:
-    for name in env_names(value):
-        raw = os.getenv(name, "").strip()
-        if raw:
-            return name, raw
-    return "", ""
-
-
-def run_command(
-    command: Sequence[str],
-    *,
-    cwd: Path,
-    env: Mapping[str, str],
-    log_path: Path,
-) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8", errors="replace") as log:
-        process = subprocess.Popen(
-            list(command),
-            cwd=str(cwd),
-            env=dict(env),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            log.write(line)
-        code = process.wait()
-    if code != 0:
-        raise RuntimeError(f"command failed with exit code {code}: {' '.join(command)}")
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -332,12 +259,6 @@ def slice_audio_clip(
     command.append(str(output_path))
     subprocess.run(command, cwd=str(PROJECT_ROOT), check=True)
     return output_path
-
-
-def extract_json_object(text: str) -> dict[str, Any]:
-    payload = extract_json_value(text, require_object=True)
-    assert isinstance(payload, dict)
-    return payload
 
 
 def extract_json_value(text: str, *, require_object: bool) -> Any:
@@ -630,6 +551,3 @@ def call_omni(
     return parsed, raw_response
 
 
-def is_empty_audio_api_error(exc: BaseException) -> bool:
-    message = str(exc).lower()
-    return "the audio is empty" in message or "audio is empty" in message

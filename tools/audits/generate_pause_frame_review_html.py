@@ -65,7 +65,6 @@ from tools.audits.pause_frame_audit import (  # noqa: E402
     blank_frames_from_runs,
     confusion,
     expand_partition,
-    frames_to_seconds,
     label_legend_html,
     labelled_frame_totals,
     read_jsonl,

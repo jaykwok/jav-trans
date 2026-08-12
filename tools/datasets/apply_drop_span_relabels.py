@@ -37,7 +37,6 @@ from typing import Any
 SCHEMA = "typed_span_relabel_report_v1"
 # Only this direction is written back; see the module docstring.
 APPLIED_LABEL = "words"
-TOLERANCE_S = 1e-3
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:

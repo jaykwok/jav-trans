@@ -128,14 +128,6 @@ def seconds_to_frame(seconds: float) -> int:
     return int(round(float(seconds) / FRAME_HOP_S))
 
 
-def partition_label_at(segments: list[dict[str, Any]], frame: int) -> str | None:
-    """The label covering `frame`, or None where the partition does not reach."""
-    for segment in segments:
-        if int(segment["start_frame"]) <= frame < int(segment["end_frame"]):
-            return str(segment["label"])
-    return None
-
-
 def expand_partition(segments: list[dict[str, Any]], frame_count: int) -> list[str]:
     """Per-frame labels, so the comparison is not done on span arithmetic.
 

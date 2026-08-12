@@ -15,9 +15,9 @@ segmentation, not timing.
 """
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
-import sys
 import unicodedata
 
 import numpy as np
@@ -93,17 +93,28 @@ def describe(values, label):
 
 
 def main() -> None:
-    film_id = sys.argv[1]
-    aligned_path = Path(sys.argv[2])
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("film_id", help="Film id as written in the teacher words file.")
+    parser.add_argument(
+        "aligned",
+        type=Path,
+        help="`aligned_segments.json` produced with the head under test.",
+    )
     # The archive covers the two films timed on 2026-08-10; films timed later
     # live in their own runner output, so the path is an argument rather than a
     # constant. Same format either way - the runner assembles both.
-    words_path = (
-        Path(sys.argv[3])
-        if len(sys.argv) > 3
-        else PROJECT_ROOT
-        / "datasets/train/jav-grok-stt-frame-teacher-v1/teacher/grok.words.jsonl"
+    parser.add_argument(
+        "words",
+        nargs="?",
+        type=Path,
+        default=PROJECT_ROOT
+        / "datasets/train/jav-grok-stt-frame-teacher-v1/teacher/grok.words.jsonl",
+        help="Grok per-word timings (defaults to the archived teacher run).",
     )
+    args = parser.parse_args()
+    film_id = args.film_id
+    aligned_path = args.aligned
+    words_path = args.words
 
     grok, grok_words = teacher_islands(words_path, film_id)
     head, head_words = head_islands(aligned_path)

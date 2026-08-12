@@ -40,9 +40,6 @@ class GpuWorkerTimeoutError(GpuWorkerError):
 
 
 _PROFILE_MARKER_SUFFIX = "__PROFILE_ACTIVE"
-_PROFILE_STAGE_BY_SETTING = {
-    "ASR_BATCH_SIZE": "asr_text_transcribe",
-}
 
 
 def _env_float(name: str, default: float) -> float:

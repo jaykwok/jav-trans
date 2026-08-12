@@ -36,15 +36,6 @@ FLAG_DUPLICATE_NEIGHBOUR = "duplicate_of_neighbour"
 FLAG_UNSUPPORTED_BY_AUDIO = "unsupported_by_audio"
 FLAG_EMPTY = "empty_text"
 
-ALL_FLAGS = (
-    FLAG_EMPTY,
-    FLAG_RUNAWAY,
-    FLAG_IMPOSSIBLE_RATE,
-    FLAG_REPEATED_UNIT,
-    FLAG_DUPLICATE_NEIGHBOUR,
-    FLAG_UNSUPPORTED_BY_AUDIO,
-)
-
 
 @dataclass(frozen=True)
 class PostGateConfig:

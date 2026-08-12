@@ -1,9 +1,13 @@
 """A CTC alignment head over the SFT'd ASR encoder.
 
-The pipeline has never had a real time axis. `src/asr/subtitle_timing.py` spreads
-each segment's text across the segment window in proportion to character count
-and reports `word_timestamps_real: False`; every branch does, so a subtitle's
-in-segment timing has never been measured, only assumed.
+Why it exists: before this head the pipeline had no real time axis at all.
+`src/asr/subtitle_timing.py` spreads each segment's text across the segment
+window in proportion to character count and reports `word_timestamps_real:
+False`, so in-segment timing was assumed rather than measured. That path is
+still the fallback when no head is configured or a chunk fails to align, and the
+subtitle layer refuses to split on it (`timestamp_kind == synthetic_proportional`
+is not a measured boundary); with a head loaded, the timestamps below are the
+production ones.
 
 Forced alignment was tried before and abandoned, for a specific reason: the ASR
 is full-SFT'd on this domain and a general-purpose aligner is not, so the aligner

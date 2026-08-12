@@ -23,6 +23,10 @@ _MILLISECONDS_PER_SECOND = Decimal(1000)
 _SECONDS_PER_MINUTE = 60
 
 
+# Nothing injects this: teacher prompts come from `--prompt/--prompt-file`, so
+# this is the canonical text to paste into one. It is kept next to the parser
+# that enforces it, because a prompt that states a different format than
+# `parse_mmss_timestamp` accepts fails at parse time, after the run is paid for.
 TIMESTAMP_PROMPT_CONTRACT_ZH = """时间坐标合同（适用于本请求中的所有区间）：
 - 所有区间边界必须使用 JSON 字符串字段 `start_ts` / `end_ts`，格式严格为 `MM:SS.mmm`。
 - 单个候选点使用 JSON 字符串字段 `time_ts`，格式同样严格为 `MM:SS.mmm`。

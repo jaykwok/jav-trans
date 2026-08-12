@@ -12,10 +12,7 @@ from asr.alignment import alignment_head_configured
 from asr.alignment_quality import classify_alignment_quality
 from asr import chunking as _chunking_module
 from asr import result_cache as _result_cache_module
-from asr.result_cache import (
-    _cacheable_text_results,
-    _is_timed_out_result,
-)
+from asr.result_cache import _is_timed_out_result
 from asr.local_backend import LocalAsrBackend
 
 

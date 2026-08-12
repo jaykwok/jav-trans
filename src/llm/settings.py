@@ -91,5 +91,4 @@ def _llm_api_format(api_format: str | None = None) -> str:
     return _normalize_llm_api_format(value)
 
 
-_REASONING_EFFORTS = set(REASONING_EFFORTS)
 _normalize_reasoning_effort = normalize_reasoning_effort
