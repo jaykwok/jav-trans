@@ -200,11 +200,36 @@ def drop_vocalisation_runs(
             doomed.update(range(begin, end))
             dropped_runs += 1
 
-    kept = [block for index, block in enumerate(blocks) if index not in doomed]
+    # A cue that neighboured a dropped run must stop claiming it continues into
+    # or out of one. The flags reach the translation prompt as `cont_prev` /
+    # `cont_next`, and after the run is gone they assert that two cues join
+    # across a passage that is no longer in the file - measured on eight films,
+    # 442 of 513 dropped runs left such a claim behind, over gaps of 20s and
+    # more. Continuity across the removed audio is unknown, and unknown must not
+    # be reported as continuing.
+    kept: list[dict] = []
+    continuity_cleared = 0
+    for index, block in enumerate(blocks):
+        if index in doomed:
+            continue
+        after_drop = (index - 1) in doomed
+        before_drop = (index + 1) in doomed
+        if (after_drop and block.get("continues_from_previous")) or (
+            before_drop and block.get("continues_into_next")
+        ):
+            block = dict(block)
+            continuity_cleared += 1
+            if after_drop:
+                block["continues_from_previous"] = False
+            if before_drop:
+                block["continues_into_next"] = False
+        kept.append(block)
+
     diagnostics = {
         "vocalisation_cues_flagged": sum(flags),
         "vocalisation_cues_dropped": len(doomed),
         "vocalisation_runs_dropped": dropped_runs,
+        "vocalisation_continuity_flags_cleared": continuity_cleared,
         # Flagged but left alone because they stood by themselves. Worth seeing:
         # if this grows large the run threshold is doing the real work, not the
         # word list.

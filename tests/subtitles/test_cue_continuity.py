@@ -26,7 +26,7 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
         sys.path.insert(0, str(root))
 
 from llm import prompt as prompt_module  # noqa: E402
-from subtitles import writer  # noqa: E402
+from subtitles import vocalisation, writer  # noqa: E402
 from subtitles.options import SubtitleOptions  # noqa: E402
 
 
@@ -158,3 +158,67 @@ class TestItReachesThePrompt:
         full = prompt_module._SYSTEM_PROMPT_FULL
         numbers = [line.split(".", 1)[0] for line in full.split("\n") if line[:2].strip().isdigit()]
         assert len(numbers) == len(set(numbers)), numbers
+
+
+class TestContinuityAcrossADroppedRun:
+    """A dropped vocalisation run breaks the adjacency the flags assert.
+
+    The filter removes whole passages of moaning between two lines of dialogue.
+    The neighbours' flags were computed while the passage was still there, so
+    left alone they tell the translator to join two cues over a gap of twenty
+    seconds of removed audio.
+    """
+
+    @staticmethod
+    def _cue(text: str, start: float, *, prev: bool = False, nxt: bool = False) -> dict:
+        return {
+            "start": start,
+            "end": start + 1.0,
+            "text": text,
+            "ja_text": text,
+            "zh_text": text,
+            "continues_from_previous": prev,
+            "continues_into_next": nxt,
+        }
+
+    def test_the_neighbours_stop_claiming_they_join(self) -> None:
+        blocks = [
+            self._cue("そのときね、", 0.0, nxt=True),
+            self._cue("んっ、んっ", 2.0),
+            self._cue("あぁ、はぁ", 4.0),
+            self._cue("それで帰った", 25.0, prev=True),
+        ]
+
+        kept, diagnostics = vocalisation.drop_vocalisation_runs(blocks, min_run=2)
+
+        assert [cue["text"] for cue in kept] == ["そのときね、", "それで帰った"]
+        assert kept[0]["continues_into_next"] is False
+        assert kept[1]["continues_from_previous"] is False
+        assert diagnostics["vocalisation_continuity_flags_cleared"] == 2
+
+    def test_an_untouched_neighbour_keeps_its_flag(self) -> None:
+        blocks = [
+            self._cue("前のセリフ", 0.0, nxt=True),
+            self._cue("続きの言葉", 1.5, prev=True, nxt=True),
+            self._cue("んっ、んっ", 3.0),
+            self._cue("あぁ、はぁ", 4.0),
+        ]
+
+        kept, diagnostics = vocalisation.drop_vocalisation_runs(blocks, min_run=2)
+
+        assert kept[0]["continues_into_next"] is True
+        assert kept[1]["continues_from_previous"] is True
+        # Only the cue that actually bordered the run is corrected.
+        assert kept[1]["continues_into_next"] is False
+        assert diagnostics["vocalisation_continuity_flags_cleared"] == 1
+
+    def test_the_caller_s_blocks_are_not_mutated(self) -> None:
+        blocks = [
+            self._cue("そのときね、", 0.0, nxt=True),
+            self._cue("んっ、んっ", 2.0),
+            self._cue("あぁ、はぁ", 4.0),
+        ]
+
+        vocalisation.drop_vocalisation_runs(blocks, min_run=2)
+
+        assert blocks[0]["continues_into_next"] is True
