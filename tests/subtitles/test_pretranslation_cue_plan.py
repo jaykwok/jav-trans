@@ -265,3 +265,62 @@ def test_local_ctc_words_stay_completely_mapped_through_cue_planning(monkeypatch
     assert summary["layout_diagnostics"]["subtitle_layout_split_source"] == {
         "measured_safe_boundary_dp": 2
     }
+
+
+def test_postgate_flags_survive_from_segment_to_cue_plan():
+    """The flags existed and reached nothing.
+
+    `_annotate_segments_with_postgate` puts them on the segment, but the block
+    builder rebuilt each block from a fixed key list, so the mark died one step
+    before the layout. Pieces of a split segment inherit it, because a chunk the
+    audio did not support does not become supported halfway through.
+    """
+    long_text = "この文字列は十分に長いので表示時間による分割が必要になります"
+    words = [
+        {
+            "word": char,
+            "start": index * 0.5,
+            "end": index * 0.5 + 0.4,
+            "timestamp_kind": "ctc_forced_alignment",
+        }
+        for index, char in enumerate(long_text)
+    ]
+    segments = [
+        {
+            "start": 0.0,
+            "end": words[-1]["end"],
+            "text": long_text,
+            "words": words,
+            "postgate_flags": ["repeated_unit"],
+        },
+        {
+            "start": 40.0,
+            "end": 41.0,
+            "text": "普通の台詞",
+            "words": [
+                {
+                    "word": char,
+                    "start": 40.0 + index * 0.2,
+                    "end": 40.0 + index * 0.2 + 0.2,
+                    "timestamp_kind": "ctc_forced_alignment",
+                }
+                for index, char in enumerate("普通の台詞")
+            ],
+        },
+    ]
+
+    cues, summary = main._prepare_translation_cues(
+        segments,
+        subtitle_options=SubtitleOptions(),
+        bilingual=False,
+    )
+
+    flagged = [cue for cue in cues if cue.get("postgate_flags")]
+    assert flagged, [cue.get("ja_text") for cue in cues]
+    assert all(cue["postgate_flags"] == ["repeated_unit"] for cue in flagged)
+    assert summary["layout_diagnostics"]["postgate_flagged_cues"] == len(flagged)
+    assert summary["layout_diagnostics"]["postgate_cue_flags"] == {
+        "repeated_unit": len(flagged)
+    }
+    # The unflagged segment stays unflagged; the union is per segment, not global.
+    assert any(not cue.get("postgate_flags") for cue in cues)

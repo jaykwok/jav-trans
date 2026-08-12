@@ -25,8 +25,17 @@ def _env_bool(name: str, default: bool) -> bool:
 # invisible, and setting the old name produced v3 output labelled v2 - output
 # that lies about its own provenance is worse than no knob at all. So an
 # unknown value is refused rather than accepted and ignored.
-LAYOUT_ENGINE = "measured_safe_boundary_dp_v3"
-TIMING_MODEL = "measured_lexical_extent_v2"
+# v3_1: the same DP and the same candidate boundaries, with the measured gap
+# graded inside `word_gap` instead of every word gap scoring alike. It moves
+# ~1.4% of cuts, so an artifact from before it must not claim to be one from
+# after it.
+LAYOUT_ENGINE = "measured_safe_boundary_dp_v3_1"
+# v3: the display end may linger into silence that is already empty, bounded by
+# `linger_s` and `max_display_shift_from_acoustic_end_s` and stopping two frames
+# before the next cue. Acoustic edges and every word timing are unchanged, and
+# the layout stamp above does not move with it - the cuts land where they did,
+# which is the reason these are two fields rather than one.
+TIMING_MODEL = "measured_lexical_extent_v3"
 
 
 @dataclass(frozen=True)

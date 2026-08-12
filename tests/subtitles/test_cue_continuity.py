@@ -222,3 +222,51 @@ class TestContinuityAcrossADroppedRun:
         vocalisation.drop_vocalisation_runs(blocks, min_run=2)
 
         assert blocks[0]["continues_into_next"] is True
+
+
+class TestContinuityCountsReachTheCuePlan:
+    """The flags are invisible in the finished SRT, so the run has to count them.
+
+    `vocalisation_continuity_flags_cleared` is a correction count and cannot be
+    read without knowing how many claims were made, which is what these two are
+    for.
+    """
+
+    def test_the_summary_counts_what_the_cues_actually_claim(self) -> None:
+        import main
+
+        cues, summary = main._prepare_translation_cues(
+            [_long_cue()],
+            subtitle_options=SubtitleOptions(),
+            bilingual=False,
+        )
+
+        assert len(cues) > 1
+        diagnostics = summary["layout_diagnostics"]
+        assert diagnostics["continues_from_previous"] == sum(
+            bool(cue["continues_from_previous"]) for cue in cues
+        )
+        assert diagnostics["continues_into_next"] == sum(
+            bool(cue["continues_into_next"]) for cue in cues
+        )
+        assert diagnostics["continues_from_previous"] == len(cues) - 1
+        # Same subject from the other side: a cue continues precisely when its
+        # boundary is not a written sentence end, so the break types have to be
+        # readable next to the counts.
+        assert sum(diagnostics["subtitle_layout_break_type"].values()) == len(cues)
+        assert diagnostics["layout_word_gap_cut_count"] == sum(
+            1 for cue in cues if cue.get("text_break_type") == "word_gap"
+        )
+
+    def test_an_unsplit_run_claims_nothing(self) -> None:
+        import main
+
+        cues, summary = main._prepare_translation_cues(
+            [_long_cue(start=0.0, end=3.0, text="はい")],
+            subtitle_options=SubtitleOptions(),
+            bilingual=False,
+        )
+
+        assert len(cues) == 1
+        assert summary["layout_diagnostics"]["continues_from_previous"] == 0
+        assert summary["layout_diagnostics"]["continues_into_next"] == 0

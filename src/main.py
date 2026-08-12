@@ -812,6 +812,11 @@ def _build_japanese_srt_blocks(segments: list[dict]) -> list[dict]:
             "chunk_acoustic_duration": seg.get("chunk_acoustic_duration"),
             "primary_cut_candidates": list(seg.get("primary_cut_candidates") or []),
             "weak_cut_candidates": list(seg.get("weak_cut_candidates") or []),
+            # The post-gate marks a chunk and `_annotate_segments_with_postgate`
+            # brings the mark down to the segment, but this key list is where it
+            # used to stop: a verdict nobody downstream can read is a detector
+            # running for nothing. Pieces inherit it through `dict(block)`.
+            "postgate_flags": list(seg.get("postgate_flags") or []),
         }
         for idx, seg in enumerate(segments)
     ]
@@ -861,6 +866,32 @@ def _prepare_translation_cues(
         for cue in normalized
         if str(cue.get("subtitle_layout_split_source") or "").strip()
     )
+    # Which evidence ended each cue, and how much silence was actually there.
+    # This is the layout's cut-point decision, and the finished SRT keeps no
+    # trace of it: a cue ending at 。 and one ending in a 0.13s gap look the
+    # same afterwards, and only the second is a guess.
+    break_types = Counter(
+        str(cue.get("text_break_type") or "").strip()
+        for cue in normalized
+        if str(cue.get("text_break_type") or "").strip()
+    )
+    word_gap_widths = sorted(
+        float(cue.get("text_break_gap_s") or 0.0)
+        for cue in normalized
+        if str(cue.get("text_break_type") or "") == "word_gap"
+    )
+    # Counted here rather than at the ASR stage because the question worth
+    # answering is not how many chunks were flagged but how many flagged cues
+    # survived the layout and the vocalisation filter into the finished file.
+    postgate_flags = Counter(
+        flag
+        for cue in normalized
+        for flag in (cue.get("postgate_flags") or [])
+        if str(flag).strip()
+    )
+    postgate_flagged_cues = sum(
+        1 for cue in normalized if (cue.get("postgate_flags") or [])
+    )
     return normalized, {
         "schema": "subtitle_cue_summary_v2",
         "cues_before": len(cues),
@@ -870,6 +901,16 @@ def _prepare_translation_cues(
             **prepare_diagnostics,
             "subtitle_layout_split_skipped": dict(sorted(split_skipped.items())),
             "subtitle_layout_split_source": dict(sorted(split_sources.items())),
+            "subtitle_layout_break_type": dict(sorted(break_types.items())),
+            "layout_word_gap_cut_count": len(word_gap_widths),
+            "layout_word_gap_cut_under_0p2s": sum(
+                1 for width in word_gap_widths if width < 0.2
+            ),
+            "layout_word_gap_median_s": (
+                round(word_gap_widths[len(word_gap_widths) // 2], 3)
+                if word_gap_widths
+                else None
+            ),
             "display_clamped_to_max": sum(
                 bool(cue.get("display_clamped_to_max")) for cue in normalized
             ),
@@ -888,6 +929,19 @@ def _prepare_translation_cues(
             "exact_measured_timeline": sum(
                 bool(cue.get("exact_measured_timeline")) for cue in normalized
             ),
+            # What the translator is told about sentences the layout split. The
+            # counts belong next to `vocalisation_continuity_flags_cleared` from
+            # `prepare_diagnostics` above: that one says how many claims were
+            # withdrawn because the neighbour was dropped, and these say how many
+            # were made in the first place, which is the only way to read it.
+            "continues_from_previous": sum(
+                bool(cue.get("continues_from_previous")) for cue in normalized
+            ),
+            "continues_into_next": sum(
+                bool(cue.get("continues_into_next")) for cue in normalized
+            ),
+            "postgate_flagged_cues": postgate_flagged_cues,
+            "postgate_cue_flags": dict(sorted(postgate_flags.items())),
         },
     }
 

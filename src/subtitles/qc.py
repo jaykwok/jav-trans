@@ -282,6 +282,129 @@ def _append_spec_warnings(warnings: list[str], spec_stats: dict) -> None:
             warnings.append(f"{key}={value:.3f} > {env_name}={limit:.3f}")
 
 
+# Chunk-boundary provenance from `asr.chunking.plan_chunk_cuts`, and the cue
+# continuity counts from the layout pass. Both are copied into the report rather
+# than recomputed: neither can be recovered from the finished subtitles, and both
+# are the only run-over-run record of decisions taken far upstream of them.
+#
+# Nothing here has a threshold. `max_chunk_fallback_share` - boundaries the pause
+# search could not place, so the chunker cut at 30s regardless - measures 0.7% to
+# 53% across eight real films, and the high ones are films that are mostly
+# continuous vocalisation rather than films that were cut badly. A limit that
+# passed those would be met by anything.
+_CHUNK_CUT_REPORT_KEYS = {
+    "policy": "chunk_cut_policy",
+    "source": "chunk_cut_source",
+    "chunk_count": "chunk_count",
+    "cut_count": "chunk_cut_count",
+    "pause_cut_count": "chunk_cut_at_pause_count",
+    "max_chunk_fallback_count": "chunk_cut_max_fallback_count",
+    "max_chunk_fallback_share": "chunk_cut_max_fallback_share",
+    "cut_pause_width_median_s": "chunk_cut_pause_width_median_s",
+    "cut_pause_width_min_s": "chunk_cut_pause_width_min_s",
+    "chunk_duration_median_s": "chunk_duration_median_s",
+    "chunk_duration_min_s": "chunk_duration_min_s",
+    "chunk_duration_max_s": "chunk_duration_max_s",
+}
+
+
+def _chunk_cut_stats(chunk_cuts: dict | None) -> dict:
+    if not isinstance(chunk_cuts, dict) or not chunk_cuts:
+        return {}
+    return {
+        report_key: chunk_cuts[source_key]
+        for source_key, report_key in _CHUNK_CUT_REPORT_KEYS.items()
+        if source_key in chunk_cuts
+    }
+
+
+# The layout's own cut points, and the continuation claims they produce. The
+# two are one subject: `continues_into_next` is set on every cue whose boundary
+# is not a written sentence end, so the break-type mix below is the reason the
+# continuation counts are what they are.
+_CUE_CONTINUITY_REPORT_KEYS = {
+    "subtitle_layout_break_type": "layout_break_type_counts",
+    "layout_word_gap_cut_count": "layout_word_gap_cut_count",
+    "layout_word_gap_cut_under_0p2s": "layout_word_gap_cut_under_0p2s",
+    "layout_word_gap_median_s": "layout_word_gap_median_s",
+    # How much reading time was taken from silence that was already empty. Read
+    # against `spec_duration_under_min_share`: this is the mechanism that moves
+    # it, so a run where the share jumps and this is zero means the pass did not
+    # run rather than that the cues changed shape.
+    "display_linger_applied_count": "display_linger_applied_count",
+    "display_linger_total_s": "display_linger_total_s",
+    "continues_from_previous": "cue_continues_from_previous_count",
+    "continues_into_next": "cue_continues_into_next_count",
+    "vocalisation_cues_dropped": "vocalisation_cues_dropped",
+    "vocalisation_runs_dropped": "vocalisation_runs_dropped",
+    "vocalisation_continuity_flags_cleared": "vocalisation_continuity_flags_cleared",
+    "postgate_flagged_cues": "postgate_flagged_cue_count",
+    "postgate_cue_flags": "postgate_cue_flag_counts",
+}
+
+
+# `asr.postgate` reviews every decoded chunk and marks the ones the audio does
+# not support, and until now the marks stopped at `aligned_segments.json`. Both
+# layers are reported because they answer different questions: the chunk counts
+# say what the detector saw, and the cue counts above say how much of it reached
+# the viewer after the layout and the vocalisation filter had their turn.
+#
+# No thresholds. `repeated_unit` alone runs around 10% of chunks on this domain
+# and most of it is genuine repeated interjection, so a limit would have to be
+# invented rather than measured - and what to do about the rest is a decision to
+# take from these numbers, not before them.
+_POSTGATE_CHUNK_REPORT_KEYS = {
+    "reviewed": "postgate_chunks_reviewed",
+    "flagged": "postgate_chunks_flagged",
+    "flags": "postgate_chunk_flag_counts",
+    "alignment_score_checked": "postgate_alignment_score_checked",
+}
+
+
+def _postgate_chunk_stats(postgate: dict | None) -> dict:
+    if not isinstance(postgate, dict) or not postgate:
+        return {}
+    stats = {
+        report_key: postgate[source_key]
+        for source_key, report_key in _POSTGATE_CHUNK_REPORT_KEYS.items()
+        if source_key in postgate
+    }
+    reviewed = int(stats.get("postgate_chunks_reviewed") or 0)
+    if reviewed > 0 and "postgate_chunks_flagged" in stats:
+        stats["postgate_chunks_flagged_share"] = round(
+            int(stats["postgate_chunks_flagged"]) / reviewed, 4
+        )
+    return stats
+
+
+def _cue_continuity_stats(cue_plan: dict | None) -> dict:
+    if not isinstance(cue_plan, dict) or not cue_plan:
+        return {}
+    diagnostics = cue_plan.get("layout_diagnostics")
+    if not isinstance(diagnostics, dict):
+        return {}
+    stats = {
+        report_key: diagnostics[source_key]
+        for source_key, report_key in _CUE_CONTINUITY_REPORT_KEYS.items()
+        if source_key in diagnostics
+    }
+    # A count of continuation claims means nothing without how many cues could
+    # have made one, and the layout's own cue count is the denominator - not the
+    # segment count below, which is taken after translation.
+    cues = int(cue_plan.get("cues_after") or 0)
+    if cues > 0 and "cue_continues_from_previous_count" in stats:
+        stats["cue_continues_from_previous_share"] = round(
+            int(stats["cue_continues_from_previous_count"]) / cues, 4
+        )
+    if cues > 0 and "postgate_flagged_cue_count" in stats:
+        stats["postgate_flagged_cue_share"] = round(
+            int(stats["postgate_flagged_cue_count"]) / cues, 4
+        )
+    if cues > 0:
+        stats["cue_plan_cue_count"] = cues
+    return stats
+
+
 def _subtitle_text_units(segment: dict) -> int:
     text = str(segment.get("text") or segment.get("ja") or "")
     return len(_COMPACT_TEXT_RE.sub("", text))
@@ -406,6 +529,10 @@ def compute_quality_report(
     alignment_issue_count: int,
     total_segments: int,
     asr_generation: dict | None = None,
+    *,
+    chunk_cuts: dict | None = None,
+    cue_plan: dict | None = None,
+    postgate: dict | None = None,
 ) -> dict:
     """Compute SRT quality metrics and flag threshold violations."""
     asr_generation = asr_generation or {}
@@ -417,6 +544,9 @@ def compute_quality_report(
     duration_stats = _subtitle_duration_stats(segments)
     density_stats = _subtitle_density_audit_stats(segments)
     spec_stats = _subtitle_spec_compliance_stats(segments)
+    chunk_cut_stats = _chunk_cut_stats(chunk_cuts)
+    cue_continuity_stats = _cue_continuity_stats(cue_plan)
+    postgate_stats = _postgate_chunk_stats(postgate)
     alignment_issue_total = max(int(total_segments or 0), 0)
 
     n = len(segments)
@@ -445,6 +575,9 @@ def compute_quality_report(
             **duration_stats,
             **density_stats,
             **spec_stats,
+            **chunk_cut_stats,
+            **cue_continuity_stats,
+            **postgate_stats,
             "warnings": warnings,
         }
 
@@ -553,6 +686,9 @@ def compute_quality_report(
         **duration_stats,
         **density_stats,
         **spec_stats,
+        **chunk_cut_stats,
+        **cue_continuity_stats,
+        **postgate_stats,
         "warnings": warnings,
     }
     return report

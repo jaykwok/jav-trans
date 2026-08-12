@@ -145,3 +145,60 @@ def test_load_global_glossary_pairs_reads_hashed_translation_glossary(tmp_path):
     )
 
     assert pairs == [("あなた", "你")]
+
+
+def test_chunk_cuts_and_cue_plan_reach_the_report(monkeypatch, tmp_path):
+    """Both live in `asr_details` and nowhere else by the time the report is
+    written, so the pass-through is the whole mechanism."""
+    monkeypatch.setenv("QUALITY_REPORT_ENABLED", "1")
+    monkeypatch.delenv("QUALITY_REPORT_DIR", raising=False)
+
+    write_quality_report(
+        video_stem="sample",
+        job_temp_dir=str(tmp_path),
+        aligned_segments=[
+            {"start": 0.0, "end": 1.0, "text": "こんにちは", "ja": "こんにちは", "zh": "你好"}
+        ],
+        asr_details={
+            "chunk_count": 3,
+            "chunk_cuts": {
+                "policy": "latest_pause_midpoint",
+                "source": "alignment_head_blank_runs",
+                "chunk_count": 3,
+                "cut_count": 2,
+                "pause_cut_count": 1,
+                "max_chunk_fallback_count": 1,
+                "max_chunk_fallback_share": 0.5,
+            },
+            "subtitle_cue_plan": {
+                "cues_after": 4,
+                "layout_diagnostics": {
+                    "subtitle_layout_break_type": {"word_gap": 3, "end": 1},
+                    "layout_word_gap_cut_under_0p2s": 1,
+                    "continues_from_previous": 1,
+                    "continues_into_next": 1,
+                    "vocalisation_continuity_flags_cleared": 2,
+                },
+            },
+        },
+        project_root=tmp_path,
+        console=_Console(),
+        write_json_atomic=_write_json_atomic,
+        env_flag=_env_flag,
+        video_duration_s=60.0,
+    )
+
+    report_dir = tmp_path / "video" / "sample"
+    payload = json.loads((report_dir / "sample.quality_report.json").read_text(encoding="utf-8"))
+    assert payload["chunk_cut_policy"] == "latest_pause_midpoint"
+    assert payload["chunk_cut_max_fallback_count"] == 1
+    assert payload["cue_continues_from_previous_count"] == 1
+    assert payload["vocalisation_continuity_flags_cleared"] == 2
+
+    assert payload["layout_break_type_counts"]["word_gap"] == 3
+
+    markdown = (report_dir / "sample.quality_report.md").read_text(encoding="utf-8")
+    assert "chunk_cut_max_fallback_share" in markdown
+    assert "vocalisation_continuity_flags_cleared" in markdown
+    assert "## Layout Break Types" in markdown
+    assert "`word_gap`: 3" in markdown

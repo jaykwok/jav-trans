@@ -336,6 +336,45 @@ def _exact_lexical_extent(
     return float(lexical[0]["start"]), float(lexical[-1]["end"])
 
 
+_BOUNDARY_BASE_PENALTY = {
+    "sentence_punctuation": 0.0,
+    "strong_gap": 0.05,
+    "clause_punctuation": 0.10,
+    "word_gap": 0.20,
+    "end": 0.0,
+}
+
+
+def _boundary_penalty(kind: str, gap_s: float) -> float:
+    """What a cut at this boundary costs the DP.
+
+    The kinds are ranked by what justifies the cut: written sentence end, a
+    pause long enough to be a pause, written clause end, and last a gap that is
+    merely wider than the space between syllables.
+
+    `word_gap` is the only kind whose entire evidence is the silence, and its
+    0.12s floor admits boundaries barely distinguishable from continuous speech.
+    So inside that kind the measured gap is read as a strength rather than
+    discarded: 0.12s costs 0.36, 0.60s costs 0.20, continuously in between.
+    Without this the DP scores every word gap alike and the choice falls to the
+    length terms, i.e. to whichever gap fills the character cap best.
+
+    Measured on eight films, 7,257 internal cuts (`agents/temp/
+    20260812_180000_cut-tracking/evaluate_layout_boundary_policy.py`): cuts
+    sitting in a marginal 0.12-0.20s gap fall 432 -> 330 (-23.6%), while cue
+    count moves 9,008 -> 9,012, characters p50/p90 stay 16/20 with the same 51
+    over the cap, and duration p50 stays 2.615s. The same grading applied to
+    every kind was also measured and rejected: it reaches only 353 and pays for
+    it by moving 134 cuts off written commas onto acoustic gaps, which trades
+    syntax for silence.
+    """
+    base = _BOUNDARY_BASE_PENALTY[kind]
+    if kind != "word_gap":
+        return base
+    shortfall = max(0.0, WORD_GAP_STRONG_S - float(gap_s)) / WORD_GAP_STRONG_S
+    return base + 0.20 * shortfall
+
+
 def _exact_safe_dp_plan(
     block: dict,
     *,
@@ -373,13 +412,6 @@ def _exact_safe_dp_plan(
 
     char_cap = max(1, int(options.max_source_chars))
     duration_cap_s = _subtitle_max_display_duration_s(options)
-    boundary_penalty = {
-        "sentence_punctuation": 0.0,
-        "strong_gap": 0.05,
-        "clause_punctuation": 0.10,
-        "word_gap": 0.20,
-        "end": 0.0,
-    }
     best: dict[int, tuple[float, int | None]] = {0: (0.0, None)}
     for end_index in candidates[1:]:
         best_cost = float("inf")
@@ -402,15 +434,14 @@ def _exact_safe_dp_plan(
                 0.0,
                 (char_cap * 0.35 - length) / max(1.0, float(char_cap)),
             )
-            kind = (
-                "end"
-                if end_index == word_count
-                else _exact_boundary_kind(words, end_index)[0]
-            )
+            if end_index == word_count:
+                kind, gap = "end", 0.0
+            else:
+                kind, gap = _exact_boundary_kind(words, end_index)
             cost = (
                 best[start_index][0]
                 + 1.0
-                + boundary_penalty[kind]
+                + _boundary_penalty(kind, gap)
                 + underfill * 0.25
                 + float(char_overflow * char_overflow) * 25.0
                 + float(duration_overflow * duration_overflow) * 25.0
@@ -438,10 +469,10 @@ def _exact_safe_dp_plan(
         extent = _exact_lexical_extent(words, start_index, end_index)
         if extent is None:
             return {"pieces": [], "reason": "punctuation_only_piece", "score": 0.0}
-        end_kind = (
-            "end"
+        end_kind, end_gap = (
+            ("end", 0.0)
             if end_index == word_count
-            else _exact_boundary_kind(words, end_index)[0]
+            else _exact_boundary_kind(words, end_index)
         )
         pieces.append(
             {
@@ -452,6 +483,11 @@ def _exact_safe_dp_plan(
                 "start": extent[0],
                 "end": extent[1],
                 "end_boundary_kind": end_kind,
+                # The measured silence the cut sits in. The DP scores boundaries
+                # by kind alone, so this is the graded evidence behind a coarse
+                # label: 0.12s and 0.55s are both `word_gap` and are not equally
+                # likely to be the end of a thought.
+                "end_boundary_gap_s": round(float(end_gap), 3),
                 "source_char_count": (
                     char_prefix[end_index] - char_prefix[start_index]
                 ),
@@ -616,9 +652,10 @@ def _split_long_display_block(
         item["anchor_type"] = end_boundary_kind if item["anchor_used"] else ""
         item["anchor_score"] = 0.0
         item["snap_distance_s"] = 0.0
-        item["snap_reason"] = "measured_safe_boundary_dp_v3"
+        item["snap_reason"] = options.layout_engine
         item["layout_score"] = float(plan.get("score") or 0.0)
         item["text_break_type"] = end_boundary_kind
+        item["text_break_gap_s"] = float(piece.get("end_boundary_gap_s") or 0.0)
         item["proportional_fallback_used"] = False
         split_blocks.append(item)
     return split_blocks
@@ -818,6 +855,78 @@ def _polish_subtitle_timeline(
     return polished
 
 
+def _linger_locked_display_ends(
+    blocks: list[dict],
+    *,
+    options: SubtitleOptions,
+    diagnostics: dict | None = None,
+) -> list[dict]:
+    """Let a locked cue stay on screen through the silence that follows it.
+
+    v3 ends a cue at its last spoken character, and `layout_timeline_locked`
+    then exempts it from `_polish_subtitle_timeline`, so the out-point extension
+    every subtitle spec asks for stopped running. Measured on eight films that
+    costs 487 of 7,016 cues a display shorter than the 20-frame floor and puts
+    the source reading rate above 7 chars/s on 40.6% of them.
+
+    The silence is already there - free space after a cue is a median 0.57-2.13s
+    per film, and only 10.4% of cues have none - so this buys reading time
+    without inventing a single timestamp:
+
+      - starts never move, and neither does any word timing;
+      - `acoustic_end` stays exactly where the last character was spoken, so
+        `display_shift_end_s` reports precisely what was added, and re-running
+        this pass cannot compound (the acoustic cap is absolute, not relative);
+      - the extension stops two frames before the next cue appears, and a cue
+        whose neighbour is already that close is left alone rather than
+        shortened - truncating measured speech is what v3 exists to prevent;
+      - nothing is pushed past the display soft cap it was laid out under.
+
+    Runs after the vocalisation filter, so the ceiling is the neighbour that
+    actually survives: a dropped moaning run leaves real silence, and holding
+    the previous line over 0.5s of it is what a viewer wants.
+    """
+    linger_s = max(0.0, float(options.linger_s))
+    acoustic_cap_s = max(0.0, float(options.max_display_shift_from_acoustic_end_s))
+    gap_s = _subtitle_gap_s(options)
+    max_display_s = _subtitle_max_display_duration_s(options)
+    extended = 0
+    added_s = 0.0
+    if linger_s <= 0.0 or acoustic_cap_s <= 0.0:
+        return blocks
+
+    for index, block in enumerate(blocks):
+        if not bool(block.get("layout_timeline_locked")):
+            continue
+        start = _safe_float(block.get("display_start"), _safe_float(block.get("start")))
+        end = max(start, _safe_float(block.get("display_end"), _safe_float(block.get("end"))))
+        acoustic_end = max(start, _safe_float(block.get("acoustic_end"), end))
+        if index + 1 < len(blocks):
+            next_start = _safe_float(
+                blocks[index + 1].get("display_start"),
+                _safe_float(blocks[index + 1].get("start")),
+            )
+            ceiling = next_start - gap_s
+        else:
+            ceiling = end + linger_s
+        limits = [end + linger_s, ceiling, acoustic_end + acoustic_cap_s]
+        if max_display_s > 0.0:
+            limits.append(start + max_display_s)
+        new_end = min(limits)
+        if new_end <= end + 1e-9:
+            continue
+        extended += 1
+        added_s += new_end - end
+        block["end"] = new_end
+        block["display_end"] = new_end
+        block["display_duration"] = max(0.0, new_end - start)
+
+    if diagnostics is not None:
+        diagnostics["display_linger_applied_count"] = extended
+        diagnostics["display_linger_total_s"] = round(added_s, 3)
+    return blocks
+
+
 def _finalize_layout_fields(
     blocks: list[dict],
     *,
@@ -932,6 +1041,14 @@ def _prepare_subtitle_blocks(
         )
         if diagnostics is not None:
             diagnostics.update(vocalisation_diagnostics)
+    if options.timing_polish_enabled:
+        # After the filter, not before: the silence a dropped run leaves behind
+        # is real silence, and the cue before it should be allowed to use it.
+        prepared = _linger_locked_display_ends(
+            prepared,
+            options=options,
+            diagnostics=diagnostics,
+        )
     prepared = _normalize_subtitle_timeline(prepared, options=options)
     prepared = _finalize_layout_fields(prepared, options=options)
     stage("layout_finalize", 1, 1)

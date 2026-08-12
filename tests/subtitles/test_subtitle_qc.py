@@ -265,3 +265,171 @@ def test_spec_compliance_clean_output_has_no_spec_warnings():
     assert report["spec_duration_under_min_count"] == 0
     assert report["spec_gap_under_2frames_count"] == 0
     assert not [w for w in report["warnings"] if w.startswith("spec_")]
+
+
+def test_the_report_carries_the_chunk_cut_provenance_it_is_given():
+    """Neither how the audio was cut nor what the layout claimed about split
+    sentences can be read back off the finished subtitles, so the report is the
+    only place a run keeps them."""
+    segs = [_seg("ア", "一句话", 0.0, 2.0)]
+    report = compute_quality_report(
+        segs,
+        60.0,
+        [],
+        0,
+        1,
+        chunk_cuts={
+            "schema": "chunk_cut_provenance_v1",
+            "policy": "latest_pause_midpoint",
+            "source": "alignment_head_blank_runs",
+            "chunk_count": 5,
+            "cut_count": 4,
+            "pause_cut_count": 3,
+            "max_chunk_fallback_count": 1,
+            "max_chunk_fallback_share": 0.25,
+            "cut_pause_width_median_s": 1.4,
+            "cut_pause_width_min_s": 0.7,
+            "chunk_duration_median_s": 28.1,
+            "chunk_duration_min_s": 21.0,
+            "chunk_duration_max_s": 30.0,
+        },
+    )
+
+    assert report["chunk_cut_policy"] == "latest_pause_midpoint"
+    assert report["chunk_cut_source"] == "alignment_head_blank_runs"
+    assert report["chunk_cut_at_pause_count"] == 3
+    assert report["chunk_cut_max_fallback_count"] == 1
+    assert report["chunk_cut_max_fallback_share"] == pytest.approx(0.25)
+    assert report["chunk_duration_median_s"] == pytest.approx(28.1)
+
+
+def test_a_high_hard_cut_rate_is_reported_and_not_warned_about():
+    """It ranges 0.7%-53% across eight real films, and the high ones are films
+    that are mostly continuous vocalisation. Any threshold that passed those
+    would be met by everything."""
+    segs = [_seg("ア", "一句话", 0.0, 2.0)]
+    report = compute_quality_report(
+        segs,
+        60.0,
+        [],
+        0,
+        1,
+        chunk_cuts={
+            "cut_count": 146,
+            "pause_cut_count": 68,
+            "max_chunk_fallback_count": 78,
+            "max_chunk_fallback_share": 0.5342,
+        },
+    )
+
+    assert report["chunk_cut_max_fallback_share"] == pytest.approx(0.5342)
+    assert not [w for w in report["warnings"] if w.startswith("chunk_")]
+
+
+def test_the_report_counts_continuation_claims_and_the_ones_withdrawn():
+    segs = [_seg("ア", "一句话", 0.0, 2.0)]
+    report = compute_quality_report(
+        segs,
+        60.0,
+        [],
+        0,
+        1,
+        cue_plan={
+            "cues_after": 200,
+            "layout_diagnostics": {
+                "subtitle_layout_break_type": {
+                    "sentence_punctuation": 148,
+                    "word_gap": 40,
+                    "end": 12,
+                },
+                "layout_word_gap_cut_count": 40,
+                "layout_word_gap_cut_under_0p2s": 9,
+                "layout_word_gap_median_s": 0.269,
+                "continues_from_previous": 50,
+                "continues_into_next": 52,
+                "vocalisation_cues_dropped": 224,
+                "vocalisation_runs_dropped": 60,
+                "vocalisation_continuity_flags_cleared": 12,
+            },
+        },
+    )
+
+    assert report["cue_continues_from_previous_count"] == 50
+    assert report["cue_continues_into_next_count"] == 52
+    assert report["cue_continues_from_previous_share"] == pytest.approx(0.25)
+    assert report["cue_plan_cue_count"] == 200
+    assert report["vocalisation_continuity_flags_cleared"] == 12
+    assert report["vocalisation_runs_dropped"] == 60
+    # The break types are the reason the continuation counts are what they are:
+    # every cue not ending on a sentence end claims to continue.
+    assert report["layout_break_type_counts"]["word_gap"] == 40
+    assert report["layout_word_gap_cut_under_0p2s"] == 9
+    assert report["layout_word_gap_median_s"] == pytest.approx(0.269)
+
+
+def test_the_report_shows_both_what_the_postgate_saw_and_what_survived():
+    """The two numbers answer different questions.
+
+    A chunk-level count says how much the detector marked; a cue-level count
+    says how much of it got past the layout and the vocalisation filter into the
+    file a viewer opens. Only the second one is a reason to act.
+    """
+    segs = [_seg("ア", "一句话", 0.0, 2.0)]
+    report = compute_quality_report(
+        segs,
+        60.0,
+        [],
+        0,
+        1,
+        cue_plan={
+            "cues_after": 400,
+            "layout_diagnostics": {
+                "postgate_flagged_cues": 20,
+                "postgate_cue_flags": {"repeated_unit": 18, "runaway_repetition": 4},
+            },
+        },
+        postgate={
+            "schema": "text_alignment_postgate_v1",
+            "reviewed": 250,
+            "flagged": 40,
+            "flags": {"repeated_unit": 36, "runaway_repetition": 7},
+            "alignment_score_checked": 0,
+        },
+    )
+
+    assert report["postgate_chunks_reviewed"] == 250
+    assert report["postgate_chunks_flagged"] == 40
+    assert report["postgate_chunks_flagged_share"] == pytest.approx(0.16)
+    assert report["postgate_chunk_flag_counts"]["repeated_unit"] == 36
+    assert report["postgate_flagged_cue_count"] == 20
+    assert report["postgate_flagged_cue_share"] == pytest.approx(0.05)
+    assert report["postgate_cue_flag_counts"]["repeated_unit"] == 18
+    # The uncalibrated alignment-score check is off, and a report that hid that
+    # would read as "the audio supports every cue".
+    assert report["postgate_alignment_score_checked"] == 0
+    assert not [w for w in report["warnings"] if w.startswith("postgate")]
+
+
+def test_provenance_absent_from_the_run_stays_absent_from_the_report():
+    """A resume that never chunked has nothing to say about cutting, and a null
+    would read as 'measured zero'."""
+    report = compute_quality_report([_seg("ア", "一句话", 0.0, 2.0)], 60.0, [], 0, 1)
+
+    assert "chunk_cut_policy" not in report
+    assert "cue_continues_from_previous_count" not in report
+
+
+def test_an_empty_subtitle_run_still_reports_how_it_was_cut():
+    """The run that produced nothing is exactly the one whose chunking is worth
+    reading."""
+    report = compute_quality_report(
+        [],
+        60.0,
+        [],
+        0,
+        0,
+        chunk_cuts={"cut_count": 2, "max_chunk_fallback_count": 2},
+    )
+
+    assert report["chunk_cut_count"] == 2
+    assert report["chunk_cut_max_fallback_count"] == 2

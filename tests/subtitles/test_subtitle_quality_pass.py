@@ -742,7 +742,10 @@ def test_source_char_target_uses_the_only_later_measured_safe_point():
     assert [len(piece["ja_text"]) for piece in pieces] == [23, 3]
     assert pieces[0]["source_char_violation"] is True
     assert pieces[1]["start"] == pytest.approx(words[23]["start"])
-    assert pieces[0]["end"] == pytest.approx(words[22]["end"])
+    # The boundary is the measured word edge; the display end may then linger in
+    # the silence after it, which is why the acoustic field is the one to assert.
+    assert pieces[0]["acoustic_end"] == pytest.approx(words[22]["end"])
+    assert pieces[0]["end"] < pieces[1]["start"]
 
 
 def test_source_char_target_does_not_invent_a_boundary_when_none_is_safe():
@@ -790,8 +793,9 @@ def test_duration_target_uses_the_same_measured_safe_boundary_dp():
 
     assert [piece["ja_text"] for piece in pieces] == ["あ" * 6, "あ" * 6]
     assert all(piece["duration_soft_cap_violation"] is False for piece in pieces)
-    assert pieces[0]["end"] == pytest.approx(words[5]["end"])
+    assert pieces[0]["acoustic_end"] == pytest.approx(words[5]["end"])
     assert pieces[1]["start"] == pytest.approx(words[6]["start"])
+    assert pieces[0]["end"] < pieces[1]["start"]
 
 
 def test_long_cue_splits_at_measured_word_gap_not_mid_word():
@@ -882,9 +886,12 @@ def test_a_long_silence_puts_the_next_cue_at_its_measured_word_start():
     assert following, [piece["ja_text"] for piece in pieces]
     assert following[0]["start"] == pytest.approx(words[target_position]["start"])
     assert following[0]["exact_measured_timeline"] is True
-    # The pause itself stays empty: the previous cue ends on its own last word.
+    # The pause is not filled: the previous cue ends on its own last word and
+    # may hold for at most the linger, leaving the rest of the 5s silent.
     previous = pieces[pieces.index(following[0]) - 1]
-    assert previous["end"] == pytest.approx(words[target_position - 1]["end"])
+    assert previous["acoustic_end"] == pytest.approx(words[target_position - 1]["end"])
+    assert previous["end"] <= previous["acoustic_end"] + 0.5 + 1e-9
+    assert previous["end"] < following[0]["start"] - 4.0
 
 
 def test_incomplete_measured_word_map_never_falls_back_to_proportional_time():
@@ -992,9 +999,12 @@ def test_long_blank_is_a_real_gap_between_independent_cue_edges():
     pieces = subtitle.prepare_srt_blocks([block], options=SubtitleOptions())
 
     assert [piece["ja_text"] for piece in pieces] == ["先", "後"]
-    # Both edges remain exactly on their measured lexical words. The 14.5s
-    # blank is genuinely subtitle-free; no display linger is added.
-    assert pieces[0]["end"] == pytest.approx(words[0]["end"])
+    # Both acoustic edges remain exactly on their measured lexical words, and
+    # the 14.5s blank stays a blank: the first cue may hold for the 0.5s linger,
+    # the remaining 14s carries no subtitle and the second cue still enters on
+    # its own measured word.
+    assert pieces[0]["acoustic_end"] == pytest.approx(words[0]["end"])
+    assert pieces[0]["end"] == pytest.approx(words[0]["end"] + 0.5)
     assert pieces[1]["start"] == pytest.approx(15.0)
     assert not any(piece["display_clamped_to_max"] for piece in pieces)
 
@@ -1057,3 +1067,64 @@ def test_within_word_spacing_is_not_a_safe_boundary():
     assert pieces[0]["subtitle_layout_split_skipped"] == (
         "measured_safe_boundaries_unavailable"
     )
+
+
+def test_a_wider_measured_gap_beats_a_marginal_one_that_fills_the_line():
+    """Where the cut lands when two word gaps are both legal.
+
+    Both boundaries fit under the 20-character cap, so with every word gap
+    scoring alike the choice fell to the fill terms and the later, narrower gap
+    won - a 0.15s silence is barely distinguishable from the space between
+    syllables. The measured gap is the only evidence a word gap has, so it is
+    read as a strength: 0.45s outranks 0.15s even though it leaves a shorter
+    first line.
+    """
+    text = "あ" * 22
+    words = _aligned_words(text, 0.0, 0.20)
+    for word in words[6:]:
+        word["start"] += 0.45
+        word["end"] += 0.45
+    for word in words[14:]:
+        word["start"] += 0.15
+        word["end"] += 0.15
+
+    prepared = subtitle.prepare_srt_blocks([
+        {
+            "start": 0.0,
+            "end": words[-1]["end"],
+            "ja_text": text,
+            "zh_text": text,
+            "words": words,
+        }
+    ], options=SubtitleOptions(drop_vocalisation_only_cues=False))
+
+    assert [len(piece["ja_text"]) for piece in prepared] == [6, 16]
+    assert prepared[0]["text_break_type"] == "word_gap"
+    assert prepared[0]["text_break_gap_s"] == pytest.approx(0.45)
+
+
+def test_the_widest_gap_does_not_override_a_written_comma():
+    """The grading stays inside `word_gap`.
+
+    A comma is syntax and a pause is not, so a wide silence must not outrank a
+    clause boundary - that trade was measured on eight films and moved 134 cuts
+    off written commas onto acoustic gaps.
+    """
+    text = "あ" * 8 + "、" + "あ" * 13
+    words = _aligned_words(text, 0.0, 0.20)
+    for word in words[14:]:
+        word["start"] += 0.55
+        word["end"] += 0.55
+
+    prepared = subtitle.prepare_srt_blocks([
+        {
+            "start": 0.0,
+            "end": words[-1]["end"],
+            "ja_text": text,
+            "zh_text": text,
+            "words": words,
+        }
+    ], options=SubtitleOptions(drop_vocalisation_only_cues=False))
+
+    assert prepared[0]["text_break_type"] == "clause_punctuation"
+    assert prepared[0]["ja_text"] == "あ" * 8 + "、"

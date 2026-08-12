@@ -141,6 +141,39 @@ def _quality_report_markdown(video_stem: str, report: dict) -> str:
         "asr_generation_overflow_count",
         "asr_timeout_count",
         "asr_quarantined_count",
+        # Upstream provenance: how the audio was cut, and what the layout told
+        # the translator about sentences it split. Absent from the report when
+        # the run did not produce them, e.g. a resume that never chunked.
+        "chunk_cut_policy",
+        "chunk_cut_source",
+        "chunk_count",
+        "chunk_cut_count",
+        "chunk_cut_at_pause_count",
+        "chunk_cut_max_fallback_count",
+        "chunk_cut_max_fallback_share",
+        "chunk_cut_pause_width_median_s",
+        "chunk_cut_pause_width_min_s",
+        "chunk_duration_median_s",
+        "chunk_duration_min_s",
+        "chunk_duration_max_s",
+        "cue_plan_cue_count",
+        "display_linger_applied_count",
+        "display_linger_total_s",
+        "layout_word_gap_cut_count",
+        "layout_word_gap_cut_under_0p2s",
+        "layout_word_gap_median_s",
+        "cue_continues_from_previous_count",
+        "cue_continues_from_previous_share",
+        "cue_continues_into_next_count",
+        "vocalisation_cues_dropped",
+        "vocalisation_runs_dropped",
+        "vocalisation_continuity_flags_cleared",
+        "postgate_chunks_reviewed",
+        "postgate_chunks_flagged",
+        "postgate_chunks_flagged_share",
+        "postgate_alignment_score_checked",
+        "postgate_flagged_cue_count",
+        "postgate_flagged_cue_share",
     ]
     lines = [
         f"# Quality Report: {video_stem}",
@@ -160,6 +193,22 @@ def _quality_report_markdown(video_stem: str, report: dict) -> str:
         lines.extend(f"- {warning}" for warning in warnings)
     else:
         lines.append("- None")
+
+    break_types = dict(report.get("layout_break_type_counts") or {})
+    if break_types:
+        lines.extend(["", "## Layout Break Types", ""])
+        for name, count in sorted(break_types.items(), key=lambda item: (-item[1], item[0])):
+            lines.append(f"- `{name}`: {count}")
+
+    chunk_flags = dict(report.get("postgate_chunk_flag_counts") or {})
+    cue_flags = dict(report.get("postgate_cue_flag_counts") or {})
+    if chunk_flags or cue_flags:
+        lines.extend(["", "## Post-gate Flags", "", "| Flag | Chunks | Cues |", "| --- | ---: | ---: |"])
+        for name in sorted(set(chunk_flags) | set(cue_flags)):
+            lines.append(
+                f"| `{name}` | {_format_report_value(chunk_flags.get(name, 0))} "
+                f"| {_format_report_value(cue_flags.get(name, 0))} |"
+            )
 
     examples = list(report.get("subtitle_overlap_examples") or [])
     if examples:
@@ -235,6 +284,9 @@ def write_quality_report(
             alignment_issue_count,
             int((asr_details or {}).get("chunk_count") or len(aligned_segments)),
             asr_generation={},
+            chunk_cuts=(asr_details or {}).get("chunk_cuts"),
+            cue_plan=(asr_details or {}).get("subtitle_cue_plan"),
+            postgate=(asr_details or {}).get("postgate"),
         )
         explicit_report_dir = str(report_dir).strip() if report_dir is not None else ""
         env_report_dir = os.getenv("QUALITY_REPORT_DIR", "").strip()

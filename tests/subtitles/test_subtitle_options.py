@@ -32,8 +32,8 @@ def test_subtitle_options_defaults_are_conservative():
 
     assert options.max_display_duration_s == 7.0
     assert options.max_source_chars == 20
-    assert options.layout_engine == "measured_safe_boundary_dp_v3"
-    assert options.timing_model == "measured_lexical_extent_v2"
+    assert options.layout_engine == "measured_safe_boundary_dp_v3_1"
+    assert options.timing_model == "measured_lexical_extent_v3"
     assert options.frame_duration_s == pytest.approx(1 / BASE_FPS)
     assert options.frame_gap_s == pytest.approx(2 / BASE_FPS)
     assert options.frame_min_duration_s == pytest.approx(20 / BASE_FPS)
@@ -52,6 +52,19 @@ def test_an_unknown_layout_engine_is_refused_instead_of_relabelled(monkeypatch):
     say so, not hand back cues that lie about which layout made them.
     """
     monkeypatch.setenv("SUBTITLE_LAYOUT_ENGINE", "anchor_aware_dp_v2")
+
+    with pytest.raises(ValueError, match="SUBTITLE_LAYOUT_ENGINE"):
+        SubtitleOptions.from_env()
+
+
+def test_the_previous_layout_stamp_is_refused_like_any_other(monkeypatch):
+    """`v3` and `v3_1` differ in where ~1.4% of cuts land.
+
+    Accepting the older name would stamp v3_1 cues as v3 output, which is the
+    exact failure the refusal exists for - and this is the name most likely to
+    be tried, because it was the default until this build.
+    """
+    monkeypatch.setenv("SUBTITLE_LAYOUT_ENGINE", "measured_safe_boundary_dp_v3")
 
     with pytest.raises(ValueError, match="SUBTITLE_LAYOUT_ENGINE"):
         SubtitleOptions.from_env()
