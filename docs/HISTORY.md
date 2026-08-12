@@ -8,7 +8,57 @@
 
 ## 当前有效状态
 
-- 2026-08-12 **JAV 非语义人声 CTC 变体与精确字幕 Layout v3 已正式晋升，同时保留原通用头**。最终把实验 `run1` 命名为 **`ctc_aligner_jav_vocalisation_v2.pt`**，SHA256 `3C1AA98CE4B692F09361C6DAB510204FCC9CF9D3733DEC26E7E53195256DD414`，作为独立文件上传到 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`；模型卡同步给出两头差异、选择场景与加载用例，最终 HF commit **`5a6a789ceb2f22d2b8606743b13a8159af218362`**。项目默认 `ASR_ALIGNMENT_HEAD_PATH` 已钉到该 commit/文件，本地落在 `models/ctc_aligner_jav_vocalisation_v2.pt`；**没有覆盖**原 `ctc_aligner.pt`，远端最终 commit 回读确认原文件仍为 SHA256 `61EF0CCD0E18F26ADBF3BCCC58165E4534BF727A793F02B363D24C556257B911`。选择并列发布而不是改义原文件，是因为新头并非原 Galgame 头的同口径小修：151.5h 混合训练含 Galgame / anime SFW / anime NSFW-JAV，使用纯声学词表、呻吟剥离目标与 blank-only 样本，目标就是把非语义人声读成 blank；原头仍适合复现旧时间轴及通用 anime/galgame 场景。头级八片验收维持原裁决：blank AUC **0.9384→0.9609**，同等约 5% 误伤下召回 **72.9%→90.5%**，起终点误差同量级；风险仍是 `blank=1.000` 86 条中 Grok 证实误伤 6 条，其余 80 条是无人反驳而非已洗清。**选 run1 而不是 run3 的理由链要连着 08-12 的两次反转一起看**：同日固定 30s 分块的因果隔离对照先判 run3（零宽压掉的语义字符 90 vs 70、CPS>7 27.19% vs 16.89%），并指出「标点碎片化」这条原本支持 run1 的理由已被生产向 `blank_runs` 传 `silent_classes` 抵消；随后用 v3 精确布局从 `segments.json` 重排，宣告前一份评估里所有布局相关指标作废（旧 `cues.json` 中 run1 带 135 条 clamp、1,200 条比例回退），重排后 run1 的 cue 数与时长分布最好，最终选 run1，详见 [2026-08-12](#2026-08-12)。**代价是已知且已量化的**：同一批词，run1 的在屏总秒数比原头少 24%（21,133s vs 27,892s，run3 24,522s），CPS>7 占比 40.6%（原头 17.3%、run3 27.3%），7.0% 的 cue 短于 20 帧最小显示时长——v3 锁定时间轴后不再补最小时长、不再补 2 帧间隔，因此 QC 的这两项已改为按份额告警（`QC_MAX_SPEC_DURATION_UNDER_SHARE` / `QC_MAX_SPEC_GAP_UNDER_SHARE`，默认 0.15），这是取舍不是回归。Grok `speaker` 没有进入 run1/run3 的训练目标或切点标签，原始响应里词内 speaker 抖动不是这版头学到的坏边界，故没有因 speaker 重训。字幕层同时晋升为 **`measured_safe_boundary_dp_v3`**：每个约 30s 源 segment 内一次 DP 联合优化 **20 个日文源字符 / 7.0s 实测词语跨度**两个软目标；内部候选只认句末/分句标点、≥0.6s 强停顿与 0.12–0.6s 实测词间隙，cue 严格从首个实测发音字起、到最后一个实测发音字止。没有安全点就保留超限 cue，**不使用 `synthetic_proportional` 造切点、不把显示时间截到 7s、也不把实测边界延展进 blank**。八片从 `segments.json` 直接调用生产实现复算，与裁决脚本逐项一致，**两个口径要分开引**：过滤前 1,751 个源 segment 出 **9,008 cue**，其 **7,257 个内部边界**为句末 2,000 / 强停顿 3,262 / 分句 1,111 / 普通实测词间隙 884，任意字符边界 0；丢掉连续纯人声 cue 后是 **7,016 cue**，字数 p50/p90/p95 `17/20/20`，超 20 字 41 条（0.584%），时长 p50/p90 `2.731/5.654s`，超 7s 34 条（0.485%）。实测边界失败、文本保真失败、比例回退、显示截断均为 **0**，**重叠 cue 也是 0 对**；低于 2 帧间隔的相邻对 553、短于最小显示时长的 493 条（7.0%），最短 0.038s（一个上采样编码帧）。生产校验产物在 `agents/temp/20260812_123536_promote-jav-vocalisation-v2/`；README 已同步头的区别、回退用法与 `SUBTITLE_MAX_SOURCE_CHARS` / `SUBTITLE_MAX_DISPLAY_DURATION_S` 用例。全量测试 **1492 passed / 1 skipped**。
+- 2026-08-13 **时间模型升到 `measured_lexical_extent_v3`：显示终点可以在本来就空着的静音里多停最多 0.5s。** v3 让 cue 在最后一个发音字结束、`layout_timeline_locked` 又把它排除在 polish 之外，于是 TTSG 的出点 +0.5s 从此没跑过，代价是 487/7,016 条 cue 短于 20 帧、日文源 CPS>7 占 40.6%。四条上限同时生效：`linger_s`(0.5)、下一条起点前 2 帧、`acoustic_end + max_display_shift_from_acoustic_end_s`(0.5，兼作幂等保证)、不越 7s 软上限；下一条在 2 帧内开始时**整条不动**（回缩会截断实测语音）。**起点、声学边界、词时间一律不动**，增量记在 `display_shift_end_s`。八片生产实现实测：短于最小显示 **487 → 198**，CPS>7 **40.6% → 27.9%**，在屏 21,115 → 23,733s，时长 p50/p90 2.692/5.615 → 3.077/6.070s；超 7s 仍 34、重叠仍 0、间隔<2 帧仍 556、超 20 字仍 41、文本逐字一致、起点位移 0 条、越过 0.5s 上限 0 条。切点落点不变，所以 `LAYOUT_ENGINE` 不动——这正是两个戳分开的用处。**同日 `asr.postgate` 的标记第一次有了消费者**：`_build_japanese_srt_blocks` 此前按固定 key 重建 block，标记到 `aligned_segments.json` 就断了；现在随 cue 下传，质量报告同时给 chunk 级与 cue 级两层计数，只观测不设阈值。详见 [2026-08-13](#2026-08-13)。
+- 2026-08-12 **字幕布局升到 `measured_safe_boundary_dp_v3_1`：同样合法的两个切点之间选证据更强的，而不是更能填满行的。** 候选类型优先级不变（句末标点 > ≥0.6s 强停顿 > 分句标点 > 词间隙），新增的是词间隙**内部**按实测静音连续加权（0.12s 罚 0.36、0.60s 罚 0.20）——词间隙唯一的依据就是那段静音，而 0.12s 下限已贴近连续语流里音节间的间隔。八片跑生产实现：落在 0.12–0.2s 边缘静音上的切点 **399 → 301（−24.6%）**，词间隙静音中位数 0.192 → 0.269s，cue 总数 7,016 不变，字数 p50/p90 仍 17/20、超 20 字仍 41 条，时长 p50/p90 2.731/5.654 → 2.692/5.615s、超 7s 仍 34 条，重叠 0、比例回退 0。把同样加权推广到所有类别的版本已被否：它会把 134 个切点从写出来的逗号挪到声学停顿上。旧戳 `measured_safe_boundary_dp_v3` 与其它未知值一样被拒绝。**音频切块不受影响**：送进 ASR 的块仍取 30s 窗口内最靠后的合法停顿，因为块长本身就是目标；改取最宽会把块长中位数压到 18.4–22.4s，正落在 2026-08-02 实测伤转写的区间。两层的切点来源与续句标记现在都记进质量报告（只观测、不设阈值），详见 [2026-08-12](#2026-08-12)。
+- 2026-08-12 **JAV 非语义人声 CTC 变体与精确字幕 Layout v3 已正式晋升，同时保留原通用头**。最终把实验 `run1` 命名为 **`ctc_aligner_jav_vocalisation_v2.pt`**，SHA256 `3C1AA98CE4B692F09361C6DAB510204FCC9CF9D3733DEC26E7E53195256DD414`，作为独立文件上传到 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`；模型卡同步给出两头差异、选择场景与加载用例，最终 HF commit **`5a6a789ceb2f22d2b8606743b13a8159af218362`**。项目默认 `ASR_ALIGNMENT_HEAD_PATH` 已钉到该 commit/文件，本地落在 `models/ctc_aligner_jav_vocalisation_v2.pt`；**没有覆盖**原 `ctc_aligner.pt`，远端最终 commit 回读确认原文件仍为 SHA256 `61EF0CCD0E18F26ADBF3BCCC58165E4534BF727A793F02B363D24C556257B911`。选择并列发布而不是改义原文件，是因为新头并非原 Galgame 头的同口径小修：151.5h 混合训练含 Galgame / anime SFW / anime NSFW-JAV，使用纯声学词表、呻吟剥离目标与 blank-only 样本，目标就是把非语义人声读成 blank；原头仍适合复现旧时间轴及通用 anime/galgame 场景。头级八片验收维持原裁决：blank AUC **0.9384→0.9609**，同等约 5% 误伤下召回 **72.9%→90.5%**，起终点误差同量级；风险仍是 `blank=1.000` 86 条中 Grok 证实误伤 6 条，其余 80 条是无人反驳而非已洗清。**选 run1 而不是 run3 的理由链要连着 08-12 的两次反转一起看**：同日固定 30s 分块的因果隔离对照先判 run3（零宽压掉的语义字符 90 vs 70、CPS>7 27.19% vs 16.89%），并指出「标点碎片化」这条原本支持 run1 的理由已被生产向 `blank_runs` 传 `silent_classes` 抵消；随后用 v3 精确布局从 `segments.json` 重排，宣告前一份评估里所有布局相关指标作废（旧 `cues.json` 中 run1 带 135 条 clamp、1,200 条比例回退），重排后 run1 的 cue 数与时长分布最好，最终选 run1，详见 [2026-08-12](#2026-08-12)。**代价是已知且已量化的**（下列数字是 v3 当时的口径，2026-08-13 恢复出点延伸后已缩小到 23,733s / CPS>7 27.9% / 2.8%，见上一条）：同一批词，run1 的在屏总秒数比原头少 24%（21,133s vs 27,892s，run3 24,522s），CPS>7 占比 40.6%（原头 17.3%、run3 27.3%），7.0% 的 cue 短于 20 帧最小显示时长——v3 锁定时间轴后不再补最小时长、不再补 2 帧间隔，因此 QC 的这两项已改为按份额告警（`QC_MAX_SPEC_DURATION_UNDER_SHARE` / `QC_MAX_SPEC_GAP_UNDER_SHARE`，默认 0.15），这是取舍不是回归。Grok `speaker` 没有进入 run1/run3 的训练目标或切点标签，原始响应里词内 speaker 抖动不是这版头学到的坏边界，故没有因 speaker 重训。字幕层同时晋升为 **`measured_safe_boundary_dp_v3`**：每个约 30s 源 segment 内一次 DP 联合优化 **20 个日文源字符 / 7.0s 实测词语跨度**两个软目标；内部候选只认句末/分句标点、≥0.6s 强停顿与 0.12–0.6s 实测词间隙，cue 严格从首个实测发音字起、到最后一个实测发音字止。没有安全点就保留超限 cue，**不使用 `synthetic_proportional` 造切点、不把显示时间截到 7s、也不把实测边界延展进 blank**。八片从 `segments.json` 直接调用生产实现复算，与裁决脚本逐项一致，**两个口径要分开引**：过滤前 1,751 个源 segment 出 **9,008 cue**，其 **7,257 个内部边界**为句末 2,000 / 强停顿 3,262 / 分句 1,111 / 普通实测词间隙 884，任意字符边界 0；丢掉连续纯人声 cue 后是 **7,016 cue**，字数 p50/p90/p95 `17/20/20`，超 20 字 41 条（0.584%），时长 p50/p90 `2.731/5.654s`，超 7s 34 条（0.485%）。实测边界失败、文本保真失败、比例回退、显示截断均为 **0**，**重叠 cue 也是 0 对**；低于 2 帧间隔的相邻对 553、短于最小显示时长的 493 条（7.0%），最短 0.038s（一个上采样编码帧）。**这一段布局数字是 v3 晋升当时的口径**；当前生效的是 v3_1，cue 总数与两项超限数不变，时长与边缘切点分布见上一条。生产校验产物在 `agents/temp/20260812_123536_promote-jav-vocalisation-v2/`；README 已同步头的区别、回退用法与 `SUBTITLE_MAX_SOURCE_CHARS` / `SUBTITLE_MAX_DISPLAY_DURATION_S` 用例。全量测试 **1492 passed / 1 skipped**。
+
+## 2026-08-13
+
+### 把 v3 一直没花的阅读时间还回去
+
+**问题**：v3 让 cue 严格在最后一个实测发音字结束，`layout_timeline_locked` 又让它跳过 `_polish_subtitle_timeline`，于是 TTSG 的「出点 +0.5s」在 v3 之后**一次都没跑过**。八片实测代价：7,016 条里 487 条短于 20 帧最小显示时长，日文源 CPS>7 占 40.6%，同一批词的在屏总秒数比原通用头少 24%。这是当时字幕侧最大的单项缺口。
+
+**为什么这一条可以还、另外两条不能**：最短时长和 2 帧间隔都要求把边界移到没有语音证据的位置，出点不需要——cue 之后的静音本来就空着（每片自由静音中位数 0.57–2.13s，只有 727/7,016 条即 10.4% 的 cue 后面完全没空隙）。多停一会儿不发明任何时间戳。
+
+**四条上限同时生效**，每条都有各自要挡的事故：`linger_s`(0.5) 是规范本身；下一条起点前 2 帧防止压住后一句；`acoustic_end + max_display_shift_from_acoustic_end_s`(0.5) 是绝对上限而不是相对增量，因此**重复运行不会叠加**（locked cue 的 `acoustic_end` 就是切分时的 `piece_end`，不随显示终点变）；不越 `max_display_duration_s`(7s) 是因为 `spec_duration_over_7s_count` 是零容忍计数器，买阅读时间不能顺手给它造条目。下一条在 2 帧内开始时**整条不动**——回缩去截断实测语音正是 v3 存在的理由，而八片里正有 556 对相邻 cue 处在这个 2 帧之内。
+
+**pass 放在纯人声过滤之后**（按用户裁决）：被删掉的呻吟段留下的是真静音，前一句可以用；天花板因此按最终存活的邻居算。
+
+八片跑生产 `prepare_srt_blocks`，对照臂把该函数打成 no-op，两臂只差这一步：
+
+| | 关闭延伸 | 开启（v3） |
+| --- | ---: | ---: |
+| 短于最小显示 | 487 | **198** |
+| 日文源 CPS>7 | 40.65% | **27.85%** |
+| 在屏总秒数 | 21,114.7s | 23,732.5s |
+| 时长 p50 / p90 | 2.692 / 5.615s | 3.077 / 6.070s |
+| 超 7s / 重叠 / 间隔<2 帧 | 34 / 0 / 556 | 34 / 0 / 556 |
+| 超 20 字 / 比例回退 | 41 / 0 | 41 / 0 |
+| 起点被移动 / 越过 0.5s 上限 | 0 / 0 | 0 / 0 |
+
+cue 总数 7,016 不变，八片文本逐字一致。剩下的 198 条是后面确实没有可用静音的，属于明知偏离。（探索阶段那份估算给的是 23,792s，比生产实现多 59.8s，差在生产还多了一条 7s 软上限。）
+
+版本戳只升 `TIMING_MODEL`（`measured_lexical_extent_v2 → v3`），`LAYOUT_ENGINE` 不动：切点一个都没变。两个戳分开正是为了这种情况。
+
+### postgate 的标记第一次有了消费者
+
+`asr.postgate` 每次运行都在算 `repeated_unit`、`runaway_repetition` 等标记，`_annotate_segments_with_postgate` 也把它们并到 segment 上，但 `rg postgate src/main.py src/subtitles/` 零命中——`_build_japanese_srt_blocks` 按固定 key 列表重建 block，标记就是在那里丢的，到 `aligned_segments.json` 为止再没有任何东西读它。检测器的钱一直在付，什么也没换回来。
+
+现在标记随 block 下传（DP 拆出的每片用 `dict(block)` 自动继承——音频不支持的 chunk 不会在中途变成被支持的），cue plan 统计条数与分类，质量报告**同时给两层**：chunk 级说检测器看到了什么，cue 级说有多少真的活过了布局和纯人声过滤、进了成品字幕。**只有 cue 级那一列构成行动理由。**
+
+两层都不设阈值：`repeated_unit` 在本域本来就有约 10% 的 chunk 命中率，且多数是真实的重复语气词，阈值只能靠发明。`postgate_alignment_score_checked` 如实报 0（未标定的对齐分检查没有运行），免得被读成「每条 cue 都有音频支持」。**下一步先看数再定**：如果被标记的 cue 基本都已经被纯人声过滤删掉，就保持只观测；如果 `repeated_unit` 大量活进成品，最便宜且正确的动作是文本层折叠重复串（产物保留 raw 文本），不是删 cue、更不是重解码——08-02 已实测短块会把 `repeated_unit` 从 10.5% 推到 14.6%。
+
+全量测试 **1529 passed / 1 skipped**。
+
+### 复现步骤
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+# 空闲静音能还回多少阅读时间（含「顶到下一条」那档为什么否掉）
+uv run python agents/temp/20260813_090000_next-directions/measure_recoverable_reading_time.py
+# 生产实现开/关延伸的八片逐片对照
+uv run python agents/temp/20260813_090000_next-directions/verify_display_linger.py
+```
 
 ## 2026-08-12
 
@@ -46,6 +96,33 @@
 
 全量测试 **1498 passed / 1 skipped**。审计脚本与产物在 `agents/temp/20260812_142856_audit-promote-commit/`。
 
+### 字幕切点改按证据强度选（Layout v3_1），音频切块维持最靠后
+
+提问是「切点既然有概率，能不能不切最末尾的，而是切概率最大的」。**先问对了是哪一层**：第一轮我按音频切块理解并做了一轮离线评估，用户指出指的是字幕层切分，音频送进 ASR 的块本来就该在 30s 内取最大长度。两层的结论正好相反，所以两层都记下来。
+
+**音频层：维持「窗口内最靠后的合法停顿」，理由是块长本身就是目标。** 用归档停顿离线复算（`agents/temp/20260812_180000_cut-tracking/baseline_cut_provenance.py`）：把选点换成「窗口内最宽」，块长中位数 A 26.6→18.4s、V 27.8→19.5s、B 27.8→19.9s、J 26.5→20.5s、Z 27.7→22.3s，八片全部下压。**这正落进 2026-08-02 实测伤转写的区间**（20s vs 30s：`成人になるために` 读成 `政治になるために`、纯人声块幻觉 `カレロンか`、`repeated_unit` 10.5%→14.6%），因为 `max_s` 就是 encoder 的音频窗口，短块会被 padding 补回去。此外这一层也没有概率可用：`blank_runs` 只对 argmax 取游程，归档的 `pause_spans/*.json` 只有区间没有后验，要排序必须重跑 GPU 前向。
+
+**字幕层：DP 原本确实丢掉了它已经算出来的概率。** `_exact_boundary_kind` 同时返回边界类型和实测静音长度，但代价函数只用类型——句末 0.0 / 强停顿 0.05 / 分句 0.10 / 词间隙 0.20——于是 0.12s 和 0.59s 的词间隙同价，谁胜出改由「谁更能填满 20 字」决定。八片 7,257 个内部边界实测：只有 45.8% 落在「最靠后的合法边界」上（所以 DP 从来不是纯贪心），但 18.6%（1,351 个）的切点后面还有更宽的静音仍在字数上限内没被选。
+
+**改法只动 `word_gap` 内部**：`0.20 + 0.20 × (0.6 − gap)/0.6`，即 0.12s 罚 0.36、0.60s 罚 0.20，其余类别不动。词间隙是唯一「全部依据就是那段静音」的类别，而 0.12s 下限已经贴近连续语流里音节之间的间隔。**把同样的加权推广到所有类别的版本先做了、再被否掉**：它把边缘切点降到 353（对 330），代价是 134 个切点从写出来的逗号挪到声学停顿上——拿语法换静音，方向错了。
+
+生产实现八片复算（`verify_shipped_layout_change.py`，跑真实 `prepare_srt_blocks` 并开启纯人声过滤；对照臂把罚函数拍平回旧值，两臂只差这一项）：
+
+| | 旧（v3） | 新（v3_1） |
+| --- | ---: | ---: |
+| cue 总数 | 7,016 | 7,016 |
+| 落在 0.12–0.2s 边缘静音的切点 | 399 | **301**（−24.6%） |
+| 词间隙切点的静音中位数 | 0.192s | **0.269s** |
+| 分句标点切点 | 776 | 794 |
+| 字数 p50/p90，超 20 字 | 17/20，41 | 17/20，41 |
+| 时长 p50/p90，超 7s | 2.731/5.654s，34 | 2.692/5.615s，34 |
+| 重叠 / 低于 2 帧间隔 / 短于最小显示 | 0 / 553 / 493 | 0 / 556 / 487 |
+| 续句声明 | 3,591 | 3,588 |
+
+即：边缘切点少了四分之一，其余各项在 ±3 条以内，比例回退与文本保真仍是 0 / 100%。**版本戳因此从 `measured_safe_boundary_dp_v3` 升到 `measured_safe_boundary_dp_v3_1`**，旧名字和其它未知值一样被拒绝——两版有约 1.4% 的切点落点不同，让旧名字通过就是把新布局的产物标成旧布局的。
+
+**追踪按用户要求加在质量报告里，两组其实是一件事。** `continues_into_next` 的定义就是「这条不是以句末标点结束的」，所以 break type 分布正是续句数量的成因：报告现在同时记 `layout_break_type_counts`、`layout_word_gap_cut_count` / `_under_0p2s` / `_median_s`，与 `cue_continues_*` 三项、`vocalisation_runs_dropped`、`vocalisation_continuity_flags_cleared`（后者是**撤回**的声明数，脱离声明总数没有意义）。音频层的切点来源同样进报告（`chunk_cut_*`、`chunk_duration_*`），硬切份额八片 0.7%–53%（V 0.7% / AA 53.4%），跨度来自片子本身，因此**只观测不设阈值**；它随 `asr_details` 透传而不写进 `boundary_signature`，因为那是缓存键，塞进去会让所有已缓存任务失效。全量测试 **1515 passed / 1 skipped**。
+
 ### 复现步骤
 
 ```powershell
@@ -57,6 +134,12 @@ uv run python agents/temp/20260812_081331_fixed30-head-factorial/aggregate_fixed
 uv run python agents/temp/20260812_081331_fixed30-head-factorial/evaluate_cut_policies.py
 # 用生产 v3 布局从 segments.json 重排三臂（判旧布局指标作废的那一步）
 uv run python agents/temp/20260812_081331_fixed30-head-factorial/evaluate_exact_joint_layout_grid.py
+# 音频切点来源基线（含「最宽停顿」对块长的影响）与生产实现回读
+uv run python agents/temp/20260812_180000_cut-tracking/baseline_cut_provenance.py
+uv run python agents/temp/20260812_180000_cut-tracking/verify_provenance_matches_spans.py
+# 字幕层三种边界罚函数对照，以及生产 prepare_srt_blocks 的新旧逐片对照
+uv run python agents/temp/20260812_180000_cut-tracking/evaluate_layout_boundary_policy.py
+uv run python agents/temp/20260812_180000_cut-tracking/verify_shipped_layout_change.py
 ```
 
 **两个口径陷阱**：①比较字数/时长前先确认输入 cue 不带 clamp 与比例回退，否则测的是旧布局而不是头；②「一次编码多头同测」只保证音频相同，**还要逐片核对三臂的 spans hash 与 transcript hash 全等**（本轮 8/8 相等）——只要有一片不等，那片的差异就可能来自分块或 ASR 文本，整组结论都不能按「只换了头」来读。

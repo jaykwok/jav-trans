@@ -133,11 +133,12 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
   -> 音频抽取与标准化
      - async resample 保留源视频 PTS / edit-list 间隙，WAV 样本位置始终对应视频时间
      - 时间轴滤镜属于音频缓存键；规则变化会自动失效旧 WAV 与下游结果
-  -> 切分（asr.chunking.cut_at_pauses）
+  -> 切分（asr.chunking.plan_chunk_cuts）
      - ASR encoder 前向 -> CTC 对齐头 -> 每帧 blank 后验
      - 连续 blank 游程即停顿，切点落在停顿中央
      - 取 ASR_CHUNK_MAX_S 之内最靠后的停顿，块长跑满上限；上限即 encoder 音频窗口
      - 输出精确铺满 [0, 总时长]，相邻块共边，不丢任何音频
+     - 每个切点记录来源（停顿中点 / 无停顿时的定长兜底），进质量报告
      - 未配置 ASR_ALIGNMENT_HEAD_PATH 时退化为定长切分
   -> ASR wav chunk export
   -> Qwen ASR text transcription
@@ -150,10 +151,13 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
   -> 后置闸（asr.postgate）
      - 失控重复 / 语速不可能 / 与邻块重复 等只打标，不删除
      - 标记随 chunk 下发到 segment，只落在产物里，当前不参与任何删除决策
-  -> Subtitle Layout v3
+  -> Subtitle Layout v3_1
      - 20 个日文源字符与 7s 词语跨度联合软约束（一次 DP，不是先后硬切）
      - 候选仅来自句末/分句标点、>=0.6s 强停顿、0.12-0.6s 实测词间隙
-     - 每条严格从首个实测发音字开始、在最后一个实测发音字结束
+     - 候选按证据强弱计分：句末标点 < 强停顿 < 分句标点 < 词间隙
+     - 词间隙内部再按实测静音长度连续加权，宽的优先，不看谁更能填满行
+     - 每条严格从首个实测发音字开始，声学终点固定在最后一个实测发音字
+     - 显示终点可在其后的空白静音里最多多停 0.5s，且在下一条前 2 帧停住
      - 没有安全点就保留超限 cue；不按比例造切点、不截断到 7s、不向 blank 中点延展
   -> 可选 LLM 翻译
   -> SRT / bilingual JSON / quality report / logs
@@ -162,6 +166,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 关键约束：
 
 - **ASR 之前不做丢弃式判断。** 切分只决定边界，输出铺满整个文件。
+- **音频切块与字幕切分是两层不同的切点，选法也不同。** 音频块要的是喂给 encoder 的最大上下文，所以取 30s 窗口内**最靠后**的合法停顿；八片实测改取最宽停顿会把块长中位数压到 18.4–22.4s，正落在 2026-08-02 实测伤转写的区间。字幕 cue 的切点不受此约束，它在候选里选**证据最强**的那个（见上文 Layout v3_1）。停顿的 blank 后验两层都没参与：`blank_runs` 只读 argmax，游程本身不带概率。
 - 内部 cut 是一个共享绝对时间戳，不允许左右 chunk 各自修边。
 - 20 字和 7 秒都是字幕 layout 的**软目标**，不是 ASR chunk 上限；实测时间轴是硬约束。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声。
@@ -241,7 +246,9 @@ SUBTITLE_MAX_DISPLAY_DURATION_S=7.0
 
 例如第 20 字附近没有安全点而第 23 字后有实测停顿，允许保留 23 字再切；整段没有安全点则整段不切。`SRT_LINE_MAX_CHARS` 只是单条字幕内部的换行宽度，和上述 cue 拆分目标不是同一个参数。
 
-`SUBTITLE_LAYOUT_ENGINE` 与 `SUBTITLE_TIMING_MODEL` **不是开关，是产物上的版本戳**：没有任何代码按它们分派，值只会写进每条 cue 的 `layout_engine` / `timing_model` 字段，供审计和 A/B 认出「这批字幕由哪一版布局生成」。本项目只有一套布局，所以写入未知值会**直接报错而不是照单标注**——用它做回滚是做不到的事，静默接受只会得到一份谎报自己出身的产物。
+**同样合法的两个切点之间，选的是证据更强的那个，不是更能填满行的那个。** 优先级是句末标点 > ≥0.6s 强停顿 > 分句标点 > 普通词间隙；词间隙内部再按实测静音长度连续加权（0.12s 罚 0.36、0.60s 罚 0.20），因为词间隙唯一的依据就是那段静音，而 0.12s 的下限已经贴近连续语流里音节之间的间隔。八片实测：落在 0.12–0.2s 边缘静音上的切点从 399 降到 301（−24.6%），cue 总数 7,016 不变、超 20 字仍是 41 条、超 7s 仍是 34 条。把同样的加权用到所有类别的版本已被测掉：它会把 134 个切点从写出来的逗号挪到声学停顿上，等于拿语法换静音。
+
+`SUBTITLE_LAYOUT_ENGINE` 与 `SUBTITLE_TIMING_MODEL` **不是开关，是产物上的版本戳**：没有任何代码按它们分派，值只会写进每条 cue 的 `layout_engine` / `timing_model` 字段，供审计和 A/B 认出「这批字幕由哪一版布局生成」。本项目只有一套布局，所以写入未知值会**直接报错而不是照单标注**——用它做回滚是做不到的事，静默接受只会得到一份谎报自己出身的产物。当前值是 `measured_safe_boundary_dp_v3_1`；上一版 `measured_safe_boundary_dp_v3` 同样会被拒绝，因为两者的切点落点有约 1.4% 不同，让旧名字通过等于把新布局的产物标成旧布局的。
 
 ### CTC 影子评测
 
@@ -336,7 +343,8 @@ auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、显存预算、�
 - **整条都是非语义人声、且连续出现的 cue 会被丢弃**（默认开启）。ASR 会把呻吟转写成假名，强制对齐无法拒绝已经给定的文本，所以只能在成句之后按文本过滤。判定是「拆解」而不是「字符集」：整条 cue 必须能被无词义假名加一份显式的拟声词表完全消耗，剩下任何一个字就保留，因此 `ちんぽ`、`イッちゃう` 这类与呻吟共用假名的词不会被误删；`うん` / `はい` / `ふふ` 等应答与笑声另有白名单。**只删连续的**：孤立一条夹在对白中间更可能是真实反应，词表无法分辨，所以用上下文代替词表。实测一部真实影片 1983 条中命中 349 条、删掉 224 条（11.3%），其余 125 条因孤立而保留。`SUBTITLE_DROP_VOCALISATION_ONLY_CUES=0` 关闭，`SUBTITLE_VOCALISATION_MIN_RUN` 改连续条数阈值（设 1 即命中就删）。
 - LLM 翻译前会先固定 cue plan，翻译不会重排时间轴。
 - 最终中文输出遵循 Netflix Chinese (Simplified) TTSG 的**文本类**规则：每行 ≤16 全角单位、最多 2 行（下宽金字塔）、不用逗号句号（句中停顿为单个空格）、省略号为单个 U+2026、全角？！且不连用、半角数字、无斜体。标点归一化与折行在 `src/subtitles/zh_style.py` 的写盘层完成，翻译缓存保留 LLM 原文；质量报告以 `spec_*` 指标核查全部硬指标。`SRT_LINE_MAX_CHARS` 默认 16。
-- **TTSG 的时间类规则（最短 5/6s、2 帧最小间隔、语音结束后出点 +0.5s）自 Layout v3 起是被明知放弃的**，因为它们都要求把 cue 的边界移到没有语音证据的位置，而 v3 的硬约束是「起止点必须是实测发音字的边界」。八片实测：7,016 条 cue 里 493 条（7.0%）短于 5/6s，最短 0.038s（一个上采样编码帧），553 对相邻 cue 间隔小于 2 帧，**重叠 0 对**。质量报告里这两项因此**按份额告警而不是按条数**：条数随片长走（同样 5–10% 的比例，短片 21 条、长片 97 条），拿一个能放过长片的条数阈值去看短片，等于放过四倍的回归。`QC_MAX_SPEC_DURATION_UNDER_SHARE` 与 `QC_MAX_SPEC_GAP_UNDER_SHARE` 默认都是 `0.15`，高于现默认头在八片上的最高单片份额（10.6% 与 9.7%）并留出波动余量；超过就说明 cue 形状变了，而不是布局在按设计工作。**换头需要重新标定这两个数**（保留的带标点头在同样八片上 gap 份额是 12.6–23.8%）。其余 `spec_*` 仍是零容忍条数阈值，它们才是回归信号。要恢复旧的时间规则只能整体退回 v2 布局，没有单独的开关。
+- **出点 +0.5s 这条已经恢复；最短 5/6s 与 2 帧最小间隔仍是被明知放弃的。** 三条规则被放弃的原因是它们都要求把 cue 边界移到没有语音证据的位置，但**出点是例外**：cue 之后的静音本来就空着（八片实测每片自由静音中位数 0.57–2.13s，只有 10.4% 的 cue 后面完全没空隙），多停一会儿不需要发明任何时间戳。所以显示终点现在可以延伸，上限四条同时生效——`SUBTITLE_LINGER_S`（0.5）、下一条起点前 2 帧、`SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_END_S`（0.5，同时保证重复运行不叠加）、以及不越过 `SUBTITLE_MAX_DISPLAY_DURATION_S`（7s）。**起点、声学边界和任何词时间都不动**，加了多少记在 `display_shift_end_s` 里；下一条在 2 帧内开始时整条不动，绝不回缩去截断实测语音。八片实测：短于 5/6s 的 cue **487 → 198**，日文源 CPS>7 **40.6% → 27.9%**，在屏总秒数 21,115 → 23,733s，而超 7s 仍是 34 条、重叠仍是 0 对、间隔小于 2 帧的 556 对不变、文本逐字不变。剩下的 198 条与 556 对仍然是明知的偏离：它们后面根本没有可用的静音。质量报告里这两项因此**按份额告警而不是按条数**：条数随片长走（同样 5–10% 的比例，短片 21 条、长片 97 条），拿一个能放过长片的条数阈值去看短片，等于放过四倍的回归。`QC_MAX_SPEC_DURATION_UNDER_SHARE` 与 `QC_MAX_SPEC_GAP_UNDER_SHARE` 默认都是 `0.15`，高于现默认头在八片上的最高单片份额（10.6% 与 9.7%）并留出波动余量；超过就说明 cue 形状变了，而不是布局在按设计工作。**换头需要重新标定这两个数**（保留的带标点头在同样八片上 gap 份额是 12.6–23.8%）。其余 `spec_*` 仍是零容忍条数阈值，它们才是回归信号。出点延伸可以用 `SUBTITLE_TIMING_POLISH_ENABLED=0` 整体关掉（那会退回「cue 在最后一个发音字就消失」）；最短时长与 2 帧间隔则没有单独开关，要它们只能整体退回 v2 布局。
+- 质量报告还记录三组**只观测、不告警**的痕迹，它们在成品 SRT 里已经看不出来。**字幕切点**：`layout_break_type_counts`（每条 cue 由哪种证据结束）、`layout_word_gap_cut_count` / `layout_word_gap_cut_under_0p2s` / `layout_word_gap_median_s`。**续句标记**：`cue_continues_from_previous_count` / `cue_continues_into_next_count` / `cue_continues_from_previous_share`，以及 `vocalisation_runs_dropped` 与 `vocalisation_continuity_flags_cleared`。两者其实是同一件事——`continues_into_next` 就是「这条不是以句末标点结束的」，所以 break type 的分布正是续句数量的成因；而 `vocalisation_continuity_flags_cleared` 是**撤回**的声明数，脱离声明总数读不出意义。**音频切块**：`chunk_cut_policy` / `chunk_cut_at_pause_count` / `chunk_cut_max_fallback_count` / `chunk_cut_max_fallback_share` / `chunk_duration_*`，其中硬切份额（窗口内没有停顿、只能按 30s 切）八片实测 0.7%–53%，高的那几片是整片连续人声而不是切得差，因此不设阈值。改选点规则或换头之后，这三组数是唯一能跨运行对照的记录。**出点延伸**另记 `display_linger_applied_count` / `display_linger_total_s`：它是 `spec_duration_under_min_share` 的成因，某次运行份额跳高而这两个数是 0，说明这一步没跑，而不是 cue 形状变了。**后置闸标记**同时给两层——chunk 级 `postgate_chunks_reviewed` / `postgate_chunks_flagged` / `postgate_chunks_flagged_share` / `postgate_chunk_flag_counts`（检测器看到什么），cue 级 `postgate_flagged_cue_count` / `postgate_flagged_cue_share` / `postgate_cue_flag_counts`（有多少真的活到成品字幕里，Markdown 里另有一张对照表）。只有 cue 级那一列才构成行动理由；`repeated_unit` 在本域本来就有约 10% 的 chunk 命中，且多数是真实的重复语气词，所以两层都不设阈值。`postgate_alignment_score_checked` 为 0 表示未标定的对齐分检查没有运行——这一项如实报告，免得被读成「每条 cue 都有音频支持」。
 
 ---
 
