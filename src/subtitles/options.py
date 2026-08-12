@@ -19,10 +19,20 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+# There is one layout and one timing model, and these two names are what every
+# cue, artifact and A/B comparison is stamped with. They are not a switch: no
+# code branches on them. While two layouts coexisted that distinction was
+# invisible, and setting the old name produced v3 output labelled v2 - output
+# that lies about its own provenance is worse than no knob at all. So an
+# unknown value is refused rather than accepted and ignored.
+LAYOUT_ENGINE = "measured_safe_boundary_dp_v3"
+TIMING_MODEL = "measured_lexical_extent_v2"
+
+
 @dataclass(frozen=True)
 class SubtitleOptions:
-    layout_engine: str = "measured_safe_boundary_dp_v3"
-    timing_model: str = "measured_lexical_extent_v2"
+    layout_engine: str = LAYOUT_ENGINE
+    timing_model: str = TIMING_MODEL
     # Japanese source-text target for one translated cue. This and the 7s
     # duration target are deliberately soft: measured character/word timings
     # are authoritative, so an unsplittable cue remains over the target rather
@@ -41,9 +51,6 @@ class SubtitleOptions:
     timing_polish_enabled: bool = True
     short_gap_collapse_s: float = 0.5
     linger_s: float = 0.5
-    weak_cut_snap_short_s: float = 0.25
-    weak_cut_snap_normal_s: float = 0.40
-    weak_cut_snap_long_s: float = 0.60
     max_display_shift_from_acoustic_end_s: float = 0.5
     # Local ASR transcribes moaning as text and forced alignment cannot refuse
     # it, so whole cues of nothing but vocalisation are dropped here. Only runs
@@ -53,6 +60,19 @@ class SubtitleOptions:
     # 224 of 1983 cues (11.3%).
     drop_vocalisation_only_cues: bool = True
     vocalisation_min_run: int = 2
+
+    def __post_init__(self) -> None:
+        for value, expected, name in (
+            (self.layout_engine, LAYOUT_ENGINE, "SUBTITLE_LAYOUT_ENGINE"),
+            (self.timing_model, TIMING_MODEL, "SUBTITLE_TIMING_MODEL"),
+        ):
+            if value != expected:
+                raise ValueError(
+                    f"{name}={value!r} is not a layout this build can produce; "
+                    f"the only value is {expected!r}. It names the output, it "
+                    "does not select an implementation, so accepting it would "
+                    "stamp cues with a layout that did not make them."
+                )
 
     @property
     def frame_duration_s(self) -> float:
@@ -72,14 +92,8 @@ class SubtitleOptions:
     @classmethod
     def from_env(cls) -> "SubtitleOptions":
         return cls(
-            layout_engine=os.getenv(
-                "SUBTITLE_LAYOUT_ENGINE",
-                "measured_safe_boundary_dp_v3",
-            ).strip(),
-            timing_model=os.getenv(
-                "SUBTITLE_TIMING_MODEL",
-                "measured_lexical_extent_v2",
-            ).strip(),
+            layout_engine=os.getenv("SUBTITLE_LAYOUT_ENGINE", LAYOUT_ENGINE).strip(),
+            timing_model=os.getenv("SUBTITLE_TIMING_MODEL", TIMING_MODEL).strip(),
             max_source_chars=max(
                 1,
                 int(os.getenv("SUBTITLE_MAX_SOURCE_CHARS", "20")),
@@ -113,18 +127,6 @@ class SubtitleOptions:
                 float(os.getenv("SUBTITLE_SHORT_GAP_COLLAPSE_S", "0.5")),
             ),
             linger_s=max(0.0, float(os.getenv("SUBTITLE_LINGER_S", "0.5"))),
-            weak_cut_snap_short_s=max(
-                0.0,
-                float(os.getenv("SUBTITLE_WEAK_CUT_SNAP_SHORT_S", "0.25")),
-            ),
-            weak_cut_snap_normal_s=max(
-                0.0,
-                float(os.getenv("SUBTITLE_WEAK_CUT_SNAP_NORMAL_S", "0.40")),
-            ),
-            weak_cut_snap_long_s=max(
-                0.0,
-                float(os.getenv("SUBTITLE_WEAK_CUT_SNAP_LONG_S", "0.60")),
-            ),
             max_display_shift_from_acoustic_end_s=max(
                 0.0,
                 float(os.getenv("SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_END_S", "0.5")),

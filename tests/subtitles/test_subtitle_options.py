@@ -44,6 +44,26 @@ def test_subtitle_options_defaults_are_conservative():
     assert options.max_display_shift_from_acoustic_end_s == 0.5
 
 
+def test_an_unknown_layout_engine_is_refused_instead_of_relabelled(monkeypatch):
+    """The name stamps the output, it does not select an implementation.
+
+    While two layouts coexisted, the retired name silently produced current
+    output labelled with the old engine. A rollback that cannot happen has to
+    say so, not hand back cues that lie about which layout made them.
+    """
+    monkeypatch.setenv("SUBTITLE_LAYOUT_ENGINE", "anchor_aware_dp_v2")
+
+    with pytest.raises(ValueError, match="SUBTITLE_LAYOUT_ENGINE"):
+        SubtitleOptions.from_env()
+
+
+def test_an_unknown_timing_model_is_refused(monkeypatch):
+    monkeypatch.setenv("SUBTITLE_TIMING_MODEL", "acoustic_display_dual_timeline_v1")
+
+    with pytest.raises(ValueError, match="SUBTITLE_TIMING_MODEL"):
+        SubtitleOptions.from_env()
+
+
 def test_write_srt_ignores_speaker_metadata(tmp_path):
     path = tmp_path / "speaker.srt"
 

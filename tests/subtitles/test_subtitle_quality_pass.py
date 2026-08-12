@@ -203,9 +203,8 @@ def test_prepare_srt_blocks_reports_dp_stage_progress():
         ),
     )
 
-    assert ("layout_dp_pass1", 0, 1) in events
-    assert ("layout_dp_pass1", 1, 1) in events
-    assert any(stage == "layout_dp_pass2" for stage, _current, _total in events)
+    assert ("layout_measured_safe_dp", 0, 1) in events
+    assert ("layout_measured_safe_dp", 1, 1) in events
     assert events[-1] == ("layout_finalize", 1, 1)
 
 
@@ -854,12 +853,12 @@ def test_long_grok_cue_splits_at_measured_word_gap_not_mid_word():
     )
 
 
-def test_long_cue_ratio_fallback_keeps_text_bound_to_measured_word_time():
+def test_a_long_silence_puts_the_next_cue_at_its_measured_word_start():
     text = "この村の儀式を受けてもらうために必ず儀式をしなければいけない男子は一週間耐えなければいけない"
     words = _aligned_words(text, 0.0, 0.25)
     target_position = text.index("必")
-    # Model a long non-speech interval before this phrase. Character ratio puts
-    # the boundary far too early; the measured word start is authoritative.
+    # Model a long non-speech interval before this phrase. Character ratio would
+    # put the boundary far too early; the measured word start is authoritative.
     for index, word in enumerate(words):
         if index >= target_position:
             word["start"] += 5.0
@@ -872,32 +871,20 @@ def test_long_cue_ratio_fallback_keeps_text_bound_to_measured_word_time():
         "words": words,
     }
 
-    plan = subtitle._long_display_dp_plan(block, options=SubtitleOptions())
-
-    assert plan is not None
-    target_nodes = [
-        node for node in plan["nodes"] if node["position"] == target_position
-    ]
-    if target_nodes:
-        assert target_nodes[0]["source"] in {
-            "measured_word_start",
-            "primary_cut",
-            "weak_cut",
-        }
-        assert target_nodes[0]["time_s"] >= words[target_position - 1]["end"]
-
-
-def test_measured_word_positions_exclude_ratio_only_candidates():
-    text = "abcdefghij"
-    measured = {3: 4.0, 8: 9.0}
-
-    positions = subtitle._candidate_text_positions_for_dp(
-        text,
-        split_count=4,
-        word_positions=measured,
+    pieces = subtitle.prepare_srt_blocks(
+        [block],
+        options=SubtitleOptions(drop_vocalisation_only_cues=False),
     )
 
-    assert positions == [3, 8]
+    following = [
+        piece for piece in pieces if str(piece["ja_text"]).startswith("必")
+    ]
+    assert following, [piece["ja_text"] for piece in pieces]
+    assert following[0]["start"] == pytest.approx(words[target_position]["start"])
+    assert following[0]["exact_measured_timeline"] is True
+    # The pause itself stays empty: the previous cue ends on its own last word.
+    previous = pieces[pieces.index(following[0]) - 1]
+    assert previous["end"] == pytest.approx(words[target_position - 1]["end"])
 
 
 def test_incomplete_measured_word_map_never_falls_back_to_proportional_time():
@@ -1040,12 +1027,12 @@ def test_long_cue_with_only_synthetic_word_timings_remains_unsplit():
     assert prepared[0]["proportional_fallback_used"] is False
 
 
-def test_word_gap_anchors_ignore_within_word_spacing():
-    # Continuous speech has small inter-character gaps. Offering those as cut
-    # candidates would put the split back inside a word.
+def test_within_word_spacing_is_not_a_safe_boundary():
+    # Continuous speech has small inter-character gaps. Treating those as safe
+    # boundaries would put the split back inside a word.
     text = "きょうはいいてんきですね" * 2
     words = _aligned_words(text, 0.0, 0.36)
-    for index, word in enumerate(words):
+    for word in words:
         # 60ms of separation everywhere: real, but far below a pause.
         word["end"] = word["start"] + 0.30
     block = {
@@ -1056,6 +1043,17 @@ def test_word_gap_anchors_ignore_within_word_spacing():
         "words": words,
     }
 
-    anchors = subtitle._word_gap_anchors(block, start=0.0, end=words[-1]["end"])
-
-    assert anchors == []
+    timed = subtitle._timed_words(block)
+    assert not any(
+        subtitle._is_exact_safe_boundary(timed, index)
+        for index in range(1, len(timed))
+    )
+    # And end to end: no measured gap, no split, no invented boundary.
+    pieces = subtitle.prepare_srt_blocks(
+        [block],
+        options=SubtitleOptions(drop_vocalisation_only_cues=False),
+    )
+    assert len(pieces) == 1
+    assert pieces[0]["subtitle_layout_split_skipped"] == (
+        "measured_safe_boundaries_unavailable"
+    )

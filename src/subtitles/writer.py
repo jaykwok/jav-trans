@@ -21,11 +21,6 @@ def format_timestamp(seconds: float) -> str:
 
 _COMPACT_SPACE_RE = re.compile(r"\s+")
 _WRAP_PUNCTUATION = "，、。！？…"
-_SENTENCE_BOUNDARY_RE = re.compile(r"[。！？!?…；;，、,]\s*")
-_CLOSING_PUNCTUATION = frozenset(
-    ".,，、。！？!?…；;:：)]}）］｝」』】〉》〕〗〙〛’”"
-)
-_OPENING_PUNCTUATION = frozenset("([{（［｛「『【〈《〔〖〘〚‘“")
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -202,15 +197,6 @@ def _subtitle_max_display_duration_s(options: SubtitleOptions) -> float:
     return max(0.0, float(options.max_display_duration_s))
 
 
-def _weak_cut_snap_window_s(duration_s: float, options: SubtitleOptions) -> float:
-    duration = max(0.0, float(duration_s))
-    if duration <= 3.0:
-        return max(0.0, float(options.weak_cut_snap_short_s))
-    if duration <= _subtitle_max_display_duration_s(options):
-        return max(0.0, float(options.weak_cut_snap_normal_s))
-    return max(0.0, float(options.weak_cut_snap_long_s))
-
-
 def _text_for_timing(block: dict) -> str:
     return str(
         block.get("ja_text")
@@ -218,33 +204,6 @@ def _text_for_timing(block: dict) -> str:
         or block.get("zh_text")
         or ""
     )
-
-
-def _candidate_text_boundaries(text: str) -> list[int]:
-    stripped = str(text or "")
-    if len(stripped) <= 1:
-        return []
-    positions = {
-        match.end()
-        for match in _SENTENCE_BOUNDARY_RE.finditer(stripped)
-        if 0 < match.end() < len(stripped)
-    }
-    positions.update(
-        index
-        for index, char in enumerate(stripped)
-        if 0 < index < len(stripped) and char.isspace()
-    )
-    return sorted(positions)
-
-
-def _text_unit_prefix_ratios(text: str, positions: list[int]) -> dict[int, float]:
-    total = _count_text_units(text)
-    if total <= 0.0:
-        return {position: 0.0 for position in positions}
-    return {
-        position: max(0.0, min(1.0, _count_text_units(text[:position]) / total))
-        for position in positions
-    }
 
 
 def _fallback_text_position(text: str, ratio: float) -> int:
@@ -279,71 +238,6 @@ def _split_text_by_ratios(text: str, ratios: list[float]) -> list[str]:
     return _split_text_by_positions(raw, sorted(set(positions)))
 
 
-def _anchor_times(block: dict, *, start: float, end: float) -> list[dict]:
-    anchors: list[dict] = []
-    for key, anchor_type in (
-        ("primary_cut_candidates", "primary_cut"),
-        ("weak_cut_candidates", "weak_cut"),
-    ):
-        for candidate in block.get(key) or []:
-            if not isinstance(candidate, dict):
-                continue
-            try:
-                time_s = float(candidate["time_s"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if not start < time_s < end:
-                continue
-            anchors.append(
-                {
-                    "time_s": time_s,
-                    "anchor_type": anchor_type,
-                    "score": _safe_float(candidate.get("score"), 0.0),
-                    "prominence": _safe_float(candidate.get("prominence"), 0.0),
-                    "speech_valley": _safe_float(candidate.get("speech_valley"), 0.0),
-                    "strength": _safe_float(candidate.get("strength"), 0.0),
-                }
-            )
-    anchors.extend(_word_gap_anchors(block, start=start, end=end))
-    anchors.sort(
-        key=lambda item: (
-            float(item["time_s"]),
-            0 if item["anchor_type"] == "primary_cut" else 1,
-            -float(item.get("strength") or 0.0),
-        )
-    )
-    return anchors
-
-
-def _text_break_score(text: str, position: int) -> float:
-    if position <= 0 or position >= len(text):
-        return 0.0
-    previous = text[position - 1]
-    if previous in "。！？!?…":
-        return 0.0
-    if previous in "；;，、,":
-        return 0.15
-    if previous.isspace():
-        return 0.35
-    return 0.75
-
-
-def _is_valid_subtitle_text_boundary(text: str, position: int) -> bool:
-    """Keep closing punctuation with the text on its left.
-
-    CTC gives punctuation a frame just like lexical characters, but punctuation
-    is not a spoken onset. A long blank before an ellipsis must therefore not
-    make the following cue enter on the first dot; the safe boundary is after
-    the complete ellipsis, at the next lexical word.
-    """
-    if not 0 < position < len(text):
-        return False
-    return (
-        text[position] not in _CLOSING_PUNCTUATION
-        and text[position - 1] not in _OPENING_PUNCTUATION
-    )
-
-
 # A silence between two measured words has to be at least this long before it is
 # offered as a cue boundary. Below it the "gap" is the ordinary space between
 # syllables of continuous speech, and cutting there splits a word.
@@ -365,115 +259,6 @@ MEASURED_WORD_TIMESTAMP_KINDS = frozenset(
 
 def _has_measured_word_timestamp(word: dict) -> bool:
     return str(word.get("timestamp_kind") or "") in MEASURED_WORD_TIMESTAMP_KINDS
-
-
-def _word_gap_anchors(block: dict, *, start: float, end: float) -> list[dict]:
-    """Cut candidates read off measured word timings.
-
-    The acoustic candidate channel (`primary_cut_candidates`/`weak_cut_candidates`)
-    was fed by the pre-ASR chain that was retired on 2026-07-31; nothing has
-    populated it since, so the "anchor-aware" DP has been running with an empty
-    anchor list and splitting long cues purely on character ratio - which lands
-    mid-word, because character count is not time.
-
-    With the alignment head on, every character has a measured extent, so the
-    silences between words are known directly. Only real gaps become anchors and
-    only aligned words are trusted: proportional timings are a restatement of the
-    character ratio the DP already has, and offering them as "acoustic" evidence
-    would launder a guess into an anchor.
-    """
-    words = [
-        word
-        for word in _timed_words(block)
-        if _has_measured_word_timestamp(word)
-    ]
-    if len(words) < 2:
-        return []
-
-    anchors: list[dict] = []
-    for earlier, later in zip(words, words[1:]):
-        gap_start = float(earlier["end"])
-        gap_end = float(later["start"])
-        gap = gap_end - gap_start
-        if gap < WORD_GAP_MIN_S:
-            continue
-        # Blank is evidence that this text boundary is safe, but a subtitle cut
-        # has two different jobs: the previous cue's out-point and the next
-        # cue's in-point. The chunker can cut audio at the middle of the blank;
-        # a shared subtitle boundary cannot, because that would display the next
-        # text for half the silence before its first measured word. Anchor the
-        # subtitle boundary at that next word instead. Timeline polish remains
-        # free to extend the previous cue into the pause independently.
-        time_s = gap_end
-        if not start < time_s < end:
-            continue
-        strong = gap >= WORD_GAP_STRONG_S
-        anchors.append(
-            {
-                "time_s": time_s,
-                "anchor_type": "primary_cut" if strong else "weak_cut",
-                "score": round(gap, 4),
-                "prominence": 0.0,
-                "speech_valley": 0.0,
-                # Longer silence is a better place to cut; the DP reads this as a
-                # tie-break and as a small bonus, both monotone in gap length.
-                "strength": round(min(gap / WORD_GAP_STRONG_S, 1.0), 4),
-                "anchor_source": "word_gap",
-                "gap_start_s": gap_start,
-                "gap_midpoint_s": gap_start + gap / 2.0,
-                # The word this silence ends at. Lets the DP pair the anchor with
-                # the exact character the word starts at instead of guessing the
-                # position back out of a ratio.
-                "next_word_start_s": gap_end,
-            }
-        )
-    return anchors
-
-
-def _measured_word_text_map(
-    block: dict,
-    text: str,
-) -> tuple[dict[int, float], dict[int, float], bool, int]:
-    """Character offsets in `text` where a measured word starts, by time.
-
-    The DP picks a text position and a time independently and pays a penalty for
-    how far apart they are. Feeding it the positions that correspond to real word
-    starts is what lets the two agree: without them the only candidate positions
-    are punctuation, spaces, and evenly-spaced ratio guesses, and in Japanese —
-    no spaces, sparse punctuation in ASR output — that means the ratio guesses.
-    """
-    words = [
-        word
-        for word in _timed_words(block)
-        if _has_measured_word_timestamp(word)
-    ]
-    if not words:
-        return {}, {}, False, 0
-
-    positions: dict[int, float] = {}
-    previous_word_ends: dict[int, float] = {}
-    cursor = 0
-    for index, word in enumerate(words):
-        token = str(word.get("word") or "")
-        if not token:
-            return {}, {}, False, len(words)
-        found = text.find(token, cursor)
-        if found < 0 or text[cursor:found].strip():
-            # Measured timings may never be silently attached to a different
-            # piece of text. The aligned production path is expected to be a
-            # complete map; returning it as incomplete keeps the caller from
-            # laundering this mismatch through proportional timing.
-            return {}, {}, False, len(words)
-        cursor = found + len(token)
-        if index == 0:
-            continue
-        if 0 < found < len(text):
-            positions[found] = float(word["start"])
-            previous_word_ends[found] = float(words[index - 1]["end"])
-    if text[cursor:].strip():
-        return {}, {}, False, len(words)
-    previous_word_ends[len(text)] = float(words[-1]["end"])
-    return positions, previous_word_ends, True, len(words)
 
 
 _SENTENCE_END_CHARS = frozenset("。！？!?…")
@@ -686,280 +471,6 @@ def _exact_safe_dp_plan(
     }
 
 
-def _candidate_text_positions_for_dp(
-    text: str,
-    *,
-    split_count: int,
-    word_positions: dict[int, float] | None = None,
-) -> list[int]:
-    raw = str(text or "")
-    if len(raw) <= 1:
-        return []
-    # A measured text/time map is authoritative. Mixing its word positions with
-    # punctuation and ratio-only positions lets the DP choose the right piece
-    # of text at a time invented from the whole block's character ratio. That
-    # is catastrophic when speech density is uneven: a word measured at 20.8s
-    # can be rendered from 15.7s even though forced alignment got it right.
-    # Fall back to text-only positions only when no measured mapping exists.
-    if word_positions:
-        return sorted(
-            position
-            for position in word_positions
-            if _is_valid_subtitle_text_boundary(raw, position)
-        )
-    positions = set(_candidate_text_boundaries(raw))
-    for index in range(1, max(1, split_count) + 1):
-        position = _fallback_text_position(raw, index / float(split_count + 1))
-        if 0 < position < len(raw):
-            positions.add(position)
-    return sorted(position for position in positions if 0 < position < len(raw))
-
-
-def _choose_anchor_for_target(
-    anchors: list[dict],
-    *,
-    target: float,
-    snap_window_s: float,
-) -> tuple[float, str, float, float]:
-    available = [
-        anchor
-        for anchor in anchors
-        if abs(float(anchor["time_s"]) - target) <= snap_window_s
-    ]
-    if not available:
-        return target, "proportional_text", 0.0, 0.0
-    selected = min(
-        available,
-        key=lambda anchor: (
-            abs(float(anchor["time_s"]) - target),
-            0 if anchor["anchor_type"] == "primary_cut" else 1,
-            -float(anchor.get("strength") or 0.0),
-        ),
-    )
-    distance = abs(float(selected["time_s"]) - target)
-    strength = float(selected.get("strength") or selected.get("score") or 0.0)
-    return float(selected["time_s"]), str(selected["anchor_type"]), strength, distance
-
-
-def _long_display_dp_plan(
-    block: dict,
-    *,
-    options: SubtitleOptions,
-) -> dict | None:
-    start = float(block.get("start", 0.0))
-    end = max(start, float(block.get("end", start)))
-    duration = end - start
-    max_display_s = _subtitle_max_display_duration_s(options)
-    if max_display_s <= 0.0 or duration <= max_display_s:
-        return None
-    text = _text_for_timing(block)
-    if not text.strip():
-        return None
-    min_duration_s = _subtitle_min_duration_s(options)
-    split_count = max(1, int(math.ceil(duration / max_display_s)) - 1)
-    # Character offsets that correspond to a measured word start, so the DP can
-    # break where a word begins rather than where the character count says.
-    (
-        word_positions,
-        previous_word_ends,
-        measured_map_complete,
-        measured_word_count,
-    ) = _measured_word_text_map(block, text)
-    if measured_word_count and not measured_map_complete:
-        # A successful CTC/Grok word-timestamp path must map the complete source
-        # text. Do not turn a data-integrity error into plausible-looking
-        # proportional subtitles; leave the block intact for the duration guard
-        # and expose the problem in tests/logged artifacts instead.
-        return None
-    if measured_word_count and not word_positions:
-        # A complete measured map with no internal word boundary (for example,
-        # one provider token covering the whole cue) cannot be split without
-        # inventing a time inside that token. Keep it intact instead.
-        return None
-    positions = _candidate_text_positions_for_dp(
-        text,
-        split_count=split_count,
-        word_positions=word_positions,
-    )
-    if not positions:
-        return None
-    ratios_by_position = _text_unit_prefix_ratios(text, positions)
-    anchors = _anchor_times(block, start=start, end=end)
-    # Reverse map: a word-gap anchor knows which word follows it, and that word's
-    # character offset is the position it should pair with exactly.
-    position_by_word_start = {
-        round(word_start, 4): position for position, word_start in word_positions.items()
-    }
-    snap_window_s = _weak_cut_snap_window_s(duration, options)
-    nodes: list[dict] = [
-        {
-            "position": 0,
-            "time_s": start,
-            "ratio": 0.0,
-            "source": "start",
-            "previous_word_end_s": start,
-            "anchor_strength": 0.0,
-            "snap_distance_s": 0.0,
-        }
-    ]
-    for position in positions:
-        ratio = ratios_by_position.get(position, 0.0)
-        target = start + duration * ratio
-        measured_word_start = word_positions.get(position)
-        if measured_word_start is not None:
-            # Text position and time come from the same measured word. A
-            # separate word-gap node may still mark this as a preferable text
-            # break, but both use the same next-word onset. A non-silence
-            # fallback must never detach the two again.
-            time_s = float(measured_word_start)
-            source = "measured_word_start"
-            strength = 0.0
-            distance = abs(time_s - target)
-        else:
-            time_s, source, strength, distance = _choose_anchor_for_target(
-                anchors,
-                target=target,
-                snap_window_s=snap_window_s,
-            )
-        nodes.append(
-            {
-                "position": position,
-                "time_s": max(start, min(end, time_s)),
-                "ratio": ratio,
-                "source": source,
-                "previous_word_end_s": previous_word_ends.get(position, time_s),
-                "anchor_strength": strength,
-                "snap_distance_s": distance,
-            }
-        )
-    for anchor in anchors:
-        anchor_ratio = (float(anchor["time_s"]) - start) / max(duration, 1e-6)
-        exact_position = position_by_word_start.get(
-            round(float(anchor.get("next_word_start_s") or -1.0), 4)
-        )
-        if exact_position is not None:
-            # A word-gap anchor: text position and time are the same measurement,
-            # so pair them directly and let the snap distance be zero.
-            position = exact_position
-        elif positions:
-            position = min(
-                positions,
-                key=lambda item: (
-                    abs(ratios_by_position.get(item, 0.0) - anchor_ratio),
-                    _text_break_score(text, item),
-                    item,
-                ),
-            )
-        else:
-            position = _fallback_text_position(text, anchor_ratio)
-        if not _is_valid_subtitle_text_boundary(text, position):
-            continue
-        target = start + duration * ratios_by_position.get(position, anchor_ratio)
-        nodes.append(
-            {
-                "position": position,
-                "time_s": float(anchor["time_s"]),
-                "ratio": ratios_by_position.get(position, anchor_ratio),
-                "source": str(anchor["anchor_type"]),
-                "previous_word_end_s": previous_word_ends.get(
-                    position,
-                    float(anchor["time_s"]),
-                ),
-                "anchor_source": str(anchor.get("anchor_source") or ""),
-                "anchor_strength": float(anchor.get("strength") or anchor.get("score") or 0.0),
-                "snap_distance_s": 0.0
-                if exact_position is not None
-                else abs(float(anchor["time_s"]) - target),
-            }
-        )
-    nodes.append(
-        {
-            "position": len(text),
-            "time_s": end,
-            "ratio": 1.0,
-            "source": "end",
-            "previous_word_end_s": previous_word_ends.get(len(text), end),
-            "anchor_strength": 0.0,
-            "snap_distance_s": 0.0,
-        }
-    )
-    nodes = sorted(nodes, key=lambda item: (int(item["position"]), float(item["time_s"])))
-
-    best: dict[int, tuple[float, int | None]] = {0: (0.0, None)}
-    for j in range(1, len(nodes)):
-        best_cost = float("inf")
-        best_prev: int | None = None
-        for i in range(0, j):
-            if i not in best:
-                continue
-            piece_start = float(nodes[i]["time_s"])
-            piece_end = float(nodes[j]["time_s"])
-            if piece_end <= piece_start:
-                continue
-            # A long CTC blank may sit between the last word in this piece and
-            # the first word in the next. It is not display content. Enforce the
-            # 7s ceiling against measured speech extent; the previous cue can
-            # end after its last word while the next still enters at its own
-            # onset, leaving the blank genuinely subtitle-free.
-            piece_content_end = max(
-                piece_start,
-                float(nodes[j].get("previous_word_end_s", piece_end)),
-            )
-            piece_duration = piece_content_end - piece_start
-            if piece_duration > max_display_s + 1e-6:
-                continue
-            piece_text = text[int(nodes[i]["position"]) : int(nodes[j]["position"])].strip()
-            if not piece_text:
-                continue
-            duration_penalty = 0.0
-            if piece_duration < min_duration_s:
-                duration_penalty += (min_duration_s - piece_duration) * 6.0
-            text_penalty = 0.0 if j == len(nodes) - 1 else _text_break_score(
-                text,
-                int(nodes[j]["position"]),
-            )
-            line_penalty = max(0.0, len(piece_text) - max(1, options.line_max_chars)) / max(
-                1.0,
-                float(options.line_max_chars),
-            )
-            anchor_bonus = 0.0
-            source = str(nodes[j]["source"])
-            if source == "primary_cut":
-                anchor_bonus = 1.20 + min(0.30, float(nodes[j]["anchor_strength"]) * 0.05)
-            elif source == "weak_cut":
-                anchor_bonus = 0.95 + min(0.25, float(nodes[j]["anchor_strength"]) * 0.05)
-            snap_penalty = min(1.0, float(nodes[j]["snap_distance_s"]) / max(snap_window_s, 1e-6)) * 0.15
-            transition_cost = (
-                1.0
-                + duration_penalty
-                + text_penalty
-                + line_penalty
-                + snap_penalty
-                - anchor_bonus
-            )
-            cost = best[i][0] + transition_cost
-            if cost < best_cost:
-                best_cost = cost
-                best_prev = i
-        if best_prev is not None:
-            best[j] = (best_cost, best_prev)
-    last = len(nodes) - 1
-    if last not in best:
-        return None
-    path: list[int] = []
-    cursor: int | None = last
-    while cursor is not None:
-        path.append(cursor)
-        cursor = best[cursor][1]
-    path.reverse()
-    if len(path) < 3:
-        return None
-    return {
-        "nodes": [nodes[index] for index in path],
-        "score": best[last][0],
-    }
-
-
 def _filter_candidates_for_window(
     candidates: list[dict],
     *,
@@ -977,165 +488,6 @@ def _filter_candidates_for_window(
         if start < time_s < end:
             filtered.append(dict(candidate))
     return filtered
-
-
-def _split_long_display_block_legacy(
-    block: dict,
-    *,
-    options: SubtitleOptions,
-) -> list[dict]:
-    start = float(block.get("start", 0.0))
-    end = max(start, float(block.get("end", start)))
-    max_display_s = _subtitle_max_display_duration_s(options)
-    if max_display_s <= 0.0 or end - start <= max_display_s:
-        return [dict(block)]
-    timing_text = _text_for_timing(block)
-    if not timing_text.strip():
-        return [dict(block)]
-    plan = _long_display_dp_plan(block, options=options)
-    if plan is None:
-        item = dict(block)
-        _, _, measured_map_complete, measured_word_count = _measured_word_text_map(
-            block,
-            timing_text,
-        )
-        if measured_word_count and not measured_map_complete:
-            item["subtitle_layout_split_skipped"] = (
-                "measured_word_text_map_incomplete"
-            )
-        elif measured_word_count:
-            item["subtitle_layout_split_skipped"] = (
-                "measured_word_boundaries_unavailable"
-            )
-        return [item]
-    nodes = list(plan["nodes"])
-    timing_positions = [int(node["position"]) for node in nodes[1:-1]]
-    split_times = [float(node["time_s"]) for node in nodes[1:-1]]
-    if not timing_positions or len(timing_positions) != len(split_times):
-        return [dict(block)]
-    ratios = [
-        _count_text_units(timing_text[:position]) / max(_count_text_units(timing_text), 1e-6)
-        for position in timing_positions
-    ]
-    split_sources = [str(node["source"]) for node in nodes[1:-1]]
-    split_anchor_sources = [str(node.get("anchor_source") or "") for node in nodes[1:-1]]
-    has_word_gap = any(source == "word_gap" for source in split_anchor_sources)
-    has_measured_word = any(source == "measured_word_start" for source in split_sources)
-    if has_word_gap and has_measured_word:
-        split_source = "word_gap_and_measured_word_dp"
-    elif has_word_gap:
-        # Split at a measured silence between two words, which is the only
-        # source here that cannot land mid-word.
-        split_source = "word_gap_dp"
-    elif has_measured_word:
-        split_source = "measured_word_dp"
-    elif any(source in {"primary_cut", "weak_cut"} for source in split_sources):
-        split_source = "acoustic_anchor_dp"
-    else:
-        split_source = "proportional_text_dp"
-
-    boundaries = [start, *split_times, end]
-    text_fields = {}
-    for key in ("ja_text", "zh_text", "text"):
-        value = block.get(key)
-        if value is None:
-            continue
-        if str(value) == timing_text:
-            text_fields[key] = _split_text_by_positions(str(value), timing_positions)
-        else:
-            text_fields[key] = _split_text_by_ratios(str(value), ratios)
-
-    split_blocks: list[dict] = []
-    for index in range(len(boundaries) - 1):
-        piece_start = boundaries[index]
-        piece_end = boundaries[index + 1]
-        item = dict(block)
-        item["start"] = piece_start
-        item["end"] = max(piece_start + 0.05, piece_end)
-        piece_words = [
-            word
-            for word in _timed_words(block)
-            if piece_start <= float(word.get("start", piece_start)) < piece_end
-        ]
-        measured_piece_words = [
-            word for word in piece_words if _has_measured_word_timestamp(word)
-        ]
-        if measured_piece_words:
-            item["acoustic_start"] = float(measured_piece_words[0]["start"])
-            item["acoustic_end"] = max(
-                item["acoustic_start"] + 0.05,
-                float(measured_piece_words[-1]["end"]),
-            )
-        else:
-            item["acoustic_start"] = piece_start
-            item["acoustic_end"] = max(piece_start + 0.05, piece_end)
-        item["acoustic_duration"] = max(
-            0.0,
-            item["acoustic_end"] - item["acoustic_start"],
-        )
-        item["display_start"] = item["start"]
-        item["display_end"] = item["end"]
-        item["display_duration"] = max(0.0, item["display_end"] - item["display_start"])
-        for key, pieces in text_fields.items():
-            item[key] = pieces[index] if index < len(pieces) else ""
-        item["words"] = piece_words
-        item["primary_cut_candidates"] = _filter_candidates_for_window(
-            list(block.get("primary_cut_candidates") or []),
-            start=piece_start,
-            end=piece_end,
-        )
-        item["weak_cut_candidates"] = _filter_candidates_for_window(
-            list(block.get("weak_cut_candidates") or []),
-            start=piece_start,
-            end=piece_end,
-        )
-        item["subtitle_layout_split"] = "max_display_duration"
-        item["subtitle_layout_split_source"] = split_source
-        # Which side of this piece is the middle of a sentence. The translator
-        # sees cues one at a time and will otherwise close each fragment off as
-        # a complete sentence; these two flags are what tells it not to.
-        #
-        # Written relative to the parent rather than to this pass, because
-        # `_split_long_display_blocks` runs twice and a piece can be split
-        # again: the first piece inherits whatever the parent said about its
-        # left edge, the last inherits its right edge, and every internal edge
-        # is a continuation by construction.
-        item["continues_from_previous"] = (
-            bool(block.get("continues_from_previous")) if index == 0 else True
-        )
-        item["continues_into_next"] = (
-            bool(block.get("continues_into_next"))
-            if index == len(boundaries) - 2
-            else True
-        )
-        item["layout_engine"] = options.layout_engine
-        item["layout_version"] = "subtitle_layout_v2"
-        item["timing_model"] = options.timing_model
-        boundary_node = nodes[index + 1] if index + 1 < len(nodes) else None
-        boundary_source = str(boundary_node.get("source") or "") if boundary_node else ""
-        boundary_anchor_source = (
-            str(boundary_node.get("anchor_source") or "") if boundary_node else ""
-        )
-        item["anchor_used"] = boundary_source in {
-            "primary_cut",
-            "weak_cut",
-            "measured_word_start",
-        }
-        item["anchor_type"] = boundary_source if item["anchor_used"] else ""
-        item["anchor_score"] = 0.0 if boundary_node is None else float(boundary_node.get("anchor_strength") or 0.0)
-        item["snap_distance_s"] = 0.0 if boundary_node is None else float(boundary_node.get("snap_distance_s") or 0.0)
-        item["snap_reason"] = "anchor_aware_dp_v2"
-        item["layout_score"] = float(plan.get("score") or 0.0)
-        item["text_break_type"] = (
-            "word_gap_boundary"
-            if boundary_anchor_source == "word_gap"
-            else "measured_word_boundary"
-            if boundary_source == "measured_word_start"
-            else "dp_text_boundary"
-        )
-        item["proportional_fallback_used"] = not item["anchor_used"]
-        split_blocks.append(item)
-    return split_blocks
 
 
 def _split_long_display_block(
@@ -1289,8 +641,6 @@ def _split_long_display_blocks(
         if progress is not None and (index >= total or index % interval == 0):
             progress(index, total)
     return split
-
-
 
 
 def _timed_words(block: dict) -> list[dict]:
@@ -1546,7 +896,7 @@ def _prepare_subtitle_blocks(
 
     stage("timeline_normalize", 0, 1)
     prepared = _copy_sorted_blocks(blocks)
-    # Preserve the legacy display policy for inputs without measured word
+    # Reading-duration display policy, kept for inputs without measured word
     # timing. Exact pieces created below overwrite these provisional windows
     # with their lexical edges and are then exempt from later polish/normalize.
     prepared = _normalize_subtitle_timeline(prepared, options=options)
@@ -1562,16 +912,14 @@ def _prepare_subtitle_blocks(
         _split_long_display_blocks(
             prepared,
             options=options,
-            progress=lambda current, total: stage("layout_dp_pass1", current, total),
+            progress=lambda current, total: stage(
+                "layout_measured_safe_dp", current, total
+            ),
         )
     )
     stage("timeline_polish", 0, 1)
     prepared = _polish_subtitle_timeline(prepared, options=options)
     stage("timeline_polish", 1, 1)
-    # v3 jointly plans source length and lexical duration in one pass. Running
-    # it twice can only repeat work; more importantly, a later pass must not
-    # reinterpret an exact piece as permission to introduce a new boundary.
-    stage("layout_dp_pass2", 1, 1)
     # Only now are these the cues a viewer will see. Filtering earlier looks
     # cheaper but measures the wrong thing: before the DP runs, a "block" is a
     # whole ASR segment, and a segment mixing dialogue with moaning is not pure
@@ -1612,7 +960,6 @@ def prepare_srt_blocks(
         on_stage=on_stage,
         diagnostics=diagnostics,
     )
-
 
 
 def write_srt(
