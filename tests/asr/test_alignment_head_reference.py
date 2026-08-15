@@ -259,3 +259,30 @@ def test_unresolvable_reference_disables_the_finalize_cache(monkeypatch):
     )
 
     assert result_cache.finalize_signature() is None
+
+
+def test_the_word_build_version_tracks_the_code_that_builds_words(monkeypatch, tmp_path):
+    """Twice now a fix to word building shipped and changed nothing.
+
+    The head bytes and the source text are both unchanged by such a fix, and
+    they are the only other things in this key, so a stale entry is served
+    forever and the rerun looks like proof that the fix was a no-op. Version 2
+    was the zero-width punctuation spans; version 3 is the chunk-window clamp in
+    `subtitle_timing.build_aligned_word_timestamps`, whose rerun re-ran the
+    alignment stage for 26s and still returned the same 24 out-of-chunk word
+    ends to the microsecond.
+
+    So this asserts the coupling itself: the current build is version 3, and it
+    is part of the key.
+    """
+    from asr import result_cache
+
+    head = tmp_path / "ctc_aligner.pt"
+    head.write_bytes(b"weights")
+    monkeypatch.setenv("ASR_ALIGNMENT_HEAD_PATH", DEFAULT_REFERENCE)
+    monkeypatch.setattr(
+        alignment, "resolve_alignment_head_path", lambda ref, download=True: str(head)
+    )
+
+    signature = result_cache.finalize_signature()
+    assert signature["word_build_version"] == 3

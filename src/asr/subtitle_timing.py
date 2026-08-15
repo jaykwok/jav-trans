@@ -160,6 +160,10 @@ def build_aligned_word_timestamps(
     alignment; this function only regroups them onto the tokens the subtitle
     layer works in and applies the seam-outlier rule.
 
+    `window_start` / `window_end` bound both paths, not just the proportional
+    one: they are this chunk's own audio, and no measurement of it can land
+    outside them.
+
     Falls back to the proportional path whenever the spans cannot be trusted to
     correspond to the text - a silent mismatch here would attach real-looking
     timestamps to the wrong characters, which is worse than admitting the times
@@ -197,6 +201,20 @@ def build_aligned_word_timestamps(
         [span.start_s for span in char_spans], [span.end_s for span in char_spans]
     )
 
+    # This chunk's own audio is the hard bound on every time below. The aligner
+    # works in encoder frames, and the final frame ends after the samples do
+    # because the encoder tiles a padded signal, so a coda walked to the last
+    # frame lands up to one frame - 38.5 ms at the 2x upsampled rate - past
+    # `window_end`. Adjacent chunks share an edge exactly, so that overrun is not
+    # slack: it sits inside the next chunk's first word, and the subtitle layer
+    # then has two cues whose measured times genuinely overlap. Measured on
+    # sample-v (2026-08-13, production geometry): 2 overlapping pairs in 1,595
+    # cues, the larger 0.038 s - exactly one frame.
+    limit_start = float(window_start)
+    limit_end = max(limit_start, float(window_end))
+    segment_start = min(max(segment_start, limit_start), limit_end)
+    segment_end = min(max(segment_end, segment_start), limit_end)
+
     # The edge characters' spans mark where the head is confident, which sits
     # inside where the sound actually is (see `alignment.speech_extent`). The
     # extent may therefore only push an edge OUTWARD, and by at most the walk's
@@ -213,6 +231,8 @@ def build_aligned_word_timestamps(
             segment_end + alignment.CODA_EXTEND_MAX_S,
             max(segment_end, float(extent_end)),
         )
+        widened_start = min(max(widened_start, limit_start), limit_end)
+        widened_end = min(max(widened_end, widened_start), limit_end)
         edged = widened_start < segment_start or widened_end > segment_end
         segment_start, segment_end = widened_start, max(widened_start, widened_end)
 

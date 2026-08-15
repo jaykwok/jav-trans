@@ -337,10 +337,17 @@ def finalize_signature() -> dict | None:
     # Bump when the code that turns spans into words changes what it stores, for
     # the same reason the caps are here: the head and the text are unchanged, so
     # nothing else in this key can notice. Version 2 stopped dropping the
-    # zero-width spans an acoustic-only head gives punctuation. This was found
-    # the hard way - the fixed pipeline re-ran and returned byte-identical
-    # output, because every chunk was served from entries written before it.
-    signature["word_build_version"] = 2
+    # zero-width spans an acoustic-only head gives punctuation. Version 3 bounds
+    # every word into its own chunk's audio, so a coda walked to the last
+    # encoder frame stops at the chunk edge instead of one frame past it, on top
+    # of the next chunk's first word.
+    #
+    # Both versions were found the hard way, and identically: the fixed pipeline
+    # re-ran and returned byte-identical output because every chunk was served
+    # from entries written before the fix. Version 3's re-run even repeated the
+    # alignment stage for 26s and still produced the same 24 out-of-chunk word
+    # ends, down to the microsecond.
+    signature["word_build_version"] = 3
     shadow_reference = (os.environ.get("ASR_ALIGNMENT_SHADOW_HEAD_PATH") or "").strip()
     if shadow_reference:
         shadow_digest = _checkpoint_digest(shadow_reference)

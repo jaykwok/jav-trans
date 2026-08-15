@@ -25,7 +25,7 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-from asr import subtitle_timing  # noqa: E402
+from asr import alignment, subtitle_timing  # noqa: E402
 from asr.alignment import CharSpan  # noqa: E402
 
 
@@ -342,3 +342,71 @@ class TestAcousticExtent:
         assert meta["word_timestamps_real"] is False
         assert meta["alignment_fallback_reason"] == "char_span_count_mismatch"
         assert all(w["end"] <= 10.0 for w in words)
+
+
+class TestChunkWindowBound:
+    """Nothing measured from a chunk may land outside that chunk's audio.
+
+    The aligner works in encoder frames and the final frame ends after the
+    samples do, so a coda walked to the end of the tensor reports a time the
+    chunk has no audio for - one upsampled frame, 38.5 ms. Chunks share their
+    edges exactly (`asr.chunking` emits `[0, duration]` with no gaps), so that
+    overrun is not harmless slack: it sits on top of the next chunk's first
+    word, and the subtitle layer is handed two cues whose *measured* times
+    overlap. It cannot repair that - refusing to truncate measured speech is
+    the whole point of the locked timeline - so the overlap ships.
+
+    Seen in production on sample-v (2026-08-13): 2 overlapping pairs in 1,595
+    cues, the larger 0.038 s, i.e. exactly one frame.
+    """
+
+    def test_a_coda_past_the_last_sample_stops_at_the_chunk_edge(self) -> None:
+        frame_s = alignment.ENCODER_FRAME_S / 2.0
+        spans = _spans("あいうえお", step=0.2, origin=2.0)
+        window_end = 3.0
+        words, _, _ = subtitle_timing.build_aligned_word_timestamps(
+            "あいうえお", spans, 0.0, window_end, (2.0, window_end + frame_s)
+        )
+        assert words[-1]["end"] == pytest.approx(window_end)
+
+    def test_a_shared_chunk_edge_produces_no_overlap(self) -> None:
+        """The two chunks of the production failure, side by side."""
+        frame_s = alignment.ENCODER_FRAME_S / 2.0
+        edge = 25.269
+
+        left_spans = _spans("あいうえお", step=0.2, origin=edge - 1.0)
+        left, _, _ = subtitle_timing.build_aligned_word_timestamps(
+            "あいうえお", left_spans, 0.0, edge, (edge - 1.0, edge + frame_s)
+        )
+        right_spans = _spans("かきくけこ", step=0.2, origin=edge)
+        right, _, _ = subtitle_timing.build_aligned_word_timestamps(
+            "かきくけこ", right_spans, edge, edge + 30.0, (edge, edge + 1.0)
+        )
+        assert left[-1]["end"] <= right[0]["start"] + 1e-9
+
+    def test_the_onset_cannot_walk_before_the_chunk_starts(self) -> None:
+        spans = _spans("あいうえお", step=0.2, origin=0.05)
+        words, _, _ = subtitle_timing.build_aligned_word_timestamps(
+            "あいうえお", spans, 0.0, 10.0, (-0.10, 1.05)
+        )
+        assert words[0]["start"] >= 0.0
+
+    def test_spans_outside_the_window_are_pulled_in_without_an_extent(self) -> None:
+        """The bound is on the output, not on the widening step."""
+        spans = _spans("あいうえお", step=0.2, origin=2.0)
+        words, mode, _ = subtitle_timing.build_aligned_word_timestamps(
+            "あいうえお", spans, 0.0, 2.5
+        )
+        assert mode == "ctc_forced_alignment"
+        assert all(word["end"] <= 2.5 + 1e-9 for word in words)
+        assert all(word["start"] >= 0.0 for word in words)
+
+    def test_a_window_that_does_not_bind_changes_nothing(self) -> None:
+        """The clamp must be invisible on every chunk that ends in silence."""
+        spans = _spans("あいうえお", step=0.2, origin=2.0)
+        words, _, meta = subtitle_timing.build_aligned_word_timestamps(
+            "あいうえお", spans, 0.0, 30.0, (1.85, 3.15)
+        )
+        assert meta["boundary_edged"] is True
+        assert words[0]["start"] == pytest.approx(1.85)
+        assert words[-1]["end"] == pytest.approx(3.15)
