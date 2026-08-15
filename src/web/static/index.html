@@ -266,6 +266,20 @@
     </div>
   </main>
 
+  <div class="qc-overlay" id="qc-overlay" hidden>
+    <div class="qc-modal" role="dialog" aria-modal="true" aria-labelledby="qc-title">
+      <div class="qc-modal-header">
+        <span class="qc-modal-title" id="qc-title">质量报告</span>
+        <span class="spacer"></span>
+        <button class="btn-sm btn-outline" id="qc-open-md" type="button" title="用系统默认程序打开 .md 报告" hidden>↗
+          打开 .md</button>
+        <button class="btn-sm btn-outline" id="qc-copy" type="button" title="复制完整 JSON">⧉ 复制 JSON</button>
+        <button class="btn-sm btn-remove" id="qc-close" type="button" title="关闭（Esc）">✕</button>
+      </div>
+      <div class="qc-body" id="qc-body"></div>
+    </div>
+  </div>
+
   <script type="module" src="js/main.js"></script>
 </body>
 

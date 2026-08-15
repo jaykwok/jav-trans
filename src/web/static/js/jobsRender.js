@@ -2,6 +2,7 @@ import { state } from './state.js';
 import { escHtml, readErrorDetail } from './util.js';
 import { jobArea, jobAreaHeader, emptyState, btnClearDone } from './dom.js';
 import { addLog } from './log.js';
+import { openQcReport } from './qcReport.js';
 
 const STATUS_LABEL = {
   pending: '待开始', queued: '排队中', asr: 'ASR转写', translating: '翻译中',
@@ -198,6 +199,13 @@ export function renderJobs() {
       ? `<button class="btn-sm btn-play" data-play="${id}" title="用系统播放器打开视频">▶ 播放</button>`
       : '';
 
+    // The report is opt-in, so the button only exists when the run actually
+    // wrote one - otherwise it would open a panel that can only apologise.
+    const hasQualityReport = isDone && job.artifacts.some(p => /\.quality_report\.md$/i.test(p));
+    const qcBtn = hasQualityReport
+      ? `<button class="btn-sm btn-qc" data-qc="${escHtml(id)}" title="查看质量报告（切分、布局、复读、交付规格）">📊 质检</button>`
+      : '';
+
     const folderPath = isDone
       ? (srtArtifacts[0] || job.artifacts[0] || job.spec?.video_paths?.[0] || '')
       : '';
@@ -235,6 +243,7 @@ export function renderJobs() {
         <span class="job-stage">${escHtml(stage)}${escHtml(progressInfo)}</span>
         ${playBtn}
         ${openFolderBtn}
+        ${qcBtn}
         ${srtBtns}
         ${otherSection}
         ${retryBtn}
@@ -305,6 +314,12 @@ export function installJobAreaHandlers(fetchAllJobs, syncSettings = null) {
       } catch (error) {
         alert('打开字幕失败：' + error.message);
       }
+      return;
+    }
+    const qc = e.target.closest('[data-qc]');
+    if (qc) {
+      const jobId = qc.dataset.qc;
+      await openQcReport(jobId, jobTitle(state.jobs[jobId] || { id: jobId }));
       return;
     }
     const dl = e.target.closest('[data-dl]');

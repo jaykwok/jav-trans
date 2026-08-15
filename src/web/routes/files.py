@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
@@ -19,6 +20,7 @@ from web.models import JobState
 router = APIRouter()
 
 _VIDEO_SUFFIXES = {".mp4", ".mkv", ".avi", ".ts", ".wmv", ".m2ts"}
+_QUALITY_MARKDOWN_SUFFIX = ".quality_report.md"
 
 
 def _safe_name(name: str) -> str:
@@ -396,6 +398,68 @@ async def open_artifact(job_id: str, path: str) -> dict[str, bool]:
     else:
         subprocess.Popen(["xdg-open", str(target)])
     return {"ok": True}
+
+
+def _quality_report_paths(job: JobState) -> tuple[Path, Path | None] | None:
+    """Locate this job's quality report and the machine-readable twin beside it.
+
+    Only the Markdown copy is registered as an artifact - it is the one a human
+    opens - while `write_quality_report` writes the JSON next to it under the
+    same stem. Resolving the Markdown through the artifact guard and then
+    swapping the suffix keeps the traversal check intact: a sibling of an
+    authorised file is inside an authorised directory by construction.
+    """
+    for artifact in job.artifacts:
+        name = Path(str(artifact)).name
+        if not name.endswith(_QUALITY_MARKDOWN_SUFFIX):
+            continue
+        markdown_path = _resolve_authorized_artifact_path(job, name)
+        if markdown_path is None:
+            continue
+        json_path = markdown_path.with_suffix(".json")
+        return markdown_path, json_path if json_path.is_file() else None
+    return None
+
+
+@router.get("/quality/{job_id}")
+async def get_quality_report(job_id: str) -> dict:
+    job = await get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    found = _quality_report_paths(job)
+    if found is None:
+        # Not an error: the report is opt-in (QUALITY_REPORT_ENABLED / the
+        # 「生成质量报告」 toggle), so its absence is the normal case and the page
+        # says so rather than showing a failed request.
+        return {"available": False, "reason": "not_generated"}
+
+    markdown_path, json_path = found
+    stem = markdown_path.name[: -len(_QUALITY_MARKDOWN_SUFFIX)]
+    if json_path is None:
+        # The Markdown is still openable; only the structured view is missing.
+        return {
+            "available": False,
+            "reason": "markdown_only",
+            "stem": stem,
+            "markdown_name": markdown_path.name,
+        }
+
+    try:
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"读取质量报告失败：{exc}",
+        ) from exc
+
+    return {
+        "available": True,
+        "stem": stem,
+        "path": str(json_path),
+        "markdown_name": markdown_path.name,
+        "report": report,
+    }
 
 
 @router.get("/output/{job_id}/{filename}")

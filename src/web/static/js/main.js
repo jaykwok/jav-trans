@@ -6,6 +6,7 @@ import { installPasteMenu } from './pasteMenu.js';
 import { installLog } from './log.js';
 import { installFiles } from './files.js';
 import { installJobAreaHandlers } from './jobsRender.js';
+import { installQcReport } from './qcReport.js';
 import { fetchAllJobs, startJobPolling } from './jobsApi.js';
 import { connectSSE } from './sse.js';
 import {
@@ -24,6 +25,7 @@ installSkipTransLink();
 installLog();
 installFiles();
 installJobAreaHandlers(fetchAllJobs, syncSettingsFromFormForSubmit);
+installQcReport();
 installSettingsPanel();
 startJobPolling();
 
