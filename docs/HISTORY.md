@@ -8,9 +8,128 @@
 
 ## 当前有效状态
 
+- 2026-08-14 **「参数调优」里写一行 `ASR_CHUNK_MAX_S=` 曾经直接杀掉 ASR 阶段，现已修。** 空值是被 UI 自己的 placeholder 教出来的写法（`ASR_ALIGNMENT_HEAD_PATH=` 就是清空该项的办法），前端逐行解析时保留空值并原样转发，而 `asr/pipeline.py` 的 `_env_float`/`_env_int` 是全仓唯一没有兜底的一对，`float("")` 直接抛。同写法的 `asr/transcribe.py` 两处一并修。**现在空值一律读作「用默认值」**，与其余五份实现一致。同一次全量审计还合并了两处会漂的重复实现（repair 回写的批次划分改为直接用引擎那份，ASR 文本路径的标点剥离改为用共享模块），并让 `jobs.json` 里解析不了的记录在被覆盖前留底。详见 [2026-08-14](#2026-08-14)。
+- 2026-08-14 **`LLM_REASONING_EFFORT=medium/max` 此前一跑就死：输出预算只算了答案，没算思考。** `response_token_budget` 是 `源字符数 × 1.5 + 28×条数 + 32`，而它作为 `max_tokens` 发出去——推理模型先花在思考流上。实测 deepseek-v4-flash：8 条 cue 的批预算 469 token，medium 光思考就 2,058 字符；24 条批预算 1,298，思考 18,393；54 条批预算 2,783，思考 20,231（max 更高，54 条 53,388）。**思考量随批增长但远不与源字符成比例**（medium 在 24 条与 54 条上花得差不多），所以补的是**按强度定的固定额度**而不是第二个比例系数——按字符缩放只会让预算最紧的小批继续饿死。新增 `TRANSLATION_REASONING_TOKEN_ALLOWANCE`（默认 32000，`max` 再乘 `TRANSLATION_REASONING_MAX_EFFORT_MULTIPLIER`=2.0；三档都会思考，所以三档都拿这份额度），额度由**任务携带的强度**解析而不是进程环境（Web 的「推理强度」是 per-job 的）。修完 sample-b 在 medium/max 下各整片翻译成功，1,700/1,700 条，零截断。详见 [2026-08-14](#2026-08-14)。
+- 2026-08-14 **「不思考」档退役，三档改为 `low` / `medium` / `max`，全部会思考。** 三臂 A/B（同一条时间轴，只重跑翻译）给出一个不需要人裁就成立的结果：**`none` 有 171 条 cue（10.1%）中文与日文原文逐字相同，即整条没翻，medium 与 max 都是 0 条**——而 `none` 正是当时生产在跑的档。省下的 8 倍时间不值一部片里十分之一的台词还是日文，所以底档换成「最快的仍然会思考的档」。**存量 `none` 读作 `low` 而不是落回 `medium`**：把旧配置悄悄升到最慢最贵的一档不是对它的安全解读；`.env` 与 `tmp/web/jobs.json` 里的 6 条 job spec 已就地迁移（备份在 `agents/rm/`）。`minimal` 仍然拒收。**换档后补跑的第四条臂确认 `low` 是真的快**：整片 238s（medium 456s、max 599s），1,700/1,700 完整、零漏翻、零截断，比默认快 1.9 倍——这推翻了我按 3 个小批探针做的先验（探针里 `low` 反而比 medium 更费思考）。默认仍留 `medium`，因为思考越多译文越短这条趋势在四条臂上单调，而 `low` 与 `medium` 的用词优劣没有人裁过（页面已生成：`agents/audits/20260814_180000_reasoning-low-vs-medium/`，1,588 条中文不同、抽 60 张卡）。页面：`agents/audits/20260814_003000_reasoning-none-vs-medium/` 与 `20260814_003100_reasoning-none-vs-max/`，各 60 张卡、甲乙各领先 30 张，仍待人裁。详见 [2026-08-14](#2026-08-14)。
+- 2026-08-13 **质量报告在 Web 端有了页面，`.quality_report.json` 不再是只能手动打开的文件。** 新增 `GET /api/quality/{job_id}`（从已登记的 `.md` 产物解析出授权路径后取同名 JSON，报告缺失分「没开开关」和「只剩 .md」两种如实作答），任务卡在**真的写了报告时**多一个「📊 质检」按钮。面板按流水线顺序分七组呈现，另给断点类型分布、复读标记的两层对照（音频块 vs 成品 cue）和三张带时间码的样例表；`warnings` 触发的行自己高亮并把阈值挂在 tooltip 上；**分组里没有的标量键落进「其他指标」照搬**，所以后续新增指标不会因为忘了写标签而看不见。详见 [2026-08-13](#2026-08-13)。
+- 2026-08-13 **翻译配置现在可以被人眼裁决：逐 cue 盲化 A/B 页面 + 统计。** `tools.audits.generate_translation_ab_audit_html` / `evaluate_translation_ab_audit`。两臂是同一部片的两次运行（改「翻译设置」后点「重试翻译」即可，重试复用 ASR 产物），工具**逐条校验 cue 数、起止点与日文原文**，不一致直接停——否则比的是 ASR 不是翻译。只抽两臂中文确实不同的 cue，甲/乙 顺序半数平衡随机，答案只在 `answers.jsonl`，盲化按**页面行的键集合**校验而不是搜臂名（臂叫 `none` 会命中 CSS）。统计只在分出胜负的卡片上做符号检验与 Wilson 区间，「都可用」不折半计入，未审阅数单独报出。**现存待裁决页面**：`agents/audits/20260814_180000_reasoning-low-vs-medium/`（推理强度 low vs medium）与两张 `20260814_0030xx_reasoning-none-vs-*`；最早那张本地 Hy-MT2 vs DeepSeek 的页面已按用户裁定删除（参数量差一个数量级，没有比较价值）。同时修掉 `update_audit_entrypoints` 对审计根之外的页面静默 return、以及 `write_latest_audit_entry` 把外部页面链接写成绝对路径这两个 bug——它们合起来的效果就是「页面生成成功、但导航里根本没有」。详见 [2026-08-13](#2026-08-13)。
+- 2026-08-13 **第一份不含缓存污染的阶段耗时：ASR 解码占整片的 86.8%，其余七个阶段加起来 121 秒。** sample-b（151.2 分钟）关掉 ASR 结果缓存整片重跑 919.8s，其中文本转写 798.3s、切块 23.2s、对齐 32.2s、翻译（`reasoning=none`）47.3s；整片 9.9× 实时、转写 11.4× 实时（RTX 4060 Ti / batch=5 / bf16）。**要提速只有解码这一处值得动。** 同时发现**同一份音频重解一遍结果不同**：块边界 339 条逐条相同，但 262 条块的文本不同（总字符 +1.0%、cue 数 1,700→1,729）。详见 [2026-08-13](#2026-08-13)。
+- 2026-08-13 **重解不一致的原因已定死：是 `generate` 的批组成，不是温度、也不是不可控的 kernel 噪声。** 重切同样的前 30 个块解三遍：batch=5 连解两遍 **0/30 不同**，与几天前那次 batch=5 整片运行的存档也是 **0/30 不同**（跨进程、跨日期逐位可复现）；改成 batch=11 则 **20/30 不同**。同批要补零对齐到最长的那条，批大小一变 bf16 累加顺序就变，个别位置 argmax 翻面。两次原始运行差的正是这个：一次 `asr_batch_size=11`（`learned_profile`），一次 `=5`（`auto_scaled_from_vram`，因为 `ASR_MAX_NEW_TOKENS="0"` 与档案身份里的空串不匹配）。**第二个入口更隐蔽**：命中缓存的块会从 `pending_chunks` 里剔除，于是部分命中会把剩下的块重新分组。要可比就钉 `ASR_BATCH_SIZE`，或让结果缓存全命中（全命中时根本不解码）。官方口径逐处核过，都是贪心：高层封装 vLLM 路径写死 `temperature=0.0`，transformers 路径连 `do_sample=False` 都不传（靠权重目录里的 `generation_config.json`），README 评测章节写明 greedy search——与我们的调用一致，温度不是入口。详见 [2026-08-13](#2026-08-13)。
+- 2026-08-13 **八片里 80 条「无人反驳」的 100% blank cue 定点重问 Grok：确认从 6 条升到 15 条，71 条仍然无法洗清，而且现在知道为什么。** 每条 cue 用 ±8s 窗口单独提问（$0.0473），并把归档已证实的 6 条一起重问当**正对照**——正对照灵敏度只有 **2/6 = 33.3%**，所以「span 里没有词义字」不构成洗清，其中三条正对照正好落在「span 内只有假名」这一格，而假名就是呻吟被转写出来的样子。按灵敏度外推，80 条里真实误伤的点估计约 **27 条**。37/86 的窗口整段返回空，与 2026-08-11 记录的失败模式一致。风险写法据此更新为「确认 15、点估计约 27、71 条无法判定」，**不推翻 v2 头的晋升**。详见 [2026-08-13](#2026-08-13)。
+- 2026-08-13 **翻译批格式失败后改成「要得更少」，而不是把同样的请求再发一遍。** sample-b 批 24 要 id 1296–1349，模型返回了 54 条但编号是 1297–1350——数量对、id 整体偏移一位。解析器拒绝是对的（接受偏移集合等于把每条译文挂到邻居 cue 上，而且静默），但重试预算随后买的是**四次一模一样的请求**，全部同样失败。54 条上的 id 偏移是容量症状，所以每次格式失败把单请求的 id 上限**减半**（54→27→13…，批内只降不升），和 ASR 阶段遇 OOM 降 batch 是同一个动作。同时把「有没有进展」的判据从「比这次请求要的少」改成「比请求前还欠的少」——否则一个完好的半批会被记成失败尝试；`TRANSLATION_BATCH_MAX_REQUESTS` 12→24，因为 12 是按「一次请求＝一次尝试」定的，会在降到模型能抄对 id 的规模之前就中止。详见 [2026-08-13](#2026-08-13)。
+- 2026-08-13 **回复被自己的输出预算截断不再直接杀掉整部片，报错也不再指错旋钮。** `_chat` 取 `min(TRANSLATION_MAX_TOKENS, 每批预算)`，而每批预算是 `源字符数 × TRANSLATION_OUTPUT_CHAR_RATIO(1.5) + 28×条数 + 32`——实测一个 54 条的批是 12,794，对着 384,000 的天花板，`min()` 永远取前者。所以旧提示「increase TRANSLATION_MAX_TOKENS」指的是一个**改了也不会生效**的值。现在截断抛 `ResponseTruncatedError`（带上真正生效的那个数），`_chat` 按 `TRANSLATION_TRUNCATION_RETRY_FACTOR`(2.0) **加大预算重试一次**再判死，并发 `output_truncated` 诊断事件。sample-b 就是被这条杀的：1,701 条里 1,310 条已翻好、已付费，整批丢弃。详见 [2026-08-13](#2026-08-13)。
+- 2026-08-13 **词时间不再越过本块自身的音频边界。** 对齐在编码帧上做，最后一帧结束在采样点之后（编码器铺的是补零信号），所以走到张量末尾的 coda 会报出一个本块没有音频的时刻——一个上采样帧、38.5ms。相邻块**共边**，于是这段越界正好压在下一块首词上，字幕层拿到两条实测时间真的重叠的 cue，而它按设计不许截断实测语音，重叠就这样进了成品。`build_aligned_word_timestamps` 现在把 `[window_start, window_end]`（本块自身音频）当成输出的硬边界，而不再只用于比例回退分支。五片真实运行实测（修复前产物）：**103 个词的终点落在自己块的音频之外**（16/16/26/21/24，最大 0.0577s），成品里 **7 对一帧重叠**（NAMH-055 1、sample-v 1、NMSL-036 4、sample-c 1），另有 4 对是 1e-5 量级的浮点级触碰。**同时把 `word_build_version` 2→3**：finalize 缓存不看这段代码，不 bump 的话修完重跑会逐项返回旧结果（已经踩到并确认）。详见 [2026-08-13](#2026-08-13)。
 - 2026-08-13 **时间模型升到 `measured_lexical_extent_v3`：显示终点可以在本来就空着的静音里多停最多 0.5s。** v3 让 cue 在最后一个发音字结束、`layout_timeline_locked` 又把它排除在 polish 之外，于是 TTSG 的出点 +0.5s 从此没跑过，代价是 487/7,016 条 cue 短于 20 帧、日文源 CPS>7 占 40.6%。四条上限同时生效：`linger_s`(0.5)、下一条起点前 2 帧、`acoustic_end + max_display_shift_from_acoustic_end_s`(0.5，兼作幂等保证)、不越 7s 软上限；下一条在 2 帧内开始时**整条不动**（回缩会截断实测语音）。**起点、声学边界、词时间一律不动**，增量记在 `display_shift_end_s`。八片生产实现实测：短于最小显示 **487 → 198**，CPS>7 **40.6% → 27.9%**，在屏 21,115 → 23,733s，时长 p50/p90 2.692/5.615 → 3.077/6.070s；超 7s 仍 34、重叠仍 0、间隔<2 帧仍 556、超 20 字仍 41、文本逐字一致、起点位移 0 条、越过 0.5s 上限 0 条。切点落点不变，所以 `LAYOUT_ENGINE` 不动——这正是两个戳分开的用处。**同日 `asr.postgate` 的标记第一次有了消费者**：`_build_japanese_srt_blocks` 此前按固定 key 重建 block，标记到 `aligned_segments.json` 就断了；现在随 cue 下传，质量报告同时给 chunk 级与 cue 级两层计数，只观测不设阈值。详见 [2026-08-13](#2026-08-13)。
 - 2026-08-12 **字幕布局升到 `measured_safe_boundary_dp_v3_1`：同样合法的两个切点之间选证据更强的，而不是更能填满行的。** 候选类型优先级不变（句末标点 > ≥0.6s 强停顿 > 分句标点 > 词间隙），新增的是词间隙**内部**按实测静音连续加权（0.12s 罚 0.36、0.60s 罚 0.20）——词间隙唯一的依据就是那段静音，而 0.12s 下限已贴近连续语流里音节间的间隔。八片跑生产实现：落在 0.12–0.2s 边缘静音上的切点 **399 → 301（−24.6%）**，词间隙静音中位数 0.192 → 0.269s，cue 总数 7,016 不变，字数 p50/p90 仍 17/20、超 20 字仍 41 条，时长 p50/p90 2.731/5.654 → 2.692/5.615s、超 7s 仍 34 条，重叠 0、比例回退 0。把同样加权推广到所有类别的版本已被否：它会把 134 个切点从写出来的逗号挪到声学停顿上。旧戳 `measured_safe_boundary_dp_v3` 与其它未知值一样被拒绝。**音频切块不受影响**：送进 ASR 的块仍取 30s 窗口内最靠后的合法停顿，因为块长本身就是目标；改取最宽会把块长中位数压到 18.4–22.4s，正落在 2026-08-02 实测伤转写的区间。两层的切点来源与续句标记现在都记进质量报告（只观测、不设阈值），详见 [2026-08-12](#2026-08-12)。
 - 2026-08-12 **JAV 非语义人声 CTC 变体与精确字幕 Layout v3 已正式晋升，同时保留原通用头**。最终把实验 `run1` 命名为 **`ctc_aligner_jav_vocalisation_v2.pt`**，SHA256 `3C1AA98CE4B692F09361C6DAB510204FCC9CF9D3733DEC26E7E53195256DD414`，作为独立文件上传到 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`；模型卡同步给出两头差异、选择场景与加载用例，最终 HF commit **`5a6a789ceb2f22d2b8606743b13a8159af218362`**。项目默认 `ASR_ALIGNMENT_HEAD_PATH` 已钉到该 commit/文件，本地落在 `models/ctc_aligner_jav_vocalisation_v2.pt`；**没有覆盖**原 `ctc_aligner.pt`，远端最终 commit 回读确认原文件仍为 SHA256 `61EF0CCD0E18F26ADBF3BCCC58165E4534BF727A793F02B363D24C556257B911`。选择并列发布而不是改义原文件，是因为新头并非原 Galgame 头的同口径小修：151.5h 混合训练含 Galgame / anime SFW / anime NSFW-JAV，使用纯声学词表、呻吟剥离目标与 blank-only 样本，目标就是把非语义人声读成 blank；原头仍适合复现旧时间轴及通用 anime/galgame 场景。头级八片验收维持原裁决：blank AUC **0.9384→0.9609**，同等约 5% 误伤下召回 **72.9%→90.5%**，起终点误差同量级；风险仍是 `blank=1.000` 86 条中 Grok 证实误伤 6 条，其余 80 条是无人反驳而非已洗清。**选 run1 而不是 run3 的理由链要连着 08-12 的两次反转一起看**：同日固定 30s 分块的因果隔离对照先判 run3（零宽压掉的语义字符 90 vs 70、CPS>7 27.19% vs 16.89%），并指出「标点碎片化」这条原本支持 run1 的理由已被生产向 `blank_runs` 传 `silent_classes` 抵消；随后用 v3 精确布局从 `segments.json` 重排，宣告前一份评估里所有布局相关指标作废（旧 `cues.json` 中 run1 带 135 条 clamp、1,200 条比例回退），重排后 run1 的 cue 数与时长分布最好，最终选 run1，详见 [2026-08-12](#2026-08-12)。**代价是已知且已量化的**（下列数字是 v3 当时的口径，2026-08-13 恢复出点延伸后已缩小到 23,733s / CPS>7 27.9% / 2.8%，见上一条）：同一批词，run1 的在屏总秒数比原头少 24%（21,133s vs 27,892s，run3 24,522s），CPS>7 占比 40.6%（原头 17.3%、run3 27.3%），7.0% 的 cue 短于 20 帧最小显示时长——v3 锁定时间轴后不再补最小时长、不再补 2 帧间隔，因此 QC 的这两项已改为按份额告警（`QC_MAX_SPEC_DURATION_UNDER_SHARE` / `QC_MAX_SPEC_GAP_UNDER_SHARE`，默认 0.15），这是取舍不是回归。Grok `speaker` 没有进入 run1/run3 的训练目标或切点标签，原始响应里词内 speaker 抖动不是这版头学到的坏边界，故没有因 speaker 重训。字幕层同时晋升为 **`measured_safe_boundary_dp_v3`**：每个约 30s 源 segment 内一次 DP 联合优化 **20 个日文源字符 / 7.0s 实测词语跨度**两个软目标；内部候选只认句末/分句标点、≥0.6s 强停顿与 0.12–0.6s 实测词间隙，cue 严格从首个实测发音字起、到最后一个实测发音字止。没有安全点就保留超限 cue，**不使用 `synthetic_proportional` 造切点、不把显示时间截到 7s、也不把实测边界延展进 blank**。八片从 `segments.json` 直接调用生产实现复算，与裁决脚本逐项一致，**两个口径要分开引**：过滤前 1,751 个源 segment 出 **9,008 cue**，其 **7,257 个内部边界**为句末 2,000 / 强停顿 3,262 / 分句 1,111 / 普通实测词间隙 884，任意字符边界 0；丢掉连续纯人声 cue 后是 **7,016 cue**，字数 p50/p90/p95 `17/20/20`，超 20 字 41 条（0.584%），时长 p50/p90 `2.731/5.654s`，超 7s 34 条（0.485%）。实测边界失败、文本保真失败、比例回退、显示截断均为 **0**，**重叠 cue 也是 0 对**；低于 2 帧间隔的相邻对 553、短于最小显示时长的 493 条（7.0%），最短 0.038s（一个上采样编码帧）。**这一段布局数字是 v3 晋升当时的口径**；当前生效的是 v3_1，cue 总数与两项超限数不变，时长与边缘切点分布见上一条。生产校验产物在 `agents/temp/20260812_123536_promote-jav-vocalisation-v2/`；README 已同步头的区别、回退用法与 `SUBTITLE_MAX_SOURCE_CHARS` / `SUBTITLE_MAX_DISPLAY_DURATION_S` 用例。全量测试 **1492 passed / 1 skipped**。
+
+## 2026-08-14
+
+### 全量代码审计：一个能杀掉 ASR 阶段的真 bug，两处会漂的拷贝，一条静默的数据丢失
+
+按四类模式各扫一遍全仓（`agents/temp/20260814_190000_full-audit/`），脚本都留着可复跑。**先说结论：文档与注释这两类基本是干净的**——README 里 238 个反引号标识符只有 1 个解析不到（`total-available`，那是散文不是标识符），src/ 注释里的反引号名字全部仍然存在，全仓 0 个 TODO/FIXME。查出来的东西集中在「同一件事有两份实现」上。
+
+**（1）真 bug：一个空的 `ASR_*` 覆盖会让 ASR 阶段崩在 `ValueError` 上。** `asr/pipeline.py` 的 `_env_float`/`_env_int` 是全仓唯一没有兜底的一对：
+
+```python
+def _env_float(name, default): return float(os.getenv(name, default))   # 空串直接抛
+```
+
+而**空值是被文档教出来的输入**——「参数调优 → 环境变量覆盖」的 placeholder 写的就是 `ASR_ALIGNMENT_HEAD_PATH=`（等号后留空表示清空），前端 `files.js` 按 `KEY=VALUE` 逐行解析且**保留空值**，`_asr_stage_env_overrides` 原样转发。于是用户照着 placeholder 写一行 `ASR_CHUNK_MAX_S=`，整个 ASR 阶段死在 `ValueError: could not convert string to float: ''`。已实测复现（`repro_empty_env.py`）：同样的空值，`llm/settings.py` 与 `subtitles/qc.py` 的同名函数都正常回落到默认值，只有 `asr/pipeline.py` 这份抛。`asr/transcribe.py` 里 `ASR_INVALID_SEGMENT_DURATION` / `ASR_MIN_REPAIRED_SEGMENT_DURATION` 是同一个写法、同样可转发（2026-08-03 才补进转发名单），一并修掉。修法是让这三处与其余五份实现一致：空或不可解析都回落默认。顺带删掉 `asr/pipeline._env_bool`——它一个调用点都没有。
+
+**（2）`_split_into_batches` 有两份完整实现**，`llm/engine.py:28` 与 `llm/translator.py:578`，逐字相同、且**两份都在跑**。这不是风格问题：repair pass 的回写 `_persist_repaired_translation_cache` 用 translator 那份重建批次，再按 `_translation_cache_key(b_index, ...)` 把修好的译文写回**引擎将来会读的那个键**。两份实现只要有一次改得不同步，修好的译文就全部写到没人读的键上，而且写入是成功的、不会报错——这正是 2026-08-03 记过的坑。改为 `_split_into_batches = engine_module._split_into_batches`，并加一条「必须是同一个对象」的断言，与推理档位那三个归一化函数用同一种钉法。
+
+**（3）`_strip_punctuation` 在 ASR 文本路径上有两份。** `asr/text_normalize.py` 就是为此存在的共享模块，`local_backend.py` 已经从那里导入，而 `transcribe.py` 自带一份**正则逐字相同**的私有拷贝，用在 `_is_low_value_text` 与段落压缩上。同一批 ASR 文本、同一个判断，改一处不会动另一处。改为导入共享实现。
+
+**（4）静默的数据丢失：`load_jobs` 丢掉解析不了的记录，下一次写入就永久删除。** 跳过时有 `log.warning`，但 `_jobs` 是从解析成功的那批重建的，只要有一个 active job 被标成 failed 就立刻整份重写 `jobs.json`——被跳过的记录从此不存在。**这不是假想**：模型收的是裸 `Literal`，08-14 退役 `none` 这一个值就让所有更早的记录同时解析失败（当天正是靠手工迁移才没丢）。改为发现无法解析的记录时先在旁边留一份 `jobs.json.rejected-<时间戳>`，再让正常流程继续。
+
+**（5）死代码。** `local_backend.transcribe_to_words`（模块级函数 + 同名方法 + 只服务于它的 `finalize_text_result`）整条链没有任何调用点，`BaseAsrBackend` 协议里也只有复数版 `finalize_text_results`——删。另有 `files.py` 的 `_QUALITY_JSON_SUFFIX`（声明后从未使用，实际代码走 `with_suffix`）、`openai_compat._chat_responses` 里 `api_format = "responses"` 这个赋了值没人读的局部变量、以及 src/ 与 tools/ 合计 10 个未使用 import。删 `translator` 那两个 import 时打红一条测试：`test_aggregated_progress_callback` 在 `monkeypatch.setattr(translator.time, ...)`，而 `_make_aggregated_progress_callback` 其实住在 `engine` 里——它一直是**借 translator 这个名字改到了 stdlib 的 time 模块**，engine 的时钟被顺带改了。改成在 engine 上打补丁。`translator.TranslationCancelledError` 确认是**故意的再导出**（外部按这个名字 catch），加 `# noqa: F401` 写明。
+
+**扫过但确认干净的**：86 个 `DEFAULT_SETTINGS` 项全部有读者（上一版审计的结论仍成立）；src/ 没有任何模块无人 import；`main._build_japanese_srt_blocks` 那个固定 key 列表没有再漏掉上游字段（`postgate_flags` 是最后一个，已修）；postgate 两层计数与 `display_linger_*` 都真的走到了 Markdown 报告与 Web 面板；QC 的每一条 warning 都是 `<metric>=…` 开头，所以面板按 `split('=')[0]` 归位的做法对全部告警成立；出点延伸的幂等、四条上限、关掉开关、被删人声段留下的空隙，测试都已覆盖。**还剩一处已知重复未动**：`_safe_float` 有 5 份（`llm/` 里 3 份逐字相同，`writer.py` 那份多拒 NaN/inf），`_env_float`/`_env_int` 各 6 份；它们没有像上面两处那样的「必须一致否则静默出错」的耦合，合并收益不抵改动面，记在这里而不是顺手改。
+
+全量 **1574 passed / 1 skipped**（新增 3 项：空覆盖回落、批次划分同一对象、无法解析的 job 记录留底）。
+
+### 推理强度一开就死：输出预算把思考算成了零
+
+**症状**：把 `LLM_REASONING_EFFORT` 从 `none` 换成 `medium`，sample-b 整片翻译死于 `ResponseTruncatedError`；把 `TRANSLATION_OUTPUT_CHAR_RATIO` 从 1.5 抬到 12.0 再跑，还是死，这次死在 24,328 token。抬比例没用本身就是线索。
+
+**原因**：`llm/profiles/json_v3.py` 的 `response_token_budget` 是 `源字符数 × TRANSLATION_OUTPUT_CHAR_RATIO + 28×条数 + 32`，`settings.py` 里那段注释写明这个 1.5 是 2026-08-04 拿 1098 条干净译文量出来的**输出/源字符比**（p50 0.69、p95 0.88、max 1.27）——它建模的是**看得见的回复**。但这个数是作为 `max_tokens` 发出去的，而推理模型的 `max_tokens` 要先付思考流。`none` 下思考为零，公式成立；一开推理就系统性不够。
+
+**实测**（`agents/temp/20260813_230000_reasoning-effort-ab/measure_reasoning_tokens.py`，把预算临时抬到不会截断，让 provider 报完整值）：
+
+| 强度 | 8 cue / 142 源字符 | 24 cue / 396 | 54 cue / 826 |
+| --- | ---: | ---: | ---: |
+| 出厂预算(token) | 469 | 1,298 | 2,783 |
+| none 思考字符 | 0 | 0 | 0 |
+| medium 思考字符 | 2,058 | 18,393 | 20,231 |
+| max 思考字符 | 6,321 | 18,917 | 53,388 |
+
+短了一到两个数量级。**并且思考量不与源字符成比例**：medium 在 24 条（396 字符）与 54 条（826 字符）上花得几乎一样多。所以补一个按字符缩放的项是错的——那样预算最紧的小批（8 条那格预算才 469）会继续饿死，而它们恰恰是分批重试时最常出现的形状。
+
+**修法**：`TRANSLATION_REASONING_TOKEN_ALLOWANCE`（默认 32000）作为**按强度定的固定额度**加进预算，`none` 时为 0（非推理运行的界一个 token 都不变），`max` 乘 `TRANSLATION_REASONING_MAX_EFFORT_MULTIPLIER`（默认 2.0，对应 53,388 vs 20,231 那一栏）。（`none` 当天晚些时候退役，那条归零分支随之删掉——现在三档都会思考、三档都拿额度，见下面「不思考档退役」。）字符当 token 用是故意取的悲观换算——流里报的是字符。额度**从任务携带的强度解析，不读进程环境**：`ctx.llm_reasoning_effort` 来自 Web 的「推理强度」下拉，读 env 会按服务器启动时的值配预算，A/B 的每条臂都会配错。`response_token_budget` 因此多一个 `reasoning_effort` 关键字参数，三个 profile 与 `engine` 的调用点同步（Hy-MT2 没有推理模式，显式忽略）。
+
+**放宽预算不等于放宽跑飞保护**：真正拦住 `嗯嗯嗯…` 的是 `bounded_schema` 给每条译文的 `maxLength`，它按批内最长源行独立生效，与 token 预算无关。
+
+**代价**：诊断之前两次整片重试是白花的（第一次很早就死，第二次跑完 12 个批），加上一次 8 条 cue 的探针。
+
+### 三臂翻译 A/B：none / medium / max
+
+**造臂不重跑 ASR**：Web 的「重试翻译」本来就是从 `translation_artifacts.json` 快照恢复 `AsrArtifacts` 再只跑翻译，脚本 `agents/temp/20260813_230000_reasoning-effort-ab/run_arm.py` 走同一条路。cue 几何与日文因此**逐条相同**，正是 `require_same_cue_set` 要的。两条安全规则写在脚本里：所有写出目标重定向进各自臂目录（绝不碰用户成品 `video/sample-b.srt` 与原任务目录），**翻译缓存不复制**（复制就等于让这条臂拿另一条臂的译文，页面会拿自己跟自己比）。
+
+| 臂 | 耗时 | cue | 中文字符 | 整条未翻（中文==日文） | 与 none 不同 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| none（生产现值） | 47s | 1,700 | 16,034 | **171（10.1%）** | — |
+| medium | 456s | 1,700 | 15,464 | **0** | 1,641 |
+| max | 599s | 1,700 | 14,889 | **0** | 1,622 |
+
+**「整条未翻」这一栏不需要人裁就成立**：`none` 下有 171 条 cue 的中文与日文原文逐字相同，屏幕上直接是日文——与 2026-08-11 记的 DeepSeek「11% 拒译」是同一个失败模式，而开了推理之后它归零。生产当时跑的就是 `none`，这一栏因此直接决定了下一节的裁决。
+
+推理还让译文更短（16,034 → 15,464 → 14,889 字符），方向与「更贴字幕、更少注水」一致，但字数说不了好坏，**这正是页面要回答的部分**：`agents/audits/20260814_003000_reasoning-none-vs-medium/` 与 `agents/audits/20260814_003100_reasoning-none-vs-max/`，各 60 张卡、60 段音频、甲乙各领先 30 张，页面按键集合结构化校验盲化通过。
+
+### 不思考档退役：三档改为 low / medium / max
+
+上一节那 171 条把裁决做完了：一个会把十分之一的台词原样留成日文的档位不该继续摆在 UI 上，哪怕它快 8 倍。所以底档不再是「关掉思考」，而是「最快的仍然会思考的档」——`low`。
+
+**换档之后补跑了第四条臂**（同一份 `translation_artifacts.json` 快照、同一条时间轴、缓存不复用）：
+
+| 臂 | 耗时 | cue | 中文字符 | 整条未翻 | 请求数 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ~~none（已退役）~~ | 47s | 1,700 | 16,034 | **171（10.1%）** | — |
+| low | **238s** | 1,700 | 16,490 | **0** | 35 |
+| medium（默认） | 456s | 1,700 | 15,464 | **0** | 35 |
+| max | 599s | 1,700 | 14,889 | **0** | 35 |
+
+**`low` 是真的快**：比默认快 1.9 倍，且整片零漏翻、零截断。这一条推翻了我按小批探针做的先验——探针只有 3 个批（8/24/54 条），`low` 在其中两档上思考得比 medium 还多（7,860 / 14,034 / 9,383 对 2,058 / 18,393 / 20,231），据此我本来准备写「别指望 `low` 提速」。整片约 140 个批的实测说了相反的话，**3 个批不构成对这个量的估计**。默认仍留 `medium`：思考越多译文越短这条趋势在四条臂上单调（16,490 → 15,464 → 14,889），而 `low` 与 `medium` 的用词优劣没有人裁过，没有实测就不动默认。
+
+**预算侧因此保持 `low` 与 `medium` 共用同一份 32000 额度**：探针分不开两者、且 `low` 有两档比 medium 更费，额度按两者的坏情况取值才安全；整片跑完零截断确认这份额度够用。只有 `max` 稳定更重（54 条批 53,388 对 20,231），所以只有它乘倍数。
+
+**存量 `none` 读作 `low`，不是落回 `medium`**：`normalize_reasoning_effort` 里加一条别名而不是把它当未知值。未知值落 `medium` 是对的（`minimal` 就该这样被拒），但 `none` 不是未知值，它是一个有明确意图的旧值——把它悄悄升到最慢最贵的一档不是对用户配置的安全解读。同时就地迁移了磁盘上的存量（`agents/temp/20260814_150000_reasoning-tier-rename/migrate_stored_tier.py`，两份都先备份进 `agents/rm/`）：`.env` 一行，`tmp/web/jobs.json` 里 6/6 条 job spec——`web/models.py` 收的是裸 `Literal["low","medium","max"]`，而任务加载器**跳过解析不了的记录**，所以留着 `none` 不会报错，会让任务列表静默变空。
+
+**UI 三档带上了注解**（`low（最快）` / `medium（默认）` / `max（最慢，成本最高）`）：档位名本身说不出代价，而这三个词就是用户唯一需要的信息。两处测试因此从断言整段 `<option ...>medium</option>` 改成只断言 `value` 与 `selected`——把人读的标签写进契约测试，等于每改一次文案就红一次。
+
+**`extra_body.thinking.type` 改成无条件 `enabled`**：它此前是 `"disabled" if effort == "none" else "enabled"`，而 `none` 已经不存在。留着一个恒假的分支比删掉更危险——2026-08-02 那次事故正是「一个读起来像开关的值其实不是开关」。
+
+**唯一还开着的问题是 `low` 与 `medium` 的用词优劣**，页面已生成待人裁：`agents/audits/20260814_180000_reasoning-low-vs-medium/`，1,700 条里两臂中文不同的有 1,588 条，从中抽 60 张卡、甲乙各领先 30 张。此前那两张 `none-vs-*` 页面保持原名不动——它们记录的是当时真的跑过的对照，改名会把记录说成另一回事。
+
+### 复现步骤
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+# 思考到底要多少 token（会调 API，9 次小批请求）
+uv run python agents/temp/20260813_230000_reasoning-effort-ab/measure_reasoning_tokens.py
+# 只重跑翻译阶段造一条臂（会调 API，整片）
+uv run python agents/temp/20260813_230000_reasoning-effort-ab/run_arm.py --effort low
+uv run python agents/temp/20260813_230000_reasoning-effort-ab/run_arm.py --effort medium
+uv run python agents/temp/20260813_230000_reasoning-effort-ab/run_arm.py --effort max
+# 把存量 none 迁成 low（.env 与 tmp/web/jobs.json，先备份进 agents/rm/）
+uv run python agents/temp/20260814_150000_reasoning-tier-rename/migrate_stored_tier.py
+# 生成盲化页面（放 agents/audits/ 下，导航靠扫描发现）
+uv run python -m tools.audits.generate_translation_ab_audit_html `
+    --arm none=tmp/web/jobs/<job>/sample-b.bilingual.json `
+    --arm medium=agents/temp/20260813_230000_reasoning-effort-ab/arm_medium/sample-b.bilingual.json `
+    --audio agents/temp/full-workflow/20260813_121940_cold-speed-run/jobs/sample-b_full_workflow/audio/sample-b.91396140.wav `
+    --output-dir agents/audits/<ts>_reasoning-none-vs-medium --sample 60
+```
 
 ## 2026-08-13
 
@@ -48,7 +167,232 @@ cue 总数 7,016 不变，八片文本逐字一致。剩下的 198 条是后面�
 
 两层都不设阈值：`repeated_unit` 在本域本来就有约 10% 的 chunk 命中率，且多数是真实的重复语气词，阈值只能靠发明。`postgate_alignment_score_checked` 如实报 0（未标定的对齐分检查没有运行），免得被读成「每条 cue 都有音频支持」。**下一步先看数再定**：如果被标记的 cue 基本都已经被纯人声过滤删掉，就保持只观测；如果 `repeated_unit` 大量活进成品，最便宜且正确的动作是文本层折叠重复串（产物保留 raw 文本），不是删 cue、更不是重解码——08-02 已实测短块会把 `repeated_unit` 从 10.5% 推到 14.6%。
 
-全量测试 **1529 passed / 1 skipped**。
+**补完最后一段（同日）**：标记此前止步于「质量报告有个数」，产物里定位不到具体哪几条——翻译路径的 `srt_blocks` 也是按固定 key 列表重建的，`bilingual.json` 里 1,700 条 block **一条都没有** `postgate_flags`（`aligned_segments.json` 里同一部片有 28 条）。当时误记成 `_copy_sorted_blocks` 丢的，实际是 `src/main.py` 里那段字面量；`_prepare_subtitle_blocks` 全程 `dict(block)`，从头到尾没丢过键。现在只在**确实带标记的 cue 上**写这个键，空列表不写，所以 `rg postgate_flags <片名>.bilingual.json` 直接落到那几条上，而未标记的 1,672 条不会给产物增重。跳过翻译那条路径本来就直接写 cue，不受影响。
+
+全量测试 **1529 passed / 1 skipped**（补完这段后 1567 passed / 1 skipped）。
+
+### 五片真实运行暴露的块边界越界（首个带翻译的真实口径）
+
+前面所有字幕数字都是离线重放，止步于日文那一半；这次跑了五部真实影片（NAMH-055 / sample-v / NMSL-036 / sample-c / sample-b，全在离线八片之内），双语模式、开翻译、`keep_temp_files`，因此第一次拿到成品中文与生产切点几何下的产物。质量报告里冒出一项离线从来没出现过的东西：**重叠 cue**（sample-v 2 对、sample-c 1 对、NAMH-055 3 对、NMSL-036 5 对），而八片离线对照里这一项一直是 0。
+
+**先排除新改的那一步**：这些 cue 的 `display_end == acoustic_end`，说明出点延伸根本没动它们——「下一条在 2 帧内开始就整条不动」那条分支按设计生效了。真正的成因在更上游：sample-v 的 chunk 108 边界在 2932.673，下一块正好从这里开始，而 chunk 108 的**末词 `?` 对齐终点是 2932.711**，越界 0.038s，正好是一个上采样编码帧（76.9/2 ms）。`speech_extent` 的外扩走在编码帧上，而帧铺的是补零后的信号，所以走到张量最后一帧就会报出一个本块没有音频的时刻。
+
+**为什么这不是无害的余量**：`asr.chunking` 输出精确铺满且相邻块共边，所以越界的那一段不是空地，是下一块的首词。字幕层收到的是两条**实测**时间重叠的 cue，而它拒绝截断实测语音（这正是 v3 锁定时间轴的意义），于是重叠原样写进 SRT。
+
+**修法**：`build_aligned_word_timestamps` 此前只在比例回退分支用 `window_start` / `window_end`，对齐分支完全不看它们。现在它们是两条分支共同的硬边界——本块自身的音频，任何对它的测量都不可能落在外面（生产里 `alignment_window_source` 恒为 `chunk`，窗口就是 `[0, duration]`，不存在被更窄的 speech-core 窗口误伤的情况）。
+
+修复前产物的实测（`agents/temp/20260813_105202_chunk-seam-overrun/`，四片已完成任务）：
+
+| 片 | segment | 词终点落在自己块外 | 最大越界 | 成品重叠对 |
+| --- | ---: | ---: | ---: | ---: |
+| NAMH-055 | 212 | 16 | 0.0385s | 3 |
+| sample-v | 302 | 16 | 0.0577s | 2 |
+| NMSL-036 | 258 | 26 | 0.0577s | 5 |
+| sample-c | 301 | 21 | 0.0577s | 1 |
+
+11 对重叠里 7 对是整一帧（0.0384–0.0385s），4 对是 1e-5 量级的浮点触碰（wav 实际时长与切点计划的舍入差），两类都由这条 clamp 收掉。**另有一类没有修**：sample-c 里有极短的块内 segment（seg 154 只有 19ms），其 `end` 与自己末词的终点不一致，最大分歧 0.173s；它没有产生成品重叠，成因也与块边界无关，留待单独查。
+
+这条同时给 08-12 那句「被压成零宽的语义字符全落在源块首尾两个字符内，是 chunk-edge 问题」补上了另一半：块边界确实是问题所在，而且在生产的按停顿切几何下依然存在。
+
+**clamp 生效后的实测（sample-b）**：`past_own_chunk` **24 → 0**、`seam_overruns` **3 → 0**。同时出现两处附带修复，都发生在同一条块边界上：chunk 200 的结尾 `...`（三个字符）原本**整个丢失**——它们的 span 被 coda 外扩推到了块外，下游据此丢弃；clamp 把它们钉在块边界上后保留了下来。chunk 201 原本被劈成 `ん`（5375.827–5376.019，0.192s，单字符）和 `ー...はい…` 两段，现在是完整的一段 `んー...はい…`。这正是 08-12 那条「零宽语义字符落在源块首尾」的生产几何版本，实测代价是**每片个位数的标点字符 + 一条虚假的 0.19s cue**，不涉及语义字符。
+
+**改完第一次重跑毫无变化，原因是 finalize 缓存**：sample-b 新建任务重跑，`stage_done asr_alignment elapsed=26.03s`，对齐阶段确实执行了，产出的 `aligned_segments.json` 却和修复前的归档副本逐项相同——`past_own_chunk=24`、`max=0.038495`、`seam_overruns=3`，连微秒都一样。`asr.result_cache` 的 finalize 缓存（`tmp/cache/boundary/`，本机 1.7GB）按「模型签名 + 对齐头 digest + 边缘 cap + `word_build_version`」寻址，而**改的是把 span 变成词的那段代码，这四项一个都不动**，于是每个 chunk 都被修复前的条目服务。`word_build_version` 2→3 后才真正生效。
+
+这个坑在 `result_cache.py` 的注释里写着，而且是**同一个坑第二次**：version 2（不再丢弃标点的零宽 span）当初也是"修完重跑，输出逐字节相同"。所以补了一条测试把耦合钉住，而不是只改数字。
+
+全量测试 **1534 passed / 1 skipped**。
+
+### postgate Phase B 裁决：保持只观测，不做文本层折叠
+
+五片真实运行给出了 cue 级数字，按 Phase A 定下的规则裁决。**结论是不动运行时**，理由不是"量不够"，而是**规则的触发条件成立、但它给出的处置对这批数据是错的**。
+
+数字（`agents/temp/20260813_105202_chunk-seam-overrun/adjudicate_postgate_cues.py`，用生产 layout 重放归档 segment，重建出的每片条数与质量报告逐项吻合）：
+
+| 片 | cue | 被标记 | 占比 | repeated_unit | runaway_repetition |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NAMH-055 | 870 | 82 | 9.43% | 73 | 13 |
+| sample-v | 1595 | 78 | 4.89% | 66 | 12 |
+| NMSL-036 | 893 | 91 | 10.19% | 70 | 36 |
+| sample-c | 609 | 65 | 10.67% | 59 | 35 |
+| sample-b | 1700 | 128 | 7.53% | 99 | 51 |
+| 合计 | 5667 | 444 | 7.84% | 367 | 147 |
+
+规则说「`repeated_unit` 大量活进成品 → 文本层折叠重复串」。367 条确实算"大量"，但规则的前提是**被标记＝有缺陷**，而证据说不是。最长重复次数的分布是 `{1:58, 2:60, 3:282, 4:27, 5:11, 6:4, 7:1, 8:1}`——**压倒性地集中在恰好重复 3 次**，也就是本域最常见的正常说法。全语料重复 ≥5 次的只有 17 条（0.3%）。
+
+按重复次数排序的最严重那些，逐条看都是**转写正确**：
+
+```
+x8 好き    3.54s  っ、好き好き好き好き好き好き好き好き
+x6 すごい  1.84s  すごいすごいすごいすごいすごいすごい!
+x6 そう    2.76s  そうそうそうそうそうそう。そうそうそう
+x5 あっ、  3.54s  あっ、あっ、あっ、あっ、あっ、あっ!
+```
+
+速率也说得通：`好き`×8 用 3.54s 是 2.3 次/秒，`すごい`×6 用 1.84s 是 3.3 次/秒，都在人能说出来的范围内——解码失控通常给出物理上不可能的速率，这批里一条都没有。真正可疑的只有 `添い寝添い寝添い寝添い寝添い寝`、`ぐもぐもぐもぐもぐも` 这类个位数。
+
+所以**折叠会删掉说话人真的说了的内容**：把「好き好き好き好き」压成「好き」是改语义和情绪强度，属于翻译质量回退而不是修复。删 cue 和重解码本来就更靠后（08-02 已实测短块把 `repeated_unit` 从 10.5% 推到 14.6%）。维持只观测。
+
+顺带暴露一个 Phase A 的缺口：`postgate_flags` 到 `aligned_segments.json` 为止，**没有进 `bilingual.json`**（`_copy_sorted_blocks` 丢掉了），所以从产物里没法定位被标记的是哪几条 cue，这次裁决是靠离线重放做的。
+
+### 一条被截断的回复杀掉整部片，而提示指向一个改了没用的旋钮
+
+同一批五片里 sample-b 在翻译阶段失败，报 `LLM JSON response was cut off by max_tokens; increase TRANSLATION_MAX_TOKENS.`，此时 1,701 条里已经翻好并付过费的有 1,310 条，全部丢弃。ASR 侧完好（339 segment，产物仍在 job 目录里）。
+
+**提示指错了旋钮，这一点从代码就能确定**：`_chat` 用的是
+
+```python
+effective_max_tokens = min(TRANSLATION_MAX_TOKENS, batch_budget)
+```
+
+而 `batch_budget` 来自 `JsonProfile.response_token_budget`：`源字符数 × TRANSLATION_OUTPUT_CHAR_RATIO(1.5) + 28×条数 + 32`。这次运行里一个 54 条的批算出来是 **12,794**，天花板是 **384,000**，`min()` 永远取前者。所以照着提示去调 `TRANSLATION_MAX_TOKENS` 不可能有任何效果。
+
+**哪一个请求被截断没有定论，而这本身就是个缺陷**：日志只记成功的批（`translation_batch_done`），失败那次什么都没留下。可用的间接证据是已完成批的 `completion_tokens` 峰值只有 2,500，对着 12,794 的预算，说明正常批离预算还很远。**中途一度怀疑 `_MIN_TOKEN_BUDGET = 96` 这条地板**（修复请求只重发缺的几条，源字符少时预算走地板）——但读清楚公式后这条不成立：`max(96, body + structure)` 里单条的 structure 就有 60，地板只会把预算**抬高**，从来不会压低，所以它不是元凶，也就没有改它。
+
+**改动**（三处，行为最小）：
+
+1. 新增 `ResponseTruncatedError(TranslationError)`，带 `limit` 字段。**故意不继承 `RetryableTranslationError`**：通用重试路径原样重发同一个请求，对截断毫无意义，只会按 `TRANSLATION_API_RETRIES` 把一次失控重复付费。
+2. 两个 transport（Chat 与 Responses）都改抛它，消息里写**真正生效的那个数**。
+3. `_chat` 捕获后按 `TRANSLATION_TRUNCATION_RETRY_FACTOR`(2.0) **加大预算重试一次**；仍被截断才判死，终局消息点名 `TRANSLATION_OUTPUT_CHAR_RATIO` 而不是天花板。预算已经顶到天花板时不重试（那才是「同一个请求再发一遍」）。重试前发一个 `output_truncated` 诊断事件进运行日志——今天答不出「是预算太紧还是模型失控」，正是因为没有这个。
+
+只重试一次是有意的：预算是对**合法**译文长度的算术上限，撞上它只有两种可能，而 transport 分不清。一次升级能救「预算太紧」，「模型失控」则多付一个请求后照样失败——比旧行为（当场终止并丢掉整片）严格更好。
+
+全量测试 **1542 passed / 1 skipped**。
+
+### 同一部片的第二种死法：id 整体偏移，而重试只会把同样的请求再发一遍
+
+修掉截断后 sample-b 重跑，换了个死法：
+
+```
+Batch translation returned invalid or incomplete JSON after 4 attempts:
+batch=24, start_index=1296, size=54,
+error=LLM JSON output returned invalid batch translation id: 1350.
+```
+
+批 24 要的是 id 1296–1349。模型返回了 **54 条**（数量检查通过），但里面出现了 1350——**整批 id 偏移了一位**，不是"多吐一条"。同一现象在进度条上也能看到：`translated` 涨到 1741 而 `expected` 是 1701，因为流式计数器数的是回复里 `"id":` 这个字面量出现了几次（`transport_util._count_translation_markers`），范围外的 id 照数不误。（顺带说明这个计数器本来就是估算：它也会**往回跳**，某批开始重发修复请求时计数从 0 重来。）
+
+**拒绝是对的**：接受一个偏移的 id 集合，等于把每条译文挂到相邻 cue 上，而且没有任何迹象。这类静默错位不能为了"跑通"而放行。
+
+**错的是拒绝之后做什么**：旧逻辑把 `pending_ids` 原样重发，于是 `TRANSLATION_API_RETRIES` 买到的是四次**形状完全相同**的请求——同样 54 条、同样的前缀，模型自然同样偏移，四次全废，整片丢弃。
+
+**改法**（`llm/engine.py::run_batch`）：新增 `request_span_limit`，单个请求最多要这么多 id。每次格式失败或零进展就**减半**（54→27→13→6），批内只降不升——让模型丢失 id 序列的那个原因并没有消失。剩下的 id 走原本就有的 missing-ids 路径再要一次。这与 ASR 阶段遇 OOM 降 batch 是同一个动作，只是这里的信号是"抄不对 id"而不是显存。
+
+两处配套修改是必需的，否则新逻辑自己会打架：
+
+- **进展判据**从 `len(missing) < len(requested_ids)` 改成 `len(missing) < pending_before_request`。窄了以后两者不再相等：一个完好的半批返回后 missing 仍等于另外半批，按旧判据会被记成失败尝试并继续收窄，永远降不到底。无收窄时两者恒等，所以旧行为逐字保持。
+- **`TRANSLATION_BATCH_MAX_REQUESTS` 12 → 24**。12 是按"一次请求＝一次尝试"定的；收窄后一个 54 条的批降到 13 需要 1 次失败 + 1 次失败 + `ceil(54/13)=5` 次覆盖请求，而重试预算允许四次这样的下降。12 会正好在它快要成功时中止。
+
+顺手删掉了 `pending_segments`：改动后每个请求的 segment 列表由 `requested_ids` 现算，这个变量只剩赋值没有读取。
+
+全量测试 **1548 passed / 1 skipped**。
+
+### 质量报告第一次有了读者：Web 端质检面板
+
+这个月加的指标——切分来源（`chunk_cut_*`）、布局断点类型（`layout_break_type_counts`）、词间隔切点（`layout_word_gap_*`）、出点延伸（`display_linger_*`）、两层复读标记（`postgate_*`）——全部写进了 `<stem>.quality_report.json`，而**只有 `.md` 被登记成任务产物**，JSON 连下载入口都没有。要看这些数就得自己去 `video/<stem>/` 打开文件，等于付了检测的钱不看结果。
+
+新增 `GET /api/quality/{job_id}`：从任务产物里找 `.quality_report.md`，走既有的越权校验解析出真实路径后**换后缀取同名 JSON**——授权文件的同目录兄弟必然还在授权目录内，所以不需要第二套路径判断。报告是可选产物，因此「没有」不是错误：`available:false` 分 `not_generated`（没开开关）和 `markdown_only`（只剩 .md，仍可用系统程序打开）两种，页面据此说不同的话。
+
+面板（`src/web/static/js/qcReport.js`）按流水线的产生顺序分七组：交付规格（TTSG）/ 时间轴与阅读时间 / 切分与布局 / 密度 / 文本与译文 / ASR 健康度 / 复读检测，另有断点类型条形分布、复读标记的**两层对照表**（音频块 vs 成品 cue）、以及规格 / 密度 / 重叠三张样例表（时间码按 `HH:MM:SS.mmm` 给出，可直接到播放器里核对）。`warnings` 里每条形如 `<metric>=<value> > <ENV>=<limit>`，因此第一个 `=` 前就是指标名——被触发的行自己高亮，阈值挂在 tooltip 上，不需要在前端复制一份阈值表。
+
+**不认识的指标不会消失**：分组之外的标量键落进「其他指标」组照搬。质量报告的键还在长，页面漏写标签是常态，漏写不该等于看不见。用真实的 sample-b 报告在 node 里跑一遍生产渲染路径核对：81 个标量键全部出现在页面上、4 条警告对应 4 个高亮行、fallback 组为空、没有 `undefined`/`NaN`。
+
+任务卡上的「📊 质检」按钮**只在这次运行真的写了报告时出现**——否则点开只能道歉。全量测试 **1556 passed / 1 skipped**。
+
+### 80 条无人反驳的静音 cue：定点重问 Grok，确认 9 条，其余 71 条仍然洗不清
+
+八片验收留下的 86 条「词义对白读成 100% blank」里，归档全片教师只证实了 6 条，另外 80 条一直按**无人反驳**记着。这次按 cue 定点重问：每条 cue 取 `acoustic_start/end` ±8s 的窗口（中位 span 2.77s，窗口约 19s），从验收当时那份 wav 上切片（同一个时钟，不需要再推 PTS），逐条送 Grok STT，86 条共 28.3 分钟音频，**实际花费 $0.0473**。
+
+**已被归档证实的 6 条一起重问，当正对照**——这是整件事的关键，没有它这份结果会被读反：
+
+| 判定 | 全部 86 | 80 条无人反驳 | 6 条正对照 |
+| --- | ---: | ---: | ---: |
+| span 内有词义字（汉字/拉丁/数字） | 11 | **9** | 2 |
+| span 内只有假名 | 11 | 8 | 3 |
+| 该窗口有转写但 span 内什么都没有 | 27 | 26 | 1 |
+| 整个窗口一个词都没返回 | 37 | 37 | 0 |
+
+**正对照的灵敏度只有 2/6 = 33.3%**：已知有真实语音的 span，这套定点方法也只在三分之一上给出词义证人。所以「span 内没有词义字」**不能**当成洗清——三条正对照恰好落在「只有假名」那格，而假名正是呻吟被转写出来的样子，对判决没有信息量。按 9 / 0.333 外推，80 条里真正的误伤点估计 **约 27 条**（n=6 的对照，区间很宽）。
+
+结论按证据分三级如实记：**确认从 6 条升到 15 条**；**71 条仍然无人反驳**，且现在有了量化的理由说明为什么它们清不掉；37/86 的窗口整段返回空，正是 2026-08-11 记的那个失败模式（Grok 在呻吟密集处整条失败），只是现在被压缩到 19 秒的窗口而不是 300 秒的分块。
+
+新确认的 9 条里，证据强度差别很大，一并记下免得被当成同一档：sample-b#1457 字幕「そいついきまってるな。大丈夫?」对 Grok「最盛期になってるよ大丈夫い」、AKDL-281#878 对「か俺が言うのっていいの」是明确吻合；而 NMSL-036#819 只落了一个「難」、sample-v#1468 只落了一个「願」——这些确认的是**那里有词状发声**，不是 ASR 那句写对了。
+
+**这不推翻 v2 头的晋升**：15 条落在八片约 7,000 条 cue 上，各候选头的证实数也在同一量级。它改的是风险的写法——原来的「6 条」是测量能力的下限而不是真实值，现在的写法是「确认 15、点估计约 27、71 条无法判定」。判据「词义对白不得读成 100% blank」在本域**仍然无法用 Grok 度量**。
+
+**踩到的坑记一条**：`create_speech_to_text_transport` 不给 `model_override` 就回落到共享配置里的 `OMNI_MODEL`（当前是 `google/gemini-3.6-flash`），OpenRouter 直接 400「does not support response_format verbose_json」。全片 runner 有 `--model` 默认值所以从没暴露过，新写的脚本必须自己带上。
+
+### 翻译配置终于可以被人眼裁决：逐 cue 盲化 A/B
+
+翻译侧到现在为止的每一次改动，靠的都是 prompt 推理和零散抽查——没有任何一次是「同一句话、同一段音频、两个配置，人来选」得出的。新增 `tools.audits.generate_translation_ab_audit_html` + `evaluate_translation_ab_audit` 把这件事补上，复用既有的人工审计 Core（播放器、状态、完成度、保存 API）与 CTC 边界 A/B 的产物形状（`manifest.jsonl` 给页面、`answers.jsonl` 是答案、`summary.json` 记生成参数）。
+
+**两臂就是同一部片的两次运行，不重新翻译任何东西**。这样做的前提是两臂的 cue 必须逐条相同，所以工具会校验 cue 数、每条起止点和日文原文，任一条不同就直接停——理由正是上一条记的解码不可复现：拿两次重新解码的运行当臂，比的是 ASR 不是翻译。造臂最省事的方法恰好也最正确：任务跑完后改「翻译设置」再点「重试翻译」，重试复用 ASR 产物，几何天然一致。
+
+三条设计决定值得记下来：
+
+- **只抽两臂中文确实不同的 cue**。相同的译文不含偏好信息，混进样本只会稀释效应量。sample-b 上 1,700 条 cue 里合成臂差异 241 条，抽样池就是这 241 条。
+- **盲化按结构校验，不按字符串搜索**。页面行只允许携带 `row_id / span / ja / clip_src / arm_1_text / arm_2_text` 六个键，多一个就报错；反过来「页面里不许出现臂名」是不可用的判据——臂叫 `none` 会命中 Core CSS 里的 `display:none`，叫 `flash` 可能命中字幕正文。甲/乙 的先后按半数平衡随机。
+- **统计只在分出胜负的卡片上做**。「都可用」不折半计给两边——它是审计者在说这个差异不重要，把它折进胜率就是把平局报成结果；未审阅卡片单独计数并报出，避免「看了一半的胜率」被当成整体胜率。给符号检验 p 值与 Wilson 95% 区间（6 张卡的冒烟里 2:1 的区间是 0.21–0.94，正好说明这种样本量什么都证明不了）。
+
+冒烟用合成臂（同一份 `bilingual.json` 改若干条中文）跑通了切片、盲化、答案与统计全链路，产物在 `agents/temp/20260813_140000_translation-ab-smoke/`；统计与对齐校验有 8 个单测。
+
+**真实页面已生成，不需要再跑一次翻译**：用户问「剩余的只需要在 index 里做审计吗」，顺着查发现 08-11/08-12 那次本地 Hy-MT2 vs DeepSeek 的对照产物还在盘上，而且**两臂共用同一条 run3 时间轴**（1,504 条 cue，几何与日文逐条相同，中文 1,486 条不同），正好是工具要求的合法臂对。据此生成 `agents/audits/20260813_223000_translation-ab-local-vs-deepseek/`（60 张卡，甲/乙 各领先 30 张，60 段 mp3，页面结构化盲化校验通过）。**这也是当时那份对照第一次能被人耳裁决**——08-12 记的 18,074 vs 13,414 字、假名残留 1.9% vs 11.0% 都是文本统计，说不了「哪句更好」。
+
+**顺带修掉两个让页面进不了导航的真 bug**：① `update_audit_entrypoints` 对**不在 `agents/audits/` 下的页面直接静默 return**——每个生成器都收 `--output-dir`，`agents/temp` 又是本文件写在复现步骤里的目的地，于是工具打印成功摘要、页面躺在盘上、`agents/audits/index.html` 里什么都没有，审计根本不会发生。`register_external_audit_page` 本来就是为这种页面准备的，但只有 CLI 子命令会调它。现在外部页面自动登记到 `external_pages.jsonl` 再刷新导航。② `write_latest_audit_entry` 用 `rel_url` 生成链接，而 `rel_url` 对不在审计根下的路径**回退成绝对文件系统路径**，HTTP 下点不开；改用 `_nav_href`（走 `os.path.relpath`，支持 `../`）。两条各加一个测试。
+
+### 冷跑一次拿到未被缓存污染的阶段耗时：ASR 解码占 86.8%，其余全部加起来 121 秒
+
+此前所有阶段耗时都是在 ASR 结果缓存命中的情况下测的（`asr_text_transcribe_s` = 0.0025s），于是「翻译是不是大头」这个问题一直没有真数据。sample-b（151.2 分钟）带 `ASR_RESULT_CACHE_ENABLED=0` 整片重跑一次，与同一部片的缓存运行对照：
+
+| 阶段 | 冷跑 | 缓存命中 |
+| --- | ---: | ---: |
+| 音频准备 | 5.62s | 5.93s |
+| 静音分析与切块 | 23.24s | 22.20s |
+| ASR 模型加载 | 4.22s | 4.10s |
+| **ASR 文本转写** | **798.32s** | 0.0025s |
+| 字幕时间轴（对齐） | 32.21s | 35.07s |
+| 字幕 Cue Plan | 0.85s | 0.85s |
+| 翻译 | 47.34s | 60.23s |
+| 输出写入 | 0.82s | 0.85s |
+| **总计** | **919.78s** | 135.77s |
+
+**结论没有悬念**：解码占冷跑的 **86.8%**，其余七个阶段合计 121 秒；翻译在 `reasoning=none` 下只有 47.3s（5.1%）。整片 9.9× 实时，单看转写 11.4× 实时（RTX 4060 Ti，batch=5，bf16）。要提速只有解码这一处值得动，其它阶段就算清零也只省 13%。
+
+**顺带撞出一件更要紧的事：同一份音频重解一遍，结果不一样。** 两次运行的**块边界逐条相同**（339 块，0 处不同），但 **262/339 块的文本不同**，总字符 29,097 vs 28,817（+1.0%），cue 数 1,729 vs 1,700（+1.7%）。分歧位置散布在块内（共同前缀占比中位 30%，24% 的块在前 10% 就分岔），长度差两边对称（冷跑更长 121 块、缓存更长 123 块）。机制当天没有定论，同日的对照实验把它定死在**批大小**上，见下一节。
+
+产物：`agents/temp/full-workflow/20260813_121940_cold-speed-run/`（含 `summary.json` 与逐阶段 `timings.json`），对照脚本 `agents/temp/20260813_121940_cold-speed-run-check/compare_runs.py`。
+
+### 重解不一致的机制：是批大小，不是温度、也不是 kernel 噪声
+
+**先排除采样。** 我们的调用是 `self.model.generate(**moved, max_new_tokens=cap, do_sample=False, ...)`，`_normalize_deterministic_generation_config` 在 `do_sample=False` 时把 `temperature` 置空，本地 `generation_config.json` 里根本没有 `temperature`/`top_p`。
+
+**官方口径逐处核过（用户指出后补查，三处不一致但结论一致）**：
+
+- `QwenLM/Qwen3-ASR` 的高层封装 `qwen_asr/inference/qwen3_asr.py:272`，vLLM 后端**写死** `SamplingParams(temperature=0.0, max_tokens=max_new_tokens)`——不是默认值，调用方连改都改不了。
+- 同一个封装的 transformers 后端（同文件 :510）是 `self.model.generate(**inputs, max_new_tokens=self.max_new_tokens)`，**连 `do_sample=False` 都不传**，纯靠模型自带 `generation_config.json` 里的 `do_sample: false`。我们显式传，等价但不依赖权重目录里的那个文件。
+- 官方 README 的 Evaluation 章节写「`dtype=torch.bfloat16`、`max_new_tokens=1024`、vLLM、**Greedy search was used for all decoding**」；但同一份 README 里那段裸 vLLM 示例给的是 `SamplingParams(temperature=0.01, max_tokens=256)`——**0.01 不是贪心**（vLLM 只把 0.0 当贪心），这是官方文档自己的不一致，示例那行不要照抄。
+- Transformers 侧的 `model_doc/qwen3_asr` 文档页则通篇没有 temperature/top_p/num_beams/repetition_penalty，示例里唯一的生成参数是 `do_sample=False`。
+
+四处说的是同一件事：**这个模型就该贪心解码**，我们已经是。所以温度不是本次分歧的入口。另外**官方自己也批量推理**（`apply_transcription_request` 收 audio 列表，封装还带 `max_inference_batch_size`），下面那条批组成的性质因此不是我们的用法造成的。
+
+顺带记一条检索教训：grok 搜索给的「官方推荐 temperature=0.0、batch 8–16 更稳」这条，**结论的前半截碰巧对上了**（见上面第一点），但它引用的 `huggingface.co/Qwen/Qwen3-ASR` 取回是 **401**、页面根本不存在，后半截的 batch 建议在任何官方文本里都找不到。凑巧说对不等于有出处——这类条目要落到仓库源码或真实页面上才能引。
+
+**对照实验**（`agents/temp/20260813_210000_decode-batch-determinism/`）：从冷跑保留的整片 wav 重切前 30 个块（span 取自冷跑 `transcript.json`，逐条相同），在同一进程里解三遍：
+
+| 跑法 | 结果 |
+| --- | --- |
+| A: batch=5 vs B: batch=5（同批重复） | **0/30 不同** |
+| A: batch=5 vs 几天前那次 batch=5 整片运行的存档 | **0/30 不同**（不同进程、不同日期） |
+| A: batch=5 vs C: batch=11 | **20/30 不同**（窗口内字符 3,158 vs 3,060） |
+| C: batch=11 vs 存档 batch=11 运行的同组前缀（块 0–21） | **1/22 不同** |
+
+最后那 1 条正好把链条闭合：那次 batch=11 运行日志写着 `ASR 缓存命中 18/339`，**第一批只有 10 行**，而块 #0 的缓存条目日期是 08-12（早于该次运行）——它是那 18 个命中之一，根本没在那次运行里解码。**它没解的那一块就是唯一对不上的那一块**，其余 21 块逐字一致。
+
+**结论**：贪心解码在批组成固定时逐位可复现；变的是一次 `generate` 里同批放了哪几个块——同批要补零对齐到最长的那条，批大小一改，bf16 累加顺序跟着改，个别位置 argmax 翻面，后续 token 顺着走偏。两次运行差的正是这个：缓存运行 `asr_batch_size=11`（`asr_batch_source=learned_profile`），冷跑 `=5`（`auto_scaled_from_vram`），因为冷跑传的 `ASR_MAX_NEW_TOKENS="0"` 与档案身份里的空串不匹配，学到的档案没命中。
+
+**还有第二个改批组成的入口，比批大小更隐蔽**：`_transcribe_asr_chunks_text_only` 把命中缓存的块从 `pending_chunks` 里剔除后才发给后端，所以**部分命中会让剩下的块重新分组**——「缓存半满 + 没钉批大小」是最容易得到第三种结果的组合。
+
+**这不是第一次撞上**：2026-08-03 拿 bar=72 与 bar=158 两次运行逐块配对时就见过同样的现象，当时归因到「bf16 + sdpa 归约顺序在近似平局上的翻转」并留下「两次 GPU 运行之间的逐块文本差异不能当门槛效果的度量」。方向是对的，缺的是**归约顺序为什么会变**——批组成。补上这一环之后，那条禁令有了解除条件：批大小钉住、且两次都是全新解码（不是部分命中），逐块文本就可以直接比。
+
+**实践后果**：要让重新解码可比就在 `.env` 里钉 `ASR_BATCH_SIZE=<n>`；缓存全命中时根本不解码，仍是最省事的可比办法。任何仍需重新解码的离线 A/B，自带约 1% 字符、约 1.7% cue 数的底噪，小于这个量级的差异不能当信号读。
 
 ### 复现步骤
 
@@ -58,6 +402,38 @@ $env:PYTHONIOENCODING = "utf-8"
 uv run python agents/temp/20260813_090000_next-directions/measure_recoverable_reading_time.py
 # 生产实现开/关延伸的八片逐片对照
 uv run python agents/temp/20260813_090000_next-directions/verify_display_linger.py
+# 真实运行产物里的块边界越界（需要 keep_temp_files 保留的 aligned_segments.json）
+uv run python agents/temp/20260813_105202_chunk-seam-overrun/measure_seam_overrun.py
+# 质检面板：用真实报告跑一遍生产渲染路径，核对键覆盖与格式化（需要 node）
+node agents/temp/20260813_180000_qc-panel/render_real_report.mjs `
+    ../../../video/sample-b/sample-b.quality_report.json
+# 静音 cue 定点重问 Grok（会真的花钱；--dry-run 只出工单和预算）
+uv run python agents/temp/20260813_121940_silent-cue-grok/adjudicate_unrefuted_silent_cues.py --dry-run
+# 四分判定与正对照灵敏度（只读已保存的响应，不再调用 provider）
+uv run python agents/temp/20260813_121940_silent-cue-grok/recount_verdicts.py
+# 冷跑阶段耗时（约 15 分钟 GPU；--asr-max-new-tokens 0 才等价于生产的「跟着音频走」）
+$env:ASR_RESULT_CACHE_ENABLED = "0"; $env:QUALITY_REPORT_ENABLED = "1"
+uv run python -m tools.workflows.run_full_workflow --video video\sample-b.mp4 `
+    --asr-max-new-tokens 0 --subtitle-mode zh --translate --translation-max-workers 16 `
+    --task-name 20260813_121940_cold-speed-run
+# 冷跑与缓存运行的块边界 / 文本对照
+uv run python agents/temp/20260813_121940_cold-speed-run-check/compare_runs.py
+# 批大小决定论对照：先取实验窗口，再同进程解三遍（约 4 分钟 GPU），最后核对存档
+uv run python agents/temp/20260813_210000_decode-batch-determinism/prep.py
+uv run python agents/temp/20260813_210000_decode-batch-determinism/rerun.py
+uv run python agents/temp/20260813_210000_decode-batch-determinism/find_cached_chunk.py
+# 翻译盲化 A/B：生成页面（两臂需来自共用 ASR 产物的两次运行）
+# 输出目录放 agents/audits/ 下，导航靠扫描发现；放别处会走外部页面登记，也能进导航
+uv run python -m tools.audits.generate_translation_ab_audit_html `
+    --arm none=<run_a>/<stem>.bilingual.json --arm medium=<run_b>/<stem>.bilingual.json `
+    --audio <job>/audio/<stem>.<key>.wav `
+    --output-dir agents/audits/<ts>_translation-ab --sample 60
+# 盘上已有的合法臂对（同一时间轴、不同翻译后端）
+uv run python agents/temp/20260813_220000_ab-arm-hunt/find_pairs.py
+# 人工裁决保存后统计（answers.jsonl 与页面保存下来的 manual_verdicts.jsonl）
+uv run python -m tools.audits.evaluate_translation_ab_audit `
+    --answers agents/audits/<ts>_translation-ab/answers.jsonl `
+    --verdicts agents/audits/<ts>_translation-ab/manual_verdicts.jsonl
 ```
 
 ## 2026-08-12
