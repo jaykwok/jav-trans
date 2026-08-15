@@ -534,7 +534,10 @@ def delete_audit_entry(
 
 
 def write_latest_audit_entry(*, audit_root: Path, latest_html: Path, title: str) -> None:
-    latest_rel = rel_url(latest_html, from_dir=audit_root)
+    # `_nav_href`, not `rel_url`: the latest page may live outside the audit
+    # root (agents/temp), and `rel_url` falls back to an absolute filesystem
+    # path there, which is not a link a browser served over HTTP can follow.
+    latest_rel = _nav_href(latest_html, audit_root=audit_root)
     audit_root.mkdir(parents=True, exist_ok=True)
     (audit_root / "latest-audit.html").write_text(
         f"""<!doctype html>
@@ -819,13 +822,40 @@ for (const button of document.querySelectorAll(".unregister-external")) {{
     )
 
 
-def update_audit_entrypoints(*, latest_html: Path, title: str) -> None:
+def update_audit_entrypoints(
+    *,
+    latest_html: Path,
+    title: str,
+    audit_root: Path = AUDIT_ROOT,
+    project_root: Path | None = None,
+) -> None:
+    """Make `latest_html` reachable from the navigation, wherever it was written.
+
+    Pages under the audit root are found by scan. A page written elsewhere in
+    the project (every generator takes `--output-dir`, and agents/temp is a
+    documented destination) used to fall out of this function silently, so the
+    generator reported success and the page existed but nothing linked to it -
+    the audit was simply never done. Such a page is registered in
+    `external_pages.jsonl` instead, which is what that registry is for.
+    """
     try:
-        latest_html.resolve().relative_to(AUDIT_ROOT.resolve())
+        latest_html.resolve().relative_to(audit_root.resolve())
     except ValueError:
+        registered = register_external_audit_page(
+            page_index=latest_html,
+            title=title,
+            audit_root=audit_root,
+            project_root=project_root,
+        )
+        if registered:
+            refresh_audit_entrypoints_after_change(
+                audit_root=audit_root,
+                latest_html=latest_html,
+                latest_title=title,
+            )
         return
-    write_latest_audit_entry(audit_root=AUDIT_ROOT, latest_html=latest_html, title=title)
-    write_audit_index(audit_root=AUDIT_ROOT, latest_html=latest_html, latest_title=title)
+    write_latest_audit_entry(audit_root=audit_root, latest_html=latest_html, title=title)
+    write_audit_index(audit_root=audit_root, latest_html=latest_html, latest_title=title)
 
 
 def _path_arg(value: str | Path) -> Path:
