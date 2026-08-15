@@ -324,3 +324,60 @@ def test_postgate_flags_survive_from_segment_to_cue_plan():
     }
     # The unflagged segment stays unflagged; the union is per segment, not global.
     assert any(not cue.get("postgate_flags") for cue in cues)
+
+
+def test_postgate_flags_reach_the_bilingual_sidecar(monkeypatch, tmp_path):
+    """A count nobody can resolve to lines is not locatable evidence.
+
+    The quality report says how many flagged cues survived into the finished
+    file; the sidecar is the only artifact that can say *which*. The translated
+    path rebuilt each block from a fixed key list, so the mark died at the last
+    step. Written only where it is set, so a grep lands on the flagged cues.
+    """
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"fake-video")
+    segments = [
+        {
+            "start": 0.0,
+            "end": 1.2,
+            "text": "今日はいい天気ですね",
+            "words": [{"word": "今日はいい天気ですね", "start": 0.0, "end": 1.2}],
+            "postgate_flags": ["repeated_unit"],
+        },
+        {
+            "start": 2.0,
+            "end": 3.0,
+            "text": "そうですね",
+            "words": [{"word": "そうですね", "start": 2.0, "end": 3.0}],
+        },
+    ]
+    artifacts = _artifacts(tmp_path, segments)
+    ctx = make_job_context(
+        video_path,
+        tmp_path / "out",
+        tmp_path / "jobs",
+        subtitle_mode="zh",
+        translation_max_workers=1,
+        keep_temp_files=True,
+    )
+
+    monkeypatch.setattr(main, "_print_timing_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main.asr_module, "get_backend_label", lambda: "mock_asr")
+    monkeypatch.setattr(main.translator_module, "generate_global_context", lambda items: "")
+    monkeypatch.setattr(
+        main.translator_module,
+        "translate_segments",
+        lambda items, **_kwargs: ([f"zh-{index}" for index, _ in enumerate(items)], [], []),
+    )
+
+    main.run_translation_and_write(str(video_path), artifacts, ctx=ctx, job_id="clip")
+
+    blocks = json.loads(
+        (tmp_path / "jobs" / "clip" / "clip.bilingual.json").read_text(encoding="utf-8")
+    )["blocks"]
+    flagged = [block for block in blocks if "postgate_flags" in block]
+    assert [block["ja_text"] for block in flagged] == ["今日はいい天気ですね"]
+    assert flagged[0]["postgate_flags"] == ["repeated_unit"]
+    assert flagged[0]["zh_text"] == "zh-0"
+    # Absent, not an empty list: the clean cues stay out of the way of a grep.
+    assert sum("postgate_flags" in block for block in blocks) == 1

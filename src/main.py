@@ -2000,6 +2000,15 @@ def _run_translation_and_write_impl(
             "raw_texts": list(seg.get("raw_texts") or []),
             "primary_cut_candidates": list(seg.get("primary_cut_candidates") or []),
             "weak_cut_candidates": list(seg.get("weak_cut_candidates") or []),
+            # Only on the cues that carry one, so the sidecar stays quiet and a
+            # grep for the key lands on exactly the flagged cues. The quality
+            # report says how many survived into the finished file; without this
+            # there is no way to go from that count to the lines themselves.
+            **(
+                {"postgate_flags": list(seg["postgate_flags"])}
+                if seg.get("postgate_flags")
+                else {}
+            ),
             **{
                 key: seg[key]
                 for key in (
