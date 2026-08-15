@@ -269,3 +269,31 @@ def test_chunk_root_reaches_transcribe_but_not_aligned_signature(
     # Where the chunks are written does not change what they contain, so it
     # must not invalidate the aligned-segment cache.
     assert "ASR_CHUNK_ROOT" not in seen["cache_signature"]["asr_stage_config"]
+
+
+def test_an_empty_forwarded_knob_falls_back_instead_of_crashing(monkeypatch):
+    """`KEY=` means "use the default" everywhere else, and has to here too.
+
+    The 「参数调优 → 环境变量覆盖」 box forwards each `KEY=VALUE` line verbatim and
+    keeps empty values - its own placeholder shows `ASR_ALIGNMENT_HEAD_PATH=` as
+    the way to clear a setting. These readers used to call `float()` on that
+    empty string unguarded, so one such line ended the ASR stage with a bare
+    `ValueError: could not convert string to float: ''`.
+    """
+    from asr import pipeline as asr_pipeline
+
+    for value in ("", "   ", "not-a-number"):
+        monkeypatch.setenv("ASR_CHUNK_MAX_S", value)
+        monkeypatch.setenv("ASR_CHUNK_MIN_S", value)
+        monkeypatch.setenv("ASR_CHUNK_MIN_PAUSE_S", value)
+        monkeypatch.setenv("ASR_FEATURE_BATCH_SIZE", value)
+        assert asr_pipeline._chunking_config() == {
+            "max_chunk_s": 30.0,
+            "min_chunk_s": 2.0,
+            "min_blank_s": 0.6,
+        }
+        assert asr_pipeline._env_int("ASR_FEATURE_BATCH_SIZE", "4") == 4
+
+    # A real value still wins, or the fallback would be hiding the setting.
+    monkeypatch.setenv("ASR_CHUNK_MAX_S", "18.5")
+    assert asr_pipeline._chunking_config()["max_chunk_s"] == 18.5

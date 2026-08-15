@@ -119,12 +119,15 @@ async def load_jobs() -> None:
     if not isinstance(payload, list):
         return
     loaded: dict[str, JobState] = {}
+    rejected = 0
     for item in payload:
         if not isinstance(item, dict):
+            rejected += 1
             continue
         try:
             job = JobState.model_validate(item)
         except Exception as exc:
+            rejected += 1
             log.warning(
                 "Skipping malformed job record in %s: %s",
                 _jobs_path,
@@ -132,6 +135,24 @@ async def load_jobs() -> None:
             )
             continue
         loaded[job.id] = job
+    if rejected:
+        # Skipping a record only hides it; the next write rewrites the file from
+        # what loaded and the record is gone for good. That is a real path, not
+        # a hypothetical: the models take bare `Literal`s, so retiring an enum
+        # value (`llm_reasoning_effort="none"`, 2026-08-14) makes every older
+        # record unparseable at once. Keep a copy before anything can overwrite
+        # it - the file is the only record of what the user ran.
+        backup = _jobs_path.with_name(
+            f"{_jobs_path.name}.rejected-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        try:
+            if not backup.exists():
+                backup.write_bytes(_jobs_path.read_bytes())
+            log.warning(
+                "Kept %d unreadable job record(s) in %s", rejected, backup
+            )
+        except OSError:
+            log.exception("Failed to back up unreadable job records")
     async with _state_lock:
         _jobs.clear()
         _jobs.update(loaded)

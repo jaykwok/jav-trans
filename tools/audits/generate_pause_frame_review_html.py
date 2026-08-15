@@ -51,15 +51,12 @@ from tools.audits.audit_nav import (  # noqa: E402
 )
 from tools.audits.pause_frame_audit import (  # noqa: E402
     FRAME_HOP_S,
-    LABEL_COLOR,
     LABEL_NON_SEMANTIC,
     LABEL_SILENCE,
-    LABEL_TEXT,
     LABEL_UNSURE,
     LABEL_WORD,
     MANUAL_LABEL_FILENAME,
     PARTITION_EDITOR_CSS,
-    PARTITION_LABELS,
     RESULT_SCHEMA,
     adapter_constants_js,
     blank_frames_from_runs,

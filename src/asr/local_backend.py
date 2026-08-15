@@ -1152,33 +1152,3 @@ class LocalAsrBackend:
                 )
             )
         return finalized
-
-    def finalize_text_result(
-        self,
-        text_result: dict,
-        on_stage: Callable[[str], None] | None = None,
-    ) -> tuple[dict, list[str]]:
-        return self.finalize_text_results([text_result], on_stage=on_stage)[0]
-
-    def transcribe_to_words(
-        self,
-        audio_path: str,
-        on_stage: Callable[[str], None] | None = None,
-    ) -> tuple[dict, list[str]]:
-        text_result = self.transcribe_texts([audio_path], on_stage=on_stage)[0]
-        self.unload_model(on_stage=on_stage)
-        return self.finalize_text_result(text_result, on_stage=on_stage)
-
-
-def transcribe_to_words(
-    audio_path: str,
-    device: str,
-    on_stage: Callable[[str], None] | None = None,
-) -> tuple[dict, list[str]]:
-    backend = LocalAsrBackend(device)
-    try:
-        log = [f"ASR backend: {current_qwen_asr_backend()}"]
-        result, extra_log = backend.transcribe_to_words(audio_path, on_stage=on_stage)
-        return result, log + extra_log
-    finally:
-        backend.close()

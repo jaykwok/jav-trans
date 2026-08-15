@@ -13,10 +13,24 @@ from asr.alignment_quality import classify_alignment_quality
 from asr import chunking as _chunking_module
 from asr import result_cache as _result_cache_module
 from asr.result_cache import _is_timed_out_result
+from asr.text_normalize import strip_text_punctuation
 from asr.local_backend import LocalAsrBackend
 
 
 logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    """Empty means "use the default", as everywhere else in the tree.
+
+    Both callers below read forwarded `ASR_*` knobs, and the 「参数调优」 box
+    passes `KEY=` through with an empty value, so an unguarded `float()` here
+    ends the stage on a bare `ValueError`.
+    """
+    try:
+        return float(os.getenv(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _emit_progress(on_stage: Callable[[str], None] | None, message: str) -> None:
@@ -24,18 +38,18 @@ def _emit_progress(on_stage: Callable[[str], None] | None, message: str) -> None
         on_stage(message)
     print(message, flush=True)
 
+
 _TRIVIAL_SEGMENT = re.compile(
     r"^[。！？…、\s,.!?・「」（）【】；：\-—–]+$"
 )
 
 
 def _asr_invalid_segment_duration_s() -> float:
-    return float(os.getenv("ASR_INVALID_SEGMENT_DURATION", "0.1"))
+    return _env_float("ASR_INVALID_SEGMENT_DURATION", 0.1)
 
 
 def _asr_min_repaired_segment_duration_s() -> float:
-    return float(os.getenv("ASR_MIN_REPAIRED_SEGMENT_DURATION", "0.6"))
-_STRIP_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]\s~〜ー-]+")
+    return _env_float("ASR_MIN_REPAIRED_SEGMENT_DURATION", 0.6)
 
 
 def _vram_budget_mb() -> float:
@@ -90,7 +104,11 @@ class ASRWorkerSystemError(RuntimeError):
 
 
 def _strip_punctuation(text: str) -> str:
-    return _STRIP_PUNCT_RE.sub("", text or "")
+    # `asr.text_normalize` owns this pattern and `local_backend` already reads
+    # it from there. The private copy that used to live here was byte-identical,
+    # which is the problem: both are applied to ASR output on the same path, so
+    # a fix to one silently left the other judging text by the old rule.
+    return strip_text_punctuation(text)
 
 
 def _collapse_repeated_noise(text: str) -> str:

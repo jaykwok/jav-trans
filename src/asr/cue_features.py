@@ -17,7 +17,7 @@ import hashlib
 import math
 import re
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 
 CUEQC_FEATURE_SCHEMA_VERSION = 1

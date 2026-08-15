@@ -182,7 +182,7 @@ def main() -> None:
             "unconfirmed": len(head_failing) - head_confirmed,
         }
 
-    print(f"\n=== lexical dialogue cues read as fully blank, by head ===")
+    print("\n=== lexical dialogue cues read as fully blank, by head ===")
     print(f"{'head':>22}  {'at 1.000':>9}  {'grok-confirmed':>15}  {'unconfirmed':>12}")
     for head, counts in summary_by_head.items():
         print(

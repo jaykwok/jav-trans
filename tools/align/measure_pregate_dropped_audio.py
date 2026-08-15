@@ -28,7 +28,6 @@ score in the dropped set would be uninterpretable.
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
 import json
 from pathlib import Path
 import statistics

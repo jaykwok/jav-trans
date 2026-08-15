@@ -92,16 +92,25 @@ def current_asr_chunk_root() -> Path:
     return chunking.current_asr_chunk_root()
 
 
-def _env_bool(name: str, default: str) -> bool:
-    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
-
-
+# An empty value means "use the default", the same reading every other module
+# in the tree gives it. It has to: the Web「参数调优」box forwards `KEY=` lines
+# verbatim - its own placeholder shows `ASR_ALIGNMENT_HEAD_PATH=` as the way to
+# clear a setting - so an empty string is a reachable value for every forwarded
+# `ASR_*` knob. These two used to call `float()` on it unguarded, which turned
+# `ASR_CHUNK_MAX_S=` into a bare `ValueError: could not convert string to float`
+# out of the middle of the ASR stage.
 def _env_float(name: str, default: str) -> float:
-    return float(os.getenv(name, default))
+    try:
+        return float(os.getenv(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _env_int(name: str, default: str) -> int:
-    return int(float(os.getenv(name, default)))
+    try:
+        return int(float(os.getenv(name, "").strip() or default))
+    except (TypeError, ValueError):
+        return int(float(default))
 
 
 def _asr_language_for_chunking() -> str:

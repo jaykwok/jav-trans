@@ -18,10 +18,8 @@ import json
 import os
 import re
 import subprocess
-import time
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 

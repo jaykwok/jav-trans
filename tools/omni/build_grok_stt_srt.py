@@ -216,7 +216,7 @@ def run(
                 cache_path=str(effective_cache_dir / f"{film_id}.jsonl"),
                 target_lang=target_lang,
                 glossary=os.getenv("TRANSLATION_GLOSSARY", ""),
-                reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "none"),
+                reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "low"),
                 api_format=os.getenv("LLM_API_FORMAT", "chat"),
             )
             if len(translations) != len(cues):

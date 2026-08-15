@@ -191,7 +191,6 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
-    import numpy as np
 
     from core.config import load_config
 

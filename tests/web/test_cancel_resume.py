@@ -182,6 +182,54 @@ def test_create_job_recreates_missing_jobs_parent(tmp_path, monkeypatch):
     asyncio.run(_test_create_job_recreates_missing_jobs_parent(tmp_path, monkeypatch))
 
 
+def test_unreadable_job_records_are_kept_before_the_file_is_rewritten(
+    tmp_path, monkeypatch
+):
+    asyncio.run(_test_unreadable_job_records_are_kept(tmp_path, monkeypatch))
+
+
+async def _test_unreadable_job_records_are_kept(tmp_path, monkeypatch):
+    """A record the models can no longer parse must not be erased silently.
+
+    `load_jobs` skips what it cannot validate, and the first write after that
+    rewrites the file from what loaded - so the skipped record is gone for good.
+    Retiring one enum value is enough to trigger it: every job spec written
+    before the 2026-08-14 `none` → `low` rename failed the bare `Literal`.
+    """
+    jobs_path = tmp_path / "jobs.json"
+    monkeypatch.setattr(pm, "_jobs_path", jobs_path)
+    await _reset_pm_state()
+    jobs_path.parent.mkdir(parents=True, exist_ok=True)
+    good = JobState(
+        id="readable",
+        spec=JobSpec(video_paths=["sample.mp4"]),
+        created_at="2026-05-04T00:00:00.000+00:00",
+        status="translating",
+    ).model_dump()
+    stale = JobState(
+        id="written-by-an-older-build",
+        spec=JobSpec(video_paths=["older.mp4"]),
+        created_at="2026-05-03T00:00:00.000+00:00",
+        status="done",
+    ).model_dump()
+    stale["spec"]["llm_reasoning_effort"] = "a-tier-that-no-longer-exists"
+    jobs_path.write_text(
+        json.dumps([good, stale], ensure_ascii=False), encoding="utf-8"
+    )
+
+    await pm.load_jobs()
+
+    # The active job was rewritten as failed, so the file no longer holds the
+    # unreadable record...
+    assert await pm.get_job("written-by-an-older-build") is None
+    assert "written-by-an-older-build" not in jobs_path.read_text(encoding="utf-8")
+    # ...which is exactly why a copy has to exist beside it.
+    backups = list(tmp_path.glob("jobs.json.rejected-*"))
+    assert len(backups) == 1
+    assert "written-by-an-older-build" in backups[0].read_text(encoding="utf-8")
+    await _reset_pm_state()
+
+
 async def _test_load_jobs_marks_active_failed_but_keeps_stage(tmp_path, monkeypatch):
     jobs_path = tmp_path / "jobs.json"
     monkeypatch.setattr(pm, "_jobs_path", jobs_path)
