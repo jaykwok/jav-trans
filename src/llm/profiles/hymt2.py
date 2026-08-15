@@ -75,7 +75,15 @@ class HyMt2Profile(TranslationProfile):
     def max_batch_size(self) -> int | None:
         return 1
 
-    def response_token_budget(self, segments: list[dict]) -> int | None:
+    def response_token_budget(
+        self,
+        segments: list[dict],
+        *,
+        reasoning_effort: str = "",
+    ) -> int | None:
+        # Hy-MT2 is a translation model with no reasoning mode, so the effort is
+        # accepted for one uniform profile API and deliberately ignored here.
+        del reasoning_effort
         if not segments:
             return None
         source_chars = sum(len(str(seg.get("text", ""))) for seg in segments)

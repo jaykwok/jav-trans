@@ -19,7 +19,7 @@ from core.stage_errors import MISSING_MODEL
 from llm import settings as llm_settings
 from llm import transport_util
 from llm.backends.base import BaseTranslationBackend
-from llm.errors import RetryableTranslationFormatError
+from llm.errors import ResponseTruncatedError, RetryableTranslationFormatError
 from llm.preflight import require_translation_config
 
 _raise_if_cancelled = transport_util._raise_if_cancelled
@@ -311,12 +311,13 @@ def _chat_completions(
         ),
         "reasoning_effort": effective_effort,
         # Providers keyed on the extra_body convention (GLM/DashScope-style)
-        # ignore reasoning_effort; "none" must switch thinking off there too.
-        "extra_body": {
-            "thinking": {
-                "type": "disabled" if effective_effort == "none" else "enabled"
-            }
-        },
+        # ignore `reasoning_effort`, so thinking has to be switched on here too.
+        # Unconditional since 2026-08-14: every tier thinks now, and this flag is
+        # the one that actually decides. Measured against DeepSeek that day -
+        # with `thinking.type = disabled` the reply carried zero reasoning at
+        # *every* effort value, including "max", so leaving a tier mapped to
+        # disabled would have made its `reasoning_effort` purely decorative.
+        "extra_body": {"thinking": {"type": "enabled"}},
         "stream_options": {"include_usage": True},
         "temperature": (
             llm_settings.TRANSLATION_TEMPERATURE if temperature is None else temperature
@@ -388,13 +389,18 @@ def _chat_completions(
 
     _raise_if_cancelled(cancel_event)
     if finish_reason == "length":
-        # Terminal failure, not retryable: retrying with the same max_tokens
-        # hits the same truncation and only burns budget. Propagates as a
-        # non-RetryableTranslationFormatError so the batch is marked failed via
-        # the normal failure path. JSON-parse failures below stay retryable.
-        raise RuntimeError(
-            f"{_JSON_OUTPUT_LABEL} response was cut off by max_tokens; "
-            "increase TRANSLATION_MAX_TOKENS."
+        # Not retryable as-is - the identical request truncates identically -
+        # but `translator._chat` may reissue once with a larger budget, so the
+        # limit travels with the error. The number below is THIS request's
+        # budget, which for the JSON profile is
+        # `source_chars * TRANSLATION_OUTPUT_CHAR_RATIO + structure`; the old
+        # message told the reader to raise `TRANSLATION_MAX_TOKENS`, a ceiling
+        # the profile budget is always orders of magnitude under, so following
+        # it changed nothing (sample-b, 2026-08-13).
+        raise ResponseTruncatedError(
+            f"{_JSON_OUTPUT_LABEL} response was cut off at "
+            f"{effective_max_tokens} output tokens.",
+            limit=effective_max_tokens,
         )
 
     final_content_str = "".join(stream_state["final_content"])
@@ -433,7 +439,6 @@ def _chat_responses(
         reasoning_effort
         or os.getenv("LLM_REASONING_EFFORT", llm_settings.LLM_REASONING_EFFORT)
     )
-    api_format = "responses"
     effective_temperature = (
         llm_settings.TRANSLATION_TEMPERATURE if temperature is None else temperature
     )
@@ -534,11 +539,12 @@ def _chat_responses(
     if incomplete_response is not None:
         reason = _response_incomplete_reason(incomplete_response)
         if reason == "max_output_tokens":
-            # Terminal failure, not retryable: same max_output_tokens cap would
-            # truncate again. JSON-parse / other-reason failures stay retryable.
-            raise RuntimeError(
-                "OpenAI Responses API response was cut off by max_output_tokens; "
-                "increase TRANSLATION_MAX_TOKENS."
+            # Same contract as the Chat path above: identical reissue is
+            # pointless, a larger budget is not, so the caller gets the limit.
+            raise ResponseTruncatedError(
+                "OpenAI Responses API response was cut off at "
+                f"{effective_max_tokens} output tokens.",
+                limit=effective_max_tokens,
             )
         raise RetryableTranslationFormatError(
             f"OpenAI Responses API returned incomplete response: {reason or 'unknown'}"

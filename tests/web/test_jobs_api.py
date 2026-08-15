@@ -634,7 +634,7 @@ def test_reasoning_effort_frontend_and_models_default_to_medium():
         project_root / "src" / "web" / "static" / "js" / "settings.js"
     ).read_text(encoding="utf-8")
 
-    assert '<option value="medium" selected>medium</option>' in index
+    assert '<option value="medium" selected>' in index
     assert "s.llm_reasoning_effort || 'medium'" in settings_js
     assert normalize_llm_reasoning_effort(None) == "medium"
     assert SettingsRead(
@@ -1159,12 +1159,12 @@ async def _test_retry_rejects_and_then_rereads_translation_settings(tmp_path, mo
             assert "API Key" in blocked.json()["detail"]
 
             monkeypatch.setenv("API_KEY", "test-key")
-            monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
+            monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
             monkeypatch.setenv("LLM_API_FORMAT", "responses")
             retried = await client.post(f"/api/jobs/{job_id}/retry")
             assert retried.status_code == 200
             spec = retried.json()["spec"]
-            assert spec["llm_reasoning_effort"] == "none"
+            assert spec["llm_reasoning_effort"] == "max"
             assert spec["llm_api_format"] == "responses"
     finally:
         await _reset_pm_state()

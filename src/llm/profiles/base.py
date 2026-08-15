@@ -14,7 +14,7 @@ plan is frozen before translation and profiles can never merge or split lines.
 from __future__ import annotations
 
 import abc
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -68,15 +68,25 @@ class TranslationProfile(abc.ABC):
         """
         return None
 
-    def response_token_budget(self, segments: list[dict]) -> int | None:
+    def response_token_budget(
+        self,
+        segments: list[dict],
+        *,
+        reasoning_effort: str = "",
+    ) -> int | None:
         """Upper bound on reply length for these segments, or None for no bound.
 
         Not a tuning knob: it is how long the answer *can* be, so a model stuck
         in a repetition loop stops at the bound rather than at the configured
         ceiling. Profiles own it because only the profile knows what structure
         it asked the model to emit around the translations.
+
+        `reasoning_effort` is passed because the bound goes out as `max_tokens`,
+        which on a reasoning model also has to cover the thinking the answer is
+        not made of. A profile that models only the visible reply is short by
+        exactly that much - see `json_v3` for what that cost.
         """
-        del segments
+        del segments, reasoning_effort
         return None
 
     def bounded_schema(self, segments: list[dict]) -> dict | None:

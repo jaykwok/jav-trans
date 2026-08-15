@@ -16,6 +16,7 @@ import pytest
 
 from llm import settings as llm_settings
 from llm.profiles import get_profile
+from llm.profiles.json_v3 import _reasoning_token_allowance
 from llm.profiles.base import ProfileContext, TranslationProfile
 
 
@@ -69,7 +70,11 @@ def test_the_budget_covers_a_real_batch():
     source_chars = sum(len(c) for c in cues)
     # The reply is a JSON object wrapping translations that are themselves
     # shorter than the source, so the budget has to clear the source by a
-    # comfortable margin without approaching a repetition loop.
+    # comfortable margin without approaching a repetition loop. Measured on the
+    # text-shaped terms alone: every tier now buys reasoning room on top, and
+    # that allowance is deliberately far larger than the reply (see
+    # `TRANSLATION_REASONING_TOKEN_ALLOWANCE`).
+    budget -= _reasoning_token_allowance(llm_settings.LLM_REASONING_EFFORT)
     assert budget > source_chars
     assert budget < source_chars * 4
 
@@ -354,3 +359,81 @@ class TestBoundedSchema:
             compact_system_prompt=False,
         )
         assert seen and seen[0] == profile.bounded_schema(segments)
+
+
+def test_reasoning_effort_adds_room_for_the_thinking(monkeypatch):
+    """`max_tokens` pays for the reasoning stream before it pays for the answer.
+
+    The two source-shaped terms model the visible reply, so with the effort at
+    medium every batch was cut off: measured 2026-08-13, an 8-cue batch got a
+    469-token budget while the model spent 2,058 characters thinking, and one
+    doubling was nowhere near enough - the whole film failed.
+    """
+    monkeypatch.setattr(
+        llm_settings, "TRANSLATION_REASONING_MAX_EFFORT_MULTIPLIER", 2.0
+    )
+    profile = get_profile("json")
+    segments = _segments("こんばんは" * 20)
+
+    monkeypatch.setattr(llm_settings, "TRANSLATION_REASONING_TOKEN_ALLOWANCE", 0)
+    text_only = profile.response_token_budget(segments, reasoning_effort="medium")
+
+    monkeypatch.setattr(llm_settings, "TRANSLATION_REASONING_TOKEN_ALLOWANCE", 32000)
+    low_budget = profile.response_token_budget(segments, reasoning_effort="low")
+    medium_budget = profile.response_token_budget(segments, reasoning_effort="medium")
+    max_budget = profile.response_token_budget(segments, reasoning_effort="max")
+
+    # `low` and `medium` share the allowance: their measured demand overlaps and
+    # neither is reliably lighter (low spent 7,860 characters on the 8-cue batch
+    # where medium spent 2,058).
+    assert low_budget == medium_budget == text_only + 32000
+    # `max` is the one tier consistently heavier - 53,388 characters against
+    # medium's 20,231 on 54 cues - so it does not share that allowance.
+    assert max_budget == text_only + 64000
+
+
+def test_the_allowance_is_the_only_thing_the_effort_changes(monkeypatch):
+    # The runaway guard for the visible reply must not move with the tier.
+    monkeypatch.setattr(llm_settings, "TRANSLATION_REASONING_TOKEN_ALLOWANCE", 0)
+    profile = get_profile("json")
+    segments = _segments("こんばんは" * 4)
+
+    assert (
+        profile.response_token_budget(segments, reasoning_effort="low")
+        == profile.response_token_budget(segments, reasoning_effort="max")
+        == profile.response_token_budget(segments)
+    )
+
+
+def test_the_allowance_comes_from_the_job_not_the_process_environment(monkeypatch):
+    """A job carries its own 推理强度; the process env is not it.
+
+    `ctx.llm_reasoning_effort` travels from the Web selector down to the request,
+    so a budget resolved from the environment would size for whatever the server
+    was started with - and every arm of a reasoning A/B would be mis-sized.
+    """
+    monkeypatch.setattr(llm_settings, "TRANSLATION_REASONING_TOKEN_ALLOWANCE", 32000)
+    monkeypatch.setattr(
+        llm_settings, "TRANSLATION_REASONING_MAX_EFFORT_MULTIPLIER", 2.0
+    )
+    monkeypatch.setattr(llm_settings, "LLM_REASONING_EFFORT", "low")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "low")
+    profile = get_profile("json")
+    # Long enough that the `_MIN_TOKEN_BUDGET` floor is not what is being read.
+    segments = _segments("こんばんは" * 20)
+
+    from_env = profile.response_token_budget(segments)
+    from_job = profile.response_token_budget(segments, reasoning_effort="max")
+
+    assert from_job == from_env + 32000
+
+
+def test_a_profile_without_reasoning_ignores_the_effort(monkeypatch):
+    # Hy-MT2 has no reasoning mode; the argument exists for one uniform API.
+    monkeypatch.setattr(llm_settings, "TRANSLATION_REASONING_TOKEN_ALLOWANCE", 32000)
+    profile = get_profile("hymt2")
+    segments = _segments("こんばんは")
+
+    assert profile.response_token_budget(
+        segments, reasoning_effort="max"
+    ) == profile.response_token_budget(segments, reasoning_effort="none")

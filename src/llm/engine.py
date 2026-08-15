@@ -531,7 +531,6 @@ def run_batched(
         progress_callback = progress_callbacks[batch_index]
         request_count = 0
         pending_ids = list(expected_ids)
-        pending_segments = list(requested_segments)
         request_usages: list[dict] = []
         first_token_ts: float | None = None
         active_request_index = 0
@@ -558,6 +557,34 @@ def run_batched(
         attempts_for_pending = 0
         retry_limit_for_pending = api_retries
         last_retry_error: RetryableTranslationFormatError | None = None
+        # How many ids one request may ask for. Reissuing the shape that just
+        # failed is what the retry budget used to buy: sample-b batch 24
+        # (2026-08-13) asked for 54 ids, got 54 objects back numbered 1297-1350
+        # instead of 1296-1349, and did that four times before failing the film.
+        # A whole-batch id shift is a capacity symptom, so the budget now buys
+        # SMALLER requests instead - the same move the ASR stage makes on OOM.
+        # It descends only on failure and never grows back within a batch,
+        # because whatever made the model lose the id sequence is still true.
+        request_span_limit = max(1, len(expected_ids))
+
+        def narrow_request_span() -> None:
+            """Halve what the next request asks for, and say so."""
+            nonlocal request_span_limit
+            if request_span_limit <= 1:
+                return
+            previous = request_span_limit
+            request_span_limit = max(1, request_span_limit // 2)
+            emit_batch_diagnostic(
+                {
+                    "phase": "batch_span_narrowed",
+                    **trace_base,
+                    "from_span": previous,
+                    "to_span": request_span_limit,
+                    "pending_count": len(pending_ids),
+                    "request_index": request_count,
+                    "error": str(last_retry_error)[:300],
+                }
+            )
 
         while True:
             _raise_if_cancelled(cancel_event)
@@ -576,31 +603,37 @@ def run_batched(
                     f"pending_ids={pending_ids[:50]}, error={last_retry_error}"
                 ) from last_retry_error
 
-            requested_ids = list(pending_ids)
+            # One request covers at most `request_span_limit` of what is still
+            # pending; the rest stays pending and the loop comes back for it via
+            # the ordinary missing-ids path.
+            requested_ids = list(pending_ids[:request_span_limit])
+            pending_before_request = len(pending_ids)
             active_request_index = request_count
             active_requested_ids = list(requested_ids)
             trace_progress({"phase": "reset", "attempt": request_count})
             try:
                 _raise_if_cancelled(cancel_event)
-                if request_count == 0:
+                request_segments = [
+                    batch_segments[index - start_index] for index in requested_ids
+                ]
+                if request_count == 0 and requested_ids == expected_ids:
                     request_messages = messages
-                    request_expected_count = len(requested_segments)
                 else:
-                    request_expected_count = len(pending_segments)
                     request_messages = profile.build_messages(
-                        pending_segments,
-                        ids=pending_ids,
+                        request_segments,
+                        ids=requested_ids,
                         ctx=_ctx(batch_index=batch_index),
                     )
+                request_expected_count = len(request_segments)
                 request_count += 1
                 request_kwargs: dict = {}
                 # Sized per request, not per batch: a partial reissue asks for
                 # only the missing ids, so it must not carry the whole batch's
                 # budget.
-                request_segments = (
-                    pending_segments if request_count > 1 else requested_segments
+                token_budget = profile.response_token_budget(
+                    request_segments,
+                    reasoning_effort=reasoning_effort,
                 )
-                token_budget = profile.response_token_budget(request_segments)
                 if token_budget is not None:
                     request_kwargs["max_tokens"] = token_budget
                 bounded = profile.bounded_schema(request_segments)
@@ -620,8 +653,8 @@ def run_batched(
                     **request_kwargs,
                 )
                 _raise_if_cancelled(cancel_event)
-                parsed = profile.parse_response(raw_output, ids=pending_ids)
-                for idx in pending_ids:
+                parsed = profile.parse_response(raw_output, ids=requested_ids)
+                for idx in requested_ids:
                     if parsed.get(idx):
                         # Convert only. The profiles already normalized this, and
                         # re-running the normalizer here could turn a truthy but
@@ -637,23 +670,28 @@ def run_batched(
                     break
 
                 pending_ids = list(missing_indexes)
-                pending_segments = [
-                    batch_segments[index - start_index]
-                    for index in pending_ids
-                ]
                 last_retry_error = RetryableTranslationFormatError(
                     "translation returned incomplete batch translations: "
                     f"{len(missing_indexes)} missing of {expected_count}; "
                     f"missing ids={missing_indexes[:50]}"
                 )
-                if len(missing_indexes) < len(requested_ids) and profile.supports_partial_reissue:
+                # Progress is measured against what was still pending, not
+                # against what this request asked for. With a narrowed span the
+                # two differ, and comparing to the request would score a
+                # perfectly good half-batch as a failed attempt.
+                if (
+                    len(missing_indexes) < pending_before_request
+                    and profile.supports_partial_reissue
+                ):
                     attempts_for_pending = 0
                     retry_limit_for_pending = batch_repair_retries
                 else:
                     attempts_for_pending += 1
+                    narrow_request_span()
             except RetryableTranslationFormatError as exc:
                 last_retry_error = exc
                 attempts_for_pending += 1
+                narrow_request_span()
 
             if attempts_for_pending < retry_limit_for_pending:
                 sleep_attempt = max(0, attempts_for_pending - 1)

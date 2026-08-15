@@ -31,7 +31,7 @@ class JobSpec(BaseModel):
     target_lang: str | None = Field(default=None, max_length=64)
     translation_glossary: str | None = Field(default=None, max_length=20000)
     llm_api_format: Literal["chat", "responses"] | None = None
-    llm_reasoning_effort: Literal["none", "medium", "max"] | None = None
+    llm_reasoning_effort: Literal["low", "medium", "max"] | None = None
     keep_temp_files: bool = False
     resume_from_job_id: str = Field(default="", max_length=128)
     advanced: dict[str, str] = Field(default_factory=dict, max_length=100)
@@ -66,7 +66,7 @@ class SettingsRead(BaseModel):
     proxy_port: int | None = None
     translation_glossary: str = ""
     llm_api_format: Literal["chat", "responses"] = "chat"
-    llm_reasoning_effort: Literal["none", "medium", "max"] = "medium"
+    llm_reasoning_effort: Literal["low", "medium", "max"] = "medium"
     target_lang: str = "简体中文"
     translation_backend: Literal["openai", "llamacpp"] = "openai"
     llamacpp_server_path: str = ""
@@ -83,7 +83,7 @@ class SettingsUpdate(BaseModel):
     proxy_port: int | None = Field(default=None, ge=1, le=65535)
     translation_glossary: str | None = Field(default=None, max_length=20000)
     llm_api_format: Literal["chat", "responses"] | None = None
-    llm_reasoning_effort: Literal["none", "medium", "max"] | None = None
+    llm_reasoning_effort: Literal["low", "medium", "max"] | None = None
     target_lang: str | None = Field(default=None, max_length=64)
     translation_backend: Literal["openai", "llamacpp"] | None = None
     llamacpp_server_path: str | None = Field(default=None, max_length=4096)

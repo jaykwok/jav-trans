@@ -3,10 +3,7 @@ import contextlib
 import os
 import re
 import threading
-import time
 from typing import Callable
-
-from openai import OpenAI
 
 from core.config import load_config
 from llm import cache as translation_cache
@@ -23,8 +20,12 @@ from llm.backends import openai_compat as openai_transport
 from llm.glossary import normalize_glossary_text
 from llm import prompt as prompt_module
 from llm.errors import (
+    ResponseTruncatedError,
     RetryableTranslationFormatError,
-    TranslationCancelledError,
+    # Re-exported, not used here: callers and tests catch
+    # `translator.TranslationCancelledError`, which is the name the cancel path
+    # is documented under even though the raise sites live in the transports.
+    TranslationCancelledError,  # noqa: F401
 )
 
 
@@ -574,12 +575,12 @@ _build_repair_context_items = repair_module._build_repair_context_items
 _public_repair_reasons = repair_module._public_repair_reasons
 
 
-def _split_into_batches(segments: list[dict], batch_size: int) -> list[list[dict]]:
-    if not segments:
-        return []
-    if batch_size <= 0:
-        return [segments]
-    return [segments[index : index + batch_size] for index in range(0, len(segments), batch_size)]
+# The engine's partition, not a second copy of it. The repair pass writes its
+# corrected text back under `_translation_cache_key(b_index, ...)`, so it has to
+# reproduce exactly the batches the engine translated - two implementations of
+# the same five lines is one edit away from writing every repaired translation
+# under a key nothing ever reads.
+_split_into_batches = engine_module._split_into_batches
 
 
 # Batches each worker should get. 1 fills the pool but does no balancing at all
@@ -791,30 +792,44 @@ def _chat(
     effective_max_tokens = min(
         TRANSLATION_MAX_TOKENS, max_tokens if max_tokens is not None else TRANSLATION_MAX_TOKENS
     )
-    backend_name = selected_backend_name()
-    if backend_name != "openai":
-        backend = get_backend(backend_name)
-        return backend.chat_completion(
-            messages,
-            temperature=TRANSLATION_TEMPERATURE,
-            top_p=TRANSLATION_TOP_P,
-            max_tokens=effective_max_tokens,
-            # Local-only, and deliberately not passed to the OpenAI transports
-            # below: their strict structured-output mode validates against a
-            # fixed keyword allowlist that has no `maxLength` for strings, so
-            # sending it is a 400 at request time rather than a tighter grammar.
-            # Nothing is lost - the repetition loop this bounds was only ever
-            # measured on local GGUF models, never on an API one.
-            response_format=bounded_response_schema or response_schema,
-            reasoning_effort=reasoning_effort,
-            api_format=api_format,
-            expected_count=expected_count,
-            cancel_event=cancel_event,
-            on_progress=on_progress,
-            on_usage=on_usage,
-        )
-    if _llm_api_format(api_format) == "responses":
-        return _chat_responses(
+
+    def _dispatch(budget: int) -> str:
+        backend_name = selected_backend_name()
+        if backend_name != "openai":
+            backend = get_backend(backend_name)
+            return backend.chat_completion(
+                messages,
+                temperature=TRANSLATION_TEMPERATURE,
+                top_p=TRANSLATION_TOP_P,
+                max_tokens=budget,
+                # Local-only, and deliberately not passed to the OpenAI
+                # transports below: their strict structured-output mode
+                # validates against a fixed keyword allowlist that has no
+                # `maxLength` for strings, so sending it is a 400 at request
+                # time rather than a tighter grammar. Nothing is lost - the
+                # repetition loop this bounds was only ever measured on local
+                # GGUF models, never on an API one.
+                response_format=bounded_response_schema or response_schema,
+                reasoning_effort=reasoning_effort,
+                api_format=api_format,
+                expected_count=expected_count,
+                cancel_event=cancel_event,
+                on_progress=on_progress,
+                on_usage=on_usage,
+            )
+        if _llm_api_format(api_format) == "responses":
+            return _chat_responses(
+                messages,
+                expected_count=expected_count,
+                on_progress=on_progress,
+                reasoning_effort=reasoning_effort,
+                on_usage=on_usage,
+                cancel_event=cancel_event,
+                response_schema=response_schema,
+                response_schema_name=response_schema_name,
+                max_tokens=budget,
+            )
+        return _chat_completions(
             messages,
             expected_count=expected_count,
             on_progress=on_progress,
@@ -823,19 +838,45 @@ def _chat(
             cancel_event=cancel_event,
             response_schema=response_schema,
             response_schema_name=response_schema_name,
-            max_tokens=effective_max_tokens,
+            max_tokens=budget,
         )
-    return _chat_completions(
-        messages,
-        expected_count=expected_count,
-        on_progress=on_progress,
-        reasoning_effort=reasoning_effort,
-        on_usage=on_usage,
-        cancel_event=cancel_event,
-        response_schema=response_schema,
-        response_schema_name=response_schema_name,
-        max_tokens=effective_max_tokens,
-    )
+
+    try:
+        return _dispatch(effective_max_tokens)
+    except ResponseTruncatedError as truncated:
+        # The budget is an arithmetic bound on a legitimate translation, so
+        # hitting it means either the bound was too tight for this batch or the
+        # model is looping - and nothing here can tell which. One escalation
+        # settles the first case; the second costs one extra request and fails
+        # anyway, which is what a terminal failure did immediately while also
+        # discarding every other batch of the film.
+        retry_budget = min(
+            TRANSLATION_MAX_TOKENS,
+            int(truncated.limit * llm_settings.TRANSLATION_TRUNCATION_RETRY_FACTOR),
+        )
+        if retry_budget <= truncated.limit:
+            raise
+        _emit_progress(
+            on_progress,
+            {
+                "phase": "output_truncated",
+                "diagnostic": True,
+                "limit": truncated.limit,
+                "retry_limit": retry_budget,
+                "expected": expected_count,
+            },
+        )
+        try:
+            return _dispatch(retry_budget)
+        except ResponseTruncatedError as again:
+            raise ResponseTruncatedError(
+                f"{again}. Retried once at {retry_budget} tokens and it was cut "
+                f"off again, so this looks like a runaway reply rather than a "
+                f"tight budget. The budget comes from "
+                f"TRANSLATION_OUTPUT_CHAR_RATIO (per request), not "
+                f"TRANSLATION_MAX_TOKENS.",
+                limit=retry_budget,
+            ) from again
 
 
 _chat_completions = openai_transport._chat_completions

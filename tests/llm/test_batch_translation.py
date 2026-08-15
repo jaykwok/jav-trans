@@ -7,6 +7,7 @@ from collections import defaultdict
 
 import pytest
 
+from llm import engine as engine_module
 from llm import translator
 def _segments(count: int) -> list[dict]:
     return [
@@ -45,6 +46,20 @@ def test_split_into_batches():
     assert len(translator._split_into_batches(_segments(200), 200)) == 1
     assert len(translator._split_into_batches(_segments(201), 200)) == 2
     assert len(translator._split_into_batches(_segments(450), 200)) == 3
+
+
+def test_the_repair_write_back_partitions_with_the_engine_not_a_copy():
+    """One partition function, shared - the same rule as the reasoning tiers.
+
+    `_persist_repaired_translation_cache` rebuilds the batches to write repaired
+    text under `_translation_cache_key(b_index, ...)`, the key the engine will
+    read. A second implementation of the same five lines is one edit away from
+    splitting differently, and every repaired translation would then be stored
+    under a key nothing ever looks up - silently, since writing succeeds.
+    """
+    from llm import engine as engine_module
+
+    assert translator._split_into_batches is engine_module._split_into_batches
 
 
 def test_auto_translation_batch_size_fills_the_worker_pool():
@@ -352,7 +367,10 @@ def test_aggregated_progress_callback(monkeypatch):
         current["value"] += 0.3
         return current["value"]
 
-    monkeypatch.setattr(translator.time, "monotonic", fake_monotonic)
+    # Patch the clock where it is read. `translator.time` used to work only
+    # because both modules held the same stdlib module object, so this was
+    # really patching `engine`'s clock through an unrelated name.
+    monkeypatch.setattr(engine_module.time, "monotonic", fake_monotonic)
     callbacks, _ = translator._make_aggregated_progress_callback(4, 450, events.append)
 
     callbacks[0]({"phase": "thinking", "reasoning_chars": 10})

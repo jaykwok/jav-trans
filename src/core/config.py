@@ -307,14 +307,25 @@ def _apply_values(values: dict[str, str], protected_keys: set[str]) -> None:
 # entirely, so a job submitted with it silently ran at "medium" no matter what
 # the UI said.
 #
-# "none" is the off switch (not "minimal", which is the smallest *nonzero*
-# budget on OpenAI, Gemini and DeepSeek alike) and "max" is the top tier.
-REASONING_EFFORTS = ("none", "medium", "max")
+# Every tier thinks; "low" is the smallest nonzero budget, "max" the top.
+#
+# The old bottom tier was "none", which switched thinking off outright. It was
+# retired 2026-08-14 on measurement: over sample-b's 1,700 cues, thinking-off
+# left 171 of them (10.1%) with the Japanese source copied through untranslated,
+# while medium and max left none. A tier whose job is to be fast is not worth
+# having if a tenth of the film comes back in the wrong language.
+REASONING_EFFORTS = ("low", "medium", "max")
+# Saved settings, job records and .env files written before that change carry
+# "none". Clamping it as unknown would silently promote them to the "medium"
+# fallback - the slowest and most expensive tier - so it maps to the bottom one
+# instead, which is what the value meant.
+_RETIRED_REASONING_EFFORTS = {"none": "low"}
 
 
 def normalize_reasoning_effort(value: str | None, fallback: str = "medium") -> str:
     """Clamp a thinking tier to the supported set."""
     normalized = (value or fallback or "medium").strip().lower()
+    normalized = _RETIRED_REASONING_EFFORTS.get(normalized, normalized)
     if normalized in REASONING_EFFORTS:
         return normalized
     return fallback if fallback in REASONING_EFFORTS else "medium"
