@@ -297,7 +297,7 @@ uv run python tools\audits\generate_ctc_alignment_shadow_audit.py `
 
 **要快就选 `low`**：比默认快 1.9 倍，整片零漏翻。默认仍是 `medium`，因为思考越多译文越短（更贴字幕、更少注水），且此前抽样里 medium 的用词比不思考档更稳；`low` 与 `medium` 的用词优劣尚未做人眼裁决，没有实测支持前不改默认。（注意不要写 `minimal`：那个值在 OpenAI、Gemini、DeepSeek 上都只是“最小的非零思考预算”而不是关闭，程序会拒收并落回 `medium`。）
 
-ASR 显存自适应默认值已经内置。batch 或显存预算可通过“参数调优”里的环境变量覆盖，或手动编辑首次保存后生成的 `.env`。覆盖框里写 `KEY=`（等号后留空）表示**用回默认值**，不是把它设成空——这也是清空 `ASR_ALIGNMENT_HEAD_PATH` 的写法。
+ASR 显存自适应默认值已经内置。batch 或显存预算可通过“参数调优”里的环境变量覆盖，或手动编辑首次保存后生成的 `.env`。数值类 ASR 覆盖项写 `KEY=`（等号后留空）表示**用回默认值**；路径类覆盖项写空值则表示**清空该路径并关闭对应能力**，例如 `ASR_ALIGNMENT_HEAD_PATH=` 会关闭 CTC 对齐头。
 
 默认配置：
 

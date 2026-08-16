@@ -105,6 +105,42 @@ def test_rendered_page_carries_no_arm_identity():
         generate.assert_page_is_blind(leaked, generate.render_page(rows, title="x"))
 
 
+def test_materialize_replaces_existing_clip_when_output_dir_is_reused(tmp_path, monkeypatch):
+    output_dir = tmp_path / "audit"
+    clip = output_dir / "media" / "translation-ab-001.mp3"
+    clip.parent.mkdir(parents=True)
+    clip.write_bytes(b"OLD CLIP")
+    calls: list[bool] = []
+
+    def fake_slice_audio_clip(*, output_path, force, **_kwargs):
+        calls.append(force)
+        output_path.write_bytes(b"NEW CLIP")
+
+    monkeypatch.setattr(generate, "slice_audio_clip", fake_slice_audio_clip)
+    rows = [
+        {
+            "index": 0,
+            "start_s": 1.0,
+            "end_s": 2.0,
+            "ja": "これは十分な長さ",
+            "none": "甲",
+            "medium": "乙",
+        }
+    ]
+
+    generate.materialize(
+        rows,
+        arm_names=("none", "medium"),
+        audio=tmp_path / "source.wav",
+        output_dir=output_dir,
+        pad_s=0.35,
+        seed=1,
+    )
+
+    assert calls == [True]
+    assert clip.read_bytes() == b"NEW CLIP"
+
+
 def _answers() -> list[dict]:
     return [
         {"row_id": "r1", "cue_index": 1, "arm_1": "none", "arm_2": "medium", "ja": "a"},
@@ -148,6 +184,11 @@ def test_ties_are_not_half_a_win_and_unreviewed_is_reported():
 def test_a_verdict_for_an_unknown_card_is_refused():
     with pytest.raises(ValueError, match="unknown row"):
         evaluate.build(_answers(), [{"row_id": "nope", "verdict": "arm_1_better"}])
+
+
+def test_an_unknown_verdict_is_refused():
+    with pytest.raises(ValueError, match="unknown verdict"):
+        evaluate.build(_answers(), [{"row_id": "r1", "verdict": "arm_1_beter"}])
 
 
 def test_wilson_interval_matches_a_known_value():

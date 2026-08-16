@@ -573,7 +573,7 @@ def write_audit_index(
     entries.sort(key=lambda entry: float(entry["mtime"]), reverse=True)
     latest_href = ""
     if latest_html is not None:
-        latest_href = rel_url(latest_html, from_dir=audit_root)
+        latest_href = _nav_href(latest_html, audit_root=audit_root)
         latest_summary = _summary_for(latest_html)
         latest_mtime = _audit_entry_mtime(latest_html)
         latest_entry = {

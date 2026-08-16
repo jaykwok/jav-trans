@@ -22,6 +22,16 @@ from typing import Any
 
 
 RESULT_SCHEMA = "translation_ab_audit_result_v1"
+ALLOWED_VERDICTS = frozenset(
+    {
+        "arm_1_better",
+        "arm_2_better",
+        "equivalent_good",
+        "equivalent_bad",
+        "unsure",
+        "unreviewed",
+    }
+)
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -75,6 +85,8 @@ def build(answers: list[dict[str, Any]], verdicts: list[dict[str, Any]]) -> dict
         answer = by_id[row_id]
         verdict = verdict_by_id.get(row_id, {"verdict": "unreviewed"})
         value = str(verdict.get("verdict") or "unreviewed")
+        if value not in ALLOWED_VERDICTS:
+            raise ValueError(f"unknown verdict for row {row_id}: {value}")
         if value == "arm_1_better":
             winner = str(answer["arm_1"])
         elif value == "arm_2_better":

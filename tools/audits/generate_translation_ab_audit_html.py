@@ -196,7 +196,9 @@ def materialize(
             fmt="mp3",
             bitrate="64k",
             sample_rate=16000,
-            force=False,
+            # The output directory is intentionally reusable: changing the
+            # sample, padding, seed or source must replace every old clip.
+            force=True,
         )
         page_rows.append(
             {

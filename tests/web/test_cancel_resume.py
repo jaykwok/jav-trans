@@ -212,7 +212,7 @@ async def _test_unreadable_job_records_are_kept(tmp_path, monkeypatch):
         created_at="2026-05-03T00:00:00.000+00:00",
         status="done",
     ).model_dump()
-    stale["spec"]["llm_reasoning_effort"] = "a-tier-that-no-longer-exists"
+    stale["spec"]["llm_reasoning_effort"] = "none"
     jobs_path.write_text(
         json.dumps([good, stale], ensure_ascii=False), encoding="utf-8"
     )

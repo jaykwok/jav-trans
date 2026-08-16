@@ -503,7 +503,7 @@ wheels = [
 
 [[package]]
 name = "jav-trans"
-version = "1.2"
+version = "1.4"
 source = { virtual = "." }
 dependencies = [
     { name = "accelerate" },

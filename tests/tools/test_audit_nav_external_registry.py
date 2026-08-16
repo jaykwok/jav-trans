@@ -172,6 +172,8 @@ def test_generator_written_page_outside_audit_root_still_reaches_the_index(tmp_p
     index = (audit_root / "index.html").read_text(encoding="utf-8")
     assert "翻译配置 · 匿名人工 A/B" in index
     assert "../temp/20260813_ab/index.html" in index
+    assert index.count('<div class="entry" data-href="../temp/20260813_ab/index.html">') == 1
+    assert str(page.resolve()).replace("\\", "/") not in index
     latest = (audit_root / "latest-audit.html").read_text(encoding="utf-8")
     assert "../temp/20260813_ab/index.html" in latest
 
