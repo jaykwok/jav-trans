@@ -11,18 +11,30 @@
 - **识别与时间轴**：正式流程使用 Qwen3-ASR 1.7B；默认 CTC 对齐头为 `ctc_aligner_jav_vocalisation_v2.pt`，字幕按实测字词时间生成，不使用比例时间伪造切点。
 - **字幕布局**：当前引擎为 `measured_safe_boundary_dp_v3_1`。20 个日文源字符与 7 秒是软目标；优先在句末、强停顿、分句标点和可靠词间隙处拆分，没有安全点时保留较长 cue。
 - **字幕过滤与质检**：仅过滤连续出现且整条可拆解为非语义人声的 cue；含可辨识词语的条目保留。质量报告在 Web 中直接展示时间轴、布局、翻译和格式风险。
-- **API 翻译**：默认组合为 `https://openrouter.ai/api/v1` + `deepseek/deepseek-v4-flash`。推理强度只保留 `none / low / high`，默认 `low`；复译使用首轮档位且下限为 `low`。Base URL 决定供应商兼容行为，模型 id 必须与端点配套。
+- **API 翻译**：默认组合为 `https://openrouter.ai/api/v1` + `deepseek/deepseek-v4-flash`，协议面只有 Responses（Chat Completions 已于 2026-08-24 退役，只支持 Chat 的端点用不了）。推理强度只保留 `none / low / high`，默认 `low`；复译使用首轮档位且下限为 `low`。Base URL 决定供应商兼容行为，模型 id 必须与端点配套。
 - **翻译成本与一致性**：`TRANSLATION_BATCH_SIZE` 默认 200，和并发数解耦；术语提取同时完成全片前缀预热。用户术语表优先于自动术语，源文回显、假名残留、术语漏用和长度异常会触发选择性复译。
 - **本地翻译**：唯一默认模型为 Hy-MT2-7B Q4_K_M，由 llama.cpp 托管；适合隐私优先和零 API 成本的草稿，不使用 API 路径的术语表、角色参考或全片上下文。
 - **已知边界**：ASR 的自动 batch 与缓存命中会改变批组成，严格对比时应固定 `ASR_BATCH_SIZE`。默认 CTC 头仍保留少量高 blank 风险样例，质量报告与人工复查不能省略。
 
 ## 2026-08-24
 
+### 砍掉 Chat Completions：API 档只剩 Responses 一个协议面
+
+同一天的两条事故（`medium` 被静默忽略、`none` 在 OpenRouter 上照常思考）出在同一条缝上：Chat Completions 没有 `none` 这个 effort，关思考因此是**第二个字段**，而这个字段各家拼法不同（DeepSeek `thinking.type`、OpenRouter `reasoning.enabled`），且未知字段是被丢弃不是被拒绝。于是「最便宜的档」和「最贵的档」在线上无法区分，只有对账单才看得出来。Responses 把整根轴收成一个 `reasoning.effort`，档位名本身就是线上值——这条缝不是被修好，是被删掉。
+
+**代价的实际范围比一开始写的小。** 本项目只有两个后端：`openai` 走 `openai_compat`，`llamacpp` 自己拉起本地 llama-server 并用 `self._client.chat.completions.create` 直连，从不经过 `openai_compat`。所以「llama-server 用不了」是错的——它根本不在这条路径上；旧版 vLLM 同理，从来不是本项目支持的端点。真正受影响的只有一种情形：把 `OPENAI_COMPATIBILITY_BASE_URL` 指向一个只提供 Chat Completions 的中转。退路也不在协议层而在后端层——本地 Hy-MT2 档不受这次改动影响。仍需记住的是 OpenRouter 的 `/api/v1/responses` 还是 beta，而默认端点同一周才换成它。
+
+**存量参数按「无视」处理，不写兼容代码**：`llm_api_format` 从 `SettingsRead`、`DEFAULT_SETTINGS`、`.env` 写入和前端 `<select>` 全部消失，但在 `JobSpec` / `SettingsUpdate` 上**保留声明、无人读取**。原因是这两个模型都是 `extra="forbid"`，而 forbid 是「无视」的反面：一条存量 job 记录带着这个字段就会解析失败，`_load_jobs` 丢弃解析不了的记录——用户会为了一个已经不起作用的旋钮丢掉整份任务历史。旧页面继续 POST 这个字段则返回 200 且什么都不发生。
+
+**删掉的东西**：`_chat_response_format`、`_create_chat_completion`、`_call_create_chat_completion`、`_chat_reasoning_fields`、`_chat_completions`（`openai_compat` 747 → 527 行），`LLM_API_FORMAT` 环境变量与 `LLM_API_FORMATS` / `DEFAULT_LLM_API_FORMAT` / `normalize_llm_api_format` / `_llm_api_format`，贯穿 `base` / `llamacpp_server` / `translator` / `engine` 的 `api_format` 参数与分派分支，前端「API 格式」控件及其 `formMemory` 排除项。上一节里那段「`none` 在 OpenRouter 上要写成 `reasoning.enabled=false`」随之作废：那是 Chat 面的补丁，现在无处可打。
+
+档位到线上的测试因此改成 3 档 × 3 端点的参数化断言（`deepseek.com` / `openrouter.ai` / 泛用中转各跑 `none`/`low`/`high`），断言请求里就是 `{"effort": <档位名>}`；`test_reasoning_effort_wiring` 里读源码的那三条 Chat 断言换成「退役函数不得复活、`"reasoning_effort"` 不得再作为请求字段出现」。全量 **1618 passed**（另 2 条失败与本次无关，HEAD 上即存在：`test_job_tempdir`、`test_audit_nav_external_registry`）。
+
 ### 默认端点改为 OpenRouter，供应商判据从模型名换成主机名
 
 改默认 Base URL 只是一行，跟着它走的四件事才是这次的内容。
 
-**模型 id 属于端点，不属于模型。** OpenRouter 只认 `author/slug`（裸 id 返回 400 `model_not_found`），DeepSeek 官方 API 反过来只认裸 id。默认值原本是 `deepseek-v4-flash`，配上新的默认 Base URL 就是一组开箱即挂的组合——本机 `.env` 早就填了自己的模型，所以这条只会砸在全新安装上。默认模型同步改成 `deepseek/deepseek-v4-flash`。
+**模型 id 属于端点，所以默认模型跟着默认 Base URL 一起改成 `deepseek/deepseek-v4-flash`。** 一开始的理由写错了：以为 OpenRouter 会拒收裸 id。实测（2026-08-24，Responses 面）不是——`deepseek-v4-flash`、`deepseek-v4-flash-0731`、`ox-alpha` 都能解析，**它只在裸 id 匹配到多个模型时才 400**：`deepseek-chat` 返回 `Model ID 'deepseek-chat' is ambiguous — it matches multiple models`。所以旧默认值不会开箱即挂，改成规范写法的真实理由是它不会因为将来多出一个同名短 id 而突然变歧义。
 
 **判据从「模型名里有没有 deepseek」换成 Base URL 的主机名。** 旧判据在 OpenRouter 上正好判反：同一份权重经 OpenRouter 是支持严格 `json_schema` 的，经 DeepSeek 自己的 API 则没有这个东西。主机名比较用 `urlsplit().hostname` 而不是字符串前缀，`https://api.deepseek.com.example/v1` 不算 DeepSeek。同时 `_normalize_openai_compat_base_url` 不再给 DeepSeek 主机补 `/v1`：官方兼容地址就是不带版本段的 `https://api.deepseek.com`，另一个是 `/beta`，补 `/v1` 会拼出一个哪里都不存在的路径。
 

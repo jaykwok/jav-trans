@@ -473,13 +473,12 @@ class LlamaCppServerBackend(BaseTranslationBackend):
         response_format: dict | None = None,
         stream: bool = True,
         reasoning_effort: str | None = None,
-        api_format: str | None = None,
         expected_count: int = 0,
         cancel_event=None,
         on_progress: Callable[[dict], None] | None = None,
         on_usage: Callable[[dict], None] | None = None,
     ) -> str:
-        del stream, reasoning_effort, api_format
+        del stream, reasoning_effort
         self._raise_if_cancelled(cancel_event)
         self._ensure_server(cancel_event)
         self._raise_if_cancelled(cancel_event)

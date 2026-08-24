@@ -232,8 +232,7 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         translation_max_workers=args.translation_max_workers,
         target_lang=args.target_lang,
         translation_glossary=os.getenv("TRANSLATION_GLOSSARY", ""),
-        llm_api_format=os.getenv("LLM_API_FORMAT", "chat"),
-        llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "xhigh"),
+        llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "low"),
         advanced=advanced,
     )
     ctx = JobContext.from_spec(

@@ -199,8 +199,6 @@ export async function loadSettings() {
 
     const effort = $('api-reasoning-effort');
     if (effort) effort.value = s.llm_reasoning_effort || 'low';
-    const apiFormat = $('api-format');
-    if (apiFormat) apiFormat.value = s.llm_api_format || 'responses';
     const targetLang = $('api-target-lang');
     if (targetLang) targetLang.value = s.target_lang || '简体中文';
     updateSubtitleModeLabels();
@@ -235,7 +233,6 @@ function normalizeGlossaryLine(line) {
 export function readJobTranslationSpecFromForm() {
   return {
     llm_reasoning_effort: $('api-reasoning-effort')?.value || 'low',
-    llm_api_format:       $('api-format')?.value || 'responses',
     target_lang:          $('api-target-lang')?.value || '简体中文',
     translation_glossary: ($('api-glossary')?.value || '')
       .split('\n').map(normalizeGlossaryLine).filter(Boolean).join(', '),

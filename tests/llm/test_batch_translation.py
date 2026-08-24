@@ -332,38 +332,6 @@ def test_batched_translation_emits_worker_timeline_diagnostics(monkeypatch):
         assert timing["worker_thread_name"]
 
 
-def test_translate_segments_uses_task_api_format(monkeypatch):
-    calls: list[str] = []
-
-    def fake_chat(
-        messages,
-        expected_count=0,
-        on_progress=None,
-        reasoning_effort=None,
-        api_format=None,
-        **_kwargs,
-    ):
-        calls.append(api_format)
-        return _mock_json(0, expected_count)
-
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
-    monkeypatch.setattr(translator, "_chat", fake_chat)
-
-    zh_texts, timings, retry_events = translator.translate_segments(
-        _segments(1),
-        max_workers=1,
-        cache_path="",
-        target_lang="簡体中文",
-        glossary="",
-        api_format="responses",
-    )
-
-    assert calls == ["responses"]
-    assert retry_events == []
-    assert zh_texts == ["zh-0"]
-    assert timings[0]["mode"] == "batched_full_context"
-
-
 def test_aggregated_progress_callback(monkeypatch):
     events: list[dict] = []
     current = {"value": 100.0}
@@ -925,7 +893,6 @@ def test_a_cheap_first_pass_escalates_only_the_flagged_ids(monkeypatch):
 
     monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
     monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-flash")
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
     monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
     monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 2)
@@ -985,7 +952,6 @@ def test_the_repair_pass_splits_an_invalid_large_reply_instead_of_repeating_it(
 
     monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
     monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-flash")
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
     monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
     monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 4)

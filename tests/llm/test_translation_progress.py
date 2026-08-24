@@ -51,21 +51,39 @@ def _response_event(event_type: str, **kwargs):
     return SimpleNamespace(type=event_type, **kwargs)
 
 
+def _response_stream(
+    reasoning_parts: list[str], content_parts: list[str], *, usage=None
+):
+    """A streamed Responses call: reasoning deltas, text deltas, completion."""
+    events = [
+        _response_event("response.reasoning_summary_text.delta", delta=part)
+        for part in reasoning_parts
+    ]
+    events += [
+        _response_event("response.output_text.delta", delta=part)
+        for part in content_parts
+    ]
+    completed = SimpleNamespace(output=[])
+    if usage is not None:
+        completed.usage = usage
+    events.append(_response_event("response.completed", response=completed))
+    return iter(events)
+
+
 def _requested_ids_from_messages(messages) -> list[int]:
     match = re.search(r"requested_ids\s*=\s*(\[[^\]]*\])", messages[1]["content"])
     assert match is not None, messages[1]["content"]
     return json.loads(match.group(1))
 
 
-def test_chat_progress_reasoning_translating_done(monkeypatch):
+def test_progress_reasoning_translating_done(monkeypatch):
     events: list[dict] = []
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
     monkeypatch.setattr(openai_compat.time, "monotonic", FakeClock(0.3).monotonic)
     monkeypatch.setattr(
         openai_compat,
-        "_create_chat_completion",
-        lambda _request: _stream(
+        "_create_response",
+        lambda _request: _response_stream(
             ["思考", "继续"],
             ['{"translations":[{"i', 'd":0,"text":"甲"},{"id":1,"text":"乙"}]}'],
         ),
@@ -87,13 +105,12 @@ def test_chat_progress_reasoning_translating_done(monkeypatch):
 
 def test_expected_zero_does_not_crash(monkeypatch):
     events: list[dict] = []
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
     monkeypatch.setattr(openai_compat.time, "monotonic", FakeClock(0.3).monotonic)
     monkeypatch.setattr(
         openai_compat,
-        "_create_chat_completion",
-        lambda _request: _stream([], ['{"translations":[]}']),
+        "_create_response",
+        lambda _request: _response_stream([], ['{"translations":[]}']),
     )
 
     output = translator._chat(
@@ -106,15 +123,17 @@ def test_expected_zero_does_not_crash(monkeypatch):
     assert events[-1] == {"phase": "done", "translated": 0, "expected": 0}
 
 
-def test_chat_uses_openai_json_schema(monkeypatch):
+def test_a_generic_endpoint_gets_the_strict_schema(monkeypatch):
     requests: list[dict] = []
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_MODEL_NAME", "gpt-5.5")
+    monkeypatch.setenv(
+        "OPENAI_COMPATIBILITY_BASE_URL", "https://api.openai.example/v1"
+    )
     monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
     monkeypatch.setattr(
         openai_compat,
-        "_create_chat_completion",
-        lambda request: requests.append(request) or _stream(
+        "_create_response",
+        lambda request: requests.append(request) or _response_stream(
             [],
             ['{"translations":[{"id":0,"text":"甲"},{"id":1,"text":"乙"}]}'],
         ),
@@ -128,57 +147,72 @@ def test_chat_uses_openai_json_schema(monkeypatch):
     assert output == '{"translations":[{"id":0,"text":"甲"},{"id":1,"text":"乙"}]}'
     request = requests[0]
     assert request["stream"] is True
-    assert request["reasoning_effort"] == "high"
-    assert request["extra_body"] == {"thinking": {"type": "enabled"}}
-    response_format = request["response_format"]
-    assert response_format["type"] == "json_schema"
-    assert response_format["json_schema"]["name"] == "subtitle_translations"
-    assert response_format["json_schema"]["strict"] is True
-    schema = response_format["json_schema"]["schema"]
+    assert request["reasoning"] == {"effort": "high"}
+    text_format = request["text"]["format"]
+    assert text_format["type"] == "json_schema"
+    assert text_format["name"] == "subtitle_translations"
+    assert text_format["strict"] is True
+    schema = text_format["schema"]
     assert schema["required"] == ["translations"]
     assert schema["properties"]["translations"]["items"]["required"] == ["id", "text"]
     assert "tools" not in request
     assert "web_search_options" not in request
     assert "include_reasoning" not in request
-    assert request["max_tokens"] == translator.TRANSLATION_MAX_TOKENS
+    assert request["max_output_tokens"] == translator.TRANSLATION_MAX_TOKENS
     assert request["temperature"] == translator.TRANSLATION_TEMPERATURE
     assert request["top_p"] == translator.TRANSLATION_TOP_P
 
 
-def test_the_none_tier_disables_thinking_without_a_contradictory_effort(monkeypatch):
-    """`none` is an ordinary tier on the caller's side and becomes a different
-    field on the wire, because Chat Completions has no `none` effort value.
-    Sending "disabled" alongside a nonzero effort would ask the two provider
-    conventions for opposite things."""
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.deepseek.com",
+        "https://openrouter.ai/api/v1",
+        "https://relay.example/v1",
+    ],
+)
+@pytest.mark.parametrize("effort", ["none", "low", "high"])
+def test_every_tier_reaches_the_wire_verbatim_on_every_endpoint(
+    monkeypatch, base_url: str, effort: str
+):
+    """The reason Chat Completions was retired, stated as a test. There the
+    thinking axis was two fields with a per-provider spelling (`thinking.type`
+    for DeepSeek, `reasoning.enabled` for OpenRouter) and an unknown one was
+    dropped rather than refused - which is how a tier silently bills as its
+    opposite. Responses has one field, and it is the tier name itself."""
     requests: list[dict] = []
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-flash")
+    monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", base_url)
     monkeypatch.setattr(
         openai_compat,
-        "_create_chat_completion",
+        "_create_response",
         lambda request: requests.append(request)
-        or _stream([], ['{"translations":[{"id":0,"text":"甲"}]}']),
+        or _response_stream([], ['{"translations":[{"id":0,"text":"甲"}]}']),
     )
 
     output = translator._chat(
         [{"role": "user", "content": "json"}],
         expected_count=1,
-        reasoning_effort="none",
+        reasoning_effort=effort,
     )
 
     assert output == '{"translations":[{"id":0,"text":"甲"}]}'
-    assert requests[0]["extra_body"] == {"thinking": {"type": "disabled"}}
-    assert "reasoning_effort" not in requests[0]
+    assert requests[0]["reasoning"] == {"effort": effort}
+    assert "thinking" not in (requests[0].get("extra_body") or {})
 
 
-def test_chat_uses_json_object_for_deepseek(monkeypatch):
+def test_deepseek_through_openrouter_gets_a_schema_its_own_api_cannot_take(
+    monkeypatch,
+):
     requests: list[dict] = []
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
-    monkeypatch.setenv("LLM_MODEL_NAME", "DeepSeek-V4-Pro")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek/deepseek-v4-flash")
+    monkeypatch.setenv(
+        "OPENAI_COMPATIBILITY_BASE_URL", "https://openrouter.ai/api/v1"
+    )
     monkeypatch.setattr(
         openai_compat,
-        "_create_chat_completion",
-        lambda request: requests.append(request) or _stream(
+        "_create_response",
+        lambda request: requests.append(request) or _response_stream(
             [],
             ['{"translations":[]}'],
         ),
@@ -190,19 +224,105 @@ def test_chat_uses_json_object_for_deepseek(monkeypatch):
     )
 
     assert output == '{"translations":[]}'
-    assert requests[0]["response_format"] == {"type": "json_object"}
+    assert requests[0]["text"]["format"]["type"] == "json_schema"
+    # ...and by default nothing constrains which upstream serves it. Measured
+    # 2026-08-24: `require_parameters` 404s any model that does not declare the
+    # `structured_outputs` capability, including one that had just translated a
+    # full film through this endpoint, so it cannot be the default.
+    assert "provider" not in (requests[0].get("extra_body") or {})
+
+
+def test_pinning_json_schema_demands_a_provider_that_can_enforce_it(monkeypatch):
+    """The pin is for callers who want the schema enforced rather than merely
+    obeyed. It fails loudly when no upstream qualifies, and `stage_errors` turns
+    that 404 into the two remedies (change model, or drop to json_object)."""
+    requests: list[dict] = []
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek/deepseek-v4-flash")
+    monkeypatch.setenv(
+        "OPENAI_COMPATIBILITY_BASE_URL", "https://openrouter.ai/api/v1"
+    )
+    monkeypatch.setattr(openai_compat.llm_settings, "LLM_STRUCTURED_OUTPUT", "json_schema")
+    monkeypatch.setattr(
+        openai_compat,
+        "_create_response",
+        lambda request: requests.append(request)
+        or _response_stream([], ['{"translations":[]}']),
+    )
+
+    translator._chat([{"role": "user", "content": "json"}], expected_count=0)
+
+    assert requests[0]["text"]["format"]["type"] == "json_schema"
+    assert requests[0]["extra_body"]["provider"] == {"require_parameters": True}
+
+
+def test_the_provider_constraint_is_openrouter_only(monkeypatch):
+    """`provider` is OpenRouter's own extension; a stricter server rejects it."""
+    requests: list[dict] = []
+    monkeypatch.setenv("LLM_MODEL_NAME", "gpt-5.5")
+    monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://api.openai.example/v1")
+    monkeypatch.setattr(openai_compat.llm_settings, "LLM_STRUCTURED_OUTPUT", "json_schema")
+    monkeypatch.setattr(
+        openai_compat,
+        "_create_response",
+        lambda request: requests.append(request)
+        or _response_stream([], ['{"translations":[]}']),
+    )
+
+    translator._chat([{"role": "user", "content": "json"}], expected_count=0)
+
+    assert requests[0]["text"]["format"]["type"] == "json_schema"
+    assert "provider" not in (requests[0].get("extra_body") or {})
+
+
+def test_a_relay_that_cannot_take_a_strict_schema_can_pin_json_object(monkeypatch):
+    """The endpoint behind a private relay domain is undetectable, so the only
+    honest answer is a switch. Pinning also drops the OpenRouter provider
+    constraint, which exists solely to protect the strict schema."""
+    requests: list[dict] = []
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-flash")
+    monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://relay.example/v1")
+    monkeypatch.setattr(openai_compat.llm_settings, "LLM_STRUCTURED_OUTPUT", "json_object")
+    monkeypatch.setattr(
+        openai_compat,
+        "_create_response",
+        lambda request: requests.append(request)
+        or _response_stream([], ['{"translations":[]}']),
+    )
+
+    translator._chat([{"role": "user", "content": "json"}], expected_count=0)
+
+    assert requests[0]["text"]["format"] == {"type": "json_object"}
+    assert openai_compat.OpenAICompatBackend().supports_json_schema() is False
+    assert "provider" not in (requests[0].get("extra_body") or {})
+
+
+def test_a_lookalike_host_is_not_the_official_deepseek_endpoint(monkeypatch):
+    """Prefix matching read `https://api.deepseek.com.example/v1` as DeepSeek,
+    which would drop every request on that endpoint to free-form JSON."""
+    monkeypatch.setattr(openai_compat.llm_settings, "LLM_STRUCTURED_OUTPUT", "")
+
+    assert openai_compat._is_official_deepseek_base_url("https://api.deepseek.com")
+    assert openai_compat._is_official_deepseek_base_url("https://api.deepseek.com/beta")
+    assert not openai_compat._is_official_deepseek_base_url(
+        "https://api.deepseek.com.example/v1"
+    )
+    assert not openai_compat._is_official_deepseek_base_url(
+        "https://openrouter.ai/api/v1"
+    )
+    assert openai_compat._is_openrouter_base_url("https://openrouter.ai/api/v1")
+    assert not openai_compat._is_openrouter_base_url("https://openrouter.ai.example/v1")
 
 
 def test_glossary_request_uses_its_own_schema(monkeypatch, tmp_path):
     requests: list[dict] = []
     monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_MODEL_NAME", "gpt-5.5")
+    monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://api.openai.example/v1")
     monkeypatch.setattr(
         openai_compat,
-        "_create_chat_completion",
+        "_create_response",
         lambda request: requests.append(request)
-        or _stream([], ['{"terms":[{"ja":"先生","zh":"老师"}]}']),
+        or _response_stream([], ['{"terms":[{"ja":"先生","zh":"老师"}]}']),
     )
 
     terms = translator.extract_global_glossary(
@@ -211,19 +331,29 @@ def test_glossary_request_uses_its_own_schema(monkeypatch, tmp_path):
     )
 
     assert terms == [{"ja": "先生", "zh": "老师"}]
-    json_schema = requests[0]["response_format"]["json_schema"]
-    assert json_schema["name"] == "translation_glossary"
-    assert json_schema["schema"]["required"] == ["terms"]
+    text_format = requests[0]["text"]["format"]
+    assert text_format["name"] == "translation_glossary"
+    assert text_format["schema"]["required"] == ["terms"]
 
 
 def test_openai_compat_base_url_defaults_to_v1():
+    assert (
+        translator._normalize_openai_compat_base_url("https://openrouter.ai/api/v1")
+        == "https://openrouter.ai/api/v1"
+    )
     assert (
         translator._normalize_openai_compat_base_url("https://api.ticketpro.cc")
         == "https://api.ticketpro.cc/v1"
     )
     assert (
         translator._normalize_openai_compat_base_url("https://api.deepseek.com/")
-        == "https://api.deepseek.com/v1"
+        == "https://api.deepseek.com"
+    )
+    # DeepSeek's other documented base URL. Appending /v1 to it would build a
+    # path that exists on no host.
+    assert (
+        translator._normalize_openai_compat_base_url("https://api.deepseek.com/beta")
+        == "https://api.deepseek.com/beta"
     )
     assert (
         translator._normalize_openai_compat_base_url("https://api.ticketpro.cc/v1")
@@ -237,23 +367,24 @@ def test_openai_compat_base_url_defaults_to_v1():
     )
 
 
-def test_chat_reports_openai_and_deepseek_cache_usage(monkeypatch):
+def test_reports_openai_and_deepseek_cache_usage(monkeypatch):
     usage_events: list[dict] = []
     requests: list[dict] = []
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_MODEL_NAME", "DeepSeek-V4-Pro")
+    monkeypatch.setenv(
+        "OPENAI_COMPATIBILITY_BASE_URL", "https://api.deepseek.com"
+    )
     monkeypatch.setattr(
         openai_compat,
-        "_create_chat_completion",
-        lambda request: requests.append(request) or iter(
-            [
-                _chunk(content='{"translations":[]}'),
-                _usage_chunk(
-                    prompt_tokens_details=SimpleNamespace(cached_tokens=128),
-                    prompt_cache_hit_tokens=96,
-                    prompt_cache_miss_tokens=32,
-                ),
-            ]
+        "_create_response",
+        lambda request: requests.append(request) or _response_stream(
+            [],
+            ['{"translations":[]}'],
+            usage=SimpleNamespace(
+                prompt_tokens_details=SimpleNamespace(cached_tokens=128),
+                prompt_cache_hit_tokens=96,
+                prompt_cache_miss_tokens=32,
+            ),
         ),
     )
 
@@ -264,8 +395,7 @@ def test_chat_reports_openai_and_deepseek_cache_usage(monkeypatch):
     )
 
     assert output == '{"translations":[]}'
-    assert requests[0]["stream_options"] == {"include_usage": True}
-    assert requests[0]["response_format"] == {"type": "json_object"}
+    assert requests[0]["text"]["format"] == {"type": "json_object"}
     assert usage_events == [
         {
             "cached_tokens": 128,
@@ -275,29 +405,6 @@ def test_chat_reports_openai_and_deepseek_cache_usage(monkeypatch):
     ]
 
 
-def test_chat_retries_without_stream_options_when_provider_rejects_usage(monkeypatch):
-    requests: list[dict] = []
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
-    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
-
-    def fake_create_chat_completion(request):
-        requests.append(dict(request))
-        if "stream_options" in request:
-            raise ValueError("unknown field stream_options")
-        return _stream([], ['{"translations":[]}'])
-
-    monkeypatch.setattr(openai_compat, "_create_chat_completion", fake_create_chat_completion)
-
-    output = translator._chat(
-        [{"role": "user", "content": "json"}],
-        expected_count=0,
-    )
-
-    assert output == '{"translations":[]}'
-    assert "stream_options" in requests[0]
-    assert "stream_options" not in requests[1]
-
-
 def test_top_tier_stream_protocol_error_falls_back_one_tier(monkeypatch):
     """A stream that dies mid-reasoning is the top tier's failure - it spends
     longest before emitting anything a parser can use. The fallback is derived
@@ -305,25 +412,25 @@ def test_top_tier_stream_protocol_error_falls_back_one_tier(monkeypatch):
     value the provider no longer accepts (which is what "medium" became)."""
     requests: list[dict] = []
     retry_events: list[dict] = []
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_MODEL_NAME", "gpt-5.5")
     monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
+    monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://api.openai.example/v1")
 
     class RemoteProtocolError(RuntimeError):
         pass
 
-    def fake_create_chat_completion(request):
+    def fake_create_response(request):
         requests.append(dict(request))
-        if request["reasoning_effort"] == "high":
+        if request["reasoning"]["effort"] == "high":
             return _broken_stream(
                 RemoteProtocolError(
                     "peer closed connection without sending complete message body "
                     "(incomplete chunked read)"
                 )
             )
-        return _stream([], ['{"translations":[{"id":0,"text":"好"}]}'])
+        return _response_stream([], ['{"translations":[{"id":0,"text":"好"}]}'])
 
-    monkeypatch.setattr(openai_compat, "_create_chat_completion", fake_create_chat_completion)
+    monkeypatch.setattr(openai_compat, "_create_response", fake_create_response)
     previous_retry_events = getattr(translator._RETRY_CONTEXT, "events", None)
     translator._RETRY_CONTEXT.events = retry_events
     try:
@@ -339,7 +446,7 @@ def test_top_tier_stream_protocol_error_falls_back_one_tier(monkeypatch):
             translator._RETRY_CONTEXT.events = previous_retry_events
 
     assert output == '{"translations":[{"id":0,"text":"好"}]}'
-    assert [request["reasoning_effort"] for request in requests] == ["high", "low"]
+    assert [request["reasoning"]["effort"] for request in requests] == ["high", "low"]
     assert retry_events
     assert retry_events[0]["note"] == "fallback_reasoning_effort_low"
 
@@ -347,8 +454,10 @@ def test_top_tier_stream_protocol_error_falls_back_one_tier(monkeypatch):
 def test_responses_progress_translating_done(monkeypatch):
     events: list[dict] = []
     requests: list[dict] = []
-    monkeypatch.setenv("LLM_API_FORMAT", "responses")
-    monkeypatch.setenv("LLM_MODEL_NAME", "DeepSeek-V4-Pro")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek/deepseek-v4-flash")
+    monkeypatch.setenv(
+        "OPENAI_COMPATIBILITY_BASE_URL", "https://openrouter.ai/api/v1"
+    )
     monkeypatch.setattr(openai_compat.time, "monotonic", FakeClock(0.3).monotonic)
 
     def fake_create_response(request):
@@ -382,7 +491,9 @@ def test_responses_progress_translating_done(monkeypatch):
     assert output == '{"translations":[{"id":0,"text":"甲"},{"id":1,"text":"乙"}]}'
     assert requests
     assert requests[0]["stream"] is True
-    assert requests[0]["text"] == {"format": {"type": "json_object"}}
+    assert requests[0]["text"]["format"]["type"] == "json_schema"
+    assert "extra_body" not in requests[0]
+    assert requests[0]["reasoning"] == {"effort": "low"}
     assert requests[0]["input"][0]["role"] == "system"
     assert requests[0]["input"][0]["content"][0]["type"] == "input_text"
     assert requests[0]["max_output_tokens"] == translator.TRANSLATION_MAX_TOKENS
@@ -392,9 +503,24 @@ def test_responses_progress_translating_done(monkeypatch):
     assert events[-1] == {"phase": "done", "translated": 2, "expected": 2}
 
 
+def test_json_schema_support_depends_only_on_official_deepseek_url(monkeypatch):
+    backend = openai_compat.OpenAICompatBackend()
+    monkeypatch.setattr(openai_compat.llm_settings, "LLM_STRUCTURED_OUTPUT", "")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek/deepseek-v4-flash")
+    monkeypatch.setenv(
+        "OPENAI_COMPATIBILITY_BASE_URL", "https://openrouter.ai/api/v1"
+    )
+    assert backend.supports_json_schema() is True
+
+    monkeypatch.setenv("LLM_MODEL_NAME", "gpt-5.5")
+    monkeypatch.setenv(
+        "OPENAI_COMPATIBILITY_BASE_URL", "https://api.deepseek.com/beta"
+    )
+    assert backend.supports_json_schema() is False
+
+
 def test_grok_responses_uses_standard_openai_shape(monkeypatch):
     requests: list[dict] = []
-    monkeypatch.setenv("LLM_API_FORMAT", "responses")
     monkeypatch.setenv("LLM_MODEL_NAME", "grok-4.20-0309-non-reasoning")
     monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
     monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://api.openai.example/v1")
@@ -441,13 +567,12 @@ def test_grok_responses_uses_standard_openai_shape(monkeypatch):
 
 def test_debounce_limits_fast_reasoning_events(monkeypatch):
     events: list[dict] = []
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
     monkeypatch.setattr(openai_compat.time, "monotonic", FakeClock(0.05).monotonic)
     monkeypatch.setattr(
         openai_compat,
-        "_create_chat_completion",
-        lambda _request: _stream(
+        "_create_response",
+        lambda _request: _response_stream(
             ["a", "b", "c", "d", "e", "f"],
             ['{"translations":[]}'],
         ),
@@ -498,13 +623,12 @@ def test_translate_segments_emits_reset_on_retry(monkeypatch):
 
 
 def test_progress_callback_errors_do_not_break(monkeypatch):
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
     monkeypatch.setattr(openai_compat.time, "monotonic", FakeClock(0.3).monotonic)
     monkeypatch.setattr(
         openai_compat,
-        "_create_chat_completion",
-        lambda _request: _stream(["thinking"], ['{"translations":[]}']),
+        "_create_response",
+        lambda _request: _response_stream(["thinking"], ['{"translations":[]}']),
     )
 
     def broken_callback(_event):

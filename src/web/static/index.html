@@ -169,7 +169,8 @@
 
               <label class="field">
                 <span>API Base URL（留空则不修改当前值）</span>
-                <input type="text" id="api-base-url" placeholder="https://api.deepseek.com/v1">
+                <input type="text" id="api-base-url" placeholder="https://openrouter.ai/api/v1">
+                <span class="field-hint">默认使用 OpenRouter（<code>https://openrouter.ai/api/v1</code>）；也可填写 DeepSeek（<code>https://api.deepseek.com</code>，官方地址不带 <code>/v1</code>）或其他 OpenAI 兼容服务的接口地址。<b>换地址后模型要重选</b>：模型名属于端点，OpenRouter 用 <code>厂商/模型</code>（如 <code>deepseek/deepseek-v4-flash</code>），DeepSeek 官方用 <code>deepseek-v4-flash</code>。</span>
               </label>
 
               <label class="field">
@@ -194,15 +195,6 @@
                   <option value="high">high（最慢，成本最高）</option>
                 </select>
                 <span class="field-hint">首轮全片按此强度翻译；之后本地质检把可疑字幕挑出来，只对这些行集中复译（复译用同一档，但不低于 low，所以只有 none 会升档）。成本几乎全在输出 token，而输出的绝大部分是思维链，所以这一档直接决定单片价格。其他兼容 API 按各供应商规则执行。</span>
-              </label>
-
-              <label class="field">
-                <span>API 格式</span>
-                <select id="api-format">
-                  <option value="responses" selected>OpenAI Responses（默认）</option>
-                  <option value="chat">OpenAI Chat（兼容面，供应商不支持 Responses 时选它）</option>
-                </select>
-                <span class="field-hint">Responses 会返回 <code>reasoning_tokens</code>，能精确记账思维链花费（成本的绝大部分），Chat 没有这个字段。两者都支持 prompt 缓存。</span>
               </label>
             </div>
 

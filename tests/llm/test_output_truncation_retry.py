@@ -33,14 +33,12 @@ def _openai_backend(monkeypatch):
 
 
 def _install(monkeypatch, transport) -> None:
-    """Both transports, so the ladder is tested wherever `LLM_API_FORMAT` points.
+    """The retry ladder lives above the transport, which is now only Responses.
 
-    The retry ladder lives above the Chat/Responses split, so which one runs is
-    incidental - but patching only one made these tests pass or fail according
-    to the developer's own `.env`, and they started hitting the live API the day
-    the default moved to Responses.
+    This used to patch both surfaces: patching one of two made these tests pass
+    or fail according to the developer's own `.env`, and they started hitting
+    the live API the day the default moved.
     """
-    monkeypatch.setattr(translator, "_chat_completions", transport)
     monkeypatch.setattr(translator, "_chat_responses", transport)
 
 
@@ -114,15 +112,6 @@ class TestEscalation:
         with pytest.raises(ResponseTruncatedError):
             _chat(max_tokens=500)
         assert transport.budgets == [500]
-
-    def test_the_responses_transport_escalates_the_same_way(self, monkeypatch):
-        transport = _Transport(truncate_first=1)
-        monkeypatch.setattr(translator, "_chat_responses", transport)
-        monkeypatch.setattr(llm_settings, "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0)
-
-        assert _chat(max_tokens=500, api_format="responses") == _REPLY
-        assert transport.budgets == [500, 1000]
-
 
 class TestMessage:
     def test_the_final_message_names_the_knob_that_actually_bound(self, monkeypatch):

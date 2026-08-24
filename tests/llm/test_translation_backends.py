@@ -78,11 +78,9 @@ def test_translator_routes_custom_backend_and_preserves_task_format(monkeypatch)
 
     texts, _timings, _retries = translator.translate_segments(
         [{"start": 0.0, "end": 1.0, "text": "いい"}],
-        api_format="responses",
     )
 
     assert texts == ["好"]
-    assert calls[0]["api_format"] == "responses"
     assert calls[0]["expected_count"] == 1
     assert calls[0]["response_format"]["required"] == ["translations"]
 

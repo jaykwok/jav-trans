@@ -25,7 +25,8 @@ MISSING_API_KEY = (
 )
 MISSING_BASE_URL = (
     "缺少 API Base URL：请在「翻译设置」的「API Base URL」中填写服务地址"
-    "（例如 https://api.deepseek.com）并保存后重试。"
+    "（例如 OpenRouter 的 https://openrouter.ai/api/v1，或 DeepSeek 的 "
+    "https://api.deepseek.com）并保存后重试。"
 )
 MISSING_MODEL = (
     "未选择翻译模型：请在「翻译设置」中填好 API Key 与 API Base URL，"
@@ -41,6 +42,15 @@ INSUFFICIENT_BALANCE = (
 MODEL_NOT_FOUND = (
     "翻译服务不认识当前模型（404）：请在「翻译设置」中重新点「获取」，"
     "选择一个该服务商当前可用的模型并保存。"
+)
+# Also a 404, and the generic one above would send the user hunting for a model
+# that is in fact available: OpenRouter returns this when no upstream endpoint
+# for the chosen model accepts the strict JSON schema. Two real remedies, so it
+# names both rather than picking one.
+NO_ROUTE_FOR_STRICT_JSON = (
+    "当前模型在 OpenRouter 上没有支持严格 JSON Schema 的供应商（404）：请在「翻译设置」中"
+    "换一个支持结构化输出的模型（模型列表里 `supported_parameters` 含 `structured_outputs` 的那些），"
+    "或在 .env 中设 LLM_STRUCTURED_OUTPUT=json_object 改用宽松的 JSON 约束后重试。"
 )
 RATE_LIMITED = (
     "翻译服务限速（429）且重试已用尽：请把「并行翻译 Worker 数」调低后重试。"
@@ -145,6 +155,8 @@ def describe_stage_failure(exc: BaseException) -> str:
             return FFMPEG_EXTRACT_FAILED
 
     status = _status_code(exc)
+    if status == 404 and "no endpoints found that can handle" in lowered:
+        return f"{NO_ROUTE_FOR_STRICT_JSON}（服务端原文：{message}）"
     if status in _STATUS_MESSAGES:
         return f"{_STATUS_MESSAGES[status]}（服务端原文：{message}）" if message else _STATUS_MESSAGES[status]
 
@@ -171,6 +183,7 @@ __all__ = [
     "MISSING_BASE_URL",
     "MISSING_MODEL",
     "MODEL_NOT_FOUND",
+    "NO_ROUTE_FOR_STRICT_JSON",
     "OUT_OF_MEMORY",
     "RATE_LIMITED",
     "TRANSLATION_PANEL",

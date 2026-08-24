@@ -1904,7 +1904,6 @@ def _run_translation_and_write_impl(
         "translation_settings "
         f"backend={llm_backends.selected_backend_name()} "
         f"model={os.getenv('LLM_MODEL_NAME', '').strip() or '-'} "
-        f"api_format={ctx.llm_api_format} "
         f"reasoning_effort={ctx.llm_reasoning_effort} "
         f"target_lang={ctx.target_lang} "
         f"workers={ctx.translation_max_workers}",
@@ -1972,7 +1971,6 @@ def _run_translation_and_write_impl(
             character_reference="",
             max_workers=ctx.translation_max_workers,
             reasoning_effort=ctx.llm_reasoning_effort,
-            api_format=ctx.llm_api_format,
             cache_path=translation_cache_path,
             on_batch_done=_on_translation_done,
             on_progress=_on_translation_progress,

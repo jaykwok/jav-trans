@@ -50,7 +50,6 @@ _raise_if_cancelled = transport_util._raise_if_cancelled
 OPENAI_COMPATIBILITY_BASE_URL = llm_settings.OPENAI_COMPATIBILITY_BASE_URL
 API_KEY = llm_settings.API_KEY
 LLM_MODEL_NAME = llm_settings.LLM_MODEL_NAME
-LLM_API_FORMAT = llm_settings.LLM_API_FORMAT
 LLM_REASONING_EFFORT = llm_settings.LLM_REASONING_EFFORT
 
 DEFAULT_TARGET_LANG = llm_settings.DEFAULT_TARGET_LANG
@@ -97,17 +96,7 @@ def _translation_output_schema() -> dict:
     return json.loads(json.dumps(TRANSLATION_OUTPUT_SCHEMA))
 
 
-_is_deepseek_model = openai_transport._is_deepseek_model
-_chat_response_format = openai_transport._chat_response_format
 _responses_text_format = openai_transport._responses_text_format
-
-
-def _normalize_llm_api_format(value: str | None, fallback: str = "chat") -> str:
-    return llm_settings._normalize_llm_api_format(value, fallback)
-
-
-def _llm_api_format(api_format: str | None = None) -> str:
-    return llm_settings._llm_api_format(api_format)
 
 
 def _normalize_reasoning_effort(
@@ -257,17 +246,14 @@ _format_global_glossary_terms = global_glossary._format_global_glossary_terms
 _global_glossary_cache_path_for_texts = global_glossary._global_glossary_cache_path_for_texts
 
 
-def _glossary_chat_factory(api_format: str | None):
+def _glossary_chat_factory():
     # Late-bound module-global _chat so the test seam on this module still
     # intercepts glossary extraction requests.
     def _glossary_chat(messages: list[dict], **chat_kwargs) -> str:
         # Fixed at the bottom tier rather than following the job's: this is one
         # term-extraction request per film whose output feeds the prompt, so
         # thinking about it buys nothing the translation pass will not redo.
-        request_kwargs = {"reasoning_effort": "none"}
-        if api_format is not None:
-            request_kwargs["api_format"] = api_format
-        return _chat(messages, **request_kwargs, **chat_kwargs)
+        return _chat(messages, reasoning_effort="none", **chat_kwargs)
 
     return _glossary_chat
 
@@ -277,7 +263,6 @@ def _resolve_translation_extra_glossary(
     cache_path: str,
     glossary: str,
     *,
-    api_format: str | None,
     cancel_event: threading.Event | None,
     messages: list[dict] | None = None,
 ) -> tuple[str, bool]:
@@ -285,7 +270,7 @@ def _resolve_translation_extra_glossary(
         segments,
         cache_path,
         glossary,
-        chat=_glossary_chat_factory(api_format),
+        chat=_glossary_chat_factory(),
         cancel_event=cancel_event,
         messages=messages,
     )
@@ -295,13 +280,12 @@ def extract_global_glossary(
     all_ja_texts: list[str],
     cache_path: str,
     *,
-    api_format: str | None = None,
     cancel_event: threading.Event | None = None,
 ) -> list[dict]:
     return global_glossary.extract_global_glossary(
         all_ja_texts,
         cache_path,
-        chat=_glossary_chat_factory(api_format),
+        chat=_glossary_chat_factory(),
         cancel_event=cancel_event,
     )
 
@@ -351,7 +335,6 @@ def translate_segments(
     glossary: str = "",
     character_reference: str | None = None,
     reasoning_effort: str | None = None,
-    api_format: str | None = None,
     on_batch_done=None,
     on_progress: Callable[[dict], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -420,7 +403,6 @@ def translate_segments(
                     segments,
                     effective_cache_path,
                     effective_glossary,
-                    api_format=api_format,
                     cancel_event=cancel_event,
                     messages=(
                         prompt_module.build_glossary_extraction_messages(
@@ -444,7 +426,6 @@ def translate_segments(
             # would both collide with that argument and silently undo the
             # escalation for any caller that got past the collision.
             chat_kwargs.setdefault("reasoning_effort", reasoning_effort)
-            chat_kwargs.setdefault("api_format", api_format)
             return _chat_with_reasoning(messages, **chat_kwargs)
 
         zh_texts, timings, worker_retry_events = engine_module.run_batched(
@@ -496,7 +477,6 @@ def translate_segments(
                 segments,
                 effective_cache_path,
                 effective_glossary,
-                api_format=api_format,
                 cancel_event=cancel_event,
             )
             cache_kwargs = {
@@ -556,7 +536,6 @@ def _chat_with_reasoning(
     *,
     expected_count: int,
     reasoning_effort: str | None = None,
-    api_format: str | None = None,
     max_tokens: int | None = None,
     on_progress: Callable[[dict], None] | None = None,
     on_usage: Callable[[dict], None] | None = None,
@@ -580,8 +559,6 @@ def _chat_with_reasoning(
         chat_kwargs["bounded_response_schema"] = bounded_response_schema
     if response_schema is not _SCHEMA_UNSET:
         chat_kwargs["response_schema"] = response_schema
-    if api_format is not None:
-        chat_kwargs["api_format"] = api_format
     if on_usage is not None:
         chat_kwargs["on_usage"] = on_usage
     try:
@@ -817,7 +794,6 @@ def _chat(
     expected_count: int = 0,
     on_progress: Callable[[dict], None] | None = None,
     reasoning_effort: str | None = None,
-    api_format: str | None = None,
     max_tokens: int | None = None,
     on_usage: Callable[[dict], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -853,25 +829,12 @@ def _chat(
                 # GGUF models, never on an API one.
                 response_format=bounded_response_schema or response_schema,
                 reasoning_effort=reasoning_effort,
-                api_format=api_format,
                 expected_count=expected_count,
                 cancel_event=cancel_event,
                 on_progress=on_progress,
                 on_usage=on_usage,
             )
-        if _llm_api_format(api_format) == "responses":
-            return _chat_responses(
-                messages,
-                expected_count=expected_count,
-                on_progress=on_progress,
-                reasoning_effort=reasoning_effort,
-                on_usage=on_usage,
-                cancel_event=cancel_event,
-                response_schema=response_schema,
-                response_schema_name=response_schema_name,
-                max_tokens=budget,
-            )
-        return _chat_completions(
+        return _chat_responses(
             messages,
             expected_count=expected_count,
             on_progress=on_progress,
@@ -921,7 +884,6 @@ def _chat(
             ) from again
 
 
-_chat_completions = openai_transport._chat_completions
 _chat_responses = openai_transport._chat_responses
 
 

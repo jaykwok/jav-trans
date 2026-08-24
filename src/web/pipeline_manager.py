@@ -31,7 +31,6 @@ from utils.model_paths import PROJECT_ROOT
 from web.models import (
     JobSpec,
     JobState,
-    normalize_llm_api_format as _normalize_llm_api_format,
     normalize_llm_reasoning_effort as _normalize_llm_reasoning_effort,
 )
 
@@ -277,9 +276,6 @@ def _current_translation_settings() -> dict[str, str]:
     return {
         "target_lang": _runtime_setting("TARGET_LANG", "简体中文") or "简体中文",
         "translation_glossary": _runtime_setting("TRANSLATION_GLOSSARY", ""),
-        "llm_api_format": _normalize_llm_api_format(
-            _runtime_setting("LLM_API_FORMAT", "chat")
-        ),
         "llm_reasoning_effort": _normalize_llm_reasoning_effort(
             _runtime_setting("LLM_REASONING_EFFORT", "medium")
         ),

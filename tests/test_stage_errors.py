@@ -60,6 +60,20 @@ def test_http_status_maps_to_the_setting_that_fixes_it(status, expected):
     assert "upstream said no" in message
 
 
+def test_openrouter_has_no_provider_for_the_strict_schema_is_not_a_missing_model():
+    """Measured against OpenRouter 2026-08-24: `provider.require_parameters`
+    turns a model whose upstreams cannot do strict structured output into a 404.
+    The generic 404 line would send the user off to pick another model without
+    saying why the current one failed, and hides the one-line escape hatch."""
+    exc = _HttpError(
+        "No endpoints found that can handle the requested parameters.", 404
+    )
+    message = describe_stage_failure(exc)
+    assert message.startswith(stage_errors.NO_ROUTE_FOR_STRICT_JSON)
+    assert "LLM_STRUCTURED_OUTPUT=json_object" in message
+    assert not message.startswith(stage_errors.MODEL_NOT_FOUND)
+
+
 def test_status_code_is_also_read_from_a_wrapped_response():
     message = describe_stage_failure(_ResponseHolder("nope", 401))
     assert message.startswith(stage_errors.INVALID_API_KEY)

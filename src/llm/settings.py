@@ -10,11 +10,9 @@ from __future__ import annotations
 import os
 
 from core.config import (
-    DEFAULT_LLM_API_FORMAT,
     DEFAULT_REASONING_EFFORT,
     escalated_reasoning_effort,
     load_config,
-    normalize_llm_api_format,
     normalize_reasoning_effort,
     recognized_reasoning_effort,
 )
@@ -44,14 +42,21 @@ OPENAI_COMPATIBILITY_BASE_URL = (
 )
 API_KEY = os.getenv("API_KEY", "").strip() or None
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "").strip()
-LLM_API_FORMAT = (
-    os.getenv("LLM_API_FORMAT", DEFAULT_LLM_API_FORMAT).strip().lower()
-    or DEFAULT_LLM_API_FORMAT
-)
 LLM_REASONING_EFFORT = (
     os.getenv("LLM_REASONING_EFFORT", DEFAULT_REASONING_EFFORT).strip()
     or DEFAULT_REASONING_EFFORT
 )
+# Which output constraint the endpoint gets, and how hard to insist on it.
+# Empty is the rule in `_structured_output_mode`: ask for a strict `json_schema`
+# everywhere except DeepSeek's own API, which has no such thing, and accept
+# whatever the endpoint does with it. `json_object` is the escape hatch for a
+# relay that proxies a provider without strict structured output, since the
+# endpoint is then some private domain nothing can detect. `json_schema` is the
+# opposite pin: on OpenRouter it also adds `provider.require_parameters`, so a
+# model whose upstreams cannot enforce the schema fails instead of quietly
+# answering without one. Env only: it is a property of the deployment, not a
+# per-job choice.
+LLM_STRUCTURED_OUTPUT = os.getenv("LLM_STRUCTURED_OUTPUT", "").strip().lower()
 
 TRANSLATION_MAX_TOKENS = 384000
 # Arithmetic bound on how long a reply may legitimately get, so a model that
@@ -166,16 +171,6 @@ TRANSLATION_REPAIR_LENGTH_RATIO_MAX = 4.0
 TRANSLATION_REPAIR_REASONING_EFFORT = os.getenv(
     "TRANSLATION_REPAIR_REASONING_EFFORT", ""
 ).strip().lower()
-
-
-_normalize_llm_api_format = normalize_llm_api_format
-
-
-def _llm_api_format(api_format: str | None = None) -> str:
-    if api_format is not None:
-        return _normalize_llm_api_format(api_format, LLM_API_FORMAT)
-    value = os.getenv("LLM_API_FORMAT", LLM_API_FORMAT)
-    return _normalize_llm_api_format(value)
 
 
 _normalize_reasoning_effort = normalize_reasoning_effort

@@ -202,44 +202,38 @@ class TestItReachesTheWire:
             PROJECT_ROOT / "src" / "llm" / "backends" / "openai_compat.py"
         ).read_text(encoding="utf-8")
 
-    def test_the_responses_path_sends_the_tier_verbatim(self) -> None:
-        """Responses spells the whole axis as one field, `none` included, so
-        there is nothing to translate here."""
+    def test_the_request_sends_the_tier_verbatim(self) -> None:
+        """One field carries the whole axis, `none` included, and it carries the
+        normalized tier itself - so `TestTheThreeTiers` above, which pins what
+        the normalizer returns, is also pinning what goes on the wire."""
         assert '"reasoning": {"effort": effective_reasoning_effort}' in self._source()
 
-    def test_the_chat_path_maps_none_onto_the_separate_toggle(self) -> None:
-        """Chat Completions has no `none` effort - switching thinking off is a
-        different field - so the one tier that is not a `reasoning_effort` value
-        has to become `thinking.type=disabled` and drop the effort entirely."""
-        source = self._source()
-        assert 'if effort == "none":' in source
-        assert '{"thinking": {"type": "disabled"}}' in source
-        assert '{"thinking": {"type": "enabled"}}' in source
-
-    def test_no_tier_reaches_chat_that_deepseek_would_ignore(self) -> None:
-        """The bug this file was rewritten for: `medium` is not in DeepSeek's
-        accepted set, was silently ignored, and the request ran at `high`."""
+    def test_every_tier_is_a_value_the_api_accepts(self) -> None:
+        """The bug this file was rewritten for: `medium` was not in the accepted
+        set, was silently ignored rather than refused, and the request ran at the
+        API default of `high` for ten days. A tier is only addable here if it is
+        already a real `reasoning.effort` value."""
         from core.config import REASONING_EFFORTS
-        from llm.backends.openai_compat import _chat_reasoning_fields
 
-        deepseek_chat_efforts = {"low", "high", "max"}
-        for tier in REASONING_EFFORTS:
-            sent = _chat_reasoning_fields(tier).get("reasoning_effort")
-            if tier == "none":
-                assert sent is None
-            else:
-                assert sent in deepseek_chat_efforts
+        assert set(REASONING_EFFORTS) <= {"none", "low", "high"}
 
-    def test_thinking_off_never_ships_a_contradictory_effort(self) -> None:
-        fields = _chat_reasoning_fields_for("none")
-        assert fields["extra_body"] == {"thinking": {"type": "disabled"}}
-        assert "reasoning_effort" not in fields
+    def test_the_per_provider_thinking_toggle_is_gone(self) -> None:
+        """Chat Completions had no `none` effort, so switching thinking off was
+        a second field spelled differently per provider - `thinking.type` on
+        DeepSeek, `reasoning.enabled` on OpenRouter - and an unknown spelling was
+        dropped rather than refused, which is how the cheapest tier billed as the
+        most expensive one. That surface was retired on 2026-08-24; nothing may
+        reintroduce a second way to say the same thing."""
+        import llm.backends.openai_compat as openai_compat
 
-
-def _chat_reasoning_fields_for(effort: str) -> dict:
-    from llm.backends.openai_compat import _chat_reasoning_fields
-
-    return _chat_reasoning_fields(effort)
+        for retired in (
+            "_chat_reasoning_fields",
+            "_chat_response_format",
+            "_create_chat_completion",
+            "_chat_completions",
+        ):
+            assert not hasattr(openai_compat, retired), retired
+        assert '"reasoning_effort"' not in self._source()
 
 
 def test_the_ui_offers_exactly_the_three_tiers() -> None:

@@ -18,7 +18,7 @@ only saves money if everything it gets wrong is something a detector can see.
 
 The repair prompt and reply share the JSON ``{"translations":[...]}`` contract,
 so this stage only runs for profiles that speak it. The ``chat`` callable comes
-from the caller — transport dispatch and api-format handling stay outside.
+from the caller — the transport stays outside.
 """
 
 from __future__ import annotations

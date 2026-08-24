@@ -134,7 +134,6 @@ def test_job_spec_accepts_a_full_browser_payload() -> None:
         "translation_max_workers": 4,
         "keep_temp_files": False,
         "llm_reasoning_effort": "low",
-        "llm_api_format": "chat",
         "target_lang": "简体中文",
         "translation_glossary": "",
         "resume_from_job_id": "",

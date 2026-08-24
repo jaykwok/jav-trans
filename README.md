@@ -44,7 +44,7 @@ jav-trans 是一个面向 Windows 和 NVIDIA 显卡的本地字幕生成工具�
 | 本地翻译 | 否 | 隐私优先、零 API 成本的中文草稿 |
 | API 翻译 | 是 | 需要术语表、全片上下文和更稳定的成品质量 |
 
-API 模式默认使用 OpenRouter。通常只需填写 API Key；如果改用其他服务，Base URL 与模型名必须配套：OpenRouter 使用 `厂商/模型` 形式，DeepSeek 官方 API 使用裸模型名。
+API 模式默认使用 OpenRouter。通常只需填写 API Key；如果改用其他服务，Base URL 与模型名必须配套：OpenRouter 使用 `厂商/模型` 形式，DeepSeek 官方 API 使用裸模型名。此外该服务必须提供 Responses 接口（`/responses`）——程序只使用这一个协议面，只支持 Chat Completions 的旧接口和中转用不了。
 
 本地翻译固定使用 `Hy-MT2-7B-Q4_K_M.gguf`，首次使用时自动下载。先安装 llama.cpp：
 
@@ -52,7 +52,14 @@ API 模式默认使用 OpenRouter。通常只需填写 API Key；如果改用其
 winget install -e --id ggml.llamacpp
 ```
 
-然后在网页控制台选择“本地 Hy-MT2”。本地后端逐句翻译，不使用 API 模式的术语表、角色参考和全片上下文；它更适合作为隐私优先的草稿方案。NVIDIA 用户也可以下载 llama.cpp CUDA 版本，并在设置中填写 `llama-server.exe` 路径。
+然后在网页控制台选择“本地 Hy-MT2”。本地后端逐句翻译，不使用 API 模式的术语表、角色参考和全片上下文；它更适合作为隐私优先的草稿方案。
+
+NVIDIA 用户可从 [llama.cpp 官方 Releases](https://github.com/ggml-org/llama.cpp/releases) 下载 CUDA 版。先运行 `nvidia-smi` 查看驱动支持的 CUDA 版本，再选择不高于该版本的 Windows x64 压缩包：
+
+- CUDA 12：`llama-b<版本号>-bin-win-cuda-12.x-x64.zip`
+- CUDA 13：`llama-b<版本号>-bin-win-cuda-13.x-x64.zip`
+
+文件名中的 build 号和 CUDA 小版本会随发布变化，请以 Releases 页面为准。如果同一项另列有匹配的 `cudart-llama-bin-win-cuda-*.zip`（CUDA DLLs），也一并下载并解压到同一目录。最后在网页设置中填写该目录里的 `llama-server.exe` 路径。
 
 ## 输出与隐私
 
@@ -91,6 +98,16 @@ winget install -e --id ggml.llamacpp
 ### API 翻译失败
 
 确认 API Key、Base URL 和模型名属于同一服务。OpenRouter 的模型名通常形如 `deepseek/deepseek-v4-flash`；DeepSeek 官方地址 `https://api.deepseek.com` 使用 `deepseek-v4-flash`。其他兼容服务请使用其文档给出的地址和模型名。
+
+如果报错指向 `/responses` 路径不存在（404 或 `Not Found`），说明该服务只提供 Chat Completions 接口，无法使用；请改用支持 Responses 的服务，或改用本地翻译。
+
+程序默认要求译文按 JSON Schema 返回（DeepSeek 官方地址除外，它只支持较宽松的 `json_object`）。如果服务商不支持严格 schema，返回结构错误或直接报错，可在 `.env` 中改用宽松约束：
+
+```env
+LLM_STRUCTURED_OUTPUT=json_object
+```
+
+反过来，如果希望 OpenRouter 只把请求发给能真正强制执行 schema 的供应商，可以设 `LLM_STRUCTURED_OUTPUT=json_schema`；此时未声明 `structured_outputs` 的模型会返回 404。
 
 ### 如何反馈长任务问题
 

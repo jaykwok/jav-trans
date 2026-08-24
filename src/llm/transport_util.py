@@ -72,13 +72,13 @@ def _first_present(usage, *paths: tuple[str, ...]):
 
 
 def _extract_usage_metrics(usage) -> dict:
-    # Chat Completions and Responses report the same quantities under different
-    # names, and `total_tokens` is the only one they share. Reading only the Chat
-    # names meant a run with LLM_API_FORMAT=responses recorded `total_tokens` and
-    # nothing else - every prompt-cache field came back null, which read as "the
-    # provider does not cache" when in fact the accounting was simply never
-    # parsed. Verified 2026-08-02 against DeepSeek: a repeated prefix reports
-    # 3200/3230 cached, and it was invisible here.
+    # Both names are still read although only Responses is called: relays serve
+    # Responses while reporting usage in the older Chat spelling, and the two
+    # surfaces share only `total_tokens`. Reading one spelling once meant a run
+    # recorded `total_tokens` and nothing else - every prompt-cache field came
+    # back null, which read as "the provider does not cache" when in fact the
+    # accounting was simply never parsed. Verified 2026-08-02 against DeepSeek:
+    # a repeated prefix reports 3200/3230 cached, and it was invisible here.
     cached_tokens = _first_present(
         usage,
         ("prompt_tokens_details", "cached_tokens"),   # Chat Completions
@@ -102,10 +102,10 @@ def _extract_usage_metrics(usage) -> dict:
     if prompt_tokens is not None:
         metrics["prompt_tokens"] = prompt_tokens
     # `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` are a DeepSeek Chat
-    # extension; the Responses surface reports only `cached_tokens`. Making
-    # Responses the default on 2026-08-24 therefore left every run's cost
-    # uncomputable from its own timings - the two fields the input bill is
-    # priced from were both null.
+    # extension; Responses reports only `cached_tokens`. Making Responses the
+    # default on 2026-08-24 therefore left every run's cost uncomputable from
+    # its own timings - the two fields the input bill is priced from were both
+    # null.
     #
     # Recorded under separate keys rather than filling the reported ones. The
     # split is arithmetic, not an estimate: on the Chat arm of sample-v,
@@ -131,8 +131,8 @@ def _extract_usage_metrics(usage) -> dict:
     # number never recorded: output is ~91% of a DeepSeek film's cost and most
     # of the output is reasoning, but establishing that took reconstructing it
     # from streamed `reasoning_chars` progress events across interleaved
-    # workers. Only Responses reports it; Chat Completions has no equivalent
-    # field, so this stays None there rather than being guessed at.
+    # workers. A provider that does not report it leaves this None rather than
+    # having it guessed at.
     reasoning_tokens = _first_present(
         usage,
         ("output_tokens_details", "reasoning_tokens"),      # Responses

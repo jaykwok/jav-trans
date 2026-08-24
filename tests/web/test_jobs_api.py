@@ -135,8 +135,8 @@ def test_proxy_test_ok_when_reachable(monkeypatch):
     asyncio.run(_test_proxy_test_ok_when_reachable(monkeypatch))
 
 
-def test_settings_llm_api_format_updates_runtime_env(monkeypatch):
-    asyncio.run(_test_settings_llm_api_format_updates_runtime_env(monkeypatch))
+def test_settings_tolerates_the_retired_api_format_field(monkeypatch):
+    asyncio.run(_test_settings_tolerates_the_retired_api_format_field(monkeypatch))
 
 
 def test_settings_translation_fields_update_runtime_env(monkeypatch):
@@ -555,10 +555,16 @@ async def _test_proxy_test_ok_when_reachable(monkeypatch):
     assert isinstance(payload["elapsed_ms"], int)
 
 
-async def _test_settings_llm_api_format_updates_runtime_env(monkeypatch):
+async def _test_settings_tolerates_the_retired_api_format_field(monkeypatch):
+    """Chat Completions was retired on 2026-08-24 and the control went with
+    it. A browser still holding the old settings page keeps POSTing the
+    field, and the model forbids extras, so the field stays declared and does
+    nothing: accepted rather than 422, absent from the response, and never
+    written to `.env`."""
     monkeypatch.delenv("LLM_API_FORMAT", raising=False)
-    monkeypatch.setattr(config_routes, "_read_env_entry", lambda key: (key == "LLM_API_FORMAT", "chat"))
-    monkeypatch.setattr(config_routes, "_update_env_file", lambda _changes: None)
+    changes: list[dict] = []
+    monkeypatch.setattr(config_routes, "_read_env_entry", lambda key: (False, ""))
+    monkeypatch.setattr(config_routes, "_update_env_file", changes.append)
 
     transport = httpx.ASGITransport(app=create_app())
     async with httpx.AsyncClient(
@@ -567,21 +573,17 @@ async def _test_settings_llm_api_format_updates_runtime_env(monkeypatch):
     ) as client:
         response = await client.post(
             "/api/settings",
-            json={"llm_api_format": "responses"},
+            json={"llm_api_format": "chat", "llm_reasoning_effort": "high"},
         )
         assert response.status_code == 200
-        assert os.environ["LLM_API_FORMAT"] == "responses"
+        assert "LLM_API_FORMAT" not in os.environ
 
         settings = await client.get("/api/settings")
         assert settings.status_code == 200
-        assert settings.json()["llm_api_format"] == "responses"
+        assert "llm_api_format" not in settings.json()
+        assert settings.json()["llm_reasoning_effort"] == "high"
 
-        invalid = await client.post(
-            "/api/settings",
-            json={"llm_api_format": "legacy"},
-        )
-
-    assert invalid.status_code == 422
+    assert all("LLM_API_FORMAT" not in change for change in changes)
 
 
 async def _test_settings_translation_fields_update_runtime_env(monkeypatch):
@@ -697,7 +699,6 @@ async def _test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch):
         "OPENAI_COMPATIBILITY_BASE_URL",
         "LLM_MODEL_NAME",
         "TARGET_LANG",
-        "LLM_API_FORMAT",
         "LLM_REASONING_EFFORT",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -714,7 +715,6 @@ async def _test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch):
                 "base_url": "https://api.example.test/v1",
                 "model": "translator-test",
                 "target_lang": "繁體中文",
-                "llm_api_format": "responses",
                 "llm_reasoning_effort": "low",
             },
         )
@@ -734,7 +734,7 @@ async def _test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch):
     assert values["OPENAI_COMPATIBILITY_BASE_URL"] == "https://api.example.test/v1"
     assert values["LLM_MODEL_NAME"] == "translator-test"
     assert values["TARGET_LANG"] == "繁體中文"
-    assert values["LLM_API_FORMAT"] == "responses"
+    assert "LLM_API_FORMAT" not in values
     assert values["LLM_REASONING_EFFORT"] == "low"
     assert "ASR_BACKEND" not in values
     assert "ASR_BATCH_SIZE_BY_REPO" not in values
@@ -878,7 +878,6 @@ async def _test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
     monkeypatch.setenv("ASR_CONTEXT", "小那海")
     monkeypatch.setenv("TRANSLATION_GLOSSARY", "ねこ-猫")
     monkeypatch.setenv("TARGET_LANG", "繁體中文")
-    monkeypatch.setenv("LLM_API_FORMAT", "responses")
     monkeypatch.setenv("LLM_REASONING_EFFORT", "low")
     await _reset_pm_state()
 
@@ -902,7 +901,6 @@ async def _test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
         assert "asr_context" not in spec
         assert spec["translation_glossary"] == "ねこ-猫"
         assert spec["target_lang"] == "繁體中文"
-        assert spec["llm_api_format"] == "responses"
         assert spec["llm_reasoning_effort"] == "low"
     finally:
         await _reset_pm_state()
@@ -1132,7 +1130,6 @@ async def _test_retry_rejects_and_then_rereads_translation_settings(tmp_path, mo
     monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
     monkeypatch.setenv("API_KEY", "test-key")
     monkeypatch.setenv("LLM_REASONING_EFFORT", "low")
-    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     await _reset_pm_state()
 
     try:
@@ -1160,11 +1157,9 @@ async def _test_retry_rejects_and_then_rereads_translation_settings(tmp_path, mo
 
             monkeypatch.setenv("API_KEY", "test-key")
             monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
-            monkeypatch.setenv("LLM_API_FORMAT", "responses")
             retried = await client.post(f"/api/jobs/{job_id}/retry")
             assert retried.status_code == 200
             spec = retried.json()["spec"]
             assert spec["llm_reasoning_effort"] == "high"
-            assert spec["llm_api_format"] == "responses"
     finally:
         await _reset_pm_state()

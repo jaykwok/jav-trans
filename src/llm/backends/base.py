@@ -20,7 +20,6 @@ class BaseTranslationBackend(ABC):
         response_format: dict | None = None,
         stream: bool = True,
         reasoning_effort: str | None = None,
-        api_format: str | None = None,
         expected_count: int = 0,
         cancel_event = None,
         on_progress: Callable[[dict], None] | None = None,

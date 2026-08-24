@@ -11,7 +11,6 @@ const FORM_MEMORY_EXCLUDED = new Set([
   'api-base-url',
   'api-model',
   'api-reasoning-effort',
-  'api-format',
   'api-target-lang',
   'api-glossary',
   'llamacpp-server-path',

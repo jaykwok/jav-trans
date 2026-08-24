@@ -109,6 +109,10 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["ASR_CHUNK_ROOT"] == "./tmp/chunks"
     assert config.DEFAULT_SETTINGS["RUN_LOG_ENABLED"] == "1"
     assert config.DEFAULT_SETTINGS["RUN_LOG_DIR"] == "./tmp/log"
+    assert (
+        config.DEFAULT_SETTINGS["OPENAI_COMPATIBILITY_BASE_URL"]
+        == "https://openrouter.ai/api/v1"
+    )
     assert config.DEFAULT_SETTINGS["LLM_REASONING_EFFORT"] == "low"
     assert "KEEP_TEMP_FILES" not in config.DEFAULT_SETTINGS
     assert "ASR_CONTEXT" not in config.DEFAULT_SETTINGS
@@ -177,7 +181,6 @@ def test_default_model_download_root_is_project_models():
     assert "CUEQC_EXPORT_CANDIDATES_PATH" not in config.DEFAULT_SETTINGS
     assert "CUEQC_EXPORT_CANDIDATES_APPEND" not in config.DEFAULT_SETTINGS
     assert "CUEQC_SHADOW_EMBED_CANDIDATES" not in config.DEFAULT_SETTINGS
-    assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "responses"
 
 
 def test_boundary_registries_are_gone_after_retirement() -> None:

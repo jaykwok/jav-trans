@@ -76,7 +76,6 @@ def test_every_browser_translation_setting_is_accepted_by_settings_api() -> None
         "translation_backend",
         "llamacpp_server_path",
         "translation_glossary",
-        "llm_api_format",
         "llm_reasoning_effort",
         "target_lang",
         "proxy_protocol",
@@ -97,7 +96,6 @@ def test_env_owned_settings_are_not_overwritten_by_browser_memory() -> None:
         "api-base-url",
         "api-model",
         "api-reasoning-effort",
-        "api-format",
         "api-target-lang",
         "api-glossary",
         "llamacpp-server-path",
@@ -115,8 +113,12 @@ def test_frontend_defaults_match_backend_defaults_and_limits() -> None:
 
     assert DEFAULT_SETTINGS["TRANSLATION_BACKEND"] == "openai"
     assert '<option value="openai" selected>' in html
-    assert DEFAULT_SETTINGS["LLM_API_FORMAT"] == "responses"
-    assert '<option value="responses" selected>' in html
+    assert (
+        DEFAULT_SETTINGS["OPENAI_COMPATIBILITY_BASE_URL"]
+        == "https://openrouter.ai/api/v1"
+    )
+    assert 'placeholder="https://openrouter.ai/api/v1"' in html
+    assert "https://api.deepseek.com" in html
     assert DEFAULT_SETTINGS["LLM_REASONING_EFFORT"] == "low"
     # The option text carries a human-facing annotation (「medium（默认）」), so
     # only the value and the `selected` marker are the contract here.

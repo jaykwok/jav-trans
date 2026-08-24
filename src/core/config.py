@@ -173,21 +173,28 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Translation backend type: openai (OpenAI-compatible API) | llamacpp
     # (fixed Hy-MT2-7B Q4_K_M GGUF served by llama.cpp).
     "TRANSLATION_BACKEND": "openai",
-    # Base URL for providers that expose an OpenAI-compatible API; DeepSeek by default.
-    "OPENAI_COMPATIBILITY_BASE_URL": "https://api.deepseek.com",
-    # Translation model name sent to the SDK client.
-    "LLM_MODEL_NAME": "deepseek-v4-flash",
-    # OpenAI-compatible API surface for translation requests. Valid values: chat, responses.
-    "LLM_API_FORMAT": "responses",
+    # Base URL for providers that expose an OpenAI-compatible API; OpenRouter by
+    # default. DeepSeek's own endpoint is `https://api.deepseek.com` (no version
+    # path), and it is the one endpoint with a documented divergence: no strict
+    # `json_schema`, so the transport sends `json_object` there.
+    "OPENAI_COMPATIBILITY_BASE_URL": "https://openrouter.ai/api/v1",
+    # Translation model name sent to the SDK client, in the id space of the base
+    # URL above. OpenRouter's canonical form is `author/slug`; a bare slug is
+    # resolved when it matches exactly one model and 400s as ambiguous when it
+    # matches several (measured 2026-08-24: `deepseek-v4-flash` resolves,
+    # `deepseek-chat` does not). The default is spelled the canonical way so it
+    # cannot start failing when a second model matches the short name.
+    "LLM_MODEL_NAME": "deepseek/deepseek-v4-flash",
     # Thinking budget for models that support it. Valid values: none, medium, max.
     "LLM_REASONING_EFFORT": "low",
     # Sampling temperature for translation. Higher = more colloquial/varied; the
     # JSON-format retry loop tolerates the extra variance. Read at import time; a
     # change requires a restart (not hot-reloaded by the web settings page).
     #
-    # Note it does nothing while thinking is on: DeepSeek documents temperature
+    # Note it may do nothing while thinking is on: DeepSeek documents temperature
     # and top_p as accepted-but-inert in thinking mode, on both the Chat and
-    # Responses surfaces. It starts mattering again at LLM_REASONING_EFFORT=none.
+    # Responses surfaces, and other providers make their own call. It always
+    # matters again at LLM_REASONING_EFFORT=none.
     "LLM_TEMPERATURE": "0.6",
     # Cues per translation request, and since the worker coupling was removed
     # this is the operating point rather than a ceiling - the only number
@@ -364,35 +371,6 @@ def recognized_reasoning_effort(value: str | None) -> str | None:
     normalized = (value or "").strip().lower()
     normalized = _RETIRED_REASONING_EFFORTS.get(normalized, normalized)
     return normalized if normalized in REASONING_EFFORTS else None
-
-
-# The OpenAI-compatible request shapes, in one place for the same reason the
-# thinking tiers are: `llm.settings`, `web.models` and `core.job_context` each
-# kept a private copy of this clamp with its own hardcoded default.
-#
-# Responses is the default since 2026-08-24. It is not merely the newer surface:
-# it reports `usage.output_tokens_details.reasoning_tokens`, and reasoning is
-# ~85% of this pipeline's bill. On Chat Completions that number does not exist,
-# which is why establishing it took reconstructing character counts from
-# interleaved progress events. It also spells the whole thinking axis as one
-# field (`reasoning.effort`, `none` included) rather than an effort plus a
-# separate `extra_body.thinking.type`.
-#
-# Chat stays, and stays supported: it is the universal surface. The local
-# llama.cpp backend speaks it, and so do the OpenAI-compatible providers that
-# implement Chat Completions only. Switching the default is not deprecating it.
-LLM_API_FORMATS = ("chat", "responses")
-DEFAULT_LLM_API_FORMAT = "responses"
-
-
-def normalize_llm_api_format(
-    value: str | None, fallback: str = DEFAULT_LLM_API_FORMAT
-) -> str:
-    """Clamp an LLM API request shape to the supported set."""
-    normalized = (value or fallback or DEFAULT_LLM_API_FORMAT).strip().lower()
-    if normalized in LLM_API_FORMATS:
-        return normalized
-    return fallback if fallback in LLM_API_FORMATS else DEFAULT_LLM_API_FORMAT
 
 
 def escalated_reasoning_effort(effort: str | None) -> str:

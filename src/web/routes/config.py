@@ -31,7 +31,6 @@ from web.models import (
     JobSpec,
     SettingsRead,
     SettingsUpdate,
-    normalize_llm_api_format as _normalize_llm_api_format,
     normalize_llm_reasoning_effort as _normalize_llm_reasoning_effort,
 )
 
@@ -461,7 +460,6 @@ async def get_settings() -> SettingsRead:
     model = _runtime_or_env_or_setting("LLM_MODEL_NAME")
     proxy_protocol, proxy_host, proxy_port = _proxy_settings_from_runtime()
     translation_glossary = _runtime_or_env_or_setting("TRANSLATION_GLOSSARY")
-    llm_api_format = _runtime_or_env_or_setting("LLM_API_FORMAT", "chat")
     llm_reasoning_effort = _normalize_llm_reasoning_effort(
         _runtime_or_env_or_setting("LLM_REASONING_EFFORT", "medium")
     )
@@ -480,7 +478,6 @@ async def get_settings() -> SettingsRead:
         proxy_host=proxy_host,
         proxy_port=proxy_port,
         translation_glossary=translation_glossary,
-        llm_api_format=_normalize_llm_api_format(llm_api_format),
         llm_reasoning_effort=llm_reasoning_effort,
         target_lang=target_lang,
         translation_backend=translation_backend,
@@ -507,9 +504,6 @@ async def post_settings(update: SettingsUpdate) -> dict:
     if update.translation_glossary is not None:
         changes["TRANSLATION_GLOSSARY"] = update.translation_glossary
         os.environ["TRANSLATION_GLOSSARY"] = update.translation_glossary
-    if update.llm_api_format is not None:
-        changes["LLM_API_FORMAT"] = update.llm_api_format
-        os.environ["LLM_API_FORMAT"] = update.llm_api_format
     if update.llm_reasoning_effort is not None:
         if update.llm_reasoning_effort not in REASONING_EFFORTS:
             raise HTTPException(
@@ -634,7 +628,8 @@ async def get_models() -> dict[str, list[str]]:
 
     detail = (
         "获取模型列表失败：请确认「API Base URL」填的是服务商的接口地址"
-        "（例如 https://api.deepseek.com），以及该 Key 是否可用。"
+        "（例如 OpenRouter 的 https://openrouter.ai/api/v1，或 DeepSeek 的 "
+        "https://api.deepseek.com），以及该 Key 是否可用。"
     )
     if errors:
         detail += "\n尝试过的地址：" + "; ".join(errors)

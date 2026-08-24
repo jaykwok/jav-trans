@@ -29,7 +29,6 @@ ALLOWED_SELECT_IDS = {
     "translation-backend",
     "api-model",
     "api-reasoning-effort",
-    "api-format",
     "api-target-lang",
 }
 

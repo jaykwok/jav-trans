@@ -308,8 +308,7 @@ class TestBoundedSchema:
             return '{"translations": []}'
 
         monkeypatch.setattr(translator, "selected_backend_name", lambda: "openai")
-        monkeypatch.setattr(translator, "_llm_api_format", lambda fmt: "chat")
-        monkeypatch.setattr(translator, "_chat_completions", _fake_completions)
+        monkeypatch.setattr(translator, "_chat_responses", _fake_completions)
         bounded = get_profile("json").bounded_schema(_segments("こんばんは"))
         translator._chat(
             [{"role": "user", "content": "x"}], bounded_response_schema=bounded
