@@ -122,7 +122,7 @@
             <label class="field">
               <span>并行翻译 Worker 数</span>
               <input type="number" id="t-translation-max-workers" value="4" min="1" max="64">
-              <span class="field-hint">每批条数 = 向上取整（字幕总条数 ÷ 并发数 ÷ 2），并受安全上限约束。使用 API 翻译时，提高并发通常更快，但会拆出更多请求、每个请求都重付一遍思维链，因此成本也会增加；遇到限速时请调低。</span>
+              <span class="field-hint">只影响同时发出的请求数，不影响每批条数（每批固定为 TRANSLATION_BATCH_SIZE，默认 200），也不会超过批的总数。调高通常更快，但不会改变成本；遇到限速时请调低。</span>
             </label>
             <div class="toggle-row">
               <span>生成质量报告（.md）</span>
@@ -193,7 +193,7 @@
                   <option value="low" selected>low（默认）</option>
                   <option value="high">high（最慢，成本最高）</option>
                 </select>
-                <span class="field-hint">首轮全片按此强度翻译；之后本地质检把可疑字幕挑出来，只对这些行用高一档强度集中复译（none→low，low→high）。成本几乎全在输出 token，而输出的绝大部分是思维链，所以这一档直接决定单片价格。其他兼容 API 按各供应商规则执行。</span>
+                <span class="field-hint">首轮全片按此强度翻译；之后本地质检把可疑字幕挑出来，只对这些行集中复译（复译用同一档，但不低于 low，所以只有 none 会升档）。成本几乎全在输出 token，而输出的绝大部分是思维链，所以这一档直接决定单片价格。其他兼容 API 按各供应商规则执行。</span>
               </label>
 
               <label class="field">

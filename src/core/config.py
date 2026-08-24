@@ -189,11 +189,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # and top_p as accepted-but-inert in thinking mode, on both the Chat and
     # Responses surfaces. It starts mattering again at LLM_REASONING_EFFORT=none.
     "LLM_TEMPERATURE": "0.6",
-    # Ceiling on one structured translation request, not the normal size: the
-    # worker-aware rule (ceil(cues / (2 * workers))) usually lands below it.
-    # Clamped to [8, 400], read at import time. Lower only for a provider that
-    # repeatedly fails large replies - it costs money, because reasoning is
-    # charged per request and smaller batches mean more of them.
+    # Cues per translation request, and since the worker coupling was removed
+    # this is the operating point rather than a ceiling - the only number
+    # deciding how many requests a film costs. Clamped to [8, 400], read at
+    # import time. Lower only for a provider that repeatedly fails large replies:
+    # it costs money, because reasoning is charged per request and smaller
+    # batches mean more of them.
     "TRANSLATION_BATCH_SIZE": "200",
     # Final subtitle language.
     "TARGET_LANG": "简体中文",

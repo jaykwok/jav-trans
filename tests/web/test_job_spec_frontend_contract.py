@@ -83,14 +83,27 @@ def test_translation_backend_choice_stays_out_of_the_job_body() -> None:
         assert settings_only not in body_keys
 
 
-def test_worker_field_explains_its_speed_and_api_cost_tradeoff() -> None:
+def test_worker_field_says_concurrency_no_longer_moves_the_bill() -> None:
+    """Until 2026-08-24 the batch size was `ceil(cues / (2 * workers))`, so this
+    field really did price the job - and the hint correctly said so. Decoupling
+    made that sentence false in the expensive direction: a user reading it would
+    keep concurrency low to save money it no longer costs."""
     html = INDEX.read_text(encoding="utf-8")
     field = html[html.index('id="t-translation-max-workers"') :]
     field = field[: field.index("</label>")]
-    assert "字幕总条数 ÷ 并发数 ÷ 2" in field
-    assert "提高并发通常更快" in field
-    assert "每个请求都重付一遍思维链" in field
-    assert "成本也会增加" in field
+    assert "字幕总条数 ÷ 并发数 ÷ 2" not in field
+    assert "不影响每批条数" in field
+    assert "不会改变成本" in field
+
+
+def test_reasoning_field_does_not_promise_an_escalated_repair() -> None:
+    """The repair pass reissues at the base tier floored at `low`, so only `none`
+    escalates. The hint used to name `low→high` explicitly."""
+    html = INDEX.read_text(encoding="utf-8")
+    field = html[html.index('id="api-reasoning-effort"') :]
+    field = field[: field.index("</label>")]
+    assert "low→high" not in field
+    assert "只有 none 会升档" in field
 
 
 def test_reasoning_field_explains_the_cascade_and_what_it_costs() -> None:
@@ -102,7 +115,7 @@ def test_reasoning_field_explains_the_cascade_and_what_it_costs() -> None:
     field = html[html.index('id="api-reasoning-effort"') :]
     field = field[: field.index("</label>")]
     assert "首轮全片按此强度翻译" in field
-    assert "只对这些行用高一档强度集中复译" in field
+    assert "只对这些行集中复译" in field
     assert "输出的绝大部分是思维链" in field
     assert "映射为 high" not in field
 
