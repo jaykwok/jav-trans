@@ -74,8 +74,6 @@ dist/
 # Claude Code project instructions are local to this workspace.
 CLAUDE.md
 
-# Local MCP/infra deployment notes (not published)
-grok-search-mcp部署文档.md
 
 # pyproject.toml is the source of truth; `uv sync` is the documented install.
 # (requirements.txt was removed 2026-07-31 - it duplicated the dependency list
