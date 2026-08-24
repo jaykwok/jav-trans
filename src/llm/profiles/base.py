@@ -62,9 +62,9 @@ class TranslationProfile(abc.ABC):
 
         A cap, not a preference: the line-oriented contract returns one bare
         translation with no ids in it, so two cues in one request cannot be told
-        apart afterwards. `translate_segments` applies this *after* its own
-        worker-aware sizing, so a capped profile still fills the worker pool -
-        it just does so with more, smaller requests.
+        apart afterwards. `translate_segments` applies this after the shared
+        cues-per-worker sizing rule; this is a model contract, not a selectable
+        scheduling mode.
         """
         return None
 
@@ -82,9 +82,10 @@ class TranslationProfile(abc.ABC):
         it asked the model to emit around the translations.
 
         `reasoning_effort` is passed because the bound goes out as `max_tokens`,
-        which on a reasoning model also has to cover the thinking the answer is
-        not made of. A profile that models only the visible reply is short by
-        exactly that much - see `json_v3` for what that cost.
+        which on a reasoning request also has to cover the thinking the answer
+        is not made of. Whether there *is* any thinking is read off the same
+        argument - the `none` tier needs no allowance - so a caller cannot size
+        a budget for a mode the request is not in. See `json_v3`.
         """
         del segments, reasoning_effort
         return None

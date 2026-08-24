@@ -25,6 +25,7 @@ if str(_SRC_WEB) not in _web_package.__path__:
 from web.models import JobSpec  # noqa: E402
 
 JS = ROOT / "src" / "web" / "static" / "js"
+INDEX = ROOT / "src" / "web" / "static" / "index.html"
 
 
 def _object_literal_keys(source: str, start_marker: str) -> set[str]:
@@ -82,6 +83,30 @@ def test_translation_backend_choice_stays_out_of_the_job_body() -> None:
         assert settings_only not in body_keys
 
 
+def test_worker_field_explains_its_speed_and_api_cost_tradeoff() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    field = html[html.index('id="t-translation-max-workers"') :]
+    field = field[: field.index("</label>")]
+    assert "字幕总条数 ÷ 并发数 ÷ 2" in field
+    assert "提高并发通常更快" in field
+    assert "每个请求都重付一遍思维链" in field
+    assert "成本也会增加" in field
+
+
+def test_reasoning_field_explains_the_cascade_and_what_it_costs() -> None:
+    """The selector is the single biggest lever on the bill, so the hint has to
+    say both halves: the tier prices the whole film, and only flagged lines are
+    escalated. It previously claimed DeepSeek maps low to high, which was the
+    documentation error that hid a tenfold cost difference."""
+    html = INDEX.read_text(encoding="utf-8")
+    field = html[html.index('id="api-reasoning-effort"') :]
+    field = field[: field.index("</label>")]
+    assert "首轮全片按此强度翻译" in field
+    assert "只对这些行用高一档强度集中复译" in field
+    assert "输出的绝大部分是思维链" in field
+    assert "映射为 high" not in field
+
+
 def test_job_spec_accepts_a_full_browser_payload() -> None:
     payload: dict[str, object] = {
         "video_paths": ["sample.mp4"],
@@ -95,7 +120,7 @@ def test_job_spec_accepts_a_full_browser_payload() -> None:
         "keep_quality_report": False,
         "translation_max_workers": 4,
         "keep_temp_files": False,
-        "llm_reasoning_effort": "medium",
+        "llm_reasoning_effort": "low",
         "llm_api_format": "chat",
         "target_lang": "简体中文",
         "translation_glossary": "",

@@ -387,7 +387,7 @@ class TestSignatureCoversWhatChangesTheTranslation:
         monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
         monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
         without = translator._translation_cache_key(0, segments)
-        monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
         assert translator._translation_cache_key(0, segments) != without
 
     def test_the_thinking_tier_changes_the_memory_key(self, monkeypatch):
@@ -396,7 +396,7 @@ class TestSignatureCoversWhatChangesTheTranslation:
         monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
         monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
         without = translator._translation_memory_key("いい天気ですね")
-        monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
         assert translator._translation_memory_key("いい天気ですね") != without
 
     def test_the_prompt_shape_changes_the_batch_key(self):
@@ -417,7 +417,7 @@ class TestSignatureCoversWhatChangesTheTranslation:
         monkeypatch.setenv("TRANSLATION_BACKEND", "llamacpp")
         monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
         low = translator._translation_cache_key(0, segments)
-        monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
         assert translator._translation_cache_key(0, segments) == low
         assert translator._effective_reasoning_effort() == ""
 
@@ -434,5 +434,5 @@ class TestSignatureCoversWhatChangesTheTranslation:
                 return "shim"
 
         monkeypatch.setattr(translator, "get_backend", lambda *_a, **_k: _Minimal())
-        monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
-        assert translator._effective_reasoning_effort() == "max"
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
+        assert translator._effective_reasoning_effort() == "high"

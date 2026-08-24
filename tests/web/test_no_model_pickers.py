@@ -1,6 +1,6 @@
 """Neither the local translation model nor the ASR model is user-selectable.
 
-Decided 2026-08-05: one local translation model ships (Hy-MT2-1.8B) and one ASR
+Decided 2026-08-05: one local translation model ships (now Hy-MT2-7B Q4) and one ASR
 model ships (the galgame Qwen3-ASR), so a picker can only offer a wrong answer.
 Every model choice that used to exist here was removed after the model behind it
 was retired, and each removal was found late - the GGUF preset, the Transformers
@@ -67,8 +67,8 @@ def test_no_local_translation_model_can_be_named_in_the_browser() -> None:
 
 def test_local_backend_is_described_as_the_fixed_hymt2_stack() -> None:
     html = _html()
-    assert "本地翻译（Hy-MT2-1.8B · llama.cpp）" in html
-    assert "本地翻译固定使用 Hy-MT2-1.8B Q8_0 GGUF" in html
+    assert "本地翻译（Hy-MT2-7B Q4 · llama.cpp）" in html
+    assert "本地翻译固定使用 Hy-MT2-7B Q4_K_M GGUF" in html
     assert "推荐本地" not in html
 
     from web.models import SettingsRead, SettingsUpdate
@@ -91,8 +91,9 @@ def test_the_shipped_defaults_are_the_two_models_that_ship() -> None:
     to be right. Reads the real settings rather than restating them."""
     from core.config import DEFAULT_SETTINGS
 
-    assert DEFAULT_SETTINGS["LLAMACPP_MODEL_REPO"] == "tencent/Hy-MT2-1.8B-GGUF"
-    assert DEFAULT_SETTINGS["LLAMACPP_MODEL_FILE"] == "Hy-MT2-1.8B-Q8_0.gguf"
+    assert DEFAULT_SETTINGS["LLAMACPP_MODEL_REPO"] == "tencent/Hy-MT2-7B-GGUF"
+    assert DEFAULT_SETTINGS["LLAMACPP_MODEL_FILE"] == "Hy-MT2-7B-Q4_K_M.gguf"
+    assert DEFAULT_SETTINGS["LLAMACPP_PARALLEL"] == "2"
     assert (
         DEFAULT_SETTINGS["ASR_BACKEND"]
         == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"

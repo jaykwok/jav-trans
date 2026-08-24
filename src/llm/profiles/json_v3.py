@@ -243,25 +243,21 @@ def _reasoning_token_allowance(reasoning_effort: str) -> int:
     and reading the env here would budget for whatever the process was started
     with - which is exactly how the A/B arms would have been mis-sized.
 
-    Every tier thinks since 2026-08-14, so every tier gets the allowance. `low`
-    and `medium` share it because the measured demand does not separate them
-    cleanly - on DeepSeek `low` spent 7,860/14,034/9,383 reasoning characters on
-    8/24/54-cue batches against medium's 2,058/18,393/20,231, i.e. sometimes
-    more - and the base is sized over the worst of both. Only `max` is reliably
-    heavier, so only `max` gets a multiple.
+    `none` is the tier that does not think, so it gets nothing - which is most
+    of why it is the cheap one. `low` and `high` share one allowance because
+    the measured demand does not separate them cleanly: on DeepSeek `low` spent
+    7,860/14,034/9,383 reasoning characters on 8/24/54-cue batches against
+    `high`'s 2,058/18,393/20,231, i.e. sometimes more. The base is sized over
+    the worst of both.
     """
     from llm import settings as llm_settings
 
     effort = llm_settings._normalize_reasoning_effort(
         reasoning_effort or llm_settings.LLM_REASONING_EFFORT
     )
-    allowance = max(0, int(llm_settings.TRANSLATION_REASONING_TOKEN_ALLOWANCE))
-    if effort == "max":
-        allowance = int(
-            allowance
-            * max(1.0, float(llm_settings.TRANSLATION_REASONING_MAX_EFFORT_MULTIPLIER))
-        )
-    return allowance
+    if effort == "none":
+        return 0
+    return max(0, int(llm_settings.TRANSLATION_REASONING_TOKEN_ALLOWANCE))
 
 
 class JsonProfile(TranslationProfile):
@@ -282,14 +278,14 @@ class JsonProfile(TranslationProfile):
         """`max_tokens` for this request: the visible reply, plus the thinking.
 
         The first two terms model what the answer is made of. The third exists
-        because this number is sent as `max_tokens`, which on a reasoning model
-        is spent on the reasoning stream first: with the effort at medium an
-        8-cue batch got a 469-token budget while the model spent 2,058 characters
-        thinking, so it was cut off every time and the film died after one
-        doubling. Reasoning is driven far more by the effort than by how much
-        text was handed over - medium spends about the same on 24 cues as on 54 -
-        so the allowance is flat per effort rather than a second ratio. See
-        `settings.TRANSLATION_REASONING_TOKEN_ALLOWANCE` for the measurements.
+        because this number is sent as `max_tokens`, which on a reasoning
+        request is spent on the reasoning stream first: at `high` an 8-cue batch
+        got a 469-token budget while the model spent 2,058 characters thinking,
+        so it was cut off every time and the film died after one doubling.
+        Reasoning is driven far more by the effort than by how much text was
+        handed over - `high` spends about the same on 24 cues as on 54 - so the
+        allowance is flat per tier rather than a second ratio, and it is zero at
+        `none`. See `settings.TRANSLATION_REASONING_TOKEN_ALLOWANCE`.
         """
         if not segments:
             return None

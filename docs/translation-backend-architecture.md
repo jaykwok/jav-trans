@@ -2,9 +2,9 @@
 
 ## 设计目标
 
-翻译侧是三层结构：**transport（backends）只执行一次消息请求**；**profile 只拥有一个模型家族的 prompt 合同**（怎么构造消息、怎么把回复解析回逐 id 文本）；**engine 只有一份编排循环**（批规划、缓存/翻译记忆、缺失项重试阶梯、滚动历史调度、进度聚合、计时）。`translator.py` 是门面：装配 seam（chat 调用、退避、崩溃探针）、选择 profile、调用 engine，然后按 profile 声明执行可选阶段（全局术语预抽取、修复批）。
+翻译侧是三层结构：**transport（backends）执行消息请求并实现供应商协议**；**profile 只拥有一个模型家族的 prompt 合同**（怎么构造消息、怎么把回复解析回逐 id 文本）；**engine 只有一份基础翻译编排循环**（批规划、缓存/翻译记忆、缺失项重试阶梯、滚动历史调度、进度聚合、计时）。`translator.py` 是门面：装配 seam（chat 调用、退避、崩溃探针）、选择 profile、调用 engine，然后按 profile 声明执行可选阶段（全局术语预抽取、修复批）。修复批同时承担成本级联，且与供应商无关：首轮按任务档位翻完全片，再聚合本地检测器标记的 id 集中复译；复译档位为「首轮档位、下限 `low`」（`_repair_reasoning_effort`），只有 `none` 升档，可用 `TRANSLATION_REPAIR_REASONING_EFFORT` 钉死。
 
-历史教训有两条，边界因此刻意如此划分：其一，2026-07 之前曾把批处理和修复拆成各自维护状态的副本，丢失过 Responses API、术语提取、取消语义和缓存统计——所以现在**编排循环全仓只有一份**（`engine.py`），repair/global_glossary 是无状态的阶段函数，通过参数拿到 chat 调用，不持有第二份调度状态。其二，transport 曾与 translator 循环导入——现在 `backends/`、`profiles/`、`engine.py`、`repair.py`、`global_glossary.py` 都禁止导入 `translator`，`tests/test_no_circular_imports.py` 用子进程锁死这条。
+历史教训有两条，边界因此刻意如此划分：其一，2026-07 之前曾把**完整基础翻译**复制进修复模块，丢失过 Responses API、术语提取、取消语义和缓存统计——所以基础批、缓存与翻译记忆仍只有 `engine.py` 一份。`repair.py` 只接收已完成的逐 id 文本，维护一个有全局请求硬顶的“可疑 id → 拆半复译”队列（`TRANSLATION_REPAIR_MAX_IDS` 默认 400），不复制基础批缓存或 worker 调度。其二，transport 曾与 translator 循环导入——现在 `backends/`、`profiles/`、`engine.py`、`repair.py`、`global_glossary.py` 都禁止导入 `translator`，`tests/test_no_circular_imports.py` 用子进程锁死这条。
 
 硬不变式：**cue plan 在翻译前冻结，翻译永远 1:1**——任何 profile 都不得合并或拆分行；`parse_response` 只能返回请求过的 id（`tests/test_profiles_contract.py` 钉住）。
 
@@ -15,7 +15,7 @@ src/llm/
 ├── settings.py               # 全部 TRANSLATION_* 常量与 env 解析
 ├── transport_util.py         # 取消/退避/重试事件/usage/流式进度等共享件
 ├── prompt.py                 # JSON 合同的 prompt 与字幕 JSON 构造（PROMPT_VERSION）
-├── repair.py                 # 修复批（profile 经 wants_repair_pass 选入）
+├── repair.py                 # 长度修复 + DeepSeek 非思考首轮的选择性推理复译
 ├── global_glossary.py        # 全片术语预抽取(profile 经 wants_extra_glossary 选入)
 ├── cache.py                  # batch cache 与 translation memory
 ├── glossary.py               # 用户词表解析
@@ -51,7 +51,7 @@ src/llm/
 
 `engine.py` 只有一条循环，由 profile 参数化：
 
-- `run_batched`：JSON 系自由并行批。全片 JSON prefix（provider prompt-cache 友好；超限回落全片概览）、prefix warmup（仅 openai 后端且 >1 个待翻批次）、批级精确缓存 + 行级翻译记忆预填、缺失 id 部分补请（`supports_partial_reissue`）、`TRANSLATION_BATCH_MAX_REQUESTS` 硬顶、逐批诊断事件与计时。单请求小任务与多批大任务走同一条路径（旧的 single-request 专用路径已删除）。
+- `run_batched`：JSON 系自由并行批。起批规则就是 `每批条数 = TRANSLATION_BATCH_SIZE`（默认 200），**与 Worker 数解耦**；Worker 数再按批数收敛（`_auto_translation_workers`），不会超过批总数。旧规则 `⌈总 cue 数 ÷ Worker 数 ÷ 2⌉` 已删除：**请求数就是 reasoning 成本**（一次请求的思考量近似固定、不随批大小成比例增长），所以让并发去决定批大小等于让并发决定账单。批大小的定值依据是「一次能否答完」——实测 200 条时 32 个请求里 7 个丢失末尾连续 id，且输出预算远未用尽，属于模型提前收尾而非截断。全片 JSON prefix（provider prompt-cache 友好；超限回落全片概览）、prefix warmup（仅 openai 后端、>1 个待翻批次，且术语提取没有替它预热过）、批级精确缓存 + 行级翻译记忆预填、缺失 id 部分补请（`supports_partial_reissue`）、`TRANSLATION_BATCH_MAX_REQUESTS` 硬顶、逐批诊断事件与计时。engine 不感知思考开关：它只传任务的 `reasoning_effort`，`none` 档由 transport 翻译成对应的线上字段。单请求小任务与多批大任务走同一条路径（旧的 single-request 专用路径已删除）。
 
 engine 不做 transport 决策：`chat` / `backoff_sleep` / `crash_probe` 由 translator 注入，所以测试在 translator 上的 `_chat`/`_chat_with_reasoning` seam 对 engine 驱动的请求仍然生效。
 
@@ -74,13 +74,13 @@ TRANSLATION_BACKEND=openai
 OPENAI_COMPATIBILITY_BASE_URL=https://api.deepseek.com
 API_KEY=your-api-key
 LLM_MODEL_NAME=your-model
-LLM_API_FORMAT=chat
-LLM_REASONING_EFFORT=medium
+LLM_API_FORMAT=responses
+LLM_REASONING_EFFORT=low
 ```
 
-`LLM_API_FORMAT` 支持 `chat` 和 `responses`。调用 `translate_segments(..., api_format=...)` 时，任务级参数优先于进程环境变量。
+`LLM_API_FORMAT` 支持 `chat` 和 `responses`，默认 `responses`。调用 `translate_segments(..., api_format=...)` 时，任务级参数优先于进程环境变量。
 
-Chat 和 Responses 的流式进度、usage、JSON Schema 与 DeepSeek `json_object` 兼容只有一份 canonical 实现，避免适配器与主流程分叉。协议就是标准 OpenAI Chat/Responses，不带任何 provider 私有 patch；网关不兼容标准协议时应换网关而不是在这里加分支。
+Chat 和 Responses 的流式进度、usage、JSON Schema 与 DeepSeek `json_object` 兼容只有一份 canonical 实现，避免适配器与主流程分叉。思考开关不是并排的第二个参数，而是 effort 轴本身的 `none` 档，落地只在 `_chat_reasoning_fields` 一个边界函数：Chat 面翻译成 `reasoning_effort` + `thinking.type=enabled/disabled`，Responses 面直接就是 `reasoning.effort`。上层（engine/profile/translator）不知道有这个开关。
 
 生产环境运行本地大模型时，推荐启动 vLLM/SGLang 等 OpenAI 兼容服务，然后仍选择 `openai` 后端。这样服务负责 continuous batching、KV cache 和多卡调度，本程序不会与 ASR 在同一进程争抢模型生命周期。
 
@@ -89,12 +89,12 @@ Chat 和 Responses 的流式进度、usage、JSON Schema 与 DeepSeek `json_obje
 ```env
 TRANSLATION_BACKEND=llamacpp
 LLAMACPP_SERVER_PATH=            # 留空则取 PATH 中的 llama-server（winget install -e --id ggml.llamacpp，装的是 Vulkan 构建）
-LLAMACPP_MODEL_REPO=tencent/Hy-MT2-1.8B-GGUF
-LLAMACPP_MODEL_FILE=Hy-MT2-1.8B-Q8_0.gguf
+LLAMACPP_MODEL_REPO=tencent/Hy-MT2-7B-GGUF
+LLAMACPP_MODEL_FILE=Hy-MT2-7B-Q4_K_M.gguf
 LLAMACPP_GGUF_PATH=              # 本地 GGUF 路径，填了则优先于 repo+file 下载
 LLAMACPP_CTX_SIZE=8192           # 每个并发槽的上下文；服务端总上下文 = CTX * PARALLEL
 LLAMACPP_N_GPU_LAYERS=999
-LLAMACPP_PARALLEL=8              # 1.8B 默认模型 ~2GB，8G 卡可开 8 槽；换大模型要调小
+LLAMACPP_PARALLEL=2              # 7B Q4_K_M 约 4.6GB；8G 卡默认保守开 2 槽
 LLAMACPP_STARTUP_TIMEOUT_S=300
 ```
 
@@ -112,10 +112,11 @@ LLAMACPP_STARTUP_TIMEOUT_S=300
 
 | profile | 用途 | 每请求条数 | schema | 上下文 |
 |---|---|---|---|---|
-| `json` | OpenAI 兼容 API | 至多 64 | JSON | 全片前缀 + 角色表 + 术语表 |
+| `json` | OpenAI 兼容 API | `TRANSLATION_BATCH_SIZE`（默认 200，与并发无关） | JSON | 全片前缀 + 角色表 + 术语表 |
 | `hymt2` | 本地 llama.cpp 默认 | 1 | 无 | 无 |
 
-`hymt2` 逐句不是口味问题。同 300 条真实台词实测未翻译率：裸模板 6、加系统提示 26、
+`hymt2` 逐句不是口味问题。以下是原 1.8B 默认在同 300 条真实台词上的合同实测，
+用于决定 7B 继续沿用同族模型的单句模板，不作为 7B 的质量成绩：裸模板 6、加系统提示 26、
 加术语表/角色块 30、加邻句背景 60、JSON 批量 152（另有 88 行原样回吐）——**每加一层
 上下文退化一档**。而本地那侧本来也买不到上下文：全片 JSON 前缀塞不进 8G 卡上 8192 的
 槽，那层是结构性不可用的。所以本地路径上**术语表、角色参考、全片上下文一律不生效**，
@@ -133,9 +134,11 @@ llamacpp 侧看 GGUF 文件名/仓库名，openai 侧看 `LLM_MODEL_NAME`。`TRA
 
 ## 缓存隔离
 
-缓存签名包含 profile 签名（`id@version`，JSON 合同当前为 `json@v3.0`）、目标语言、词表、人物参考和后端 `cache_identity()`。API 模型与本地模型不会复用同一翻译缓存；不同 profile 之间也不会。
+缓存签名包含 profile 签名（`id@version`，JSON 合同当前为 `json@v3.4`）、目标语言、词表、人物参考和后端 `cache_identity()`。API 模型与本地模型不会复用同一翻译缓存；不同 profile 之间也不会。v3.4 把全片提取的术语块从 system prompt 移到任务尾部，使术语提取、prefix warmup 与每个批次共用同一段可缓存前缀。
 
-全局术语提取使用独立的 `terms` JSON Schema，不再错误套用字幕 `translations` Schema。修复后的译文会写回同一个 batch cache key。
+全局术语提取使用独立的 `terms` JSON Schema，不再错误套用字幕 `translations` Schema。术语提取本身按 `reasoning_effort="none"` 发出。提取结果在进提示词前会先和用户术语表比对：**词形变体且目标译词不一致的条目一律丢弃**（打码字符 `○〇●◯*＊` 两侧都按通配符比对，因为 `おち○ぽ` 必须能匹配术语表里的 `ちんぽ`），目标一致的变体保留。否则同一段提示会对同一个词给出两种译法，而模型会跨词形泛化到整个词族。质量门检测 NFKC/去标点后的源文回显、目标中的平假名/片假名、源文命中术语表条目但译文没有出现对应译词、以及既有长度异常；候选先按整片聚合，结构错误时才二分，所有请求共享 `TRANSLATION_BATCH_MAX_REQUESTS` 硬顶。修复后的译文会写回同一个 batch cache key；复译后仍源文回显则终止任务，不缓存成品。
+
+术语检查只做单向字面判断（源文含 `A`、译文不含 `B` 即标记），不评价替代词。没有配置词表时该检测器完全不参与，避免凭空产生用词意见。
 
 ## 扩展后端
 

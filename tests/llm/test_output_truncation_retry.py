@@ -32,6 +32,18 @@ def _openai_backend(monkeypatch):
     monkeypatch.setattr(translator, "selected_backend_name", lambda: "openai")
 
 
+def _install(monkeypatch, transport) -> None:
+    """Both transports, so the ladder is tested wherever `LLM_API_FORMAT` points.
+
+    The retry ladder lives above the Chat/Responses split, so which one runs is
+    incidental - but patching only one made these tests pass or fail according
+    to the developer's own `.env`, and they started hitting the live API the day
+    the default moved to Responses.
+    """
+    monkeypatch.setattr(translator, "_chat_completions", transport)
+    monkeypatch.setattr(translator, "_chat_responses", transport)
+
+
 def _chat(**kwargs) -> str:
     return translator._chat(
         [{"role": "user", "content": "x"}],
@@ -61,7 +73,7 @@ class _Transport:
 class TestEscalation:
     def test_a_tight_budget_is_retried_once_at_the_factor(self, monkeypatch):
         transport = _Transport(truncate_first=1)
-        monkeypatch.setattr(translator, "_chat_completions", transport)
+        _install(monkeypatch, transport)
         monkeypatch.setattr(llm_settings, "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0)
 
         assert _chat(max_tokens=500) == _REPLY
@@ -71,7 +83,7 @@ class TestEscalation:
         """The failure that prompted this could not be classified afterwards,
         because nothing recorded which limit bound or how close the reply got."""
         transport = _Transport(truncate_first=1)
-        monkeypatch.setattr(translator, "_chat_completions", transport)
+        _install(monkeypatch, transport)
         monkeypatch.setattr(llm_settings, "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0)
 
         events: list[dict] = []
@@ -84,7 +96,7 @@ class TestEscalation:
 
     def test_only_one_escalation_so_a_runaway_stays_bounded(self, monkeypatch):
         transport = _Transport(truncate_first=99)
-        monkeypatch.setattr(translator, "_chat_completions", transport)
+        _install(monkeypatch, transport)
         monkeypatch.setattr(llm_settings, "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0)
 
         with pytest.raises(ResponseTruncatedError):
@@ -95,7 +107,7 @@ class TestEscalation:
         """A budget already at `TRANSLATION_MAX_TOKENS` cannot be raised, so
         reissuing would be the identical request the old comment ruled out."""
         transport = _Transport(truncate_first=99)
-        monkeypatch.setattr(translator, "_chat_completions", transport)
+        _install(monkeypatch, transport)
         monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 500)
         monkeypatch.setattr(llm_settings, "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0)
 
@@ -115,7 +127,7 @@ class TestEscalation:
 class TestMessage:
     def test_the_final_message_names_the_knob_that_actually_bound(self, monkeypatch):
         transport = _Transport(truncate_first=99)
-        monkeypatch.setattr(translator, "_chat_completions", transport)
+        _install(monkeypatch, transport)
         monkeypatch.setattr(llm_settings, "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0)
 
         with pytest.raises(ResponseTruncatedError) as excinfo:

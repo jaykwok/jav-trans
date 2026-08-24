@@ -171,24 +171,30 @@ DEFAULT_SETTINGS: dict[str, str] = {
 
     # --- LLM Translation Settings ---
     # Translation backend type: openai (OpenAI-compatible API) | llamacpp
-    # (fixed Hy-MT2-1.8B Q8_0 GGUF served by llama.cpp).
+    # (fixed Hy-MT2-7B Q4_K_M GGUF served by llama.cpp).
     "TRANSLATION_BACKEND": "openai",
     # Base URL for providers that expose an OpenAI-compatible API; DeepSeek by default.
     "OPENAI_COMPATIBILITY_BASE_URL": "https://api.deepseek.com",
     # Translation model name sent to the SDK client.
     "LLM_MODEL_NAME": "deepseek-v4-flash",
     # OpenAI-compatible API surface for translation requests. Valid values: chat, responses.
-    "LLM_API_FORMAT": "chat",
+    "LLM_API_FORMAT": "responses",
     # Thinking budget for models that support it. Valid values: none, medium, max.
-    "LLM_REASONING_EFFORT": "medium",
+    "LLM_REASONING_EFFORT": "low",
     # Sampling temperature for translation. Higher = more colloquial/varied; the
     # JSON-format retry loop tolerates the extra variance. Read at import time; a
     # change requires a restart (not hot-reloaded by the web settings page).
+    #
+    # Note it does nothing while thinking is on: DeepSeek documents temperature
+    # and top_p as accepted-but-inert in thinking mode, on both the Chat and
+    # Responses surfaces. It starts mattering again at LLM_REASONING_EFFORT=none.
     "LLM_TEMPERATURE": "0.6",
-    # Subtitles per translation request, independent of worker count. Smaller
-    # batches trade throughput for higher per-line quality (less long-output
-    # decay). Clamped to [8, 400]. Read at import time; restart to apply.
-    "TRANSLATION_BATCH_SIZE": "64",
+    # Ceiling on one structured translation request, not the normal size: the
+    # worker-aware rule (ceil(cues / (2 * workers))) usually lands below it.
+    # Clamped to [8, 400], read at import time. Lower only for a provider that
+    # repeatedly fails large replies - it costs money, because reasoning is
+    # charged per request and smaller batches mean more of them.
+    "TRANSLATION_BATCH_SIZE": "200",
     # Final subtitle language.
     "TARGET_LANG": "简体中文",
     # Comma-separated Japanese-to-target-language term mapping injected into API prompts.
@@ -201,28 +207,23 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # ggml.llamacpp, which is the Vulkan build; the CUDA zip is faster on
     # NVIDIA and has to be pointed at explicitly).
     "LLAMACPP_SERVER_PATH": "",
-    # Default model: Hy-MT2-1.8B Q8_0 (~2GB), driven by the `hymt2` per-line
-    # profile rather than the JSON batch contract. Chosen for local hardware on
-    # 2026-08-05: a 9B at Q4 fits an 8GB card only at two server slots, where a
-    # 1.8B at Q8 runs eight, and the measured end-to-end difference on 300 real
-    # cues was ~11x (0.88 vs 9.97 lines/s). The context layers the JSON contract
-    # buys are largely unavailable here anyway - a whole-transcript prefix does
-    # not fit the local context budget.
-    "LLAMACPP_MODEL_REPO": "tencent/Hy-MT2-1.8B-GGUF",
-    "LLAMACPP_MODEL_FILE": "Hy-MT2-1.8B-Q8_0.gguf",
+    # Default model: official Hy-MT2-7B Q4_K_M (7.5B parameters, 4.62GB GGUF),
+    # driven by the `hymt2` per-line profile rather than the JSON batch contract.
+    # Q4 leaves the necessary runtime/KV headroom on an 8GB card; larger
+    # quantizations are not the shipped default.
+    "LLAMACPP_MODEL_REPO": "tencent/Hy-MT2-7B-GGUF",
+    "LLAMACPP_MODEL_FILE": "Hy-MT2-7B-Q4_K_M.gguf",
     # Explicit local GGUF path wins over repo+file download.
     "LLAMACPP_GGUF_PATH": "",
     # Context per server slot; total server context is CTX_SIZE * PARALLEL.
     "LLAMACPP_CTX_SIZE": "8192",
     "LLAMACPP_N_GPU_LAYERS": "999",
-    # Eight slots, because the default model is now ~2GB rather than ~5.5GB and
-    # the per-line contract makes requests small. Raise CTX_SIZE, not this, if a
-    # custom GGUF needs the JSON contract's longer prompts.
-    "LLAMACPP_PARALLEL": "8",
+    # Two slots target enough headroom for the 4.62GB model plus per-slot
+    # KV/runtime buffers on an 8GB card. The per-line requests are small.
+    "LLAMACPP_PARALLEL": "2",
     "LLAMACPP_STARTUP_TIMEOUT_S": "300",
-    # Prompt contract: auto | json (off/none are accepted aliases for json).
-    # Only the JSON contract ships, so auto resolves to json everywhere; the
-    # switch stays because adding a model family means registering a profile.
+    # Prompt contract: auto | json | hymt2 (off/none alias json). Auto selects
+    # the one contract registered for the configured model family.
     "TRANSLATION_PROMPT_PROFILE": "auto",
 
     # --- Output & Cache ---
@@ -307,28 +308,109 @@ def _apply_values(values: dict[str, str], protected_keys: set[str]) -> None:
 # entirely, so a job submitted with it silently ran at "medium" no matter what
 # the UI said.
 #
-# Every tier thinks; "low" is the smallest nonzero budget, "max" the top.
+# These are wire values, not labels. DeepSeek's Chat surface accepts exactly
+# `low` / `high` / `max` for `reasoning_effort` and switches thinking off
+# through `extra_body={"thinking": {"type": "disabled"}}`; its Responses
+# surface spells the same axis as `reasoning.effort` in `none|low|high|max`.
+# Both readings agree that off-vs-on is one more point on the effort axis, so
+# it is modelled here as the "none" tier rather than a second parameter.
 #
-# The old bottom tier was "none", which switched thinking off outright. It was
-# retired 2026-08-14 on measurement: over sample-b's 1,700 cues, thinking-off
-# left 171 of them (10.1%) with the Japanese source copied through untranslated,
-# while medium and max left none. A tier whose job is to be fast is not worth
-# having if a tenth of the film comes back in the wrong language.
-REASONING_EFFORTS = ("low", "medium", "max")
-# Saved settings, job records and .env files written before that change carry
-# "none". Clamping it as unknown would silently promote them to the "medium"
-# fallback - the slowest and most expensive tier - so it maps to the bottom one
-# instead, which is what the value meant.
-_RETIRED_REASONING_EFFORTS = {"none": "low"}
+# "medium" was never one of them. It shipped as this project's default from
+# 2026-08-14 to 2026-08-24 and DeepSeek silently ignored it, falling back to
+# its documented default of `high` - so every job billed at the second-most
+# expensive tier while the UI read "medium（默认）". That is the whole of the
+# cost anomaly: on sample-x (1,396 cues) one run spent 570,031 output tokens,
+# ~93% of them reasoning, and output was ~91% of the bill at either price
+# tier. See docs/HISTORY.md 2026-08-24.
+#
+# "max" is dropped rather than kept: on deepseek-v4-flash it maps to `max`,
+# the single most expensive setting, and nothing in this pipeline was ever
+# shown to need it.
+REASONING_EFFORTS = ("none", "low", "high")
+# Saved settings, job records and .env files carry values these tiers replaced.
+# `medium` resolves to what it actually ran as, so a re-run reproduces the old
+# result rather than quietly changing tier along with the rename. `max`/`xhigh`
+# fold down to `high`, which is both the nearest surviving tier and the cheaper
+# direction - the point of the change.
+_RETIRED_REASONING_EFFORTS = {"medium": "high", "xhigh": "high", "max": "high"}
+# `none` costs the least and, since 2026-08-24, is safe to default to: the
+# repair pass escalates the failures it is known to produce. Thinking-off alone
+# left 171/1,700 cues (10.1%) of sample-b with the Japanese source copied
+# through untranslated, which is why it was retired as a standalone tier on
+# 2026-08-14; the default is one step up from it for that reason.
+DEFAULT_REASONING_EFFORT = "low"
 
 
-def normalize_reasoning_effort(value: str | None, fallback: str = "medium") -> str:
+def normalize_reasoning_effort(
+    value: str | None, fallback: str = DEFAULT_REASONING_EFFORT
+) -> str:
     """Clamp a thinking tier to the supported set."""
-    normalized = (value or fallback or "medium").strip().lower()
+    normalized = (value or fallback or DEFAULT_REASONING_EFFORT).strip().lower()
     normalized = _RETIRED_REASONING_EFFORTS.get(normalized, normalized)
     if normalized in REASONING_EFFORTS:
         return normalized
-    return fallback if fallback in REASONING_EFFORTS else "medium"
+    return fallback if fallback in REASONING_EFFORTS else DEFAULT_REASONING_EFFORT
+
+
+def recognized_reasoning_effort(value: str | None) -> str | None:
+    """The tier this names, or None if it names nothing.
+
+    `normalize_reasoning_effort` cannot answer this: it clamps an unknown value
+    to the default, so a typo comes back as `low` and is indistinguishable from
+    someone asking for `low`. Callers that must reject garbage rather than
+    silently accept a tier need this instead.
+    """
+    normalized = (value or "").strip().lower()
+    normalized = _RETIRED_REASONING_EFFORTS.get(normalized, normalized)
+    return normalized if normalized in REASONING_EFFORTS else None
+
+
+# The OpenAI-compatible request shapes, in one place for the same reason the
+# thinking tiers are: `llm.settings`, `web.models` and `core.job_context` each
+# kept a private copy of this clamp with its own hardcoded default.
+#
+# Responses is the default since 2026-08-24. It is not merely the newer surface:
+# it reports `usage.output_tokens_details.reasoning_tokens`, and reasoning is
+# ~85% of this pipeline's bill. On Chat Completions that number does not exist,
+# which is why establishing it took reconstructing character counts from
+# interleaved progress events. It also spells the whole thinking axis as one
+# field (`reasoning.effort`, `none` included) rather than an effort plus a
+# separate `extra_body.thinking.type`.
+#
+# Chat stays, and stays supported: it is the universal surface. The local
+# llama.cpp backend speaks it, and so do the OpenAI-compatible providers that
+# implement Chat Completions only. Switching the default is not deprecating it.
+LLM_API_FORMATS = ("chat", "responses")
+DEFAULT_LLM_API_FORMAT = "responses"
+
+
+def normalize_llm_api_format(
+    value: str | None, fallback: str = DEFAULT_LLM_API_FORMAT
+) -> str:
+    """Clamp an LLM API request shape to the supported set."""
+    normalized = (value or fallback or DEFAULT_LLM_API_FORMAT).strip().lower()
+    if normalized in LLM_API_FORMATS:
+        return normalized
+    return fallback if fallback in LLM_API_FORMATS else DEFAULT_LLM_API_FORMAT
+
+
+def escalated_reasoning_effort(effort: str | None) -> str:
+    """The tier the repair pass reissues a flagged cue at: one step up, clamped.
+
+    One step rather than "always the top" is what makes the cascade cheap at
+    both ends. The base pass sets the price of the whole film; the repair pass
+    only pays for the cues a detector actually flagged, so it can afford to
+    think - but jumping straight to `high` from `none` would also make the
+    repair the expensive half on a film where the base pass flagged a lot.
+
+    `high` escalates to itself. There is nowhere left to go, and a repair that
+    reissues at the same tier is still worth making: it carries the neighbouring
+    lines as context and an explicit statement of what looked wrong, neither of
+    which the base request had.
+    """
+    normalized = normalize_reasoning_effort(effort)
+    index = REASONING_EFFORTS.index(normalized)
+    return REASONING_EFFORTS[min(index + 1, len(REASONING_EFFORTS) - 1)]
 
 
 _PROXY_ENV_KEYS = (

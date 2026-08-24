@@ -194,7 +194,9 @@ async def _test_unreadable_job_records_are_kept(tmp_path, monkeypatch):
     `load_jobs` skips what it cannot validate, and the first write after that
     rewrites the file from what loaded - so the skipped record is gone for good.
     Retiring one enum value is enough to trigger it: every job spec written
-    before the 2026-08-14 `none` → `low` rename failed the bare `Literal`.
+    before the 2026-08-24 tier change says `medium`, which no longer passes the
+    bare `Literal`. (`none` was the example here until that change made it a
+    real tier again, which is exactly how this test stops testing anything.)
     """
     jobs_path = tmp_path / "jobs.json"
     monkeypatch.setattr(pm, "_jobs_path", jobs_path)
@@ -212,7 +214,7 @@ async def _test_unreadable_job_records_are_kept(tmp_path, monkeypatch):
         created_at="2026-05-03T00:00:00.000+00:00",
         status="done",
     ).model_dump()
-    stale["spec"]["llm_reasoning_effort"] = "none"
+    stale["spec"]["llm_reasoning_effort"] = "medium"
     jobs_path.write_text(
         json.dumps([good, stale], ensure_ascii=False), encoding="utf-8"
     )

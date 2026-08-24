@@ -13,8 +13,8 @@ it must never load a backend or spawn a server.
 Two contracts ship, split by where the model runs rather than by vendor:
 
 * ``json`` - the batch contract, for API models. It carries the layers that
-  make a whole film cohere: up to 64 cues per request, the full-transcript
-  prefix, the character table and the glossary.
+  make a whole film cohere: worker-aware batching, the full-transcript prefix,
+  the character table and the glossary.
 * ``hymt2`` - one cue per request, bare template, for the local llama.cpp
   default. Not a downgrade by taste: Hy-MT2 measured 6/300 untranslated on the
   bare template against 152/300 on the batch contract, and every context layer

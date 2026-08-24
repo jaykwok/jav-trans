@@ -1,9 +1,9 @@
 """Line-oriented contract for Hy-MT2, the local translation default.
 
-Hy-MT2-1.8B is a single-sentence translation model, and this profile exists
-because that is not a style preference - it is measured. On 300 real ASR cues,
-scored by kana in the output (a Chinese subtitle line cannot contain kana, so
-kana there is untranslated source handed back):
+Hy-MT2 is a single-sentence translation model, and this profile exists because
+that is not a style preference. The contract was measured on the former 1.8B
+default using 300 real ASR cues, scored by kana in the output (a Chinese subtitle
+line cannot contain kana, so kana there is untranslated source handed back):
 
     bare per-line template          6 / 300
     + project system prompt v2.9   26 / 300

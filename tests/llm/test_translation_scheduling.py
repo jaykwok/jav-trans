@@ -1,22 +1,13 @@
-"""Translation wall time is a makespan, and the default settings were losing to it.
+"""Translation batches use one cues-per-worker rule; ordering handles skew.
 
-Two independent losses were measured by replaying seven real cue lists through a
-list-scheduling model:
+The remaining scheduling optimization was measured by replaying seven real cue
+lists through a list-scheduling model:
 
   Order. Batches are id-addressed and independent, so which one starts first is
   free - but submitted in index order, the largest batch can be picked up last
   and the whole stage then ends one full large batch after the pool went idle.
-  Longest-first removed 0.5-13.4% of the makespan.
-
-  Granularity. `TRANSLATION_BATCH_SIZE` is 64 and the pool is 16 workers, so a
-  613-cue film is ten batches for sixteen workers: six of them never receive
-  one. That loss is independent of what a request costs, and no ordering can
-  recover it.
-
-These tests pin the two behaviours. They cannot pin the sizes of the wins: those
-depend on per-request overhead, which the live API says is not a constant -
-reasoning dominates it, so it is ~65s per request with thinking on and ~0.05s
-with it off.
+  Longest-first removed 0.5-13.4% of the makespan. These tests pin that ordering;
+  cues-per-worker sizing is covered with the translator batch tests.
 """
 
 from __future__ import annotations

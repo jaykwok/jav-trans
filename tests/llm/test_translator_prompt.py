@@ -4,7 +4,7 @@ from llm import translator
 def test_prompt_version_is_current():
     """The cache key is `id@version`, so this constant is what decides whether a
     prompt change reaches anyone who already has a cache."""
-    assert translator.PROMPT_VERSION == "v3.2"
+    assert translator.PROMPT_VERSION == "v3.4"
 
 
 def test_system_prompt_no_male_prefix_example():
@@ -109,4 +109,3 @@ def test_serialize_segments_preserves_repeated_vocalizations():
 def test_normalize_translation_text_strips_human_role_labels():
     assert translator._normalize_translation_text("男：过来") == "过来"
     assert translator._normalize_translation_text("Aya：过来") == "过来"
-

@@ -8,6 +8,7 @@ from collections import defaultdict
 import pytest
 
 from llm import engine as engine_module
+from llm import repair as repair_module
 from llm import translator
 def _segments(count: int) -> list[dict]:
     return [
@@ -62,52 +63,56 @@ def test_the_repair_write_back_partitions_with_the_engine_not_a_copy():
     assert translator._split_into_batches is engine_module._split_into_batches
 
 
-def test_auto_translation_batch_size_fills_the_worker_pool():
-    """The batch size now answers to the pool, because ignoring it left workers
-    with nothing to do.
-
-    613 cues at the configured 64 is ten batches for a sixteen-worker pool - six
-    workers never receive one, and no scheduling fixes a round that is mostly
-    empty. The rule aims for two batches per worker: one fills the pool but
-    balances nothing, four multiplies requests that each re-send the full-film
-    prefix. Expectations are derived from the module constant so a local
-    TRANSLATION_BATCH_SIZE override does not break the test.
-    """
-    cap = translator.TRANSLATION_BATCH_SIZE
-    assert 8 <= cap <= 400
-    assert translator._auto_translation_batch_size(0, 4) == 0
-
-    # Short film, wide pool: shrink so every worker gets work.
-    assert translator._auto_translation_batch_size(cap + 100, 16) == -(
-        -(cap + 100) // 32
-    )
-
-    # It never grows past the configured cap, however long the film is.
-    assert translator._auto_translation_batch_size(100_000, 16) == cap
+def test_batch_size_ignores_the_worker_count(monkeypatch):
+    """Decoupled 2026-08-24. The old rule sized batches as `count / (workers x 2)`
+    to balance the pool, which made concurrency a billing control: reasoning is
+    charged per request and barely scales with the batch, so asking for more
+    workers manufactured more requests and multiplied the thinking bill for the
+    same work. Cost belongs to `TRANSLATION_BATCH_SIZE`, parallelism to workers."""
+    monkeypatch.setattr(translator, "TRANSLATION_BATCH_SIZE", 200)
+    assert translator._auto_translation_batch_size(0) == 0
+    assert translator._auto_translation_batch_size(1384) == 200
+    assert translator._auto_translation_batch_size(60) == 60
 
 
-def test_auto_translation_batch_size_leaves_long_films_alone():
-    """Where the pool is already saturated, the rule must not fire - the extra
-    requests would be paid for nothing."""
-    cap = translator.TRANSLATION_BATCH_SIZE
-    assert translator._auto_translation_batch_size(
-        5000, 1
-    ) == translator._auto_translation_batch_size(5000, 32)
-    assert translator._auto_translation_batch_size(5000, 32) == cap
+def test_more_workers_no_longer_buys_more_requests(monkeypatch):
+    """The regression this closes: on 1,396 cues the same film cost 8 requests at
+    4 workers and 32 at 16, purely because the pool size chose the batch size."""
+    monkeypatch.setattr(translator, "TRANSLATION_BATCH_SIZE", 200)
+    cues = 1396
+    size = translator._auto_translation_batch_size(cues)
+    requests = len(translator._split_into_batches(_segments(cues), size))
+
+    assert requests == 7
+    for workers in (1, 4, 16, 64):
+        assert translator._auto_translation_workers(requests, workers) == min(
+            workers, requests
+        )
 
 
-def test_auto_translation_batch_size_does_not_split_for_one_worker():
-    """With a single worker there is nothing to balance, so a smaller batch buys
-    nothing and pays time-to-first-token an extra time."""
-    cap = translator.TRANSLATION_BATCH_SIZE
-    assert translator._auto_translation_batch_size(cap + 100, 1) == cap
-    assert translator._auto_translation_batch_size(60, 1) == 60
+def test_workers_never_exceed_the_batches_there_are():
+    """Spawning idle workers only ever looked useful because more workers used to
+    manufacture more batches."""
+    assert translator._auto_translation_workers(3, 16) == 3
+    assert translator._auto_translation_workers(40, 4) == 4
+    assert translator._auto_translation_workers(0, 8) == 1
 
 
-def test_auto_translation_batch_size_has_a_floor():
-    """A handful of cues must not become one request per cue."""
-    assert translator._auto_translation_batch_size(10, 16) == 4
-    assert translator._auto_translation_batch_size(3, 16) == 3
+def test_auto_translation_batch_size_keeps_a_large_request_safety_cap(monkeypatch):
+    cap = 400
+    monkeypatch.setattr(translator, "TRANSLATION_BATCH_SIZE", cap)
+    assert translator._auto_translation_batch_size(cap + 100) == cap
+    assert translator._auto_translation_batch_size(100_000) == cap
+
+
+def test_default_translation_batch_size_is_the_measured_one():
+    """200 is now the whole rule, so it is the only number deciding a film's
+    request count - and the request count is what the thinking bill tracks.
+    Measured at this size on sample-v: 8 requests per run, with 7 of 32 coming
+    back with a dropped tail and needing a reissue."""
+    from core.config import DEFAULT_SETTINGS
+
+    assert DEFAULT_SETTINGS["TRANSLATION_BATCH_SIZE"] == "200"
 
 
 def test_env_float_falls_back_on_bad_value(monkeypatch):
@@ -807,6 +812,199 @@ def test_translation_repair_selects_length_mismatch_candidates():
     assert repair_ids == [1, 2]
     assert reasons[1] == ["length_mismatch"]
     assert reasons[2] == ["length_mismatch"]
+
+
+def test_the_repair_gate_selects_echo_kana_and_length_anomalies():
+    """One detector set, not two. There used to be a second selector for the
+    cascade's escalation path with these same three checks plus a copy of the
+    length one, which is the arrangement where they drift apart."""
+    segments = [
+        {"text": "これは翻訳されるべきです。"},
+        {"text": "こんにちは。"},
+        {"text": "これはかなり長い日本語の字幕です。"},
+        {"text": "大丈夫ですか。"},
+    ]
+    zh_texts = [
+        " これは翻訳されるべきです ",
+        "你好，太郎さん。",
+        "嗯",
+        "没事吧？",
+    ]
+
+    repair_ids, reasons = translator._select_translation_repair_ids(segments, zh_texts)
+
+    assert repair_ids == [0, 1, 2]
+    assert reasons[0] == ["source_echo", "japanese_remaining"]
+    assert reasons[1] == ["japanese_remaining"]
+    assert reasons[2] == ["length_mismatch"]
+
+
+def test_the_repair_gate_catches_a_glossary_term_the_translation_dropped():
+    """Measured on sample-v 2026-08-24: at effort=low the base pass rendered 6
+    of 37 ちんぽ cues as 鸡巴 instead of the configured 肉棒, and the other three
+    detectors saw none of them - a substituted term is not an echo, carries no
+    kana, and is the same length. Thinking paraphrases away from an injected
+    term list, so the cheap tier is only safe if the gate can see that."""
+    segments = [
+        {"text": "新吉のチンポが、新吉のチンポが..."},
+        {"text": "ちんぽ、気持ちいい。"},
+        {"text": "今日はいい天気ですね。"},
+    ]
+    zh_texts = [
+        "新吉的鸡巴 新吉的鸡巴",
+        "肉棒，好舒服。",
+        "今天天气真好呢。",
+    ]
+    glossary = "ちんぽ-肉棒, チンポ-肉棒"
+
+    repair_ids, reasons = translator._select_translation_repair_ids(
+        segments, zh_texts, glossary
+    )
+
+    assert repair_ids == [0]
+    assert reasons[0] == ["glossary_violation"]
+
+
+def test_the_repair_gate_ignores_the_glossary_when_none_is_configured():
+    """No glossary means no opinion about wording; the rule must not invent one."""
+    segments = [{"text": "新吉のチンポが、新吉のチンポが..."}]
+    zh_texts = ["新吉的鸡巴 新吉的鸡巴"]
+
+    assert translator._select_translation_repair_ids(segments, zh_texts) == ([], {})
+    assert translator._select_translation_repair_ids(segments, zh_texts, "") == ([], {})
+
+
+def test_the_repair_prompt_names_the_glossary_reason():
+    """The reason reaches the model as a category it was told how to act on;
+    an unmapped reason degrades to the generic translation_quality label."""
+    segments = [{"text": "新吉のチンポが..."}]
+    zh_texts = ["新吉的鸡巴"]
+    repair_ids, reasons = translator._select_translation_repair_ids(
+        segments, zh_texts, "チンポ-肉棒"
+    )
+
+    items = repair_module._build_repair_context_items(
+        segments, zh_texts, repair_ids, reasons
+    )
+
+    assert items[0]["reason"] == ["glossary_violation"]
+
+
+def test_a_cheap_first_pass_escalates_only_the_flagged_ids(monkeypatch):
+    """The cost cascade, end to end: the whole film goes out at the job's tier,
+    then only the ids a local detector flagged are reissued one tier up. The
+    saving is that the escalation is proportional to the failures, not to the
+    film - reasoning is charged per request and does not scale with the batch.
+    """
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "これは翻訳されるべきです。"},
+        {"start": 1.0, "end": 2.0, "text": "こんにちは。"},
+        {"start": 2.0, "end": 3.0, "text": "これはかなり長い日本語の字幕です。"},
+        {"start": 3.0, "end": 4.0, "text": "大丈夫ですか。"},
+    ]
+    initial = {
+        0: "これは翻訳されるべきです。",
+        1: "你好，太郎さん。",
+        2: "嗯",
+        3: "没事吧？",
+    }
+    repaired = {0: "这句话应该被翻译。", 1: "你好，太郎。", 2: "这是一条很长的字幕。"}
+    calls: list[dict] = []
+
+    def fake_chat(messages, expected_count=0, reasoning_effort=None, **_kwargs):
+        ids = _requested_ids_from_messages(messages)
+        is_repair = "【翻译修复任务】" in messages[1]["content"]
+        calls.append(
+            {"ids": ids, "repair": is_repair, "reasoning_effort": reasoning_effort}
+        )
+        values = repaired if is_repair else initial
+        return json.dumps(
+            {"translations": [{"id": idx, "text": values[idx]} for idx in ids]},
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-flash")
+    monkeypatch.setenv("LLM_API_FORMAT", "chat")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
+    monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 2)
+    monkeypatch.setattr(translator, "TRANSLATION_PREFIX_WARMUP", False)
+
+    zh_texts, timings, retry_events = translator.translate_segments(
+        segments,
+        max_workers=2,
+        cache_path="",
+        reasoning_effort="none",
+    )
+
+    assert retry_events == []
+    assert zh_texts == [repaired[0], repaired[1], repaired[2], initial[3]]
+    first_pass = [call for call in calls if not call["repair"]]
+    repair = [call for call in calls if call["repair"]]
+    assert {idx for call in first_pass for idx in call["ids"]} == {0, 1, 2, 3}
+    assert all(call["reasoning_effort"] == "none" for call in first_pass)
+    # Only the three flagged ids, and one tier up from the base pass.
+    assert {idx for call in repair for idx in call["ids"]} == {0, 1, 2}
+    assert all(call["reasoning_effort"] == "low" for call in repair)
+    timing = next(
+        item for item in timings if item.get("mode") == "translation_repair_pass"
+    )
+    assert timing["reasoning_effort"] == "low"
+
+
+def test_the_repair_pass_splits_an_invalid_large_reply_instead_of_repeating_it(
+    monkeypatch,
+):
+    segments = [
+        {"start": float(idx), "end": float(idx + 1), "text": f"日本語です{idx}"}
+        for idx in range(4)
+    ]
+    repair_request_sizes: list[int] = []
+
+    def fake_chat(messages, expected_count=0, reasoning_effort=None, **_kwargs):
+        ids = _requested_ids_from_messages(messages)
+        is_repair = "【翻译修复任务】" in messages[1]["content"]
+        if not is_repair:
+            assert reasoning_effort == "none"
+            return json.dumps(
+                {
+                    "translations": [
+                        {"id": idx, "text": segments[idx]["text"]} for idx in ids
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        repair_request_sizes.append(len(ids))
+        if len(ids) > 1:
+            return "not json"
+        return json.dumps(
+            {"translations": [{"id": ids[0], "text": f"中文{ids[0]}"}]},
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-flash")
+    monkeypatch.setenv("LLM_API_FORMAT", "chat")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
+    monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 4)
+    monkeypatch.setattr(translator, "TRANSLATION_PREFIX_WARMUP", False)
+
+    zh_texts, timings, retry_events = translator.translate_segments(
+        segments,
+        max_workers=1,
+        cache_path="",
+        reasoning_effort="none",
+    )
+
+    assert retry_events == []
+    assert zh_texts == ["中文0", "中文1", "中文2", "中文3"]
+    assert repair_request_sizes == [4, 2, 1, 1, 2, 1, 1]
+    timing = next(
+        item for item in timings if item.get("mode") == "translation_repair_pass"
+    )
+    assert timing["format_split_count"] == 3
 
 
 def test_translation_repair_length_mismatch_uses_source_translation_fields():

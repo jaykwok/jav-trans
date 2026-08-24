@@ -8,7 +8,11 @@ from llm.glossary import normalize_glossary_text
 # sentence in half, and the system prompt says what to do with them. Bumped
 # because the cache key is `id@version` - translations produced without the
 # markers are the exact ones this change exists to replace.
-PROMPT_VERSION = "v3.2"
+# v3.4: the per-film extracted terms moved from the system prompt to the tail of
+# the user task, so term extraction, prefix warmup and every batch share one
+# cacheable prefix. Bumped because the cache key is `id@version` and the prompt
+# the old entries were produced under no longer exists.
+PROMPT_VERSION = "v3.4"
 _LEADING_ROLE_LABEL_RE = re.compile(
     r"^\s*(?:男|女|男性|女性|男优|女优|スタッフ|撮影者|カメラマン|"
     r"[A-Za-z][A-Za-z ._-]{0,20})\s*[：:]\s*"
@@ -137,14 +141,14 @@ def _build_system_prompt(
     effective_glossary = normalize_glossary_text(glossary)
     if effective_glossary:
         prompt += f"\n\n以下词汇表必须严格遵守，不得自行创造译名：\n{effective_glossary}"
-    effective_extra_glossary = normalize_glossary_text(extra_glossary)
-    if effective_extra_glossary:
-        prompt += (
-            "\n\n<glossary>\n"
-            "本片已确定译法（必须沿用）：\n"
-            f"{effective_extra_glossary}\n"
-            "</glossary>"
-        )
+    # The per-film extracted terms deliberately do NOT go here. Everything the
+    # provider caches is a token prefix, so a block that only exists once the
+    # extraction has returned splits the film's own requests into two prefixes:
+    # the extraction pays the full-source miss, then the first batch pays it
+    # again because the system message no longer matches. Keeping the system
+    # prompt free of them lets one request warm the prefix for all of them -
+    # see _build_requested_ids_task, which carries the block instead.
+    del extra_glossary
     return prompt
 
 
@@ -185,6 +189,24 @@ def _format_requested_ids(requested_ids: list[int]) -> str:
     return json.dumps([int(idx) for idx in requested_ids], ensure_ascii=False)
 
 
+def _build_extra_glossary_block(extra_glossary: str) -> str:
+    """The per-film extracted terms, as a task-tail block rather than a system one.
+
+    Sits after the full-film payload so that everything before it is shared by
+    the extraction request and every batch, which is what lets a single request
+    warm the provider's prefix cache for the whole film.
+    """
+    effective = normalize_glossary_text(extra_glossary)
+    if not effective:
+        return ""
+    return (
+        "<glossary>\n"
+        "本片已确定译法（必须沿用，与上面的词汇表冲突时以词汇表为准）：\n"
+        f"{effective}\n"
+        "</glossary>"
+    )
+
+
 def _build_requested_ids_task(
     requested_ids: list[int],
     *,
@@ -211,9 +233,61 @@ def _build_requested_ids_task(
                 '每个 `text` 只能是翻译结果本身，输出 JSON：{"translations":[{"id":0,"text":"..."}]}',
             ]
         )
-    if extra_glossary.strip():
-        task.append("注意：必须严格使用 System Prompt 中 <glossary> 标签内的术语表翻译。")
+    block = _build_extra_glossary_block(extra_glossary)
+    if block:
+        task.append(block)
+        task.append("注意：必须严格使用上面 <glossary> 标签内的术语表翻译。")
     return "\n".join(task)
+
+
+# Sharing the translation system prompt means inheriting its rules, and one of
+# them is the instruction to romanise character names whose kanji are unknown.
+# That rule is correct for a subtitle line and wrong for a term list: the first
+# merged run returned `ジェイ-Jay`, `シルス-Sirusu`, `おなみ-Onami`, which then went
+# back into the batch prompt as "本片已确定译法" and taught the model to leave the
+# source alone - 239 of 1,595 cues came back as verbatim Japanese. The task text
+# has to override the inherited rule explicitly, because it is the only part of
+# this request that differs from a batch.
+_GLOSSARY_EXTRACTION_TASK = "\n".join(
+    [
+        "【本次任务】",
+        "不要翻译任何字幕，也不要输出 translations。",
+        "请从上面的全片字幕中提取 10-20 个反复出现的核心词，"
+        "范围包括代词、人名、性器官词、高频形容词，并给出推荐中文译词。",
+        "本任务不适用上面关于人名罗马音化的规则：`zh` 必须是中文词，"
+        "不得出现日文假名、罗马字或英文；人名一律给汉字译名。",
+        '只返回合法 JSON：{"terms":[{"ja":"...","zh":"..."}]}。',
+    ]
+)
+
+
+def build_glossary_extraction_messages(
+    *,
+    full_source_payload: str,
+    target_lang: str,
+    glossary: str,
+    character_reference: str,
+) -> list[dict]:
+    """Term extraction issued on the translation prefix, so it doubles as warmup.
+
+    Byte-identical to a batch request up to the end of the full-film payload;
+    only the trailing task differs. That is the whole point: the extraction used
+    to send the same source again in its own private shape, so a film paid the
+    full-source cache miss twice before translating anything.
+    """
+    messages = _build_translation_messages(
+        source_payload="",
+        expected_count=0,
+        compact_system_prompt=False,
+        extra_glossary="",
+        target_lang=target_lang,
+        glossary=glossary,
+        character_reference=character_reference,
+    )
+    messages[1]["content"] = "\n\n".join(
+        ["【全片字幕 JSON】", full_source_payload, _GLOSSARY_EXTRACTION_TASK]
+    )
+    return messages
 
 
 def _build_batch_messages(

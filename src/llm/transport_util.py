@@ -90,9 +90,9 @@ def _extract_usage_metrics(usage) -> dict:
     cache_miss_tokens = _coerce_optional_int(
         _get_nested_value(usage, "prompt_cache_miss_tokens")
     )
-    # Not synthesised from `input_tokens - cached_tokens`: hit/miss is a billing
-    # split the provider owns, and a derived number here would be indistinguishable
-    # from a reported one in the timings.
+    # The reported fields are never synthesised: hit/miss is a billing split the
+    # provider owns, and a derived number sitting in the same key as a reported
+    # one is indistinguishable from it in the timings.
     metrics = {
         "cached_tokens": cached_tokens,
         "cache_hit_tokens": cache_hit_tokens,
@@ -101,6 +101,24 @@ def _extract_usage_metrics(usage) -> dict:
     prompt_tokens = _first_present(usage, ("prompt_tokens",), ("input_tokens",))
     if prompt_tokens is not None:
         metrics["prompt_tokens"] = prompt_tokens
+    # `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` are a DeepSeek Chat
+    # extension; the Responses surface reports only `cached_tokens`. Making
+    # Responses the default on 2026-08-24 therefore left every run's cost
+    # uncomputable from its own timings - the two fields the input bill is
+    # priced from were both null.
+    #
+    # Recorded under separate keys rather than filling the reported ones. The
+    # split is arithmetic, not an estimate: on the Chat arm of sample-v,
+    # `cache_hit_tokens` equalled `cached_tokens` exactly and
+    # 1,796,224 + 125,959 = 1,922,183 = `prompt_tokens`.
+    if (
+        cache_hit_tokens is None
+        and cache_miss_tokens is None
+        and cached_tokens is not None
+        and prompt_tokens is not None
+    ):
+        metrics["cache_hit_tokens_derived"] = cached_tokens
+        metrics["cache_miss_tokens_derived"] = max(0, prompt_tokens - cached_tokens)
     completion_tokens = _first_present(
         usage, ("completion_tokens",), ("output_tokens",)
     )
@@ -109,6 +127,19 @@ def _extract_usage_metrics(usage) -> dict:
     total_tokens = _coerce_optional_int(_get_nested_value(usage, "total_tokens"))
     if total_tokens is not None:
         metrics["total_tokens"] = total_tokens
+    # The line the bill actually turns on, and until 2026-08-24 it was the one
+    # number never recorded: output is ~91% of a DeepSeek film's cost and most
+    # of the output is reasoning, but establishing that took reconstructing it
+    # from streamed `reasoning_chars` progress events across interleaved
+    # workers. Only Responses reports it; Chat Completions has no equivalent
+    # field, so this stays None there rather than being guessed at.
+    reasoning_tokens = _first_present(
+        usage,
+        ("output_tokens_details", "reasoning_tokens"),      # Responses
+        ("completion_tokens_details", "reasoning_tokens"),  # OpenAI Chat
+    )
+    if reasoning_tokens is not None:
+        metrics["reasoning_tokens"] = reasoning_tokens
     return metrics
 
 
@@ -132,6 +163,9 @@ def _merge_usage_metrics(usages: list[dict]) -> dict:
         "prompt_tokens": None,
         "completion_tokens": None,
         "total_tokens": None,
+        "reasoning_tokens": None,
+        "cache_hit_tokens_derived": None,
+        "cache_miss_tokens_derived": None,
     }
     for usage in usages:
         for key in merged:

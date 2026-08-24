@@ -364,32 +364,25 @@ class TestBoundedSchema:
 def test_reasoning_effort_adds_room_for_the_thinking(monkeypatch):
     """`max_tokens` pays for the reasoning stream before it pays for the answer.
 
-    The two source-shaped terms model the visible reply, so with the effort at
-    medium every batch was cut off: measured 2026-08-13, an 8-cue batch got a
+    The two source-shaped terms model the visible reply, so with thinking on
+    every batch was cut off: measured 2026-08-13, an 8-cue batch got a
     469-token budget while the model spent 2,058 characters thinking, and one
     doubling was nowhere near enough - the whole film failed.
     """
-    monkeypatch.setattr(
-        llm_settings, "TRANSLATION_REASONING_MAX_EFFORT_MULTIPLIER", 2.0
-    )
     profile = get_profile("json")
     segments = _segments("こんばんは" * 20)
 
     monkeypatch.setattr(llm_settings, "TRANSLATION_REASONING_TOKEN_ALLOWANCE", 0)
-    text_only = profile.response_token_budget(segments, reasoning_effort="medium")
+    text_only = profile.response_token_budget(segments, reasoning_effort="high")
 
     monkeypatch.setattr(llm_settings, "TRANSLATION_REASONING_TOKEN_ALLOWANCE", 32000)
     low_budget = profile.response_token_budget(segments, reasoning_effort="low")
-    medium_budget = profile.response_token_budget(segments, reasoning_effort="medium")
-    max_budget = profile.response_token_budget(segments, reasoning_effort="max")
+    high_budget = profile.response_token_budget(segments, reasoning_effort="high")
 
-    # `low` and `medium` share the allowance: their measured demand overlaps and
-    # neither is reliably lighter (low spent 7,860 characters on the 8-cue batch
-    # where medium spent 2,058).
-    assert low_budget == medium_budget == text_only + 32000
-    # `max` is the one tier consistently heavier - 53,388 characters against
-    # medium's 20,231 on 54 cues - so it does not share that allowance.
-    assert max_budget == text_only + 64000
+    # One allowance covers both thinking tiers: their measured demand overlaps
+    # and neither is reliably lighter (low spent 7,860 characters on the 8-cue
+    # batch where high spent 2,058).
+    assert low_budget == high_budget == text_only + 32000
 
 
 def test_the_allowance_is_the_only_thing_the_effort_changes(monkeypatch):
@@ -400,9 +393,23 @@ def test_the_allowance_is_the_only_thing_the_effort_changes(monkeypatch):
 
     assert (
         profile.response_token_budget(segments, reasoning_effort="low")
-        == profile.response_token_budget(segments, reasoning_effort="max")
+        == profile.response_token_budget(segments, reasoning_effort="high")
         == profile.response_token_budget(segments)
     )
+
+
+def test_the_none_tier_reserves_no_reasoning_tokens(monkeypatch):
+    """Whether there is thinking to pay for is read off the tier, not a second
+    argument. A separate `reasoning_enabled` flag let a caller size a budget for
+    a mode the request was not in; deriving it makes that unrepresentable."""
+    monkeypatch.setattr(llm_settings, "TRANSLATION_REASONING_TOKEN_ALLOWANCE", 32000)
+    profile = get_profile("json")
+    segments = _segments("こんばんは" * 20)
+
+    with_reasoning = profile.response_token_budget(segments, reasoning_effort="low")
+    without_reasoning = profile.response_token_budget(segments, reasoning_effort="none")
+
+    assert with_reasoning == without_reasoning + 32000
 
 
 def test_the_allowance_comes_from_the_job_not_the_process_environment(monkeypatch):
@@ -413,17 +420,14 @@ def test_the_allowance_comes_from_the_job_not_the_process_environment(monkeypatc
     was started with - and every arm of a reasoning A/B would be mis-sized.
     """
     monkeypatch.setattr(llm_settings, "TRANSLATION_REASONING_TOKEN_ALLOWANCE", 32000)
-    monkeypatch.setattr(
-        llm_settings, "TRANSLATION_REASONING_MAX_EFFORT_MULTIPLIER", 2.0
-    )
-    monkeypatch.setattr(llm_settings, "LLM_REASONING_EFFORT", "low")
-    monkeypatch.setenv("LLM_REASONING_EFFORT", "low")
+    monkeypatch.setattr(llm_settings, "LLM_REASONING_EFFORT", "none")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
     profile = get_profile("json")
     # Long enough that the `_MIN_TOKEN_BUDGET` floor is not what is being read.
     segments = _segments("こんばんは" * 20)
 
     from_env = profile.response_token_budget(segments)
-    from_job = profile.response_token_budget(segments, reasoning_effort="max")
+    from_job = profile.response_token_budget(segments, reasoning_effort="high")
 
     assert from_job == from_env + 32000
 
@@ -435,5 +439,5 @@ def test_a_profile_without_reasoning_ignores_the_effort(monkeypatch):
     segments = _segments("こんばんは")
 
     assert profile.response_token_budget(
-        segments, reasoning_effort="max"
+        segments, reasoning_effort="high"
     ) == profile.response_token_budget(segments, reasoning_effort="none")

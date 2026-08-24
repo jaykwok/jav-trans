@@ -279,6 +279,32 @@ def _response_incomplete_reason(response) -> str:
     return str(getattr(details, "reason", "") or "")
 
 
+def _chat_reasoning_fields(effort: str) -> dict:
+    """Translate one thinking tier into the Chat Completions wire fields.
+
+    The only place the tier names meet the API, which is why the mismatch that
+    caused them survived so long. DeepSeek's Chat surface accepts `low`, `high`
+    and `max` for `reasoning_effort` and nothing else; an unrecognised value is
+    not rejected, it is ignored, and the request falls back to the documented
+    default of `high`. `core.config.REASONING_EFFORTS` is therefore restricted
+    to values that survive this trip - passing a tier through verbatim is only
+    safe because that tuple is now wire-accurate.
+
+    Switching thinking off is a separate field (`extra_body.thinking.type`)
+    rather than an effort value on this surface, so `none` sets that and omits
+    `reasoning_effort` entirely: providers keyed on the extra_body convention
+    ignore the effort, providers keyed on the effort ignore the extra_body, and
+    sending "disabled" alongside a nonzero effort asks the two conventions for
+    opposite things.
+    """
+    if effort == "none":
+        return {"extra_body": {"thinking": {"type": "disabled"}}}
+    return {
+        "reasoning_effort": effort,
+        "extra_body": {"thinking": {"type": "enabled"}},
+    }
+
+
 def _chat_completions(
     messages: list[dict],
     expected_count: int = 0,
@@ -309,21 +335,13 @@ def _chat_completions(
             schema=response_schema,
             schema_name=response_schema_name,
         ),
-        "reasoning_effort": effective_effort,
-        # Providers keyed on the extra_body convention (GLM/DashScope-style)
-        # ignore `reasoning_effort`, so thinking has to be switched on here too.
-        # Unconditional since 2026-08-14: every tier thinks now, and this flag is
-        # the one that actually decides. Measured against DeepSeek that day -
-        # with `thinking.type = disabled` the reply carried zero reasoning at
-        # *every* effort value, including "max", so leaving a tier mapped to
-        # disabled would have made its `reasoning_effort` purely decorative.
-        "extra_body": {"thinking": {"type": "enabled"}},
         "stream_options": {"include_usage": True},
         "temperature": (
             llm_settings.TRANSLATION_TEMPERATURE if temperature is None else temperature
         ),
         "top_p": llm_settings.TRANSLATION_TOP_P if top_p is None else top_p,
     }
+    request.update(_chat_reasoning_fields(effective_effort))
     effective_max_tokens = (
         llm_settings.TRANSLATION_MAX_TOKENS if max_tokens is None else max_tokens
     )

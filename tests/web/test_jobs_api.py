@@ -295,7 +295,7 @@ async def _test_config_payload_has_no_backend_select(monkeypatch):
     assert "engine_defaults" not in payload
     assert "asr_backend" not in payload["defaults"]
     assert "translation_batch_size" not in payload["defaults"]
-    assert payload["defaults"]["translation_max_workers"] == 16
+    assert payload["defaults"]["translation_max_workers"] == 4
     assert "show_speaker" not in payload["defaults"]
     assert payload["subtitle_modes"] == ["zh", "bilingual"]
 
@@ -609,7 +609,7 @@ async def _test_settings_translation_fields_update_runtime_env(monkeypatch):
             json={
                 "translation_glossary": "",
                 "target_lang": "繁體中文",
-                "llm_reasoning_effort": "medium",
+                "llm_reasoning_effort": "low",
             },
         )
         assert response.status_code == 200
@@ -620,10 +620,10 @@ async def _test_settings_translation_fields_update_runtime_env(monkeypatch):
     payload = settings.json()
     assert payload["translation_glossary"] == ""
     assert payload["target_lang"] == "繁體中文"
-    assert payload["llm_reasoning_effort"] == "medium"
+    assert payload["llm_reasoning_effort"] == "low"
 
 
-def test_reasoning_effort_frontend_and_models_default_to_medium():
+def test_reasoning_effort_frontend_and_models_default_to_low():
     from web.models import SettingsRead, normalize_llm_reasoning_effort
 
     project_root = Path(__file__).resolve().parents[2]
@@ -634,14 +634,14 @@ def test_reasoning_effort_frontend_and_models_default_to_medium():
         project_root / "src" / "web" / "static" / "js" / "settings.js"
     ).read_text(encoding="utf-8")
 
-    assert '<option value="medium" selected>' in index
-    assert "s.llm_reasoning_effort || 'medium'" in settings_js
-    assert normalize_llm_reasoning_effort(None) == "medium"
+    assert '<option value="low" selected>' in index
+    assert "s.llm_reasoning_effort || 'low'" in settings_js
+    assert normalize_llm_reasoning_effort(None) == "low"
     assert SettingsRead(
         api_key_set=False,
         api_key_preview="",
         base_url="",
-    ).llm_reasoning_effort == "medium"
+    ).llm_reasoning_effort == "low"
 
 
 async def _test_settings_rejects_unknown_fields(monkeypatch):
@@ -715,7 +715,7 @@ async def _test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch):
                 "model": "translator-test",
                 "target_lang": "繁體中文",
                 "llm_api_format": "responses",
-                "llm_reasoning_effort": "medium",
+                "llm_reasoning_effort": "low",
             },
         )
         settings = await client.get("/api/settings")
@@ -735,7 +735,7 @@ async def _test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch):
     assert values["LLM_MODEL_NAME"] == "translator-test"
     assert values["TARGET_LANG"] == "繁體中文"
     assert values["LLM_API_FORMAT"] == "responses"
-    assert values["LLM_REASONING_EFFORT"] == "medium"
+    assert values["LLM_REASONING_EFFORT"] == "low"
     assert "ASR_BACKEND" not in values
     assert "ASR_BATCH_SIZE_BY_REPO" not in values
     assert settings.status_code == 200
@@ -879,7 +879,7 @@ async def _test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
     monkeypatch.setenv("TRANSLATION_GLOSSARY", "ねこ-猫")
     monkeypatch.setenv("TARGET_LANG", "繁體中文")
     monkeypatch.setenv("LLM_API_FORMAT", "responses")
-    monkeypatch.setenv("LLM_REASONING_EFFORT", "medium")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "low")
     await _reset_pm_state()
 
     try:
@@ -903,7 +903,7 @@ async def _test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
         assert spec["translation_glossary"] == "ねこ-猫"
         assert spec["target_lang"] == "繁體中文"
         assert spec["llm_api_format"] == "responses"
-        assert spec["llm_reasoning_effort"] == "medium"
+        assert spec["llm_reasoning_effort"] == "low"
     finally:
         await _reset_pm_state()
 
@@ -1131,7 +1131,7 @@ async def _test_retry_rejects_and_then_rereads_translation_settings(tmp_path, mo
     monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
     monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
     monkeypatch.setenv("API_KEY", "test-key")
-    monkeypatch.setenv("LLM_REASONING_EFFORT", "medium")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "low")
     monkeypatch.setenv("LLM_API_FORMAT", "chat")
     await _reset_pm_state()
 
@@ -1150,7 +1150,7 @@ async def _test_retry_rejects_and_then_rereads_translation_settings(tmp_path, mo
             assert (await client.delete(f"/api/jobs/{job_id}")).status_code == 200
 
             queued_spec = (await client.get(f"/api/jobs/{job_id}")).json()["spec"]
-            assert queued_spec["llm_reasoning_effort"] == "medium"
+            assert queued_spec["llm_reasoning_effort"] == "low"
 
             # Clearing the key blocks the retry with the same actionable message.
             monkeypatch.setenv("API_KEY", "")
@@ -1159,12 +1159,12 @@ async def _test_retry_rejects_and_then_rereads_translation_settings(tmp_path, mo
             assert "API Key" in blocked.json()["detail"]
 
             monkeypatch.setenv("API_KEY", "test-key")
-            monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+            monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
             monkeypatch.setenv("LLM_API_FORMAT", "responses")
             retried = await client.post(f"/api/jobs/{job_id}/retry")
             assert retried.status_code == 200
             spec = retried.json()["spec"]
-            assert spec["llm_reasoning_effort"] == "max"
+            assert spec["llm_reasoning_effort"] == "high"
             assert spec["llm_api_format"] == "responses"
     finally:
         await _reset_pm_state()

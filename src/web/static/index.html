@@ -120,8 +120,9 @@
               <label class="toggle"><input type="checkbox" id="r-skip-translation"><span class="slider"></span></label>
             </div>
             <label class="field">
-              <span>并行翻译 Worker 数（API 限速时可调低）</span>
-              <input type="number" id="t-translation-max-workers" value="16" min="1" max="64">
+              <span>并行翻译 Worker 数</span>
+              <input type="number" id="t-translation-max-workers" value="4" min="1" max="64">
+              <span class="field-hint">每批条数 = 向上取整（字幕总条数 ÷ 并发数 ÷ 2），并受安全上限约束。使用 API 翻译时，提高并发通常更快，但会拆出更多请求、每个请求都重付一遍思维链，因此成本也会增加；遇到限速时请调低。</span>
             </label>
             <div class="toggle-row">
               <span>生成质量报告（.md）</span>
@@ -152,7 +153,7 @@
               <span>翻译后端</span>
               <select id="translation-backend">
                 <option value="openai" selected>API 调用（OpenAI 兼容）</option>
-                <option value="llamacpp">本地翻译（Hy-MT2-1.8B · llama.cpp）</option>
+                <option value="llamacpp">本地翻译（Hy-MT2-7B Q4 · llama.cpp）</option>
               </select>
             </label>
 
@@ -188,18 +189,20 @@
               <label class="field">
                 <span>推理强度</span>
                 <select id="api-reasoning-effort">
-                  <option value="low">low（最快）</option>
-                  <option value="medium" selected>medium（默认）</option>
-                  <option value="max">max（最慢，成本最高）</option>
+                  <option value="none">none（不思考，最便宜）</option>
+                  <option value="low" selected>low（默认）</option>
+                  <option value="high">high（最慢，成本最高）</option>
                 </select>
+                <span class="field-hint">首轮全片按此强度翻译；之后本地质检把可疑字幕挑出来，只对这些行用高一档强度集中复译（none→low，low→high）。成本几乎全在输出 token，而输出的绝大部分是思维链，所以这一档直接决定单片价格。其他兼容 API 按各供应商规则执行。</span>
               </label>
 
               <label class="field">
                 <span>API 格式</span>
                 <select id="api-format">
-                  <option value="chat">OpenAI Chat</option>
-                  <option value="responses">OpenAI Responses</option>
+                  <option value="responses" selected>OpenAI Responses（默认）</option>
+                  <option value="chat">OpenAI Chat（兼容面，供应商不支持 Responses 时选它）</option>
                 </select>
+                <span class="field-hint">Responses 会返回 <code>reasoning_tokens</code>，能精确记账思维链花费（成本的绝大部分），Chat 没有这个字段。两者都支持 prompt 缓存。</span>
               </label>
             </div>
 
@@ -213,7 +216,7 @@
                 需要先安装 llama.cpp：<code>winget install -e --id ggml.llamacpp</code>（Vulkan 构建，
                 装完自动在 PATH 上，上方路径可留空），N 卡想要更快可到 GitHub Releases 下载
                 <code>llama-*-bin-win-cuda-*.zip</code> 解压后填写上方路径。
-                本地翻译固定使用 Hy-MT2-1.8B Q8_0 GGUF；首次使用自动下载约 2GB，建议配合代理。
+                本地翻译固定使用 Hy-MT2-7B Q4_K_M GGUF；首次使用自动下载约 4.6GB，建议配合代理。
                 翻译开始时会临时释放 ASR 显存，任务切回 ASR 时自动重载。
                 本地模型逐句翻译，不使用术语表、角色参考和全片上下文——这些只在
                 OpenAI 兼容 API 后端生效。

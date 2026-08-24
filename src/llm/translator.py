@@ -5,7 +5,7 @@ import re
 import threading
 from typing import Callable
 
-from core.config import load_config
+from core.config import DEFAULT_REASONING_EFFORT, REASONING_EFFORTS, load_config
 from llm import cache as translation_cache
 from llm import engine as engine_module
 from llm import global_glossary
@@ -110,7 +110,9 @@ def _llm_api_format(api_format: str | None = None) -> str:
     return llm_settings._llm_api_format(api_format)
 
 
-def _normalize_reasoning_effort(value: str | None, fallback: str = "medium") -> str:
+def _normalize_reasoning_effort(
+    value: str | None, fallback: str = DEFAULT_REASONING_EFFORT
+) -> str:
     return llm_settings._normalize_reasoning_effort(value, fallback)
 
 
@@ -259,7 +261,10 @@ def _glossary_chat_factory(api_format: str | None):
     # Late-bound module-global _chat so the test seam on this module still
     # intercepts glossary extraction requests.
     def _glossary_chat(messages: list[dict], **chat_kwargs) -> str:
-        request_kwargs = {"reasoning_effort": "medium"}
+        # Fixed at the bottom tier rather than following the job's: this is one
+        # term-extraction request per film whose output feeds the prompt, so
+        # thinking about it buys nothing the translation pass will not redo.
+        request_kwargs = {"reasoning_effort": "none"}
         if api_format is not None:
             request_kwargs["api_format"] = api_format
         return _chat(messages, **request_kwargs, **chat_kwargs)
@@ -274,13 +279,15 @@ def _resolve_translation_extra_glossary(
     *,
     api_format: str | None,
     cancel_event: threading.Event | None,
-) -> str:
+    messages: list[dict] | None = None,
+) -> tuple[str, bool]:
     return global_glossary.resolve_extra_glossary(
         segments,
         cache_path,
         glossary,
         chat=_glossary_chat_factory(api_format),
         cancel_event=cancel_event,
+        messages=messages,
     )
 
 
@@ -360,20 +367,20 @@ def translate_segments(
         # and inflate per-request latency past the watchdog timeouts.
         effective_max_workers = min(
             effective_max_workers,
-            _env_int_clamped("LLAMACPP_PARALLEL", 4, 1, 16),
+            _env_int_clamped("LLAMACPP_PARALLEL", 2, 1, 16),
         )
-    # Selected before sizing because a profile may cap the batch. The cap is
-    # applied after the worker-aware sizing rather than instead of it, so a
-    # one-cue-per-request contract still saturates the pool - it just does so
-    # with more, smaller requests.
+    # Selected before sizing because a model contract may impose a stricter
+    # hard cap (Hy-MT2 is deliberately one cue per request).
     profile = profiles_module.select_profile()
-    effective_batch_size = _auto_translation_batch_size(
-        len(segments),
-        effective_max_workers,
-    )
+    effective_batch_size = _auto_translation_batch_size(len(segments))
     profile_batch_cap = profile.max_batch_size()
     if profile_batch_cap is not None:
         effective_batch_size = min(effective_batch_size, max(1, int(profile_batch_cap)))
+    if effective_batch_size > 0:
+        effective_max_workers = _auto_translation_workers(
+            -(-len(segments) // effective_batch_size),  # ceil
+            effective_max_workers,
+        )
     effective_cache_path = cache_path or ""
     effective_target_lang = (target_lang or DEFAULT_TARGET_LANG).strip() or DEFAULT_TARGET_LANG
     effective_glossary = normalize_glossary_text(glossary)
@@ -388,17 +395,6 @@ def translate_segments(
     _RETRY_CONTEXT.events = retry_events
     try:
         _raise_if_cancelled(cancel_event)
-        extra_glossary_value = (
-            _resolve_translation_extra_glossary(
-                segments,
-                effective_cache_path,
-                effective_glossary,
-                api_format=api_format,
-                cancel_event=cancel_event,
-            )
-            if profile.wants_extra_glossary
-            else ""
-        )
         full_context = (
             global_context
             if global_context is not None
@@ -412,16 +408,44 @@ def translate_segments(
             context_char_limit <= 0
             or len(full_source_payload) <= context_char_limit
         )
+        # Ordered after the payload on purpose: when the film is sent as one
+        # JSON prefix, the extraction is issued on exactly that prefix, so the
+        # request that computes the terms is also the request that warms the
+        # provider's cache for every batch behind it.
+        extra_glossary_value = ""
+        prefix_already_warmed = False
+        if profile.wants_extra_glossary:
+            extra_glossary_value, prefix_already_warmed = (
+                _resolve_translation_extra_glossary(
+                    segments,
+                    effective_cache_path,
+                    effective_glossary,
+                    api_format=api_format,
+                    cancel_event=cancel_event,
+                    messages=(
+                        prompt_module.build_glossary_extraction_messages(
+                            full_source_payload=full_source_payload,
+                            target_lang=effective_target_lang,
+                            glossary=effective_glossary,
+                            character_reference=effective_character_reference,
+                        )
+                        if use_full_json_prefix
+                        else None
+                    ),
+                )
+            )
 
         def _engine_chat(messages: list[dict], **chat_kwargs) -> str:
             # Late global lookup keeps the _chat/_chat_with_reasoning test
             # seams on this module working for engine-driven requests.
-            return _chat_with_reasoning(
-                messages,
-                reasoning_effort=reasoning_effort,
-                api_format=api_format,
-                **chat_kwargs,
-            )
+            #
+            # Defaults, not overrides: the repair pass reissues at an escalated
+            # tier and passes its own `reasoning_effort`. Binding the job's here
+            # would both collide with that argument and silently undo the
+            # escalation for any caller that got past the collision.
+            chat_kwargs.setdefault("reasoning_effort", reasoning_effort)
+            chat_kwargs.setdefault("api_format", api_format)
+            return _chat_with_reasoning(messages, **chat_kwargs)
 
         zh_texts, timings, worker_retry_events = engine_module.run_batched(
             segments,
@@ -435,7 +459,12 @@ def translate_segments(
             api_retries=TRANSLATION_API_RETRIES,
             batch_repair_retries=TRANSLATION_BATCH_REPAIR_RETRIES,
             batch_max_requests=TRANSLATION_BATCH_MAX_REQUESTS,
-            prefix_warmup=TRANSLATION_PREFIX_WARMUP,
+            # The extraction request already sent this exact prefix, so warming
+            # it again buys the same cache miss twice.
+            prefix_warmup=(
+                TRANSLATION_PREFIX_WARMUP
+                and not (prefix_already_warmed and use_full_json_prefix)
+            ),
             extra_glossary=extra_glossary_value,
             full_context=full_context,
             full_source_payload=full_source_payload,
@@ -461,7 +490,9 @@ def translate_segments(
             # translation phase used, so subsequent runs reuse the repair.
             if not effective_cache_path or not segments:
                 return
-            extra_glossary = _resolve_translation_extra_glossary(
+            # Reads the on-disk extraction written above, so this never issues a
+            # request; the boolean is discarded for the same reason.
+            extra_glossary, _ = _resolve_translation_extra_glossary(
                 segments,
                 effective_cache_path,
                 effective_glossary,
@@ -498,6 +529,9 @@ def translate_segments(
                 segments,
                 zh_texts,
                 chat=_engine_chat,
+                profile=profile,
+                batch_size=effective_batch_size,
+                reasoning_effort=_effective_reasoning_effort(reasoning_effort),
                 target_lang=effective_target_lang,
                 glossary=effective_glossary,
                 character_reference=effective_character_reference,
@@ -556,17 +590,28 @@ def _chat_with_reasoning(
             **chat_kwargs,
         )
     except RetryableTranslationFormatError as exc:
-        if effective_effort != "max" or not _is_stream_interrupted_error(exc):
+        # A stream that dies mid-reasoning is the top tier's characteristic
+        # failure - it is the tier that spends longest before emitting anything
+        # a parser can use. One retry one tier down is cheaper than the batch
+        # repair loop and usually enough; every other tier re-raises, because
+        # there the interruption is not about how long the model was thinking.
+        top_tier = REASONING_EFFORTS[-1]
+        if effective_effort != top_tier or not _is_stream_interrupted_error(exc):
             raise
-        _record_api_retry_event(exc, 0, 0.0, note="fallback_reasoning_effort_medium")
+        fallback_effort = REASONING_EFFORTS[-2]
+        _record_api_retry_event(
+            exc, 0, 0.0, note=f"fallback_reasoning_effort_{fallback_effort}"
+        )
         fallback_kwargs = dict(chat_kwargs)
-        fallback_kwargs["reasoning_effort"] = "medium"
+        fallback_kwargs["reasoning_effort"] = fallback_effort
         return _chat(messages, **fallback_kwargs)
 
 
 # Repair-pass implementation lives in llm.repair; aliases keep the module's
 # public test surface stable.
 _select_translation_repair_ids = repair_module._select_translation_repair_ids
+_has_source_echo = repair_module._has_source_echo
+_has_remaining_japanese_kana = repair_module._has_remaining_japanese_kana
 _repair_source_text = repair_module._repair_source_text
 _repair_translation_text = repair_module._repair_translation_text
 _has_translation_length_mismatch = repair_module._has_translation_length_mismatch
@@ -583,49 +628,45 @@ _public_repair_reasons = repair_module._public_repair_reasons
 _split_into_batches = engine_module._split_into_batches
 
 
-# Batches each worker should get. 1 fills the pool but does no balancing at all
-# - the wall time becomes whatever the single slowest batch takes. Higher values
-# balance better but multiply requests, and every request re-sends the full-film
-# JSON prefix and pays time-to-first-token before producing anything.
-_TARGET_BATCHES_PER_WORKER = 2
-_MIN_AUTO_BATCH_SIZE = 4
+def _auto_translation_batch_size(segment_count: int) -> int:
+    """How many cues one request can be trusted to return - nothing else.
 
+    Deliberately independent of the worker count. The old rule sized batches as
+    `ceil(count / (workers x 2))` to balance the pool, which quietly made
+    concurrency a billing control: reasoning is charged per request and barely
+    scales with batch size, so raising workers from 4 to 16 on a 1,595-cue film
+    turned 8 requests into 32 and roughly quadrupled the thinking bill for the
+    same work. Two knobs that each move both cost and parallelism cannot be
+    tuned against each other; now `TRANSLATION_BATCH_SIZE` owns cost and
+    `max_workers` owns parallelism.
 
-def _auto_translation_batch_size(segment_count: int, max_workers: int) -> int:
-    """Batch size that keeps the worker pool busy without shredding requests.
+    The remaining question is what a single request can actually finish, and the
+    answer is not "as many as fit in the token budget". Measured on sample-v
+    over four full runs at 200 cues per request, 7 of 32 requests came back
+    incomplete - always a dropped contiguous tail (9, 50, 100, 100 and 184
+    missing of 200) or an id outside the requested range. The output budget was
+    42,495 tokens against a 31,486-token worst case, so nothing was truncated:
+    the model simply stops early, and it does so more often the more items it is
+    holding. That failure is expensive in the one currency that matters here,
+    because the abandoned request's thinking is charged in full and the reissue
+    thinks again from scratch.
 
-    `TRANSLATION_BATCH_SIZE` alone ignores how many workers there are, and on
-    short films that leaves most of them idle: 613 cues at the configured 64 is
-    ten batches for a sixteen-worker pool, so six workers never receive one.
-
-    Simulated on seven real cue lists over a swept per-request overhead F, as
-    worst-case regret against the best fixed size for each film:
-
-        overhead F     0     30     60    120    240
-        1 per worker  77%    52%    42%    34%    26%
-        2 per worker  13%     9%     7%     7%    16%
-        4 per worker   5%     9%    18%    34%    71%
-        fixed 64      86%    67%    56%    42%    36%
-
-    F was then measured against the live API, and it turns out not to be one
-    number: reasoning is a per-request cost that does not scale with the batch,
-    so F is ~65s per request with thinking on and ~0.05s with it off - the two
-    ends of that sweep, both reachable by flipping one setting. Two per worker
-    is the only column that is fine at both ends, which is what a default has to
-    be when the user owns the switch. The cap is still the configured size, so
-    this only ever makes batches smaller.
+    So the size is a reliability constant, and it is the caller's to set.
     """
     count = max(0, int(segment_count))
     if count <= 0:
         return 0
-    workers = max(1, int(max_workers))
-    if workers == 1:
-        # Nothing to balance. Splitting here would only pay the per-request
-        # overhead twice for work that runs back to back either way.
-        return min(count, TRANSLATION_BATCH_SIZE)
-    target_batches = workers * _TARGET_BATCHES_PER_WORKER
-    balanced = -(-count // target_batches)  # ceil
-    return min(count, TRANSLATION_BATCH_SIZE, max(_MIN_AUTO_BATCH_SIZE, balanced))
+    return min(count, TRANSLATION_BATCH_SIZE)
+
+
+def _auto_translation_workers(batch_count: int, max_workers: int) -> int:
+    """Parallelism follows the batches, instead of the batches following it.
+
+    Spawning more workers than there are batches does not make anything faster;
+    it only used to look useful because the batch size was derived from the
+    worker count, so asking for more workers manufactured more batches.
+    """
+    return max(1, min(int(max_workers), max(1, int(batch_count))))
 
 
 _serialize_segments = prompt_module._serialize_segments
@@ -712,6 +753,7 @@ def _build_batch_messages(
 
 
 _build_character_name_guidance = prompt_module._build_character_name_guidance
+_build_glossary_extraction_messages = prompt_module.build_glossary_extraction_messages
 
 
 _is_retryable_api_error = transport_util._is_retryable_api_error

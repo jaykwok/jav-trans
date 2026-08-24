@@ -7,7 +7,12 @@ from typing import Any
 
 _MAX_TRANSLATION_WORKERS = 64
 
-from core.config import DEFAULT_SETTINGS, normalize_reasoning_effort
+from core.config import (
+    DEFAULT_LLM_API_FORMAT,
+    DEFAULT_SETTINGS,
+    normalize_llm_api_format,
+    normalize_reasoning_effort,
+)
 
 
 def _flag(value: Any, default: bool = False) -> bool:
@@ -46,11 +51,7 @@ def _translation_setting(
     return _setting(env_key, default)
 
 
-def _llm_api_format(value: str) -> str:
-    normalized = (value or "chat").strip().lower()
-    return normalized if normalized in {"chat", "responses"} else "chat"
-
-
+_llm_api_format = normalize_llm_api_format
 _llm_reasoning_effort = normalize_reasoning_effort
 
 
@@ -69,7 +70,7 @@ class JobContext:
     keep_temp_files: bool
     run_log_enabled: bool = True
     run_log_dir: str = "./tmp/log"
-    llm_api_format: str = "chat"
+    llm_api_format: str = DEFAULT_LLM_API_FORMAT
     llm_reasoning_effort: str = "medium"
     advanced: dict[str, str] = field(default_factory=dict)
 
@@ -105,7 +106,7 @@ class JobContext:
             ),
             translation_max_workers=min(
                 _MAX_TRANSLATION_WORKERS,
-                max(1, int(getattr(spec, "translation_max_workers", 16))),
+                max(1, int(getattr(spec, "translation_max_workers", 4))),
             ),
             translation_cache_path=str(cache_path or ""),
             job_id=str(job_id or ""),

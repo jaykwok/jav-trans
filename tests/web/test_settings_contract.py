@@ -115,12 +115,12 @@ def test_frontend_defaults_match_backend_defaults_and_limits() -> None:
 
     assert DEFAULT_SETTINGS["TRANSLATION_BACKEND"] == "openai"
     assert '<option value="openai" selected>' in html
-    assert DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
-    assert '<option value="chat">OpenAI Chat</option>' in html
-    assert DEFAULT_SETTINGS["LLM_REASONING_EFFORT"] == "medium"
+    assert DEFAULT_SETTINGS["LLM_API_FORMAT"] == "responses"
+    assert '<option value="responses" selected>' in html
+    assert DEFAULT_SETTINGS["LLM_REASONING_EFFORT"] == "low"
     # The option text carries a human-facing annotation (「medium（默认）」), so
     # only the value and the `selected` marker are the contract here.
-    assert '<option value="medium" selected>' in html
+    assert '<option value="low" selected>' in html
     assert DEFAULT_SETTINGS["TARGET_LANG"] == "简体中文"
     assert '<option value="简体中文">简体中文</option>' in html
     assert JobSpec.model_fields["subtitle_mode"].default == "zh"
