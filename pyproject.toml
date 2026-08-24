@@ -1,6 +1,6 @@
 [project]
 name = "jav-trans"
-version = "1.4"
+version = "1.5"
 requires-python = ">3.14"
 dependencies = [
     "accelerate",
@@ -22,7 +22,13 @@ dependencies = [
     "scipy",
     "soundfile",
     "torch>=2.13.0",
-    "torchcodec",
+    # 0.16.0 is the first release carrying the FFmpeg 9 loaders
+    # (`libtorchcodec_core9`). Unpinned, a fresh install resolves to whatever is
+    # newest at the time and 0.15.0 enumerates majors 8 down to 4 only - paired
+    # with the FFmpeg 9.x that `winget install Gyan.FFmpeg.Shared` now delivers,
+    # nothing loads and no audio decodes. The floor is what keeps the bundled
+    # DLLs and the installed wheel from drifting apart.
+    "torchcodec>=0.16.0",
     "transformers>=5.13.0",
     "uvicorn[standard]",
     "xxhash",
