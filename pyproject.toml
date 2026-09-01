@@ -7,7 +7,6 @@ dependencies = [
     "fastapi",
     "huggingface-hub>=0.25",
     "httpx",
-    "librosa",
     "numpy",
     "openai",
     # Pure-Python OpenCC port: forces translated output into the Chinese variant
