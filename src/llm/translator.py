@@ -76,8 +76,6 @@ TRANSLATION_REPAIR_CONTEXT_RADIUS = llm_settings.TRANSLATION_REPAIR_CONTEXT_RADI
 TRANSLATION_REPAIR_LENGTH_RATIO_MIN = llm_settings.TRANSLATION_REPAIR_LENGTH_RATIO_MIN
 TRANSLATION_REPAIR_LENGTH_RATIO_MAX = llm_settings.TRANSLATION_REPAIR_LENGTH_RATIO_MAX
 
-_GLOSSARY_OUTPUT_SCHEMA = global_glossary._GLOSSARY_OUTPUT_SCHEMA
-
 # Distinguishes "caller said nothing" from "caller said no schema". The line
 # contract needs the second, and collapsing them would hand Hy-MT2 a JSON
 # grammar - the configuration that scored 152/300 untranslated against 6/300
@@ -241,53 +239,9 @@ _emit_usage = transport_util._emit_usage
 _merge_usage_metrics = transport_util._merge_usage_metrics
 
 
-_filter_global_glossary_terms = global_glossary._filter_global_glossary_terms
 _format_global_glossary_terms = global_glossary._format_global_glossary_terms
 _global_glossary_cache_path_for_texts = global_glossary._global_glossary_cache_path_for_texts
-
-
-def _glossary_chat_factory():
-    # Late-bound module-global _chat so the test seam on this module still
-    # intercepts glossary extraction requests.
-    def _glossary_chat(messages: list[dict], **chat_kwargs) -> str:
-        # Fixed at the bottom tier rather than following the job's: this is one
-        # term-extraction request per film whose output feeds the prompt, so
-        # thinking about it buys nothing the translation pass will not redo.
-        return _chat(messages, reasoning_effort="none", **chat_kwargs)
-
-    return _glossary_chat
-
-
-def _resolve_translation_extra_glossary(
-    segments: list[dict],
-    cache_path: str,
-    glossary: str,
-    *,
-    cancel_event: threading.Event | None,
-    messages: list[dict] | None = None,
-) -> tuple[str, bool]:
-    return global_glossary.resolve_extra_glossary(
-        segments,
-        cache_path,
-        glossary,
-        chat=_glossary_chat_factory(),
-        cancel_event=cancel_event,
-        messages=messages,
-    )
-
-
-def extract_global_glossary(
-    all_ja_texts: list[str],
-    cache_path: str,
-    *,
-    cancel_event: threading.Event | None = None,
-) -> list[dict]:
-    return global_glossary.extract_global_glossary(
-        all_ja_texts,
-        cache_path,
-        chat=_glossary_chat_factory(),
-        cancel_event=cancel_event,
-    )
+resolve_settled_glossary = global_glossary.resolve_settled_glossary
 
 
 def _test_crash_translation_batch() -> int:
@@ -391,31 +345,6 @@ def translate_segments(
             context_char_limit <= 0
             or len(full_source_payload) <= context_char_limit
         )
-        # Ordered after the payload on purpose: when the film is sent as one
-        # JSON prefix, the extraction is issued on exactly that prefix, so the
-        # request that computes the terms is also the request that warms the
-        # provider's cache for every batch behind it.
-        extra_glossary_value = ""
-        prefix_already_warmed = False
-        if profile.wants_extra_glossary:
-            extra_glossary_value, prefix_already_warmed = (
-                _resolve_translation_extra_glossary(
-                    segments,
-                    effective_cache_path,
-                    effective_glossary,
-                    cancel_event=cancel_event,
-                    messages=(
-                        prompt_module.build_glossary_extraction_messages(
-                            full_source_payload=full_source_payload,
-                            target_lang=effective_target_lang,
-                            glossary=effective_glossary,
-                            character_reference=effective_character_reference,
-                        )
-                        if use_full_json_prefix
-                        else None
-                    ),
-                )
-            )
 
         def _engine_chat(messages: list[dict], **chat_kwargs) -> str:
             # Late global lookup keeps the _chat/_chat_with_reasoning test
@@ -440,13 +369,11 @@ def translate_segments(
             api_retries=TRANSLATION_API_RETRIES,
             batch_repair_retries=TRANSLATION_BATCH_REPAIR_RETRIES,
             batch_max_requests=TRANSLATION_BATCH_MAX_REQUESTS,
-            # The extraction request already sent this exact prefix, so warming
-            # it again buys the same cache miss twice.
-            prefix_warmup=(
-                TRANSLATION_PREFIX_WARMUP
-                and not (prefix_already_warmed and use_full_json_prefix)
-            ),
-            extra_glossary=extra_glossary_value,
+            prefix_warmup=TRANSLATION_PREFIX_WARMUP,
+            # No settled rendering exists before the base pass has translated
+            # anything - see `global_glossary`. The repair pass gets one,
+            # derived from this pass's own output.
+            extra_glossary="",
             full_context=full_context,
             full_source_payload=full_source_payload,
             use_full_json_prefix=use_full_json_prefix,
@@ -471,16 +398,12 @@ def translate_segments(
             # translation phase used, so subsequent runs reuse the repair.
             if not effective_cache_path or not segments:
                 return
-            # Reads the on-disk extraction written above, so this never issues a
-            # request; the boolean is discarded for the same reason.
-            extra_glossary, _ = _resolve_translation_extra_glossary(
-                segments,
-                effective_cache_path,
-                effective_glossary,
-                cancel_event=cancel_event,
-            )
             cache_kwargs = {
-                "extra_glossary": extra_glossary,
+                # The base pass always ran with no settled rendering (there was
+                # none to give it yet), so its cache keys carry "" here too -
+                # this has to match or the repair is written under a key the
+                # base pass's own entries never used.
+                "extra_glossary": "",
                 "glossary": effective_glossary,
                 "target_lang": effective_target_lang,
                 "character_reference": effective_character_reference,
@@ -505,6 +428,11 @@ def translate_segments(
                 )
 
         if profile.wants_repair_pass:
+            # Derived from this pass's own output, so it only exists once
+            # there is something to measure - see `global_glossary`.
+            settled_glossary_value = resolve_settled_glossary(
+                segments, zh_texts, effective_cache_path, effective_glossary
+            )
             zh_texts, repair_timing = repair_module.apply_repair_pass(
                 segments,
                 zh_texts,
@@ -515,7 +443,7 @@ def translate_segments(
                 target_lang=effective_target_lang,
                 glossary=effective_glossary,
                 character_reference=effective_character_reference,
-                extra_glossary=extra_glossary_value,
+                extra_glossary=settled_glossary_value,
                 on_progress=on_progress,
                 cancel_event=cancel_event,
                 cache_writer=_persist_repaired_translation_cache,
@@ -731,7 +659,6 @@ def _build_batch_messages(
 
 
 _build_character_name_guidance = prompt_module._build_character_name_guidance
-_build_glossary_extraction_messages = prompt_module.build_glossary_extraction_messages
 
 
 _is_retryable_api_error = transport_util._is_retryable_api_error

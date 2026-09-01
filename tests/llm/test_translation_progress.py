@@ -313,29 +313,6 @@ def test_a_lookalike_host_is_not_the_official_deepseek_endpoint(monkeypatch):
     assert not openai_compat._is_openrouter_base_url("https://openrouter.ai.example/v1")
 
 
-def test_glossary_request_uses_its_own_schema(monkeypatch, tmp_path):
-    requests: list[dict] = []
-    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
-    monkeypatch.setenv("LLM_MODEL_NAME", "gpt-5.5")
-    monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://api.openai.example/v1")
-    monkeypatch.setattr(
-        openai_compat,
-        "_create_response",
-        lambda request: requests.append(request)
-        or _response_stream([], ['{"terms":[{"ja":"先生","zh":"老师"}]}']),
-    )
-
-    terms = translator.extract_global_glossary(
-        ["先生、ありがとう"],
-        str(tmp_path / "glossary.json"),
-    )
-
-    assert terms == [{"ja": "先生", "zh": "老师"}]
-    text_format = requests[0]["text"]["format"]
-    assert text_format["name"] == "translation_glossary"
-    assert text_format["schema"]["required"] == ["terms"]
-
-
 def test_openai_compat_base_url_defaults_to_v1():
     assert (
         translator._normalize_openai_compat_base_url("https://openrouter.ai/api/v1")

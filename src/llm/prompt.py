@@ -240,56 +240,6 @@ def _build_requested_ids_task(
     return "\n".join(task)
 
 
-# Sharing the translation system prompt means inheriting its rules, and one of
-# them is the instruction to romanise character names whose kanji are unknown.
-# That rule is correct for a subtitle line and wrong for a term list: the first
-# merged run returned `ジェイ-Jay`, `シルス-Sirusu`, `おなみ-Onami`, which then went
-# back into the batch prompt as "本片已确定译法" and taught the model to leave the
-# source alone - 239 of 1,595 cues came back as verbatim Japanese. The task text
-# has to override the inherited rule explicitly, because it is the only part of
-# this request that differs from a batch.
-_GLOSSARY_EXTRACTION_TASK = "\n".join(
-    [
-        "【本次任务】",
-        "不要翻译任何字幕，也不要输出 translations。",
-        "请从上面的全片字幕中提取 10-20 个反复出现的核心词，"
-        "范围包括代词、人名、性器官词、高频形容词，并给出推荐中文译词。",
-        "本任务不适用上面关于人名罗马音化的规则：`zh` 必须是中文词，"
-        "不得出现日文假名、罗马字或英文；人名一律给汉字译名。",
-        '只返回合法 JSON：{"terms":[{"ja":"...","zh":"..."}]}。',
-    ]
-)
-
-
-def build_glossary_extraction_messages(
-    *,
-    full_source_payload: str,
-    target_lang: str,
-    glossary: str,
-    character_reference: str,
-) -> list[dict]:
-    """Term extraction issued on the translation prefix, so it doubles as warmup.
-
-    Byte-identical to a batch request up to the end of the full-film payload;
-    only the trailing task differs. That is the whole point: the extraction used
-    to send the same source again in its own private shape, so a film paid the
-    full-source cache miss twice before translating anything.
-    """
-    messages = _build_translation_messages(
-        source_payload="",
-        expected_count=0,
-        compact_system_prompt=False,
-        extra_glossary="",
-        target_lang=target_lang,
-        glossary=glossary,
-        character_reference=character_reference,
-    )
-    messages[1]["content"] = "\n\n".join(
-        ["【全片字幕 JSON】", full_source_payload, _GLOSSARY_EXTRACTION_TASK]
-    )
-    return messages
-
-
 def _build_batch_messages(
     batch_segments: list[dict],
     full_segments_summary: str,

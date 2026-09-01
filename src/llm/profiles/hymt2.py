@@ -66,7 +66,6 @@ class HyMt2Profile(TranslationProfile):
     # here is one cue, so a bad reply is retried as a whole by the engine's
     # normal path rather than repaired in place.
     wants_repair_pass = False
-    wants_extra_glossary = False
     supports_partial_reissue = False
     # Free-form text. Constraining this model with a grammar is what produced
     # the 152/300 failure above.

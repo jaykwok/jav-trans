@@ -45,7 +45,6 @@ class TranslationProfile(abc.ABC):
 
     # Orchestration stages the profile opts into.
     wants_repair_pass: bool = False
-    wants_extra_glossary: bool = False
     # Can the profile re-request only the missing ids of a partial reply?
     supports_partial_reissue: bool = False
     # JSON schema for structured decoding, passed to backends that report

@@ -842,6 +842,41 @@ def test_the_repair_gate_ignores_the_glossary_when_none_is_configured():
     assert translator._select_translation_repair_ids(segments, zh_texts, "") == ([], {})
 
 
+def test_the_repair_gate_catches_a_rendering_that_drifted_from_the_settled_index():
+    """`settled_pairs` comes from `global_glossary.derive_settled_glossary` -
+    this same film's own dominant rendering for a line it translated more than
+    once. A cue whose exact source line has a settled entry but whose current
+    text does not match it is exactly the drift the index exists to catch."""
+    segments = [
+        {"text": "気持ちいい…"},
+        {"text": "気持ちいい…"},
+        {"text": "今日はいい天気ですね。"},
+    ]
+    zh_texts = ["好舒服…", "爽死了…", "今天天气真好呢。"]
+    settled_pairs = {"気持ちいい…": "好舒服…"}
+
+    repair_ids, reasons = translator._select_translation_repair_ids(
+        segments, zh_texts, "", settled_pairs
+    )
+
+    assert repair_ids == [1]
+    assert reasons[1] == ["inconsistent_rendering"]
+
+
+def test_the_repair_gate_ignores_settled_pairs_when_none_are_derived():
+    segments = [{"text": "気持ちいい…"}]
+    zh_texts = ["爽死了…"]
+
+    assert translator._select_translation_repair_ids(segments, zh_texts, "", {}) == (
+        [],
+        {},
+    )
+    assert translator._select_translation_repair_ids(segments, zh_texts, "", None) == (
+        [],
+        {},
+    )
+
+
 def test_the_repair_prompt_names_the_glossary_reason():
     """The reason reaches the model as a category it was told how to act on;
     an unmapped reason degrades to the generic translation_quality label."""
@@ -934,6 +969,54 @@ def test_a_cheap_first_pass_escalates_only_the_flagged_ids(monkeypatch):
     assert timing["reasoning_effort"] == "low"
     assert timing["none_tier_reasoning_effort"] == "none"
     assert timing["escalated_count"] == 3
+
+
+def test_the_settled_index_from_the_base_pass_repairs_a_drifted_repeat(monkeypatch):
+    """End to end: the base pass renders the same line two ways, the settled
+    index built from its own output (see `global_glossary`) picks the majority
+    rendering, and the repair pass both sees that rendering in its prompt and
+    fixes the cue that drifted from it - with no model call involved in
+    building the index itself."""
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "気持ちいい…"},
+        {"start": 1.0, "end": 2.0, "text": "気持ちいい…"},
+        {"start": 2.0, "end": 3.0, "text": "気持ちいい…"},
+        {"start": 3.0, "end": 4.0, "text": "こんにちは。"},
+        {"start": 4.0, "end": 5.0, "text": "こんにちは。"},
+    ]
+    base = {0: "好舒服…", 1: "好舒服…", 2: "很舒服…", 3: "你好。", 4: "你好。"}
+    repair_prompts: list[str] = []
+
+    def fake_chat(messages, expected_count=0, reasoning_effort=None, **_kwargs):
+        ids = _requested_ids_from_messages(messages)
+        is_repair = "【翻译修复任务】" in messages[1]["content"]
+        if is_repair:
+            repair_prompts.append(messages[1]["content"])
+            values = {2: "好舒服…"}
+        else:
+            values = base
+        return json.dumps(
+            {"translations": [{"id": idx, "text": values[idx]} for idx in ids]},
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-flash")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
+    monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 5)
+    monkeypatch.setattr(translator, "TRANSLATION_PREFIX_WARMUP", False)
+
+    zh_texts, _timings, _retry_events = translator.translate_segments(
+        segments,
+        max_workers=1,
+        cache_path="",
+        reasoning_effort="none",
+    )
+
+    assert zh_texts == ["好舒服…", "好舒服…", "好舒服…", "你好。", "你好。"]
+    assert repair_prompts, "the drifted cue should have triggered a repair request"
+    assert "気持ちいい…-好舒服…" in repair_prompts[0]
 
 
 def test_the_repair_pass_splits_an_invalid_large_reply_instead_of_repeating_it(

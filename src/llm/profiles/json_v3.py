@@ -265,7 +265,6 @@ class JsonProfile(TranslationProfile):
     version = prompt_module.PROMPT_VERSION
 
     wants_repair_pass = True
-    wants_extra_glossary = True
     supports_partial_reissue = True
     schema = TRANSLATION_OUTPUT_SCHEMA
 

@@ -59,6 +59,16 @@
 
 定向测试：`tests/llm/test_batch_translation.py`、`tests/llm/test_reasoning_effort_wiring.py` 更新了两条断言旧单档行为的用例，改为验证两段级联；`tests/llm` 全量 334 passed / 1 skipped；`tests/llm tests/pipeline tests/web` 532 passed / 1 failed（`test_job_tempdir`，与本次改动无关，同上）。
 
+### 术语表提取从「译前 LLM 猜译法」改成「译后统计本片自己的译法」
+
+`global_glossary.py` 原来的机制：译前发一次 LLM 请求，让模型看全片日文自己挑 10-20 个高频词并猜中文译法，猜的结果被当作"已确定译法"塞回首轮翻译的每个批次 prompt。08-24 记录过两个实测问题，根源是同一个——开始翻译之前，这个"确定译法"根本不存在，是编出来的：这次请求的 usage 没接进 `on_usage`，全片成本统计漏记这一块；以及猜错的案例——角色名"オナ美"被猜成"小穴"（女性器官词），这个错误译法又被当作术语表反过来教坏首轮翻译。
+
+**改动**：把 `_extract_global_glossary`（LLM 猜译法）整个删掉，换成 `derive_settled_glossary`——纯文本统计，不发请求，在首轮翻译**之后**跑：同一句日文原文如果在全片出现不止一次（这个题材的台词经常重复——呻吟、口头禅、转场台词），且首轮翻译对它的处理方式有明显多数（占比 ≥60%），那个多数译法就是"本片实际上怎么翻的"这件事实，不是猜测。产出格式与落盘路径不变（`translation_global_glossary.<digest>.json`，`{"terms":[{"ja":...,"zh":...}]}`），`pipeline/quality.py` 的读取端不用改，只是现在写的人和写的时机换了。这份索引原来喂给首轮翻译（现在首轮翻译不再拿到任何 extra_glossary——译前没有可信的"已确定译法"可给），改为只喂给复译阶段：一是复用 08-24 复译加的 `extra_glossary` 通道，作为比"局部前后 2 行"更可靠的参考；二是给 `repair.py` 新增一个检测器 `inconsistent_rendering`——某个 cue 的原文和索引里某条已收录的原文精确相同，但这次译法跟索引里的多数译法不一样，判定需要复译（和 `glossary_violation` 同级：便宜、纯文本、检测器可见）。连带删掉了 `wants_extra_glossary` 这个已经没有真实调用方的 profile 标志位。
+
+**验证**：单测层面新增/重写了 `tests/llm/test_glossary_preextract.py`（索引推导的纯函数行为：多数才算数、无多数不猜、非中文目标丢弃、含 `-`/`,` 的候选会破坏 pair 解析所以丢弃、写盘格式与 `quality.py` 期望一致、全程不发请求）和 `tests/llm/test_batch_translation.py` 里新增的 `inconsistent_rendering` 检测器单测与一条端到端集成测试（fake chat：首轮把同一句日文译成两种中文，索引应该选多数，复译应该修正少数）。真实 API 验证（2026-09-01，`agents/temp/20260901_202619_settled-glossary-ab/`，非真实素材）：分三轮加大样本（40 行单批 → 40 行/5 批 → 57 行/8 批，故意调小 `TRANSLATION_BATCH_SIZE` 让重复台词落进不同的独立请求）反复确认索引推导本身：全部命中——多数译法与 `zh_texts` 实际输出一致、写盘文件是合法的 `{"terms":[...]}`、过程中没有一次多余的模型调用。但三轮里 `deepseek-v4-flash` 在 `none` 档对同一句台词（包括刻意选的、措辞有自由度的稍长句子）跨独立请求的译法保持了 100% 一致，没有自然触发 `inconsistent_rendering`——复译没有被这个新检测器叫起来过。**这是如实记录，不是把它调没調出来**：说明索引本身是对的，检测器逻辑在 fake-chat 集成测试里也证明是对的，但这个模型在这个规模下漂移概率看起来比预期低，这个检测器目前更像是安全网而非常态生效项——真实成本是零（不发请求），保留它没有下行风险。
+
+定向测试：`tests/llm` 全量 337 passed / 1 skipped；`tests/llm tests/pipeline tests/web tests/asr` 996 passed / 1 failed（`test_job_tempdir`，与本次改动无关，同上）。
+
 ## 2026-08-24
 
 ### 砍掉 Chat Completions：API 档只剩 Responses 一个协议面
