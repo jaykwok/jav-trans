@@ -49,6 +49,16 @@
 
 **风险边界**：VRAM 富余量在这张卡上测得约 2GB（8,188 MB 总显存，模型+context 用 6,192 MB，桌面基线占 527 MB），别的机器桌面占用更高时富余会更小；本次验证的最长台词是合成句子，真实素材若出现更极端的超长单句仍建议留意质量报告里的截断/假名残留信号。
 
+### 复译闸门分级：先 none 后按检测器结果升级，08-24 提过没做的那一步
+
+08-24 测样片 V 时记录过：一次集中思考复译吃掉全片 57.5% completion token、90.4% 墙钟时间，当时就写了"下一步应该先用 none 档小 span 试一次，只把仍失败的升级"，但没实现——`repair.py::apply_repair_pass` 一直是检测器（源文回显/残留假名/术语表未生效/长度异常）标记出的 cue 直接在 `repair_effort`（至少 `low`）上重译。
+
+**改动**：`apply_repair_pass` 改成两段。第一段所有被标记的 cue 先在 `none` 档发一次修复请求——不是重新翻译，是带着 `reason` 字段（明确指出"这行回显了原文"这类具体问题）和全片术语表（`extra_glossary`，此前 repair 阶段完全拿不到，只有首轮翻译能用）的定向修复请求，比首轮的批量翻译请求本身更有针对性。第二段用同一套检测器重新扫一遍 `none` 档修复后的文本，只把仍然不合格的 id 升到 `escalated_effort`（原有的 `_repair_reasoning_effort` 逻辑不变）。原有的"源文回显最终兜底二次机会"保留在最后，档位不变。顺带把 `_build_repair_context_items` 的上下文半径从 1 行扩到 2 行——`none` 档没有思考能力兜底，需要更多局部已译台词做参考。没有加新的环境变量开关，验证通过直接成为唯一行为。
+
+**验证**（2026-09-01，真实 API，`agents/temp/20260901_203000_repair-cascade-ab/`）：50 条合成日文台词（非真实素材），`reasoning_effort=none` 强制走复译，触发 2 条被标记；其中 **1 条在 `none` 档直接修复成功，未升级**，另 1 条升到 `low` 档修复。最终质量闸门：0 条源文回显、0 条假名残留、术语表命中 4/4。复译阶段总耗费 3,340 prompt / 634 completion token（其中 583 是升级那 1 条的推理 token）。样本量小（仅 2 条候选），修复率还不能当统计结论，但机制本身端到端跑通：`none` 档确实能在不思考的情况下修好至少一部分被标记的 cue——`none_tier_resolved_count > 0` 这件事本身就是相对旧代码（100% 一律升级）的净成本节省，不需要重新跑旧代码做对照。
+
+定向测试：`tests/llm/test_batch_translation.py`、`tests/llm/test_reasoning_effort_wiring.py` 更新了两条断言旧单档行为的用例，改为验证两段级联；`tests/llm` 全量 334 passed / 1 skipped；`tests/llm tests/pipeline tests/web` 532 passed / 1 failed（`test_job_tempdir`，与本次改动无关，同上）。
+
 ## 2026-08-24
 
 ### 砍掉 Chat Completions：API 档只剩 Responses 一个协议面

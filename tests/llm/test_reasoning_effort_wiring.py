@@ -167,7 +167,13 @@ class TestRepairTier:
         assert llm_settings._repair_reasoning_effort("low") == "high"
 
     def test_the_repair_pass_reads_the_tier(self, monkeypatch) -> None:
-        """Wired, not merely defined - the tier has to reach the request."""
+        """Wired, not merely defined - the tier has to reach the request.
+
+        The fake reply ("你好") never stops looking short next to the source,
+        so the length-mismatch detector keeps flagging it after the cheap
+        `none` attempt and the pass escalates - which is what this test
+        checks for: the base pass's tier reaching the escalated request.
+        """
         self._pin(monkeypatch, "")
         efforts: list[str] = []
 
@@ -190,7 +196,9 @@ class TestRepairTier:
             character_reference="",
         )
 
-        assert efforts == ["low"]
+        # Cheap none-tier attempt first, then escalated because the reply is
+        # still flagged (length mismatch persists regardless of the tier).
+        assert efforts == ["none", "low"]
 
 
 class TestItReachesTheWire:

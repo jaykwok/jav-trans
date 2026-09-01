@@ -860,9 +860,15 @@ def test_the_repair_prompt_names_the_glossary_reason():
 
 def test_a_cheap_first_pass_escalates_only_the_flagged_ids(monkeypatch):
     """The cost cascade, end to end: the whole film goes out at the job's tier,
-    then only the ids a local detector flagged are reissued one tier up. The
+    then only the ids a local detector flagged are reissued - cheap (`none`)
+    first, and only what is still wrong after that pays for a tier up. The
     saving is that the escalation is proportional to the failures, not to the
     film - reasoning is charged per request and does not scale with the batch.
+
+    The fake repair backend deliberately does not fix anything at `none`
+    (returns the same broken text), so this exercises the real cascade: a
+    none-tier repair attempt for every flagged id, then an escalated attempt
+    for whatever the local detectors still flag afterwards.
     """
     segments = [
         {"start": 0.0, "end": 1.0, "text": "これは翻訳されるべきです。"},
@@ -885,7 +891,12 @@ def test_a_cheap_first_pass_escalates_only_the_flagged_ids(monkeypatch):
         calls.append(
             {"ids": ids, "repair": is_repair, "reasoning_effort": reasoning_effort}
         )
-        values = repaired if is_repair else initial
+        if is_repair:
+            # Only the escalated tier actually fixes these - the none-tier
+            # repair attempt returns the same broken text on purpose.
+            values = repaired if reasoning_effort == "low" else initial
+        else:
+            values = initial
         return json.dumps(
             {"translations": [{"id": idx, "text": values[idx]} for idx in ids]},
             ensure_ascii=False,
@@ -911,13 +922,18 @@ def test_a_cheap_first_pass_escalates_only_the_flagged_ids(monkeypatch):
     repair = [call for call in calls if call["repair"]]
     assert {idx for call in first_pass for idx in call["ids"]} == {0, 1, 2, 3}
     assert all(call["reasoning_effort"] == "none" for call in first_pass)
-    # Only the three flagged ids, and one tier up from the base pass.
-    assert {idx for call in repair for idx in call["ids"]} == {0, 1, 2}
-    assert all(call["reasoning_effort"] == "low" for call in repair)
+    # Every flagged id gets a cheap none-tier repair attempt first...
+    none_tier_repair = [call for call in repair if call["reasoning_effort"] == "none"]
+    assert {idx for call in none_tier_repair for idx in call["ids"]} == {0, 1, 2}
+    # ...and only the three flagged ids ever reach the escalated tier.
+    escalated = [call for call in repair if call["reasoning_effort"] == "low"]
+    assert {idx for call in escalated for idx in call["ids"]} == {0, 1, 2}
     timing = next(
         item for item in timings if item.get("mode") == "translation_repair_pass"
     )
     assert timing["reasoning_effort"] == "low"
+    assert timing["none_tier_reasoning_effort"] == "none"
+    assert timing["escalated_count"] == 3
 
 
 def test_the_repair_pass_splits_an_invalid_large_reply_instead_of_repeating_it(

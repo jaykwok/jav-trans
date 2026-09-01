@@ -515,6 +515,7 @@ def translate_segments(
                 target_lang=effective_target_lang,
                 glossary=effective_glossary,
                 character_reference=effective_character_reference,
+                extra_glossary=extra_glossary_value,
                 on_progress=on_progress,
                 cancel_event=cancel_event,
                 cache_writer=_persist_repaired_translation_cache,

@@ -161,7 +161,10 @@ TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS = 180000
 TRANSLATION_REPAIR_MAX_IDS = _env_int_clamped(
     "TRANSLATION_REPAIR_MAX_IDS", 400, 0, 4000
 )
-TRANSLATION_REPAIR_CONTEXT_RADIUS = 1
+# Widened 2026-09-01 alongside the none-first repair cascade: a none-tier
+# repair request has to lean on local context instead of reasoning, so it
+# gets a couple more lines of already-translated dialogue on each side.
+TRANSLATION_REPAIR_CONTEXT_RADIUS = 2
 TRANSLATION_REPAIR_LENGTH_RATIO_MIN = 0.25
 TRANSLATION_REPAIR_LENGTH_RATIO_MAX = 4.0
 # Which tier the repair pass reissues at. Empty follows the rule in

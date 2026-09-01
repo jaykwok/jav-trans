@@ -64,15 +64,24 @@ def apply_repair_pass(
     target_lang: str,
     glossary: str,
     character_reference: str,
+    extra_glossary: str = "",
     on_progress: Callable[[dict], None] | None = None,
     cancel_event: threading.Event | None = None,
     cache_writer: Callable[[list[str]], None] | None = None,
 ) -> tuple[list[str], dict | None]:
-    """Reissue flagged ids at the repair tier, by default one above the base.
+    """Reissue flagged ids cheap-first, escalating only what is still wrong.
 
-    `reasoning_effort` is the base pass's tier, not this pass's; the repair tier
-    is derived from it so the two can never be configured out of step, unless
-    `TRANSLATION_REPAIR_REASONING_EFFORT` pins it.
+    Stage 1 reissues every flagged id at `none` - not a blind retry of the
+    original batch request, but the repair prompt, which names the exact
+    defect (`reason`) and now carries the film's settled term glossary
+    (`extra_glossary`), neither of which the original batch request had. Most
+    flagged ids resolve here without paying for reasoning at all. Stage 2
+    re-runs the same local detectors against the stage-1 output and only pays
+    `escalated_effort` (derived from the base pass's tier via
+    `_repair_reasoning_effort`, unless `TRANSLATION_REPAIR_REASONING_EFFORT`
+    pins it) for ids that are still wrong. A final small-span second chance
+    for lingering source echo - the correctness failure that retired the old
+    always-`none` tier - runs at the escalated tier, unchanged from before.
 
     Candidate ids are collected across the whole film before any request goes
     out. That aggregation is the cost property: a detector firing once in each
@@ -81,6 +90,7 @@ def apply_repair_pass(
     for less" recovery rule instead of reissuing an identical bad shape.
     """
     _raise_if_cancelled(cancel_event)
+    glossary_pairs = parse_glossary_pairs(glossary) if glossary else []
     repair_ids, reasons = _select_translation_repair_ids(segments, zh_texts, glossary)
     if not repair_ids:
         return zh_texts, None
@@ -96,7 +106,8 @@ def apply_repair_pass(
     request_count = 0
     request_cap = max(1, int(llm_settings.TRANSLATION_BATCH_MAX_REQUESTS))
     initial_span = max(1, int(batch_size))
-    repair_effort = llm_settings._repair_reasoning_effort(reasoning_effort)
+    none_effort = "none"
+    escalated_effort = llm_settings._repair_reasoning_effort(reasoning_effort)
 
     _emit_progress(
         on_progress,
@@ -104,11 +115,12 @@ def apply_repair_pass(
             "phase": "repair_start",
             "repair_ids": repair_ids,
             "candidate_count": len(repair_ids),
-            "reasoning_effort": repair_effort,
+            "reasoning_effort": none_effort,
+            "escalated_reasoning_effort": escalated_effort,
         },
     )
 
-    def request_group(group: list[int]) -> list[int]:
+    def request_group(group: list[int], effort: str) -> list[int]:
         nonlocal request_count, format_split_count
         if not group:
             return []
@@ -124,14 +136,15 @@ def apply_repair_pass(
             target_lang=target_lang,
             glossary=glossary,
             character_reference=character_reference,
+            extra_glossary=extra_glossary,
         )
         request_kwargs: dict = {
             "response_schema": profile.schema,
-            "reasoning_effort": repair_effort,
+            "reasoning_effort": effort,
         }
         token_budget = profile.response_token_budget(
             request_segments,
-            reasoning_effort=repair_effort,
+            reasoning_effort=effort,
         )
         if token_budget is not None:
             request_kwargs["max_tokens"] = token_budget
@@ -158,7 +171,7 @@ def apply_repair_pass(
                 return list(group)
             format_split_count += 1
             midpoint = max(1, len(group) // 2)
-            return request_group(group[:midpoint]) + request_group(group[midpoint:])
+            return request_group(group[:midpoint], effort) + request_group(group[midpoint:], effort)
 
         missing: list[int] = []
         for idx in group:
@@ -174,8 +187,8 @@ def apply_repair_pass(
         if len(missing) == len(group) and len(group) > 1:
             format_split_count += 1
             midpoint = max(1, len(group) // 2)
-            return request_group(group[:midpoint]) + request_group(group[midpoint:])
-        return request_group(missing)
+            return request_group(group[:midpoint], effort) + request_group(group[midpoint:], effort)
+        return request_group(missing, effort)
 
     def lingering_echoes() -> list[int]:
         return [
@@ -187,18 +200,50 @@ def apply_repair_pass(
             )
         ]
 
+    def recheck(candidates: list[int]) -> list[int]:
+        """Ids the detector suite still flags after a repair attempt.
+
+        Updates `reasons` in place so the next request describes the CURRENT
+        defect - a cue fixed for length but freshly echoing after stage 1
+        must not carry a stale `length_mismatch` label into stage 2.
+        """
+        flagged: list[int] = []
+        for idx in candidates:
+            source = _repair_source_text(segments[idx])
+            target = _repair_translation_text(segments[idx], repaired_texts, idx)
+            local_reasons = _detect_repair_reasons(source, target, glossary_pairs)
+            if local_reasons:
+                reasons[idx] = list(dict.fromkeys(local_reasons))
+                flagged.append(idx)
+        return flagged
+
     unresolved: list[int] = []
+    escalate_candidates: list[int] = []
     request_error: Exception | None = None
     try:
+        # Stage 1: every flagged id, cheap.
+        none_tier_unresolved: list[int] = []
         for offset in range(0, len(repair_ids), initial_span):
-            unresolved.extend(request_group(repair_ids[offset : offset + initial_span]))
+            none_tier_unresolved.extend(
+                request_group(repair_ids[offset : offset + initial_span], none_effort)
+            )
+
+        # Stage 2: only what stage 1 did not actually fix, escalated. Ids that
+        # never got a reply (hit the request cap) go straight in too - a
+        # different tier is worth one more try before giving up on them.
+        escalate_candidates = sorted(set(recheck(repair_ids)) | set(none_tier_unresolved))
+        retry_span = max(1, initial_span // 2)
+        for offset in range(0, len(escalate_candidates), retry_span):
+            unresolved.extend(
+                request_group(escalate_candidates[offset : offset + retry_span], escalated_effort)
+            )
+
         # Exact source echo is the correctness failure that retired the old
         # no-thinking tier. Anything still echoing gets one smaller second
         # chance, because a shorter group is the lever that fixed the rest.
-        retry_span = max(1, initial_span // 2)
         echoes = lingering_echoes()
         for offset in range(0, len(echoes), retry_span):
-            unresolved.extend(request_group(echoes[offset : offset + retry_span]))
+            unresolved.extend(request_group(echoes[offset : offset + retry_span], escalated_effort))
     except TranslationCancelledError:
         raise
     except Exception as exc:
@@ -215,7 +260,7 @@ def apply_repair_pass(
         detail = f" after {request_error}" if request_error is not None else ""
         raise RuntimeError(
             f"translation still echoes the Japanese source for {len(final_echoes)} "
-            f"cues after repair at effort={repair_effort}{detail}; "
+            f"cues after repair at effort={escalated_effort}{detail}; "
             f"ids={final_echoes[:50]}"
         )
 
@@ -264,7 +309,13 @@ def apply_repair_pass(
         "request_count": request_count,
         "repair_ids": repair_ids,
         "candidate_count": len(repair_ids),
-        "reasoning_effort": repair_effort,
+        # Kept for callers that read a single tier; the two-stage cascade
+        # below is the fuller picture.
+        "reasoning_effort": escalated_effort,
+        "none_tier_reasoning_effort": none_effort,
+        "none_tier_resolved_count": len(repair_ids) - len(escalate_candidates),
+        "escalated_count": len(escalate_candidates),
+        "escalated_ids": escalate_candidates,
         "format_split_count": format_split_count,
         "missing_count": len(set(unresolved)),
         "missing_indexes": sorted(set(unresolved)),
@@ -313,6 +364,24 @@ def _glossary_violations(source: str, target: str, pairs: list[tuple[str, str]])
     return False
 
 
+def _detect_repair_reasons(
+    source: str, target: str, glossary_pairs: list[tuple[str, str]]
+) -> list[str]:
+    """The detector suite, factored out so the post-none-tier recheck in
+    `apply_repair_pass` shares one implementation with the initial selection
+    below instead of drifting into a second copy."""
+    local_reasons: list[str] = []
+    if _has_source_echo(source, target):
+        local_reasons.append("source_echo")
+    if _has_remaining_japanese_kana(target):
+        local_reasons.append("japanese_remaining")
+    if glossary_pairs and _glossary_violations(source, target, glossary_pairs):
+        local_reasons.append("glossary_violation")
+    if _has_translation_length_mismatch(source, target):
+        local_reasons.append("length_mismatch")
+    return local_reasons
+
+
 def _select_translation_repair_ids(
     segments: list[dict],
     zh_texts: list[str],
@@ -341,15 +410,7 @@ def _select_translation_repair_ids(
     for idx, seg in enumerate(segments):
         source = _repair_source_text(seg)
         target = _repair_translation_text(seg, zh_texts, idx)
-        local_reasons: list[str] = []
-        if _has_source_echo(source, target):
-            local_reasons.append("source_echo")
-        if _has_remaining_japanese_kana(target):
-            local_reasons.append("japanese_remaining")
-        if pairs and _glossary_violations(source, target, pairs):
-            local_reasons.append("glossary_violation")
-        if _has_translation_length_mismatch(source, target):
-            local_reasons.append("length_mismatch")
+        local_reasons = _detect_repair_reasons(source, target, pairs)
         if not local_reasons:
             continue
         repair_ids.append(idx)
@@ -391,6 +452,7 @@ def _build_repair_messages(
     target_lang: str,
     glossary: str,
     character_reference: str,
+    extra_glossary: str = "",
 ) -> list[dict]:
     system_prompt = prompt_module._build_system_prompt(
         character_reference,
@@ -410,12 +472,22 @@ def _build_repair_messages(
         repair_ids,
         reasons,
     )
-    user_content = "\n\n".join(
+    user_parts = [
+        "【翻译修复任务】",
+        f"requested_ids = {prompt_module._format_requested_ids(repair_ids)}",
+        "只返回 requested_ids 中列出的 id，恰好返回这些 id，不要返回 context_only 项。",
+        "每个 text 只能是修复后的中文字幕；不要解释原因。",
+    ]
+    # Same block the base pass got, threaded through so a `none`-tier repair
+    # request has the film's already-settled terms to fall back on instead of
+    # having to infer them from three lines of local context alone - this is
+    # most of what makes a cheap first attempt viable.
+    extra_block = prompt_module._build_extra_glossary_block(extra_glossary)
+    if extra_block:
+        user_parts.append(extra_block)
+        user_parts.append("注意：必须严格使用上面 <glossary> 标签内的术语表翻译。")
+    user_parts.extend(
         [
-            "【翻译修复任务】",
-            f"requested_ids = {prompt_module._format_requested_ids(repair_ids)}",
-            "只返回 requested_ids 中列出的 id，恰好返回这些 id，不要返回 context_only 项。",
-            "每个 text 只能是修复后的中文字幕；不要解释原因。",
             "【局部上下文 JSON】",
             json.dumps(context_items, ensure_ascii=False, indent=2),
             '输出 JSON：{"translations":[{"id":0,"text":"..."}]}',
@@ -423,7 +495,7 @@ def _build_repair_messages(
     )
     return [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
+        {"role": "user", "content": "\n\n".join(user_parts)},
     ]
 
 
