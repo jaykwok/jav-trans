@@ -69,6 +69,16 @@
 
 定向测试：`tests/llm` 全量 337 passed / 1 skipped；`tests/llm tests/pipeline tests/web tests/asr` 996 passed / 1 failed（`test_job_tempdir`，与本次改动无关，同上）。
 
+### 复译分级 Stage 1 失败会连带跳过 Stage 2：三部真实素材验证 `inconsistent_rendering` 时发现的真 bug
+
+用三部真实素材（匿名样片 A/B/C，ASR 原始片段 302/316/212 条，cue-planning 后共约 1,400-1,600 条字幕）测试 `inconsistent_rendering` 检测器在真实大规模台词上会不会触发。第一轮用 bigmodel.cn/glm-5.3-flash：基础翻译还没跑完就被内容审查（`cyber_policy`）和账号限速挡住，检测器和复译都没机会跑到——这本身是一条值得记的结论，这类题材的台词在这个供应商上不可靠。换回 openrouter 后三部片子基础翻译全部成功，但复译阶段全部**静默失败**：日志里每部片子只有一条 `repair_start`→`repair_failed`，没有第二条，检测器标出的候选（三部分别 27/19/89 句）一句都没被修，任务仍然报 `done`。
+
+根因在 `apply_repair_pass`（`repair.py`）：Stage 1（`none` 档）和 Stage 2（升级档）包在同一个 `try/except` 里。这次触发的是端点对 `none` 档的**请求级拒绝**（"Reasoning is mandatory for this endpoint and cannot be disabled"，不是格式/解析错误），不属于内部会拆分重试的两种异常类型，直接冒泡出整个 try 块，Stage 2 从未被尝试——三部片子的 27/19/89 句候选全部原样保留了基础翻译的译文，复译分级机制在这个后端上等于完全没生效。也因为这样，`inconsistent_rendering` 具体有没有在这 135 句里触发依旧无法确认：reason 标签只在构造复译 prompt 时临时存在，从不落盘，任务成功后作业临时目录（含术语索引缓存）也按现有清理约定被自动删除了。
+
+**改动**：把 Stage 1 拆到独立的 `try/except`，与 Stage 2 分开。Stage 1 请求级失败时发一条 `repair_stage1_failed` 进度事件、不再对剩余 chunk 重试 `none` 档（同一个端点级拒绝几乎必然对每个 chunk 重复发生），落到 Stage 2；`recheck()` 按当前译文状态（Stage 1 没碰过的句子仍是原文）自然重新判定要不要升级，不需要额外传参。原有"回声兜底闸门必须能让任务失败"的设计保留，只是现在只在 Stage 2 也失败时才触发。
+
+**验证**：新增回归测试（fake chat 里 `none` 档抛真实异常，断言 escalate 档仍然跑完并修好译文）；`tests/llm` 全量 337 passed / 1 skipped / 1 failed（`test_responses_progress_translating_done`，`.env` 里 `LLM_REASONING_EFFORT=high` 和该测试硬编码期望 `low` 冲突，与本次改动无关，HEAD 上即存在）。真实数据复测（同一批样片之一，重新触发 79 句候选）：Stage 1 复现同样的请求级拒绝，`repair_stage1_failed` 之后 Stage 2 成功接手，`repair_done: repaired=79/79`——修复前是 0/79。
+
 ## 2026-08-24
 
 ### 砍掉 Chat Completions：API 档只剩 Responses 一个协议面
