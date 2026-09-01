@@ -52,6 +52,17 @@ NO_ROUTE_FOR_STRICT_JSON = (
     "换一个支持结构化输出的模型（模型列表里 `supported_parameters` 含 `structured_outputs` 的那些），"
     "或在 .env 中设 LLM_STRUCTURED_OUTPUT=json_object 改用宽松的 JSON 约束后重试。"
 )
+# Also a 404, and also not a missing/renamed model: OpenRouter's account-level
+# privacy settings (data policy / which providers may see the prompt) reject
+# the request before it reaches any upstream. Measured 2026-09-01 against a
+# real account whose default policy blocked every provider for an NSFW prompt -
+# the generic 404 line sent the user re-picking a model that was never the
+# problem.
+OPENROUTER_GUARDRAIL_BLOCKED = (
+    "OpenRouter 因隐私/数据策略拦截了这次请求（404），不是模型选错了：请打开 "
+    "https://openrouter.ai/settings/privacy 调整数据策略（例如允许存储训练数据的供应商），"
+    "或在「翻译设置」中换一个不受该策略限制的模型/服务商。"
+)
 RATE_LIMITED = (
     "翻译服务限速（429）且重试已用尽：请把「并行翻译 Worker 数」调低后重试。"
 )
@@ -157,6 +168,8 @@ def describe_stage_failure(exc: BaseException) -> str:
     status = _status_code(exc)
     if status == 404 and "no endpoints found that can handle" in lowered:
         return f"{NO_ROUTE_FOR_STRICT_JSON}（服务端原文：{message}）"
+    if status == 404 and ("guardrail" in lowered or "data policy" in lowered):
+        return f"{OPENROUTER_GUARDRAIL_BLOCKED}（服务端原文：{message}）"
     if status in _STATUS_MESSAGES:
         return f"{_STATUS_MESSAGES[status]}（服务端原文：{message}）" if message else _STATUS_MESSAGES[status]
 
@@ -184,6 +197,7 @@ __all__ = [
     "MISSING_MODEL",
     "MODEL_NOT_FOUND",
     "NO_ROUTE_FOR_STRICT_JSON",
+    "OPENROUTER_GUARDRAIL_BLOCKED",
     "OUT_OF_MEMORY",
     "RATE_LIMITED",
     "TRANSLATION_PANEL",

@@ -74,6 +74,23 @@ def test_openrouter_has_no_provider_for_the_strict_schema_is_not_a_missing_model
     assert not message.startswith(stage_errors.MODEL_NOT_FOUND)
 
 
+def test_openrouter_guardrail_block_is_not_a_missing_model():
+    """Measured 2026-09-01 against a real OpenRouter account: the account's
+    default data-policy settings rejected every provider for an NSFW prompt,
+    returning this 404 before the request ever reached an upstream. The
+    generic 404 line sent the user re-picking a model that was never the
+    problem; the real fix is the account's own privacy settings page."""
+    exc = _HttpError(
+        "No endpoints available matching your guardrail restrictions and "
+        "data policy. Configure: https://openrouter.ai/settings/privacy",
+        404,
+    )
+    message = describe_stage_failure(exc)
+    assert message.startswith(stage_errors.OPENROUTER_GUARDRAIL_BLOCKED)
+    assert "openrouter.ai/settings/privacy" in message
+    assert not message.startswith(stage_errors.MODEL_NOT_FOUND)
+
+
 def test_status_code_is_also_read_from_a_wrapped_response():
     message = describe_stage_failure(_ResponseHolder("nope", 401))
     assert message.startswith(stage_errors.INVALID_API_KEY)
