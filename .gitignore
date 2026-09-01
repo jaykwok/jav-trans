@@ -71,8 +71,9 @@ dist/
 *.tar
 *.tar.*
 
-# Claude Code project instructions are local to this workspace.
+# Agent project instructions are local to this workspace.
 CLAUDE.md
+AGENTS.md
 
 
 # pyproject.toml is the source of truth; `uv sync` is the documented install.
