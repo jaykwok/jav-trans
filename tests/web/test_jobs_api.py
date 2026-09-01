@@ -135,10 +135,6 @@ def test_proxy_test_ok_when_reachable(monkeypatch):
     asyncio.run(_test_proxy_test_ok_when_reachable(monkeypatch))
 
 
-def test_settings_tolerates_the_retired_api_format_field(monkeypatch):
-    asyncio.run(_test_settings_tolerates_the_retired_api_format_field(monkeypatch))
-
-
 def test_settings_translation_fields_update_runtime_env(monkeypatch):
     asyncio.run(_test_settings_translation_fields_update_runtime_env(monkeypatch))
 
@@ -553,37 +549,6 @@ async def _test_proxy_test_ok_when_reachable(monkeypatch):
     assert payload["status_code"] == 200
     assert payload["proxy_url"] == "http://127.0.0.1:7890"
     assert isinstance(payload["elapsed_ms"], int)
-
-
-async def _test_settings_tolerates_the_retired_api_format_field(monkeypatch):
-    """Chat Completions was retired on 2026-08-24 and the control went with
-    it. A browser still holding the old settings page keeps POSTing the
-    field, and the model forbids extras, so the field stays declared and does
-    nothing: accepted rather than 422, absent from the response, and never
-    written to `.env`."""
-    monkeypatch.delenv("LLM_API_FORMAT", raising=False)
-    changes: list[dict] = []
-    monkeypatch.setattr(config_routes, "_read_env_entry", lambda key: (False, ""))
-    monkeypatch.setattr(config_routes, "_update_env_file", changes.append)
-
-    transport = httpx.ASGITransport(app=create_app())
-    async with httpx.AsyncClient(
-        transport=transport,
-        base_url="http://test",
-    ) as client:
-        response = await client.post(
-            "/api/settings",
-            json={"llm_api_format": "chat", "llm_reasoning_effort": "high"},
-        )
-        assert response.status_code == 200
-        assert "LLM_API_FORMAT" not in os.environ
-
-        settings = await client.get("/api/settings")
-        assert settings.status_code == 200
-        assert "llm_api_format" not in settings.json()
-        assert settings.json()["llm_reasoning_effort"] == "high"
-
-    assert all("LLM_API_FORMAT" not in change for change in changes)
 
 
 async def _test_settings_translation_fields_update_runtime_env(monkeypatch):

@@ -33,13 +33,6 @@ class JobSpec(BaseModel):
     translation_max_workers: int = Field(default=4, ge=1, le=MAX_TRANSLATION_WORKERS)
     target_lang: str | None = Field(default=None, max_length=64)
     translation_glossary: str | None = Field(default=None, max_length=20000)
-    # Accepted and ignored since 2026-08-24, when Chat Completions was retired
-    # and Responses became the only surface. Declared rather than deleted
-    # because both models forbid extras, and forbidding is the opposite of
-    # ignoring: a saved job carrying this field would stop parsing, and
-    # `_load_jobs` drops what it cannot parse, so the user's whole job history
-    # would disappear over a knob that no longer does anything.
-    llm_api_format: str | None = None
     llm_reasoning_effort: Literal["none", "low", "high"] | None = None
     keep_temp_files: bool = False
     resume_from_job_id: str = Field(default="", max_length=128)
@@ -90,10 +83,6 @@ class SettingsUpdate(BaseModel):
     proxy_host: str | None = Field(default=None, max_length=255)
     proxy_port: int | None = Field(default=None, ge=1, le=65535)
     translation_glossary: str | None = Field(default=None, max_length=20000)
-    # Same retirement as JobSpec.llm_api_format: accepted, ignored, and kept
-    # only so a browser still holding the old settings page does not get a 422
-    # for sending a field that no longer exists.
-    llm_api_format: str | None = None
     llm_reasoning_effort: Literal["none", "low", "high"] | None = None
     target_lang: str | None = Field(default=None, max_length=64)
     translation_backend: Literal["openai", "llamacpp"] | None = None

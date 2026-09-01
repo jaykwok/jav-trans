@@ -28,6 +28,10 @@
 
 3 项均获用户确认后删除。定向测试 `tests/pipeline/test_memory_safety.py tests/asr/test_asr_alignment_head.py tests/asr/test_asr_backend_dispatch.py tests/asr/test_asr_pipeline_module_boundaries.py` 133 passed；`tests/asr tests/pipeline` 全量 577 passed / 1 failed（`test_job_tempdir`，tmp 目录落在 `C:` 与项目根 `D:\Projects\jav-trans` 跨盘，`relative_to` 必然失败，与本次改动无关，HEAD 上即存在）。
 
+### `llm_api_format` 从「声明但无人读取」改为彻底删除
+
+08-24 退役 Chat Completions 时特意保留了这个字段的声明（见下一节），为的是不让存量 job 记录因为 `extra="forbid"` 解析失败而从任务列表消失。用户判断这仍是死代码，要求彻底清理；核实后确认后果是真实的，不是假设：当天仍有 3 条真实失败任务的 spec 里带着 `"llm_api_format": null`。选择直接删，不额外写迁移层——`load_jobs()` 已经有 08-14 退役 `none` 档位时补上的机制（解析失败的记录先备份到 `tmp/web/jobs.json.rejected-<时间戳>` 再继续），这次沿用同一条路径而不是为了保留三条已经失败、大概率会被重新提交的记录另写一次性兼容代码。**代价**：那 3 条记录会在下次服务重启时从任务列表消失（备份文件仍在，未销毁，只是界面不再显示）。
+
 ## 2026-08-24
 
 ### 砍掉 Chat Completions：API 档只剩 Responses 一个协议面
