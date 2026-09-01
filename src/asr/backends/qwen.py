@@ -36,19 +36,6 @@ def qwen_asr_repo_id(backend: str | None = None) -> str:
         ) from exc
 
 
-def qwen_asr_repo_tag(repo_id: str | None = None) -> str:
-    normalized = (repo_id or DEFAULT_QWEN_ASR_BACKEND).strip()
-    if not normalized:
-        normalized = DEFAULT_QWEN_ASR_BACKEND
-    if normalized in QWEN_ASR_BACKEND_REPOS:
-        normalized = qwen_asr_repo_id(normalized)
-    return normalized.replace("/", "-")
-
-
-def qwen_asr_default_model_path(repo_id: str | None = None) -> str:
-    return f"models/{qwen_asr_repo_tag(repo_id)}"
-
-
 def active_qwen_asr_model_id() -> str:
     override = os.getenv("ASR_MODEL_ID", "").strip()
     return override or qwen_asr_repo_id(current_qwen_asr_backend())

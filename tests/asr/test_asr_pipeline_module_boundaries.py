@@ -60,7 +60,6 @@ class TestNoDeadReExports:
     # cost of a forwarding layer: it keeps an old name alive after the owner has
     # picked a better one.
     RETIRED = {
-        "_create_asr_backend": (registry, "_create_asr_backend"),
         "_is_timed_out_result": (result_cache, "_is_timed_out_result"),
         "_checkpointable_text_results": (result_cache, "_cacheable_text_results"),
         "_chunk_duration": (chunking, "_chunk_duration"),

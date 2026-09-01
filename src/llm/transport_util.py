@@ -7,11 +7,10 @@ the layer both backends and the orchestration engine stand on.
 
 from __future__ import annotations
 
-import contextlib
 import re
 import threading
 import time
-from typing import Callable, Iterator
+from typing import Callable
 
 from llm import settings
 from llm.errors import (
@@ -178,25 +177,16 @@ def _merge_usage_metrics(usages: list[dict]) -> dict:
 
 # --- retry events -------------------------------------------------------------
 
-# Worker threads bind their own event list via retry_event_scope(); the engine
-# merges the lists on the main thread. threading.local means an unbound thread
-# simply records nothing.
+# Worker threads bind their own event list by assigning `_RETRY_CONTEXT.events`
+# directly (see llm/engine.py, llm/translator.py); the engine merges the lists
+# on the main thread. threading.local means an unbound thread simply records
+# nothing.
 _RETRY_CONTEXT = threading.local()
 
 
 def _current_retry_events() -> list[dict] | None:
     events = getattr(_RETRY_CONTEXT, "events", None)
     return events if isinstance(events, list) else None
-
-
-@contextlib.contextmanager
-def retry_event_scope(events: list[dict]) -> Iterator[list[dict]]:
-    previous = getattr(_RETRY_CONTEXT, "events", None)
-    _RETRY_CONTEXT.events = events
-    try:
-        yield events
-    finally:
-        _RETRY_CONTEXT.events = previous
 
 
 # --- retry classification / backoff -------------------------------------------

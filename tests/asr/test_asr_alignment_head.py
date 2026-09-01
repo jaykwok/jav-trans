@@ -67,7 +67,6 @@ class TestFrameGeometry:
             head = alignment.build_head(vocab_size=VOCAB.size, upsample=upsample, blocks=1)
             output = head(torch.zeros(2, 17, 2048))
             assert output.shape[0] == 2
-            assert output.shape[1] == alignment.output_frame_count(17, upsample=upsample)
             assert output.shape[1] == 17 * upsample
             assert output.shape[2] == VOCAB.size
 

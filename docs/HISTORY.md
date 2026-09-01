@@ -16,6 +16,18 @@
 - **本地翻译**：唯一默认模型为 Hy-MT2-7B Q4_K_M，由 llama.cpp 托管；适合隐私优先和零 API 成本的草稿，不使用 API 路径的术语表、角色参考或全片上下文。
 - **已知边界**：ASR 的自动 batch 与缓存命中会改变批组成，严格对比时应固定 `ASR_BATCH_SIZE`。默认 CTC 头仍保留少量高 blank 风险样例，质量报告与人工复查不能省略。
 
+## 2026-09-01
+
+### 死代码清理：4 个真死函数，均为子系统退役或被通用基础设施取代的残留
+
+`vulture` 初筛 + `src`/`tools`/`tests` 全量 grep 交叉核验后，先删掉 4 个零调用者的低风险项（`AlignmentQuality` 类型别名、`_normalize_base_url` 静态方法、`_create_asr_backend` 包装函数、`retry_event_scope` 上下文管理器）。剩 3 个只在各自专属单测里出现，一开始没敢动——不确定是真死代码还是没接完线的新功能，逐一查 `git log -S` 和提交信息后结论都是前者：
+
+- **`reset_shared_vram_baseline`**（`src/pipeline/memory_safety.py`）：07-19 为 `tools/boundary/ja/build_feature_cache.py` 写的显存基线重置函数，08-01 `c28faab` 整体退役 boundary/scorer 链时，调用方连同测试一起被删，函数本体留了下来。真实的共享显存误判事故（见 08-01 archive）后来是靠 `ASR_SHARED_VRAM_SPILL_TOLERANCE_MB` 容差机制解决的，从未调用过这个函数。`_SHARED_VRAM_BASELINE_BY_PID` 字典本身仍被 `runtime_memory_snapshot()` 使用，只删了这一个孤立函数。
+- **`output_frame_count`**（`src/asr/alignment.py`）：08-01 随 CTC 对齐头一起写的 `frame_to_seconds` 对称函数（帧数→时长的反向：encoder 帧数→上采样后输出帧数），但从未被采用——两处真实调用点（`tools/align/evaluate_ctc_cache.py`、`tools/align/train_ctc_aligner.py`）各自手写了同一条 `encoder_frames * upsample` 而不是调用它。
+- **`qwen_asr_default_model_path`** 及其唯一内部依赖 **`qwen_asr_repo_tag`**（`src/asr/backends/qwen.py`）：06-19 写的 Qwen-ASR 专属默认路径推导，被后来的通用基础设施 `utils/model_paths.py::canonical_model_dir()` 取代——`resolve_model_spec()` 在收到 `None` 路径时走的是这条通用链路，从未调用过 Qwen 专属版本。删掉前者后，`qwen_asr_repo_tag` 也失去了唯一真实调用者，一并清理。
+
+3 项均获用户确认后删除。定向测试 `tests/pipeline/test_memory_safety.py tests/asr/test_asr_alignment_head.py tests/asr/test_asr_backend_dispatch.py tests/asr/test_asr_pipeline_module_boundaries.py` 133 passed；`tests/asr tests/pipeline` 全量 577 passed / 1 failed（`test_job_tempdir`，tmp 目录落在 `C:` 与项目根 `D:\Projects\jav-trans` 跨盘，`relative_to` 必然失败，与本次改动无关，HEAD 上即存在）。
+
 ## 2026-08-24
 
 ### 砍掉 Chat Completions：API 档只剩 Responses 一个协议面

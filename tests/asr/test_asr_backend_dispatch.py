@@ -136,15 +136,6 @@ def test_qwen_asr_minimum_physical_vram_uses_repo_table(monkeypatch):
         qwen.qwen_asr_min_physical_vram_mb(ASR_17B_BACKEND)
 
 
-def test_repo_tag_and_default_model_path(monkeypatch):
-    from asr.backends import qwen
-
-    assert qwen.qwen_asr_repo_tag(ASR_17B_BACKEND) == "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
-    assert qwen.qwen_asr_default_model_path(ASR_17B_BACKEND) == (
-        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
-    )
-
-
 def test_retired_checkpoint_mapping_machinery_is_gone():
     # The per-repo checkpoint registries and their env resolution went with the
     # boundary chain on 2026-07-31. The alignment head binds through

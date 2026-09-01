@@ -289,12 +289,6 @@ def frame_to_seconds(frame: int, *, upsample: int) -> float:
     return float(frame) * ENCODER_FRAME_S / float(upsample)
 
 
-def output_frame_count(encoder_frames: int, *, upsample: int) -> int:
-    if upsample < 1:
-        raise ValueError("upsample must be >= 1")
-    return int(encoder_frames) * int(upsample)
-
-
 def plan_head_windows(
     total_samples: int,
     *,

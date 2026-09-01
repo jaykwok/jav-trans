@@ -489,10 +489,6 @@ class OpenAICompatBackend(BaseTranslationBackend):
     def supports_streaming(self) -> bool:
         return True
 
-    @staticmethod
-    def _normalize_base_url(base_url: str | None) -> str | None:
-        return _normalize_openai_compat_base_url(base_url)
-
     def chat_completion(
         self,
         messages: list[dict],

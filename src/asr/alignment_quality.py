@@ -3,13 +3,6 @@ from __future__ import annotations
 from typing import Any, Literal
 
 
-AlignmentQuality = Literal[
-    "aligned",
-    "boundary",
-    "partial",
-    "nonlexical",
-    "drop_or_review",
-]
 AlignmentIssueType = Literal["none", "unknown"]
 
 

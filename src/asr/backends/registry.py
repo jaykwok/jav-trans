@@ -36,7 +36,3 @@ def _resolve_asr_backend(device: str) -> BaseAsrBackend:
             f"expected one of {sorted(_VALID_ASR_BACKENDS)}"
         )
     return LocalAsrBackend(device)
-
-
-def _create_asr_backend(device: str) -> BaseAsrBackend:
-    return _resolve_asr_backend(device)
