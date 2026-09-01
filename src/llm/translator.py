@@ -350,7 +350,7 @@ def translate_segments(
         # and inflate per-request latency past the watchdog timeouts.
         effective_max_workers = min(
             effective_max_workers,
-            _env_int_clamped("LLAMACPP_PARALLEL", 2, 1, 16),
+            _env_int_clamped("LLAMACPP_PARALLEL", 8, 1, 16),
         )
     # Selected before sizing because a model contract may impose a stricter
     # hard cap (Hy-MT2 is deliberately one cue per request).

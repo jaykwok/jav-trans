@@ -306,9 +306,9 @@ class LlamaCppServerBackend(BaseTranslationBackend):
         return log_dir / "llamacpp_server.log"
 
     def _build_command(self, exe: str, model_path: str, port: int) -> list[str]:
-        ctx = _env_int("LLAMACPP_CTX_SIZE", 8192, 1024, 131072)
+        ctx = _env_int("LLAMACPP_CTX_SIZE", 1024, 1024, 131072)
         ngl = _env_int("LLAMACPP_N_GPU_LAYERS", 999, 0, 999)
-        parallel = _env_int("LLAMACPP_PARALLEL", 2, 1, 16)
+        parallel = _env_int("LLAMACPP_PARALLEL", 8, 1, 16)
         # -c is the total context; llama-server splits it across -np slots, so
         # the env var means "context per slot". Flash attention stays on the
         # server's own default ("auto" on current builds).

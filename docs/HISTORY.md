@@ -32,6 +32,23 @@
 
 08-24 退役 Chat Completions 时特意保留了这个字段的声明（见下一节），为的是不让存量 job 记录因为 `extra="forbid"` 解析失败而从任务列表消失。用户判断这仍是死代码，要求彻底清理；核实后确认后果是真实的，不是假设：当天仍有 3 条真实失败任务的 spec 里带着 `"llm_api_format": null`。选择直接删，不额外写迁移层——`load_jobs()` 已经有 08-14 退役 `none` 档位时补上的机制（解析失败的记录先备份到 `tmp/web/jobs.json.rejected-<时间戳>` 再继续），这次沿用同一条路径而不是为了保留三条已经失败、大概率会被重新提交的记录另写一次性兼容代码。**代价**：那 3 条记录会在下次服务重启时从任务列表消失（备份文件仍在，未销毁，只是界面不再显示）。
 
+### 本地 llama.cpp 的 ctx/parallel：8192×2 是旧 1.8B 时代的遗留值，实测重配后显存更省、吞吐更高
+
+审查翻译链路（API 与本地 Hy-MT2 两条）找优化点时发现 `LLAMACPP_CTX_SIZE=8192`／`LLAMACPP_PARALLEL=2`（每槽 8,192、共 16,384 context）是从旧 1.8B/`n_slots=8` 时代传下来的整数默认值，而现在 `hymt2` 契约是单句一请求（`profiles/hymt2.py`：`max_batch_size()=1`，输出硬顶 512 token，输入就一行字幕），没有理由还需要这么大的每槽 context。不能靠猜数字改配置，实测（2026-09-01，RTX 4060 Ti 8GB，`agents/temp/20260901_191442_local-ctx-tuning/`）：
+
+| 配置 | 显存占用（模型+KV，delta） | 40 请求吞吐 | 假名残留 |
+|---|---:|---:|---:|
+| 8192×2（旧默认） | 6,697 MB | 7.76 req/s | 0/40 |
+| 2048×4 | 5,667 MB | 11.04 req/s | 0/40 |
+| 1536×6 | 5,795 MB | 11.99 req/s | 0/40 |
+| **1024×8（新默认）** | **5,665 MB** | **12.72 req/s（+64%）** | 0/40 |
+
+短句样本（10-30 字符）prompt token 只有 34-40、completion 只有 9-11；额外用 3 条刻意拉长的合成台词（71-84 字符，是项目自己 cue 长度软目标 20 字符的 3-4 倍）复测 1024×8 与 1536×6，prompt token 87-93、completion 29-35，总量远低于两档的 ctx 上限，均无报错、无假名残留。1024×8 在四档里显存最省、吞吐最高，定为新默认；`LLAMACPP_CTX_SIZE` 的硬下限本来就是 1024（`_env_int` 的 clamp），已经在下限上，不再继续下探。
+
+**改动**：`src/core/config.py` 默认值 `LLAMACPP_CTX_SIZE` 8192→1024、`LLAMACPP_PARALLEL` 2→8；`src/llm/backends/llamacpp_server.py::_build_command` 与 `src/llm/translator.py::translate_segments` 里两处兜底默认值同步更新，避免默认值分叉。定向测试 `tests/llm`（334 passed / 1 skipped）、`tests/web/test_no_model_pickers.py`、`tests/web/test_settings_contract.py` 全过。
+
+**风险边界**：VRAM 富余量在这张卡上测得约 2GB（8,188 MB 总显存，模型+context 用 6,192 MB，桌面基线占 527 MB），别的机器桌面占用更高时富余会更小；本次验证的最长台词是合成句子，真实素材若出现更极端的超长单句仍建议留意质量报告里的截断/假名残留信号。
+
 ## 2026-08-24
 
 ### 砍掉 Chat Completions：API 档只剩 Responses 一个协议面

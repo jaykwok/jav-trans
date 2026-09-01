@@ -224,11 +224,24 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Explicit local GGUF path wins over repo+file download.
     "LLAMACPP_GGUF_PATH": "",
     # Context per server slot; total server context is CTX_SIZE * PARALLEL.
-    "LLAMACPP_CTX_SIZE": "8192",
+    # The hymt2 per-line contract sends one short cue per request (bare
+    # template + one subtitle line, real usage measured 2026-09-01 on an
+    # RTX 4060 Ti 8GB: 34-93 prompt tokens even for an 80-char cue 4x the
+    # project's own ~20-char soft cue-length target, 512-token completion
+    # ceiling). 8192 was a leftover from the old 1.8B/n_slots=8 config, sized
+    # for a contract this model no longer uses. 1024 leaves ~8x headroom over
+    # measured worst-case usage while using *less* VRAM than the old default,
+    # because KV cache at this size is a rounding error next to the model
+    # weights and per-slot compute buffers now dominate instead.
+    "LLAMACPP_CTX_SIZE": "1024",
     "LLAMACPP_N_GPU_LAYERS": "999",
-    # Two slots target enough headroom for the 4.62GB model plus per-slot
-    # KV/runtime buffers on an 8GB card. The per-line requests are small.
-    "LLAMACPP_PARALLEL": "2",
+    # More slots than the old default because the per-line requests are tiny:
+    # measured 2026-09-01 (RTX 4060 Ti 8GB, 40 concurrent single-cue
+    # requests), ctx=1024/parallel=8 used 5,665MB VRAM (vs the old
+    # ctx=8192/parallel=2's 6,697MB) and pushed throughput from 7.76 to
+    # 12.72 req/s (+64%) with zero kana-residue regressions. Smaller ctx
+    # frees more than the extra slots cost.
+    "LLAMACPP_PARALLEL": "8",
     "LLAMACPP_STARTUP_TIMEOUT_S": "300",
     # Prompt contract: auto | json | hymt2 (off/none alias json). Auto selects
     # the one contract registered for the configured model family.

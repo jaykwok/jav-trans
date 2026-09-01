@@ -102,12 +102,12 @@ def test_build_command_shape(monkeypatch):
     assert command[command.index("--host") + 1] == "127.0.0.1"
 
 
-def test_build_command_defaults_to_two_slots_for_the_7b_q4_model():
+def test_build_command_defaults_to_eight_slots_for_the_7b_q4_model():
     command = LlamaCppServerBackend()._build_command(
         "llama-server.exe", "D:\\m.gguf", 12345
     )
-    assert command[command.index("-np") + 1] == "2"
-    assert command[command.index("-c") + 1] == "16384"
+    assert command[command.index("-np") + 1] == "8"
+    assert command[command.index("-c") + 1] == "8192"
 
 
 def test_cache_identity_reflects_model(monkeypatch):

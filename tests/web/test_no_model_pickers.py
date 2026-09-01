@@ -98,7 +98,7 @@ def test_the_shipped_defaults_are_the_two_models_that_ship() -> None:
 
     assert DEFAULT_SETTINGS["LLAMACPP_MODEL_REPO"] == "tencent/Hy-MT2-7B-GGUF"
     assert DEFAULT_SETTINGS["LLAMACPP_MODEL_FILE"] == "Hy-MT2-7B-Q4_K_M.gguf"
-    assert DEFAULT_SETTINGS["LLAMACPP_PARALLEL"] == "2"
+    assert DEFAULT_SETTINGS["LLAMACPP_PARALLEL"] == "8"
     assert (
         DEFAULT_SETTINGS["ASR_BACKEND"]
         == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
