@@ -28,6 +28,18 @@ dependencies = [
     # nothing loads and no audio decodes. The floor is what keeps the bundled
     # DLLs and the installed wheel from drifting apart.
     "torchcodec>=0.16.0",
+    # 5.15.0 changed Qwen3ASRProcessor.apply_transcription_request's language
+    # forcing from a system-prompt message + add_generation_prompt=True to an
+    # assistant-turn prefill + continue_final_message=True (upstream commit
+    # c7f9c881, "Add hotword parsing, and fix language parsing and training").
+    # continue_final_message requires the model's own chat template to render
+    # a trailing assistant message and stop before its closing token. This
+    # project's fine-tuned Qwen3-ASR repos (both the 1.7B and 0.6B `-hf`
+    # layouts) had their chat_template.jinja patched 2026-09-02 with an
+    # assistant-role rendering block (copied from the base Qwen3-ASR-hf
+    # template) to support it - see each repo's README changelog. No floor
+    # bump needed: the patch is additive, so 5.13.0-5.14.x still work via the
+    # old system-prompt convention.
     "transformers>=5.13.0",
     "uvicorn[standard]",
     "xxhash",

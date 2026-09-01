@@ -16,6 +16,33 @@
 - **本地翻译**：唯一默认模型为 Hy-MT2-7B Q4_K_M，由 llama.cpp 托管；适合隐私优先和零 API 成本的草稿，不使用 API 路径的术语表、角色参考或全片上下文。
 - **已知边界**：ASR 的自动 batch 与缓存命中会改变批组成，严格对比时应固定 `ASR_BATCH_SIZE`。默认 CTC 头仍保留少量高 blank 风险样例，质量报告与人工复查不能省略。
 
+## 2026-09-02
+
+### transformers 5.15 起 Qwen3-ASR 语言强制方式改变，微调仓库的 chat_template 完全接不住——真实任务报错定位到，修在模型仓库而不是这个项目
+
+09-01 依赖批量升级把 `transformers` 从 5.14.1 提到 5.16.1，随 v1.6 一起发布（见 [2026-08-24 依赖批量升级](#2026-08-24)）。用户在自己跑的 web app 里，真实转写任务上收到：
+
+```
+ValueError: continue_final_message is set but the final message does not appear
+in the chat after applying the chat template!
+```
+
+每一次转写请求都必现，ASR 完全不可用——这是这次升级里最严重的回归。
+
+根因用 `gh api repos/huggingface/transformers/commits/c7f9c881` 精确定位到上游提交：`Qwen3ASRProcessor.apply_transcription_request()` 的语言强制方式从"system 消息纯文本 + `add_generation_prompt=True`"改成"assistant 轮次预填 `f"language {lang}<asr_text>"` + `continue_final_message=True`"。`continue_final_message` 要求 chat_template 把这条 assistant 消息实际渲染进输出（HF 侧实现见 `transformers/utils/chat_template_utils.py::render_jinja_template`：在渲染结果里找预填文本+标记串定位截断点，找不到就抛这个 `ValueError`）。取回 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf` 当时的 `chat_template.jinja` 后确认：这份模板只处理 `system` 和 `user` 两种角色，从未写过 `assistant` 分支——新版本塞进去的这条消息被模板整体忽略，`continue_final_message` 自然找不到目标文本。
+
+对照模型的官方基座 `Qwen/Qwen3-ASR-1.7B-hf`（以及体积不同但模板逐字节相同的 `Qwen3-ASR-0.6B-hf`）的 `chat_template.jinja`，发现基座模板本来就带着完整的 assistant 渲染分支（含 `{% generation %}` 标记，用于 `return_assistant_tokens_mask`）——上游这次升级本身没问题，是当初转换微调仓库时套用的模板落后于基座、从未补上这个分支。
+
+**修复落在模型仓库而不是这个项目**：把基座模板里的 assistant 渲染块逐字复制进两个微调仓库（`jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf` 与 `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`）的 `chat_template.jinja`。纯增量：不改动原有 system/user 渲染和 `add_generation_prompt` 分支，仍在用 `transformers<5.15` 的调用方不受影响。两个仓库的 README 都加了 Changelog 记录这次改动和原因。项目侧 `pyproject.toml` 相应去掉了升级当天临时加的 `<5.15.0` 版本上限。
+
+**验证**：
+
+1. 用真实（非 mock）`AutoProcessor` 复现根因：打补丁前对着 dummy 音频调 `apply_transcription_request` 精确复现同一个 `ValueError`；打补丁后先在本地内存里覆盖模板验证思路，再强制刷新缓存对着推送后的线上模板重新验证，渲染正确产出 `<|im_start|>assistant\nlanguage Japanese<asr_text>`，`continue_final_message` 正确截断收尾 `<|im_end|>`；顺带验证了这次上游升级带的新特性 `prompt=`（热词提示）也正确落进 system 段。
+2. 全量测试（transformers 5.16.1）1619 passed / 1 skipped，另 3 项本机固定失败与本次改动无关（两处 Windows C/D 跨盘路径断言、一处 `.env` 推理强度断言，HEAD 上即存在）。
+3. 真实端到端：下载完整 1.7B 权重，从匿名样片音轨截取 12 秒真实片段，跑通 `model.generate()`，转写结果语义合理（非乱码、非空输出），确认不只是模板渲染层面的修复，生成层面同样正常。
+
+**教训**：批量依赖升级当天的验证覆盖了 API 翻译链路的真实数据，但没有覆盖真实 ASR 推理——本地没有缓存模型权重，出于下载成本当时选择跳过，单测里的 ASR 全是 mock，覆盖不到 chat_template 渲染这一层。这类直接决定 ASR 能不能跑的依赖（`transformers`/`torch`）再升级时，即使要下载几 GB 模型权重，也需要至少跑一次真实音频片段的 `generate()` 冒烟，不能止步于 import 或 processor 级别的验证。
+
 ## 2026-09-01
 
 ### 死代码清理：4 个真死函数，均为子系统退役或被通用基础设施取代的残留
@@ -78,6 +105,15 @@
 **改动**：把 Stage 1 拆到独立的 `try/except`，与 Stage 2 分开。Stage 1 请求级失败时发一条 `repair_stage1_failed` 进度事件、不再对剩余 chunk 重试 `none` 档（同一个端点级拒绝几乎必然对每个 chunk 重复发生），落到 Stage 2；`recheck()` 按当前译文状态（Stage 1 没碰过的句子仍是原文）自然重新判定要不要升级，不需要额外传参。原有"回声兜底闸门必须能让任务失败"的设计保留，只是现在只在 Stage 2 也失败时才触发。
 
 **验证**：新增回归测试（fake chat 里 `none` 档抛真实异常，断言 escalate 档仍然跑完并修好译文）；`tests/llm` 全量 337 passed / 1 skipped / 1 failed（`test_responses_progress_translating_done`，`.env` 里 `LLM_REASONING_EFFORT=high` 和该测试硬编码期望 `low` 冲突，与本次改动无关，HEAD 上即存在）。真实数据复测（同一批样片之一，重新触发 79 句候选）：Stage 1 复现同样的请求级拒绝，`repair_stage1_failed` 之后 Stage 2 成功接手，`repair_done: repaired=79/79`——修复前是 0/79。
+
+### 依赖批量升级：openai 3.x / torch 2.14 / torchcodec 0.16 / transformers 5.16
+
+准备发布 v1.6 前，先用 `uv pip list --outdated` 摸底约 40 个可升级依赖，删掉一个无人引用的直接依赖 `librosa`（`src/` 内无任何 import），风险最高的两处逐一用真实数据验证而不是只看 import：
+
+- **openai 2.46.0 → 3.6.0**：默认 HTTP 客户端换成 HTTPX2，但本项目构造 client 是纯 `OpenAI(api_key=..., base_url=...)`，无自定义 httpx 接线，不受影响；2.52.0 起遵守服务端 `Retry-After`（最多 2 分钟），恰好对应同一天真实复译测试中被 openrouter 限速打回的场景。
+- **torch 2.13.0 → 2.14.0 + torchcodec 0.16.0**：本项目吃过 torch/torchcodec/FFmpeg 版本配对的亏（`torchcodec>=0.16.0` 楼层的注释即为此事故记录），这次不只看 import 成不成功，而是拿真实素材音轨跑 `torchcodec.decoders.AudioDecoder` 实际解码，确认新 torch 下解码正常（`sample_rate=48000, shape=[2, 259036144]`）。
+
+`uv lock --upgrade` 后全量测试 1619 passed / 1 skipped，另 3 项本机固定失败与本次改动无关。**这次验证覆盖了 API 翻译链路的真实数据，但没有覆盖真实 ASR 转写**（本地没有缓存模型权重，成本原因当时跳过，单测里的 ASR 全是 mock）——`transformers` 5.14.1→5.16.1 这一跳携带的破坏性契约变更因此漏了过去，随 v1.6 一起发布后才被真实使用暴露，见 [2026-09-02](#2026-09-02)。
 
 ## 2026-08-24
 
