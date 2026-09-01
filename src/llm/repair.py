@@ -90,6 +90,11 @@ def apply_repair_pass(
     base batch must not buy one fixed reasoning preamble per batch. Invalid or
     truncated replies split the group in half, which reuses the engine's "ask
     for less" recovery rule instead of reissuing an identical bad shape.
+
+    Stage 1 failing outright - some endpoints reject `none` reasoning as a
+    request-level error rather than a bad reply - does not skip stage 2:
+    a provider rejecting the cheap tier says nothing about the escalated one,
+    which is a different request shape (a real reasoning budget).
     """
     _raise_if_cancelled(cancel_event)
     glossary_pairs = parse_glossary_pairs(glossary) if glossary else []
@@ -231,17 +236,37 @@ def apply_repair_pass(
     unresolved: list[int] = []
     escalate_candidates: list[int] = []
     request_error: Exception | None = None
+
+    # Stage 1 gets its own try/except, separate from stage 2's below: a
+    # request-level failure here (the endpoint refuses `none` outright, a
+    # timeout, ...) must not skip stage 2. Escalation is a different request
+    # shape - a real reasoning budget - and may well work where `none`
+    # cannot. Whatever stage 1 fixed before failing is already recorded in
+    # `repaired_texts`; `recheck` below re-derives what is still wrong from
+    # that state, so nothing needs to be threaded through by hand.
+    none_tier_unresolved: list[int] = []
     try:
-        # Stage 1: every flagged id, cheap.
-        none_tier_unresolved: list[int] = []
         for offset in range(0, len(repair_ids), initial_span):
             none_tier_unresolved.extend(
                 request_group(repair_ids[offset : offset + initial_span], none_effort)
             )
+    except TranslationCancelledError:
+        raise
+    except Exception as exc:
+        # A request-level failure at this tier almost always repeats for
+        # every remaining chunk, so stop retrying stage 1 rather than burn it
+        # on doomed requests - whatever it never reached falls through to
+        # stage 2 below exactly like ids stage 1 tried and failed to fix.
+        _emit_progress(
+            on_progress,
+            {"phase": "repair_stage1_failed", "error": str(exc)[:200]},
+        )
 
+    try:
         # Stage 2: only what stage 1 did not actually fix, escalated. Ids that
-        # never got a reply (hit the request cap) go straight in too - a
-        # different tier is worth one more try before giving up on them.
+        # never got a reply (hit the request cap, or stage 1 failed outright)
+        # go straight in too - a different tier is worth one more try before
+        # giving up on them.
         escalate_candidates = sorted(set(recheck(repair_ids)) | set(none_tier_unresolved))
         retry_span = max(1, initial_span // 2)
         for offset in range(0, len(escalate_candidates), retry_span):

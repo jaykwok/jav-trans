@@ -971,6 +971,64 @@ def test_a_cheap_first_pass_escalates_only_the_flagged_ids(monkeypatch):
     assert timing["escalated_count"] == 3
 
 
+def test_a_request_level_failure_in_the_cheap_repair_pass_still_lets_escalation_run(
+    monkeypatch,
+):
+    """A provider that rejects `none` reasoning outright - a request-level
+    error, not a bad reply - must not skip the escalated pass. That tier is a
+    different request shape (a real reasoning budget) and may well work where
+    `none` cannot; the run must not settle for the unrepaired base text just
+    because the cheap tier was unusable on this endpoint."""
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "これは翻訳されるべきです。"},
+        {"start": 1.0, "end": 2.0, "text": "こんにちは。"},
+    ]
+    initial = {0: "これは翻訳されるべきです。", 1: "你好，太郎さん。"}
+    repaired = {0: "这句话应该被翻译。", 1: "你好，太郎。"}
+    events: list[dict] = []
+
+    def fake_chat(messages, expected_count=0, reasoning_effort=None, **_kwargs):
+        ids = _requested_ids_from_messages(messages)
+        is_repair = "【翻译修复任务】" in messages[1]["content"]
+        if is_repair:
+            if reasoning_effort == "none":
+                raise RuntimeError(
+                    "Reasoning is mandatory for this endpoint and cannot be "
+                    "disabled."
+                )
+            values = repaired
+        else:
+            values = initial
+        return json.dumps(
+            {"translations": [{"id": idx, "text": values[idx]} for idx in ids]},
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-flash")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
+    monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 2)
+    monkeypatch.setattr(translator, "TRANSLATION_PREFIX_WARMUP", False)
+
+    zh_texts, timings, retry_events = translator.translate_segments(
+        segments,
+        max_workers=1,
+        cache_path="",
+        reasoning_effort="none",
+        on_progress=events.append,
+    )
+
+    assert retry_events == []
+    assert zh_texts == [repaired[0], repaired[1]]
+    assert any(evt.get("phase") == "repair_stage1_failed" for evt in events)
+    assert any(evt.get("phase") == "repair_done" for evt in events)
+    timing = next(
+        item for item in timings if item.get("mode") == "translation_repair_pass"
+    )
+    assert timing["escalated_count"] == 2
+
+
 def test_the_settled_index_from_the_base_pass_repairs_a_drifted_repeat(monkeypatch):
     """End to end: the base pass renders the same line two ways, the settled
     index built from its own output (see `global_glossary`) picks the majority
