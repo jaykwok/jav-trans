@@ -462,6 +462,10 @@ if __name__ == "__main__":
             width=1280,
             height=820,
             resizable=True,
+            # The layout is a fixed 344px sidebar + fluid job panel with no
+            # responsive breakpoint; below this the job panel gets crushed
+            # (titles collapse to 1-2 characters, action buttons run off-screen).
+            min_size=(900, 600),
         )
         webview.start(
             _bind,
