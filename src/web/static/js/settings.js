@@ -1,7 +1,8 @@
 import { state } from './state.js';
-import { $, escHtml, showToast } from './util.js';
+import { $, escHtml, showToast, readErrorDetail } from './util.js';
 import { loadFormMemory, saveFormMemory, applyFormMemory } from './formMemory.js';
 import { setActivePreset } from './presets.js';
+import { setModelComboboxOptions, installModelCombobox } from './modelCombobox.js';
 
 const _SUBTITLE_MODE_LABELS = {
   '简体中文': {
@@ -59,6 +60,7 @@ function scheduleModelRequirementsPoll(missingModels) {
 
 function renderModelRequirements(payload) {
   const notice = $('model-requirements-notice');
+  const panel = $('panel-model-requirements');
   if (!notice) return;
   const missing = (payload.required_models || []).filter(item => !item.present);
   // Polls skip the CUDA probe (it spawns a torch import), so keep the last
@@ -68,10 +70,11 @@ function renderModelRequirements(payload) {
   const cudaProblem = cuda.status && cuda.status !== 'ok';
   scheduleModelRequirementsPoll(missing.length > 0);
   if (!missing.length && !cudaProblem) {
-    notice.hidden = true;
+    if (panel) panel.hidden = true;
     notice.textContent = '';
     return;
   }
+  if (panel) panel.hidden = false;
 
   const sections = [];
   if (missing.length) {
@@ -168,13 +171,7 @@ export async function loadSettings() {
       : '当前：未设置';
     if (s.base_url) $('api-base-url').value = s.base_url;
     if (s.model) {
-      const sel = $('api-model');
-      sel.innerHTML = '';
-      const opt = document.createElement('option');
-      opt.value = s.model;
-      opt.textContent = s.model;
-      sel.appendChild(opt);
-      sel.disabled = false;
+      setModelComboboxOptions([s.model], { selected: s.model });
       $('api-model-preview').textContent = '当前：' + s.model;
     }
 
@@ -328,6 +325,8 @@ export async function syncSettingsFromFormForSubmit() {
 }
 
 export function installSettingsPanel() {
+  installModelCombobox();
+
   const saveProxySettings = async () => {
     try {
       await saveSettingsBody(buildSettingsBodyFromForm({ includeProxy: true }));
@@ -423,7 +422,7 @@ export function installSettingsPanel() {
 
       const r = await fetch('/api/models');
       if (r.status === 400) {
-        alert('配置不完整：' + await r.text());
+        alert('配置不完整：' + await readErrorDetail(r));
         return;
       }
       if (r.status === 401 || r.status === 403) {
@@ -431,7 +430,7 @@ export function installSettingsPanel() {
         return;
       }
       if (!r.ok) {
-        alert('获取失败（' + r.status + '），请检查 Base URL：\n' + await r.text());
+        alert('获取失败（' + r.status + '），请检查 Base URL：\n' + await readErrorDetail(r));
         return;
       }
       const { models } = await r.json();
@@ -439,12 +438,7 @@ export function installSettingsPanel() {
         alert('API 未返回任何模型，请确认 Base URL 和 Key 填写正确');
         return;
       }
-      const sel = $('api-model');
-      const current = sel.value;
-      sel.innerHTML = models.map(m =>
-        `<option value="${escHtml(m)}"${m === current ? ' selected' : ''}>${escHtml(m)}</option>`
-      ).join('');
-      sel.disabled = false;
+      setModelComboboxOptions(models);
       const wrap = $('api-model-wrap');
       if (wrap) wrap.removeAttribute('title');
     } catch (e) {

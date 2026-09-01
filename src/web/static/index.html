@@ -56,11 +56,13 @@
         </label>
       </div>
 
-      <!-- Model / environment readiness -->
-      <div class="panel">
+      <!-- Model / environment readiness. Hidden as a whole (not just the
+           inner notice) when nothing is missing, so this doesn't sit on
+           screen as an empty section with a title and no content. -->
+      <div class="panel" id="panel-model-requirements" hidden>
         <div class="panel-title">🎯 运行环境</div>
         <div class="form-grid">
-          <div id="model-requirements-notice" class="model-requirements-notice" hidden></div>
+          <div id="model-requirements-notice" class="model-requirements-notice"></div>
         </div>
       </div>
 
@@ -170,21 +172,22 @@
               <label class="field">
                 <span>API Base URL（留空则不修改当前值）</span>
                 <input type="text" id="api-base-url" placeholder="https://openrouter.ai/api/v1">
-                <span class="field-hint">默认使用 OpenRouter（<code>https://openrouter.ai/api/v1</code>）；也可填写 DeepSeek（<code>https://api.deepseek.com</code>，官方地址不带 <code>/v1</code>）或其他 OpenAI 兼容服务的接口地址。<b>换地址后模型要重选</b>：模型名属于端点，OpenRouter 用 <code>厂商/模型</code>（如 <code>deepseek/deepseek-v4-flash</code>），DeepSeek 官方用 <code>deepseek-v4-flash</code>。</span>
+                <span class="field-hint">默认使用 OpenRouter（<code>https://openrouter.ai/api/v1</code>）；也可填写 DeepSeek（<code>https://api.deepseek.com</code>，官方地址不带 <code>/v1</code>）、智谱 GLM 等其他 OpenAI 兼容服务的接口地址。<br><b>换地址后请重新点「获取」选模型</b>：模型名属于端点，同一模型在不同服务商下命名可能不同（如 OpenRouter 用 <code>厂商/模型</code> 的 <code>deepseek/deepseek-v4-flash</code>，DeepSeek 官方用 <code>deepseek-v4-flash</code>）。</span>
               </label>
 
               <label class="field">
                 <span>模型</span>
                 <div class="model-row">
-                  <div id="api-model-wrap" class="model-select-wrap" title="请先填写并保存 API Key 和 Base URL，再点击「获取」">
-                    <select id="api-model" disabled>
-                      <option value="">-- 填好 Key 和 URL 后点获取 --</option>
-                    </select>
+                  <div id="api-model-wrap" class="model-combobox" title="请先填写并保存 API Key 和 Base URL，再点击「获取」">
+                    <input type="text" id="api-model" class="model-combobox-input" disabled
+                      autocomplete="off" placeholder="-- 填好 Key 和 URL 后点获取 --">
+                    <ul class="model-combobox-list" id="api-model-list" hidden></ul>
                   </div>
                   <button class="btn-sm btn-outline" id="btn-fetch-models" type="button"
                     title="从 API 拉取可用模型列表">获取</button>
                 </div>
                 <span class="key-preview" id="api-model-preview"></span>
+                <span class="field-hint">拉取到的列表可以直接输入关键字筛选；最终只能选中列表里的一项。</span>
               </label>
 
               <label class="field">
@@ -194,7 +197,7 @@
                   <option value="low" selected>low（默认）</option>
                   <option value="high">high（最慢，成本最高）</option>
                 </select>
-                <span class="field-hint">首轮全片按此强度翻译；之后本地质检把可疑字幕挑出来，只对这些行集中复译（复译用同一档，但不低于 low，所以只有 none 会升档）。成本几乎全在输出 token，而输出的绝大部分是思维链，所以这一档直接决定单片价格。其他兼容 API 按各供应商规则执行。</span>
+                <span class="field-hint">首轮全片按此强度翻译；之后本地质检把可疑字幕挑出来，只对这些行集中复译（复译用同一档，但不低于 low，所以只有 none 会升档）。<br>成本几乎全在输出 token，而输出的绝大部分是思维链，所以这一档直接决定单片价格。<br>其他兼容 API 按各供应商规则执行。</span>
               </label>
             </div>
 

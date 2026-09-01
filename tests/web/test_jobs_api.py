@@ -203,6 +203,10 @@ def test_models_api_falls_back_to_v1_models(monkeypatch):
     asyncio.run(_test_models_api_falls_back_to_v1_models(monkeypatch))
 
 
+def test_models_api_accepts_models_slug_shape(monkeypatch):
+    asyncio.run(_test_models_api_accepts_models_slug_shape(monkeypatch))
+
+
 def test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
     asyncio.run(_test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch))
 
@@ -757,6 +761,46 @@ async def _test_models_api_falls_back_to_v1_models(monkeypatch):
         "https://api.example.test/models",
         "https://api.example.test/v1/models",
     ]
+
+
+async def _test_models_api_accepts_models_slug_shape(monkeypatch):
+    """bigmodel.cn's /api/v1/models (Codex-CLI gateway) answers `models[].slug`.
+
+    Confirmed live against the vendor on 2026-09-01: HTTP 200 with
+    `{"models": [{"slug": "glm-5.3", ...}]}`, not OpenAI's `data[].id`.
+    """
+    monkeypatch.setenv("API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://open.bigmodel.cn/api/v1")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "models": [
+                    {"slug": "glm-5.3", "display_name": "glm-5.3"},
+                    {"slug": "glm-5.3-flash", "display_name": "glm-5.3-flash"},
+                ],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    def mock_async_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(config_routes.httpx, "AsyncClient", mock_async_client)
+
+    app_transport = httpx.ASGITransport(app=create_app())
+    async with original_async_client(
+        transport=app_transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/api/models")
+
+    assert response.status_code == 200
+    assert response.json() == {"models": ["glm-5.3", "glm-5.3-flash"]}
 
 
 async def _test_jobs_api_crud(tmp_path, monkeypatch):

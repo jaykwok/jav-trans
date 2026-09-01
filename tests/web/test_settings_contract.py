@@ -125,11 +125,33 @@ def test_frontend_defaults_match_backend_defaults_and_limits() -> None:
     assert '<option value="low" selected>' in html
     assert DEFAULT_SETTINGS["TARGET_LANG"] == "简体中文"
     assert '<option value="简体中文">简体中文</option>' in html
-    assert JobSpec.model_fields["subtitle_mode"].default == "zh"
-    assert "'r-mode':                    'zh'" in (
-        STATIC / "js" / "presets.js"
-    ).read_text(encoding="utf-8")
     assert f'max="{MAX_TRANSLATION_WORKERS}"' in html
+
+
+def test_standard_preset_matches_backend_job_defaults() -> None:
+    """"标准" is applied unconditionally on every load for non-custom users
+    (main.js's `applyPreset(state.activePreset)`), so a TUNING_FIELDS value
+    that drifts from JobSpec silently overrides whatever /api/config just
+    reported. translation_max_workers did exactly that once (shipped as 16
+    against a backend default of 4) - this pins every "标准" field against
+    the real JobSpec default so that class of bug fails the suite instead of
+    showing up in a user's job list."""
+    presets_js = (STATIC / "js" / "presets.js").read_text(encoding="utf-8")
+    tuning_block = presets_js[
+        presets_js.index("export const TUNING_FIELDS") :
+        presets_js.index("};", presets_js.index("export const TUNING_FIELDS"))
+    ]
+
+    def js_value(field_id: str) -> str:
+        match = re.search(rf"'{re.escape(field_id)}':\s*([^,\n]+),", tuning_block)
+        assert match, f"{field_id} missing from presets.js TUNING_FIELDS"
+        return match.group(1).strip()
+
+    assert js_value("r-mode") == f"'{JobSpec.model_fields['subtitle_mode'].default}'"
+    assert js_value("r-skip-translation") == str(JobSpec.model_fields["skip_translation"].default).lower()
+    assert js_value("t-translation-max-workers") == f"'{JobSpec.model_fields['translation_max_workers'].default}'"
+    assert js_value("t-quality-report") == str(JobSpec.model_fields["keep_quality_report"].default).lower()
+    assert js_value("t-keep-temp") == str(JobSpec.model_fields["keep_temp_files"].default).lower()
 
 
 def test_every_html_control_is_wired_and_every_direct_js_id_exists() -> None:

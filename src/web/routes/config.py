@@ -394,13 +394,35 @@ def _model_endpoint_candidates(base_url: str) -> list[str]:
     return deduped
 
 
+def _model_id_from_item(item: dict) -> str | None:
+    for field in ("id", "slug", "model", "name"):
+        value = item.get(field)
+        if value:
+            return str(value)
+    return None
+
+
 def _extract_model_ids(payload: Any) -> list[str]:
-    data = payload.get("data", []) if isinstance(payload, dict) else []
-    return sorted(
-        str(item["id"])
-        for item in data
-        if isinstance(item, dict) and item.get("id")
-    )
+    """Model ids from either OpenAI's `data[]` or a `models[]` variant.
+
+    bigmodel.cn's `/api/v1/models` (the Codex-CLI-compatible gateway) answers
+    200 with `{"models": [{"slug": "glm-5.3", ...}]}` instead of OpenAI's
+    `{"data": [{"id": ...}]}` - same list-of-models intent, different key
+    names, confirmed against the vendor with a live key on 2026-09-01.
+    """
+    if not isinstance(payload, dict):
+        return []
+    for key in ("data", "models"):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        ids = [
+            _model_id_from_item(item) for item in items if isinstance(item, dict)
+        ]
+        ids = [model_id for model_id in ids if model_id]
+        if ids:
+            return sorted(ids)
+    return []
 
 
 @router.get("/config")

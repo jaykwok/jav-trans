@@ -10,6 +10,13 @@ the next one is found by the suite instead of by a user.
 `api-model` is deliberately allowed: that is the *remote* API model name, which
 only the user can know. The local backend is the fixed Hy-MT2 + llama.cpp stack;
 even a free-form GGUF path would be a model picker and may not appear.
+
+`api-model` itself is a filterable text input (`js/modelCombobox.js`) rather than
+a `<select>`, since providers with long model lists need to be searchable - but
+the combobox still only accepts values that came back from `/api/models`, so
+this stays a "pick from what the vendor offers" control, not free text. Hence
+it does not appear in `ALLOWED_SELECT_IDS` below, which only inventories native
+`<select>` elements.
 """
 
 from __future__ import annotations
@@ -27,7 +34,6 @@ ALLOWED_SELECT_IDS = {
     "proxy-protocol",
     "r-mode",
     "translation-backend",
-    "api-model",
     "api-reasoning-effort",
     "api-target-lang",
 }

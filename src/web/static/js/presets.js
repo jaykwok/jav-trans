@@ -4,10 +4,19 @@ import { saveFormMemory, loadFormMemory } from './formMemory.js';
 
 const CUSTOM_PRESET_KEY = 'jav-trans.customPreset.v1';
 
+// "标准" must equal the backend's own defaults (`JobSpec` in web/models.py) -
+// it is applied unconditionally on every load for non-custom users
+// (main.js's `applyPreset(state.activePreset)`), so a value here that drifts
+// from the backend silently overrides whatever `/api/config` just reported.
+// `t-translation-max-workers` did exactly that (shipped as 16 against a
+// backend default of 4); test_settings_contract.py now pins this block
+// against JobSpec's real defaults so a future drift fails the suite instead
+// of a user's job list. Only "自定义" may hold a non-default value, via its
+// own saved template.
 export const TUNING_FIELDS = {
   'r-mode':                    'zh',
   'r-skip-translation':        false,
-  't-translation-max-workers': '16',
+  't-translation-max-workers': '4',
   't-quality-report':          false,
   't-keep-temp':               false,
 };
