@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -88,6 +89,38 @@ def test_local_backend_returns_primary_words_when_shadow_disagrees(monkeypatch) 
         for word in expected_words
     ]
     assert result["timing_meta"]["alignment_shadow"]["onset_delta_ms"] == pytest.approx(200.0)
+
+
+def test_finalize_log_names_the_checkpoint_file_not_the_algorithm_tag(monkeypatch) -> None:
+    """The log used to print ALIGNED_TIMING_SOURCE ("ctc_forced_alignment_v1"),
+    an algorithm-version tag easily misread as the checkpoint's own version.
+    Show the file that actually ran instead."""
+    backend = LocalAsrBackend("cpu")
+    primary = [_span(1.0, 2.0)]
+    monkeypatch.setattr(
+        backend,
+        "_align_characters",
+        lambda *_args, **_kwargs: (primary, (1.0, 2.0)),
+    )
+    backend._alignment_head = SimpleNamespace(
+        checkpoint_path="D:/models/ctc_aligner_jav_vocalisation_v2.pt"
+    )
+
+    _result, log = backend._use_boundary_timing_result(
+        master_text="あ",
+        raw_master_text="あ",
+        duration=3.0,
+        detected_language="Japanese",
+        normalized_path="unused.wav",
+        timing_start=0.0,
+        timing_end=3.0,
+        timing_window_source="chunk",
+        log=[],
+        cached_features=np.zeros((3, 4), dtype=np.float32),
+    )
+
+    assert any("ctc_aligner_jav_vocalisation_v2.pt" in line for line in log)
+    assert not any("ctc_forced_alignment_v1" in line for line in log)
 
 
 def test_run_details_are_lifted_to_absolute_audio_time(monkeypatch) -> None:

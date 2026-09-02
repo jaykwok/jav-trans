@@ -160,14 +160,20 @@ def test_download_lands_in_models_at_the_pinned_revision(monkeypatch, models_roo
     repo, revision, filename = alignment._parse_hf_reference(DEFAULT_REFERENCE)
 
     assert resolved == str(models_root / filename)
-    assert calls == [
-        {
-            "repo_id": repo,
-            "filename": filename,
-            "revision": revision,
-            "local_dir": str(models_root),
-        }
-    ], "must download into models/, not the Hub cache under tmp/"
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["repo_id"] == repo
+    assert call["filename"] == filename
+    assert call["revision"] == revision
+    assert call["local_dir"] == str(models_root), (
+        "must download into models/, not the Hub cache under tmp/"
+    )
+    from utils import hf_progress
+
+    assert call["tqdm_class"] is hf_progress.HfDownloadProgressTqdm, (
+        "must report download progress like every other model fetch, "
+        "not silently bypass the UI progress bar"
+    )
     marker = alignment._revision_marker(models_root / filename)
     assert marker.read_text(encoding="utf-8") == revision
 

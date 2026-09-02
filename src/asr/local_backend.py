@@ -24,6 +24,7 @@ from asr.decode_guard import (
     plausible_token_budget,
 )
 from asr.subtitle_timing import (
+    ALIGNED_TIMING_SOURCE,
     build_aligned_word_timestamps,
     build_boundary_word_timestamps,
 )
@@ -974,7 +975,14 @@ class LocalAsrBackend:
         if timing_window_source == "speech_core":
             log.append("Subtitle timing window: speech_core")
         if timing_meta is not None and timing_meta.get("timing_source"):
-            log.append(f"Subtitle timing source: {timing_meta['timing_source']}")
+            source = timing_meta["timing_source"]
+            head = self._alignment_head if self._alignment_head else None
+            if source == ALIGNED_TIMING_SOURCE and head is not None and head.checkpoint_path:
+                # The algorithm tag ("ctc_forced_alignment_v1") names the
+                # timing method, not the checkpoint -- it looks like a head
+                # version and isn't one, so show the actual file in use.
+                source = Path(head.checkpoint_path).name
+            log.append(f"Subtitle timing source: {source}")
         log.append(f"Subtitle timing mode: {alignment_mode}")
         return {
             "words": word_dicts,

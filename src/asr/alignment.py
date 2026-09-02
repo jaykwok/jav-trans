@@ -876,6 +876,7 @@ def resolve_alignment_head_path(reference: str, *, download: bool = True) -> str
 
     from huggingface_hub import hf_hub_download
 
+    from utils import hf_progress
     from utils.model_paths import MODELS_ROOT
 
     MODELS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -884,6 +885,7 @@ def resolve_alignment_head_path(reference: str, *, download: bool = True) -> str
         filename=filename,
         revision=revision or None,
         local_dir=str(MODELS_ROOT),
+        tqdm_class=hf_progress.tqdm_class(),
     )
     if revision:
         # Written after the file lands, so an interrupted download leaves no
@@ -940,12 +942,17 @@ class AlignmentHead:
         upsample: int,
         device,
         blank_bias: float = 0.0,
+        checkpoint_path: str = "",
     ) -> None:
         self.module = module
         self.vocab = vocab
         self.upsample = int(upsample)
         self.device = device
         self.blank_bias = float(blank_bias)
+        # The resolved local file, not the `hf:`/pinned-sha reference it came
+        # from -- callers logging which checkpoint actually ran want a name
+        # they can compare against what's on disk, not an internal reference.
+        self.checkpoint_path = checkpoint_path
 
     @property
     def context_frames(self) -> int:
@@ -1014,6 +1021,7 @@ class AlignmentHead:
             blank_bias=(
                 blank_bias_from_env() if blank_bias is None else float(blank_bias)
             ),
+            checkpoint_path=resolved_path,
         )
 
     @classmethod

@@ -19,6 +19,7 @@ from llm.backends import get_backend, selected_backend_name
 from llm.backends import openai_compat as openai_transport
 from llm.glossary import normalize_glossary_text
 from llm import prompt as prompt_module
+from utils import hf_progress
 from llm.errors import (
     ResponseTruncatedError,
     RetryableTranslationFormatError,
@@ -346,7 +347,17 @@ def translate_segments(
             or len(full_source_payload) <= context_char_limit
         )
 
+        job_id_for_worker_threads = hf_progress.current_job_id()
+
         def _engine_chat(messages: list[dict], **chat_kwargs) -> str:
+            # run_batched dispatches this from a ThreadPoolExecutor pool, and a
+            # fresh worker thread has no `core.events` thread-local of its own
+            # -- a GGUF download triggered from here (llamacpp backend, first
+            # call starts the server) would otherwise emit model_download
+            # events with an empty job_id, which the frontend silently drops
+            # instead of showing a progress bar.
+            hf_progress.propagate_job_id_to_current_thread(job_id_for_worker_threads)
+
             # Late global lookup keeps the _chat/_chat_with_reasoning test
             # seams on this module working for engine-driven requests.
             #

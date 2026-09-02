@@ -774,6 +774,23 @@ class TestReceptiveField:
             module.context_frames * alignment.ENCODER_FRAME_S
         )
 
+    def test_checkpoint_path_defaults_empty_and_round_trips_when_given(self) -> None:
+        """`local_backend.py` logs this to say which checkpoint file actually
+        ran - it must be the resolved on-disk path, not the `hf:`/pinned-sha
+        reference passed to `load()`."""
+        module = alignment.build_head(vocab_size=VOCAB.size, input_dim=8, hidden_dim=8)
+        bare = alignment.AlignmentHead(module, VOCAB, 2, torch.device("cpu"))
+        assert bare.checkpoint_path == ""
+
+        named = alignment.AlignmentHead(
+            module,
+            VOCAB,
+            2,
+            torch.device("cpu"),
+            checkpoint_path="models/ctc_aligner_jav_vocalisation_v2.pt",
+        )
+        assert named.checkpoint_path == "models/ctc_aligner_jav_vocalisation_v2.pt"
+
 
 class TestOverlapSaveWindows:
     """Long audio is windowed for the encoder; the head must not pay for it.
