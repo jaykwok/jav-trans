@@ -84,8 +84,14 @@ def test_job_tempdir_groups_temp_outputs_and_keeps_srt_at_output_root(monkeypatc
 
     timings = json.loads((job_dir / "sample.timings.json").read_text(encoding="utf-8"))
     assert timings["job_id"] == "sample"
-    assert Path(timings["job_temp_dir"]) == job_dir.relative_to(main.PROJECT_ROOT)
-    assert Path(timings["outputs"]["srt"]) == (output_dir / "sample.ja.srt").relative_to(main.PROJECT_ROOT)
+    # Compared against the same project_relative() the pipeline itself calls
+    # before writing, not a hardcoded relative_to(PROJECT_ROOT): pytest's
+    # tmp_path can land on a different drive than the checkout (e.g. Windows
+    # user temp on C: with the project on D:), where relative_to() would
+    # raise even though the pipeline's own anonymization falls back to an
+    # absolute path correctly.
+    assert timings["job_temp_dir"] == main._project_relative(str(job_dir))
+    assert timings["outputs"]["srt"] == main._project_relative(str(output_dir / "sample.ja.srt"))
     assert timings["outputs"]["run_log"] is None
     _assert_no_project_absolute_path((job_dir / "sample.timings.json").read_text(encoding="utf-8"))
     _assert_no_project_absolute_path((job_dir / "sample.aligned_segments.json").read_text(encoding="utf-8"))

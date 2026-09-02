@@ -435,6 +435,10 @@ def test_responses_progress_translating_done(monkeypatch):
     monkeypatch.setenv(
         "OPENAI_COMPATIBILITY_BASE_URL", "https://openrouter.ai/api/v1"
     )
+    # Asserted as the no-override default below; llm/settings.py runs
+    # load_config() at import time, so a developer's own .env (e.g.
+    # LLM_REASONING_EFFORT=high for real runs) would otherwise leak in here.
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "low")
     monkeypatch.setattr(openai_compat.time, "monotonic", FakeClock(0.3).monotonic)
 
     def fake_create_response(request):
