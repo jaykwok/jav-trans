@@ -273,10 +273,6 @@ def _download_snapshot(
     target_dir.parent.mkdir(parents=True, exist_ok=True)
     target_dir.mkdir(parents=True, exist_ok=True)
     print(f"[models] downloading {repo_id} -> {_project_relative(target_dir)}", flush=True)
-    progress_kwargs = hf_progress.snapshot_download_kwargs(snapshot_download)
-    fallback_token = None
-    if not progress_kwargs:
-        fallback_token = hf_progress.fallback_start(repo_id)
     try:
         endpoint = normalize_hf_endpoint() or DEFAULT_HF_ENDPOINT
         snapshot_download(
@@ -286,20 +282,15 @@ def _download_snapshot(
             allow_patterns=allow_patterns,
             ignore_patterns=effective_ignore_patterns,
             endpoint=endpoint,
-            **progress_kwargs,
+            tqdm_class=hf_progress.tqdm_class(),
         )
-    except BaseException as exc:
+    except BaseException:
         if not existed_before:
             try:
                 target_dir.rmdir()
             except OSError:
                 pass
-        if fallback_token is not None:
-            hf_progress.fallback_error(fallback_token, exc)
         raise
-    else:
-        if fallback_token is not None:
-            hf_progress.fallback_done(fallback_token)
     if not _path_has_model_files(target_dir):
         raise RuntimeError(
             f"模型 {repo_id} 没有下载完整（已下载的部分保留在 "

@@ -1007,6 +1007,22 @@ def worker_main(parent_conn: Connection) -> None:
     sys.stdout = sys.stderr
     pid = os.getpid()
     ffmpeg_shared_directories = configure_ffmpeg_shared_runtime()
+
+    # Model downloads (the ASR model, on first run) happen inside this
+    # subprocess, so hf_progress's tqdm-hooked events need their own route to
+    # the SSE stream: the main process already runs a TCP listener for this
+    # (see web/app.py) and merely points its own core.events sink at it, so
+    # pointing this process's sink at the same port makes downloads show up
+    # in the job card exactly like any other stage event. Best-effort: a
+    # stuck/slow port never blocks ASR, it only silences the progress bar.
+    try:
+        from core import events as _events
+
+        events_port = os.environ.get("JAV_TRANS_EVENTS_PORT", "2234")
+        _events.configure_sink(f"tcp:127.0.0.1:{events_port}")
+    except Exception:
+        pass
+
     if not _safe_send(parent_conn, {"op": "ready", "pid": pid}):
         return
 
@@ -1048,6 +1064,14 @@ def worker_main(parent_conn: Connection) -> None:
             raise SystemExit(0)
 
         job_id = str(msg.get("job_id") or "")
+        try:
+            from core import events as _events
+            from utils import hf_progress as _hf_progress
+
+            _events.set_current_job_id(job_id)
+            _hf_progress.set_current_job_id(job_id)
+        except Exception:
+            pass
         if op != "transcribe_and_align":
             _safe_send(
                 parent_conn,

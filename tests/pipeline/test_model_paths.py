@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import sys
-import types
-
+import huggingface_hub
 import pytest
 
-from utils import hf_progress
 from utils import model_paths
 
 
@@ -273,10 +270,6 @@ def test_resolve_model_spec_redownloads_config_only_directory(monkeypatch, tmp_p
 
 def test_download_snapshot_uses_default_endpoint_when_env_is_empty(monkeypatch, tmp_path):
     monkeypatch.setenv("HF_ENDPOINT", "")
-    monkeypatch.setattr(hf_progress, "snapshot_download_kwargs", lambda _fn: {})
-    monkeypatch.setattr(hf_progress, "fallback_start", lambda _repo_id: "token")
-    monkeypatch.setattr(hf_progress, "fallback_done", lambda _token: None)
-
     calls = []
 
     def fake_snapshot_download(**kwargs):
@@ -285,8 +278,7 @@ def test_download_snapshot_uses_default_endpoint_when_env_is_empty(monkeypatch, 
         (local_dir / "config.json").write_text("{}", encoding="utf-8")
         (local_dir / "model.safetensors").write_bytes(b"weights")
 
-    fake_module = types.SimpleNamespace(snapshot_download=fake_snapshot_download)
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_module)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
 
     result = model_paths._download_snapshot("owner/repo", tmp_path / "model")
 
@@ -299,10 +291,6 @@ def test_download_snapshot_uses_default_endpoint_when_env_is_empty(monkeypatch, 
 
 def test_download_snapshot_merges_inference_ignore_patterns(monkeypatch, tmp_path):
     monkeypatch.delenv("HF_ENDPOINT", raising=False)
-    monkeypatch.setattr(hf_progress, "snapshot_download_kwargs", lambda _fn: {})
-    monkeypatch.setattr(hf_progress, "fallback_start", lambda _repo_id: "token")
-    monkeypatch.setattr(hf_progress, "fallback_done", lambda _token: None)
-
     calls = []
 
     def fake_snapshot_download(**kwargs):
@@ -311,8 +299,7 @@ def test_download_snapshot_merges_inference_ignore_patterns(monkeypatch, tmp_pat
         (local_dir / "config.json").write_text("{}", encoding="utf-8")
         (local_dir / "model.safetensors").write_bytes(b"weights")
 
-    fake_module = types.SimpleNamespace(snapshot_download=fake_snapshot_download)
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_module)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
 
     model_paths._download_snapshot(
         "owner/repo",
@@ -326,10 +313,6 @@ def test_download_snapshot_merges_inference_ignore_patterns(monkeypatch, tmp_pat
 
 def test_download_snapshot_keeps_existing_partial_dir_on_failure(monkeypatch, tmp_path):
     monkeypatch.delenv("HF_ENDPOINT", raising=False)
-    monkeypatch.setattr(hf_progress, "snapshot_download_kwargs", lambda _fn: {})
-    monkeypatch.setattr(hf_progress, "fallback_start", lambda _repo_id: "token")
-    monkeypatch.setattr(hf_progress, "fallback_error", lambda _token, _exc: None)
-
     target = tmp_path / "model"
     target.mkdir()
     keep = target / "keep.txt"
@@ -341,8 +324,7 @@ def test_download_snapshot_keeps_existing_partial_dir_on_failure(monkeypatch, tm
         (local_dir / "model-00001-of-00002.safetensors").write_bytes(b"partial")
         raise RuntimeError("boom")
 
-    fake_module = types.SimpleNamespace(snapshot_download=fake_snapshot_download)
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_module)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
 
     with pytest.raises(RuntimeError, match="boom"):
         model_paths._download_snapshot("owner/repo", target)
@@ -354,10 +336,6 @@ def test_download_snapshot_keeps_existing_partial_dir_on_failure(monkeypatch, tm
 
 def test_download_snapshot_rejects_incomplete_success(monkeypatch, tmp_path):
     monkeypatch.delenv("HF_ENDPOINT", raising=False)
-    monkeypatch.setattr(hf_progress, "snapshot_download_kwargs", lambda _fn: {})
-    monkeypatch.setattr(hf_progress, "fallback_start", lambda _repo_id: "token")
-    monkeypatch.setattr(hf_progress, "fallback_done", lambda _token: None)
-
     target = tmp_path / "model"
 
     def fake_snapshot_download(**kwargs):
@@ -365,8 +343,7 @@ def test_download_snapshot_rejects_incomplete_success(monkeypatch, tmp_path):
         (local_dir / "config.json").write_text("{}", encoding="utf-8")
         (local_dir / "model-00001-of-00002.safetensors").write_bytes(b"partial")
 
-    fake_module = types.SimpleNamespace(snapshot_download=fake_snapshot_download)
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_module)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
 
     # The message goes to the task bar, so it says what to do next in Chinese
     # rather than describing the state in English.
@@ -378,12 +355,7 @@ def test_download_snapshot_rejects_incomplete_success(monkeypatch, tmp_path):
 
 def test_download_snapshot_rejects_hf_endpoint_without_protocol(monkeypatch, tmp_path):
     monkeypatch.setenv("HF_ENDPOINT", "hf-mirror.com")
-    monkeypatch.setattr(hf_progress, "snapshot_download_kwargs", lambda _fn: {})
-    monkeypatch.setattr(hf_progress, "fallback_start", lambda _repo_id: "token")
-    monkeypatch.setattr(hf_progress, "fallback_error", lambda _token, _exc: None)
-
-    fake_module = types.SimpleNamespace(snapshot_download=lambda **_kwargs: None)
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_module)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda **_kwargs: None)
 
     with pytest.raises(ValueError, match="HF_ENDPOINT must be empty or a full URL"):
         model_paths._download_snapshot("owner/repo", tmp_path / "model")

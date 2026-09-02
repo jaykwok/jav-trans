@@ -102,7 +102,13 @@ def resolve_gguf_model_path(*, download_enabled: bool = True) -> str:
         raise RuntimeError(
             f"本地未找到 {repo}/{filename}，且未启用自动下载。"
         )
-    return hf_hub_download(repo_id=repo, filename=filename)
+    from utils import hf_progress
+
+    return hf_hub_download(
+        repo_id=repo,
+        filename=filename,
+        tqdm_class=hf_progress.tqdm_class(),
+    )
 
 
 def _torch_library_dir() -> Path | None:
