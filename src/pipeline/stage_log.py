@@ -17,6 +17,14 @@ _ASR_PROGRESS_RE = re.compile(
     r"(?P<label>切分|音频切块|ASR 文本转写|字幕时间轴)"
     r"\s+(?P<current>\d+)/(?P<total>\d+)"
 )
+# gpu_worker.py's "still alive" ping while the worker sits idle (e.g. blocked
+# on a model download). It echoes the *last real* stage message inside itself
+# for diagnostics, which means _ASR_PROGRESS_RE matches it too -- without
+# excluding it, every heartbeat tick got misread as a fresh stage-progress
+# update, so the UI showed audio_chunking "progressing" once every
+# ASR_STAGE_WORKER_HEARTBEAT_S (10s default) while it was actually just
+# waiting on something else entirely.
+ASR_STAGE_HEARTBEAT_PREFIX = "阶段心跳"
 _STAGE_LOG_RE = re.compile(
     r"^stage_(?P<phase>start|done|skip|blocked|degraded)\s+(?P<stage>[A-Za-z0-9_]+)(?:\s+(?P<extra>.*))?$"
 )
@@ -122,6 +130,8 @@ def _emit_stage_log_event(video_path: str | None, message: str) -> None:
 
 
 def _parse_asr_stage_event(message: str) -> tuple[str, dict] | None:
+    if message.startswith(ASR_STAGE_HEARTBEAT_PREFIX):
+        return None
     match = _ASR_PROGRESS_RE.search(message)
     if not match:
         return None

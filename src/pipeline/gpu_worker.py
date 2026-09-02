@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from pipeline import batch_profile
+from pipeline.stage_log import ASR_STAGE_HEARTBEAT_PREFIX
 from utils.ffmpeg_runtime import configure_ffmpeg_shared_runtime
 
 
@@ -1469,7 +1470,7 @@ class _GpuWorkerClient:
                     and now - last_heartbeat_at >= heartbeat_s
                 ):
                     on_stage(
-                        "阶段心跳 "
+                        f"{ASR_STAGE_HEARTBEAT_PREFIX} "
                         f"current={last_stage_message} "
                         f"elapsed={now - request_started:.1f}s "
                         f"idle={now - last_stage_at:.1f}s"

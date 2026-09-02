@@ -181,6 +181,16 @@ def test_progress_labels_map_to_frontend_stages():
         assert _parse_asr_stage_event(retired) is None
 
 
+def test_heartbeat_pings_are_not_mistaken_for_stage_progress():
+    """gpu_worker.py's heartbeat echoes the last real stage message inside
+    itself (for diagnostics while the worker sits idle, e.g. blocked on a
+    model download), which used to make this regex match it too -- so the UI
+    showed audio_chunking "progressing" once every heartbeat tick even though
+    nothing was actually chunking."""
+    heartbeat = "阶段心跳 current=切分 0/1 elapsed=27.9s idle=27.9s"
+    assert _parse_asr_stage_event(heartbeat) is None
+
+
 def test_timing_summary_matches_current_non_overlapping_pipeline_stages():
     rows = _timing_summary_rows(
         {

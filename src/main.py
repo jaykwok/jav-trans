@@ -1223,7 +1223,10 @@ def _run_asr_alignment_impl(
                     _raise_if_cancelled(cancel_event)
                     elapsed = time.time() - asr_start
                     _log_stage(logger, f"asr_stage elapsed={elapsed:.1f}s message={msg}")
-                    parsed_event = _parse_asr_stage_event(msg)
+                    is_heartbeat = msg.startswith(
+                        stage_log_module.ASR_STAGE_HEARTBEAT_PREFIX
+                    )
+                    parsed_event = None if is_heartbeat else _parse_asr_stage_event(msg)
                     if parsed_event is not None:
                         event_stage, event_extra = parsed_event
                         event_extra["elapsed_s"] = round(elapsed, 1)
@@ -1255,7 +1258,7 @@ def _run_asr_alignment_impl(
                                 event_extra,
                             )
                             asr_event_done.add(event_stage)
-                    match = _ASR_PROGRESS_RE.search(msg)
+                    match = None if is_heartbeat else _ASR_PROGRESS_RE.search(msg)
                     if match:
                         raw_label = match.group("label")
                         label = _format_asr_stage_label(raw_label)
