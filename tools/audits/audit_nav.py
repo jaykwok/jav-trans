@@ -57,12 +57,13 @@ def anonymize_display_text(value: str) -> str:
     return text
 
 
-def project_rel(value: str | Path | None) -> str:
+def project_rel(value: str | Path | None, *, project_root: Path | None = None) -> str:
     if not value:
         return ""
     raw = Path(value)
+    root = (project_root or PROJECT_ROOT).resolve()
     try:
-        return raw.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+        return raw.resolve().relative_to(root).as_posix()
     except Exception:
         return raw.as_posix()
 
@@ -491,17 +492,23 @@ def refresh_audit_entrypoints_after_change(
     audit_root: Path = AUDIT_ROOT,
     latest_html: Path | None = None,
     latest_title: str = "",
+    project_root: Path | None = None,
 ) -> Path | None:
     if latest_html is None:
         latest_html = _newest_entry_index(audit_root)
     if latest_html is None:
         write_empty_latest_audit_entry(audit_root=audit_root)
-        write_audit_index(audit_root=audit_root)
+        write_audit_index(audit_root=audit_root, project_root=project_root)
         return None
     summary = _summary_for(latest_html)
     title = latest_title or _entry_title(latest_html, summary)
     write_latest_audit_entry(audit_root=audit_root, latest_html=latest_html, title=title)
-    write_audit_index(audit_root=audit_root, latest_html=latest_html, latest_title=title)
+    write_audit_index(
+        audit_root=audit_root,
+        latest_html=latest_html,
+        latest_title=title,
+        project_root=project_root,
+    )
     return latest_html
 
 
@@ -591,7 +598,11 @@ def write_audit_index(
     cards = "\n".join(_card(entry, latest_href=latest_href) for entry in entries)
     if not cards:
         cards = '  <p class="muted">当前没有审计页。新的审计生成后会按更新时间倒序显示在这里。</p>'
-    latest_meta = f"当前 latest: {project_rel(latest_html)}" if latest_html else "当前 latest: 未指定"
+    latest_meta = (
+        f"当前 latest: {project_rel(latest_html, project_root=project_root)}"
+        if latest_html
+        else "当前 latest: 未指定"
+    )
     (audit_root / "index.html").write_text(
         f"""<!doctype html>
 <html lang="zh-CN">
@@ -852,10 +863,16 @@ def update_audit_entrypoints(
                 audit_root=audit_root,
                 latest_html=latest_html,
                 latest_title=title,
+                project_root=project_root,
             )
         return
     write_latest_audit_entry(audit_root=audit_root, latest_html=latest_html, title=title)
-    write_audit_index(audit_root=audit_root, latest_html=latest_html, latest_title=title)
+    write_audit_index(
+        audit_root=audit_root,
+        latest_html=latest_html,
+        latest_title=title,
+        project_root=project_root,
+    )
 
 
 def _path_arg(value: str | Path) -> Path:
