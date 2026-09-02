@@ -123,6 +123,46 @@ def test_windows_picker_subprocesses_hide_console(monkeypatch):
         assert call["capture_output"] is True
 
 
+def test_pick_folder_windows_passes_through_a_custom_description(monkeypatch):
+    calls: list[dict] = []
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": command, **kwargs})
+        return files_routes.subprocess.CompletedProcess(
+            command, 0, stdout="D:\\llama.cpp\n", stderr=""
+        )
+
+    monkeypatch.setattr(files_routes.subprocess, "run", fake_run)
+
+    assert files_routes._pick_folder_windows("选择 llama-server 所在文件夹") == "D:\\llama.cpp"
+    assert "选择 llama-server 所在文件夹" in calls[0]["command"][-1]
+
+
+def test_pick_directory_api_returns_the_picked_path(monkeypatch):
+    asyncio.run(_test_pick_directory_api_returns_the_picked_path(monkeypatch))
+
+
+async def _test_pick_directory_api_returns_the_picked_path(monkeypatch):
+    seen_descriptions: list[str] = []
+
+    def fake_pick_folder_blocking(description="选择视频文件夹"):
+        seen_descriptions.append(description)
+        return "D:\\llama.cpp"
+
+    monkeypatch.setattr(files_routes, "_pick_folder_blocking", fake_pick_folder_blocking)
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.post(
+            "/api/pick-directory",
+            params={"description": "选择 llama-server 所在文件夹"},
+        )
+
+    assert r.status_code == 200
+    assert r.json() == {"path": "D:\\llama.cpp"}
+    assert seen_descriptions == ["选择 llama-server 所在文件夹"]
+
+
 def test_settings_proxy_updates_runtime_env(monkeypatch):
     asyncio.run(_test_settings_proxy_updates_runtime_env(monkeypatch))
 

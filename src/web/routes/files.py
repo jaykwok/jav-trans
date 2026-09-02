@@ -189,17 +189,17 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
 
 
-def _pick_folder_windows() -> str:
+def _pick_folder_windows(description: str = "选择视频文件夹") -> str:
     script = r"""
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = '选择视频文件夹'
+$dialog.Description = '%s'
 $dialog.ShowNewFolderButton = $false
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     [Console]::WriteLine($dialog.SelectedPath)
 }
-"""
+""" % description
     completed = subprocess.run(
         [
             "powershell",
@@ -245,8 +245,8 @@ def _pick_files_macos() -> list[str]:
     return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
 
 
-def _pick_folder_macos() -> str:
-    script = "POSIX path of (choose folder with prompt \"选择视频文件夹\")"
+def _pick_folder_macos(description: str = "选择视频文件夹") -> str:
+    script = f'POSIX path of (choose folder with prompt "{description}")'
     completed = subprocess.run(
         ["osascript", "-e", script],
         check=False,
@@ -282,11 +282,11 @@ def _pick_files_linux() -> list[str]:
     return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
 
 
-def _pick_folder_linux() -> str:
+def _pick_folder_linux(description: str = "选择视频文件夹") -> str:
     if shutil.which("zenity") is None:
         return ""
     completed = subprocess.run(
-        ["zenity", "--file-selection", "--directory"],
+        ["zenity", "--file-selection", "--directory", f"--title={description}"],
         check=False,
         capture_output=True,
         text=True,
@@ -311,16 +311,20 @@ def _pick_video_files_blocking() -> list[str]:
     return _normalize_video_paths(paths)
 
 
-def _pick_video_folder_blocking() -> list[str]:
+def _pick_folder_blocking(description: str = "选择视频文件夹") -> str:
     try:
         if os.name == "nt":
-            folder = _pick_folder_windows()
+            return _pick_folder_windows(description)
         elif sys.platform == "darwin":
-            folder = _pick_folder_macos()
+            return _pick_folder_macos(description)
         else:
-            folder = _pick_folder_linux()
+            return _pick_folder_linux(description)
     except Exception:
-        return []
+        return ""
+
+
+def _pick_video_folder_blocking() -> list[str]:
+    folder = _pick_folder_blocking()
     if not folder:
         return []
     return _scan_video_folder(folder)
@@ -338,6 +342,14 @@ async def pick_folder() -> dict[str, list[str]]:
     loop = asyncio.get_running_loop()
     paths = await loop.run_in_executor(None, _pick_video_folder_blocking)
     return {"paths": paths}
+
+
+@router.post("/pick-directory")
+async def pick_directory(description: str = "选择文件夹") -> dict[str, str]:
+    """Generic folder picker (unlike /pick-folder, does not scan for videos)."""
+    loop = asyncio.get_running_loop()
+    path = await loop.run_in_executor(None, _pick_folder_blocking, description)
+    return {"path": path}
 
 
 @router.post("/open-video")

@@ -102,7 +102,7 @@
               <button class="btn-sm btn-outline" id="btn-proxy-test" type="button" disabled>测试连接</button>
               <span class="proxy-test-result" id="proxy-test-result"></span>
             </div>
-            <p class="field-hint">填好地址与端口并打开开关后生效；关闭开关保存即可禁用代理，无需清空字段。点「测试连接」可验证能否经代理访问 HuggingFace。</p>
+            <p class="field-hint">填好地址端口并打开开关即可生效；关闭开关可随时禁用，无需清空字段。点「测试连接」验证能否访问 HuggingFace。</p>
           </div>
         </details>
       </div>
@@ -124,7 +124,7 @@
             <label class="field">
               <span>并行翻译 Worker 数</span>
               <input type="number" id="t-translation-max-workers" value="4" min="1" max="64">
-              <span class="field-hint">只影响同时发出的请求数，不影响每批条数（每批固定为 TRANSLATION_BATCH_SIZE，默认 200），也不会超过批的总数。调高通常更快，但不会改变成本；遇到限速时请调低。</span>
+              <span class="field-hint">只影响并发请求数，不影响成本；调高通常更快，遇到限速请调低。</span>
             </label>
             <div class="toggle-row">
               <span>生成质量报告（.md）</span>
@@ -172,7 +172,7 @@
               <label class="field">
                 <span>API Base URL（留空则不修改当前值）</span>
                 <input type="text" id="api-base-url" placeholder="https://openrouter.ai/api/v1">
-                <span class="field-hint">默认使用 OpenRouter（<code>https://openrouter.ai/api/v1</code>）；也可填写 DeepSeek（<code>https://api.deepseek.com</code>，官方地址不带 <code>/v1</code>）、智谱 GLM 等其他 OpenAI 兼容服务的接口地址。<br><b>换地址后请重新点「获取」选模型</b>：模型名属于端点，同一模型在不同服务商下命名可能不同（如 OpenRouter 用 <code>厂商/模型</code> 的 <code>deepseek/deepseek-v4-flash</code>，DeepSeek 官方用 <code>deepseek-v4-flash</code>）。</span>
+                <span class="field-hint">留空默认使用 OpenRouter；也可填 DeepSeek 官方（<code>https://api.deepseek.com</code>，不带 <code>/v1</code>）等其他 OpenAI 兼容地址。<br><b>换地址后请重新点「获取」选模型</b>：不同服务商对同一模型的命名方式可能不同。</span>
               </label>
 
               <label class="field">
@@ -197,24 +197,24 @@
                   <option value="low" selected>low（默认）</option>
                   <option value="high">high（最慢，成本最高）</option>
                 </select>
-                <span class="field-hint">首轮全片按此强度翻译；之后本地质检把可疑字幕挑出来，只对这些行集中复译（复译用同一档，但不低于 low，所以只有 none 会升档）。<br>成本几乎全在输出 token，而输出的绝大部分是思维链，所以这一档直接决定单片价格。<br>其他兼容 API 按各供应商规则执行。</span>
+                <span class="field-hint">决定全片翻译强度与成本（成本主要来自思维链输出）；质检复译可疑字幕时不降档（none 除外）。其他兼容 API 按各自规则执行。</span>
               </label>
             </div>
 
             <div id="llamacpp-backend-fields" style="display:none">
               <label class="field">
-                <span>llama-server 路径（留空则使用 PATH 中的 llama-server）</span>
-                <input type="text" id="llamacpp-server-path" placeholder="例：D:\llama.cpp\llama-server.exe">
+                <span>llama-server 所在文件夹或 exe 路径（留空则自动使用已安装的 llama-server）</span>
+                <div class="input-group">
+                  <input type="text" id="llamacpp-server-path" placeholder="例：D:\llama.cpp">
+                  <button class="btn-icon" id="btn-pick-llamacpp-folder" type="button" title="选择文件夹">📁</button>
+                </div>
               </label>
 
               <p class="field-hint">
-                需要先安装 llama.cpp：<code>winget install -e --id ggml.llamacpp</code>（Vulkan 构建，
-                装完自动在 PATH 上，上方路径可留空），N 卡想要更快可到 GitHub Releases 下载
-                <code>llama-*-bin-win-cuda-*.zip</code> 解压后填写上方路径。
-                本地翻译固定使用 Hy-MT2-7B Q4_K_M GGUF；首次使用自动下载约 4.6GB，建议配合代理。
-                翻译开始时会临时释放 ASR 显存，任务切回 ASR 时自动重载。
-                本地模型逐句翻译，不使用术语表、角色参考和全片上下文——这些只在
-                OpenAI 兼容 API 后端生效。
+                先安装 llama.cpp：<code>winget install -e --id ggml.llamacpp</code>（Vulkan 版，装好后上方可留空）；
+                追求速度可用 N 卡版，GitHub Releases 下载 <code>llama-*-bin-win-cuda-*.zip</code> 解压后点 📁 选文件夹。<br>
+                固定使用 Hy-MT2-7B Q4_K_M，首次翻译自动下载约 4.6GB（建议开代理），期间临时释放 ASR 显存，用完自动重载。<br>
+                仅支持逐句翻译，不支持术语表、角色参考和全片上下文（API 后端才有）。
               </p>
             </div>
 

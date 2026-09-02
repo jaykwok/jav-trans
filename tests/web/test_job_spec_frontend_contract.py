@@ -87,36 +87,23 @@ def test_worker_field_says_concurrency_no_longer_moves_the_bill() -> None:
     """Until 2026-08-24 the batch size was `ceil(cues / (2 * workers))`, so this
     field really did price the job - and the hint correctly said so. Decoupling
     made that sentence false in the expensive direction: a user reading it would
-    keep concurrency low to save money it no longer costs."""
+    keep concurrency low to save money it no longer costs. Wording is free to
+    change during copy edits; only the reintroduced false formula is guarded."""
     html = INDEX.read_text(encoding="utf-8")
     field = html[html.index('id="t-translation-max-workers"') :]
     field = field[: field.index("</label>")]
     assert "字幕总条数 ÷ 并发数 ÷ 2" not in field
-    assert "不影响每批条数" in field
-    assert "不会改变成本" in field
 
 
-def test_reasoning_field_does_not_promise_an_escalated_repair() -> None:
-    """The repair pass reissues at the base tier floored at `low`, so only `none`
-    escalates. The hint used to name `low→high` explicitly."""
+def test_reasoning_field_does_not_misstate_cost_or_escalation() -> None:
+    """Two documentation bugs to keep out of this hint: it once claimed DeepSeek
+    maps low to high (hid a tenfold cost difference), and it once implied the
+    repair pass escalates every tier when only `none` actually does. Wording is
+    free to change during copy edits; only these two false claims are guarded."""
     html = INDEX.read_text(encoding="utf-8")
     field = html[html.index('id="api-reasoning-effort"') :]
     field = field[: field.index("</label>")]
     assert "low→high" not in field
-    assert "只有 none 会升档" in field
-
-
-def test_reasoning_field_explains_the_cascade_and_what_it_costs() -> None:
-    """The selector is the single biggest lever on the bill, so the hint has to
-    say both halves: the tier prices the whole film, and only flagged lines are
-    escalated. It previously claimed DeepSeek maps low to high, which was the
-    documentation error that hid a tenfold cost difference."""
-    html = INDEX.read_text(encoding="utf-8")
-    field = html[html.index('id="api-reasoning-effort"') :]
-    field = field[: field.index("</label>")]
-    assert "首轮全片按此强度翻译" in field
-    assert "只对这些行集中复译" in field
-    assert "输出的绝大部分是思维链" in field
     assert "映射为 high" not in field
 
 

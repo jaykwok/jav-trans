@@ -391,6 +391,19 @@ export function installSettingsPanel() {
     $('btn-show-key').textContent = show ? '🙈' : '👁';
   });
 
+  $('btn-pick-llamacpp-folder')?.addEventListener('click', async () => {
+    try {
+      const r = await fetch('/api/pick-directory?description=' + encodeURIComponent('选择 llama-server 所在文件夹'), {
+        method: 'POST',
+      });
+      if (!r.ok) { showToast('选择文件夹失败：' + await readErrorDetail(r)); return; }
+      const { path } = await r.json();
+      if (path) $('llamacpp-server-path').value = path;
+    } catch (e) {
+      showToast('选择文件夹出错：' + e.message);
+    }
+  });
+
   $('btn-fetch-models').addEventListener('click', async () => {
     const baseUrl     = $('api-base-url').value.trim();
     const apiKeyInput = $('api-key').value.trim();

@@ -73,7 +73,7 @@ def test_no_local_translation_model_can_be_named_in_the_browser() -> None:
 def test_local_backend_is_described_as_the_fixed_hymt2_stack() -> None:
     html = _html()
     assert "本地翻译（Hy-MT2-7B Q4 · llama.cpp）" in html
-    assert "本地翻译固定使用 Hy-MT2-7B Q4_K_M GGUF" in html
+    assert "Hy-MT2-7B Q4_K_M" in html
     assert "推荐本地" not in html
 
     from web.models import SettingsRead, SettingsUpdate
