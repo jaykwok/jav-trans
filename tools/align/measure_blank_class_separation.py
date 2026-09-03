@@ -44,9 +44,9 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
         sys.path.insert(0, str(root))
 
 from asr.alignment import (  # noqa: E402
-    ALIGNMENT_MODEL_SCHEMA,
     BLANK_INDEX,
     ENCODER_FRAME_S,
+    SUPPORTED_ALIGNMENT_MODEL_SCHEMAS,
     AlignmentVocab,
     build_head,
 )
@@ -250,12 +250,16 @@ def measure(
     from tools.align.train_ctc_aligner import FeatureCache
 
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if str(payload.get("schema") or "") != ALIGNMENT_MODEL_SCHEMA:
+    if str(payload.get("schema") or "") not in SUPPORTED_ALIGNMENT_MODEL_SCHEMAS:
         raise SystemExit(f"not an alignment checkpoint: {payload.get('schema')!r}")
     vocab = AlignmentVocab.from_payload(payload["vocab"])
     upsample = int(payload["upsample"])
     frame_s = ENCODER_FRAME_S / float(upsample)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # This measurement is entirely about the CTC blank column and does not read
+    # the frame classes at all - but a v2 checkpoint carries the extra layer, and
+    # `load_state_dict` is strict, so the head has to be built with it or the
+    # load fails on a tensor this tool will never look at.
     head = build_head(
         vocab_size=vocab.size,
         input_dim=int(payload.get("input_dim", 2048)),
@@ -263,6 +267,7 @@ def measure(
         upsample=upsample,
         blocks=int(payload["blocks"]),
         dropout=0.0,
+        frame_classes=len(payload.get("frame_classes") or []),
     )
     head.load_state_dict(payload["state_dict"])
     head.to(device).eval()

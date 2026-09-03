@@ -37,15 +37,19 @@ for root in (PROJECT_ROOT, SRC_ROOT):
 
 from asr.alignment import (  # noqa: E402
     ALIGNMENT_MODEL_SCHEMA,
+    ALIGNMENT_MODEL_SCHEMA_V2,
     BLANK_INDEX,
+    FRAME_CLASSES,
     AlignmentVocab,
     build_head,
     is_acoustic_char,
     minimum_ctc_frames,
+    normalize_text,
 )
 from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
 from tools.align.frame_teacher_supervision import (  # noqa: E402
     IGNORE_LABEL,
+    balanced_frame_class_loss,
     balanced_sparse_frame_loss,
     compile_sparse_frame_targets,
     load_accepted_frame_teachers,
@@ -178,6 +182,159 @@ def _cap_empty_train_rows(
             else 0.0,
         }
     return kept, report
+
+
+def apply_text_overrides(
+    rows: list[dict],
+    cache_names: list[str],
+    *,
+    manifests: list[str],
+    caches: list[str],
+) -> dict[str, object]:
+    """Replace cached target text from a manifest, in place, per cache.
+
+    The cached features are a function of the audio alone, so a change that only
+    revises the *target* text - a corrected vocalisation lexicon restoring words
+    the strip had removed - does not invalidate 28 GB of encoder output. Only
+    `index.jsonl`'s text column is stale, and rewriting that in memory is the
+    cheap half of the alternative.
+
+    Keyed by cache and `audio_id` together, for the reason `_row_key` exists:
+    the corpora number their clips independently, so a manifest applied by id
+    alone would silently retarget another cache's clip.
+
+    Coverage is required, not best-effort. A manifest that misses rows would
+    leave a mixture of old and new targets that trains without complaint and is
+    afterwards indistinguishable from either.
+    """
+    cache_index_by_name = {name: index for index, name in enumerate(cache_names)}
+    overrides: dict[tuple[int, str], str] = {}
+    for manifest_path, cache_name in zip(manifests, caches):
+        if cache_name not in cache_index_by_name:
+            raise SystemExit(
+                f"--text-override-cache {cache_name!r} is not one of the "
+                f"--cache-dir names; available: {sorted(cache_index_by_name)}"
+            )
+        cache_index = cache_index_by_name[cache_name]
+        for row in _read_jsonl(Path(manifest_path)):
+            audio_id = str(row.get("audio_id") or "")
+            if not audio_id:
+                raise SystemExit(f"{manifest_path}: a row has no audio_id")
+            overrides[(cache_index, audio_id)] = normalize_text(
+                str(row.get("text") or "")
+            )
+
+    covered_indices = {cache_index_by_name[name] for name in caches}
+    missing = sorted(
+        {
+            row["audio_id"]
+            for row in rows
+            if int(row.get("cache_index") or 0) in covered_indices
+            and _row_key(row) not in overrides
+        }
+    )
+    if missing:
+        raise SystemExit(
+            f"{len(missing)} cached rows in the overridden caches are absent from "
+            f"the override manifests; first={missing[0]}"
+        )
+
+    # `rows` holds the same dict object once per `--cache-repeat` copy, so it is
+    # deduplicated first: rewriting through one reference reaches every copy,
+    # and counting the copies would report an oversampled cache as having
+    # changed several times as much as it did.
+    unique: dict[tuple[int, str], dict] = {}
+    for row in rows:
+        unique.setdefault(_row_key(row), row)
+
+    changed = became_empty = became_text = 0
+    chars_before = chars_after = 0
+    for key, row in unique.items():
+        replacement = overrides.get(key)
+        if replacement is None:
+            continue
+        previous = str(row.get("text") or "")
+        chars_before += len(previous)
+        chars_after += len(replacement)
+        if replacement == previous:
+            continue
+        changed += 1
+        if previous and not replacement:
+            became_empty += 1
+        elif replacement and not previous:
+            became_text += 1
+        row["text"] = replacement
+        row["target_kind"] = "text" if replacement else "blank"
+    return {
+        "manifests": list(manifests),
+        "caches": list(caches),
+        "override_rows": len(overrides),
+        "unique_cached_rows_covered": sum(
+            1 for key in unique if key in overrides
+        ),
+        "rows_rewritten": changed,
+        "rows_became_empty": became_empty,
+        "rows_became_text": became_text,
+        "target_chars_before": chars_before,
+        "target_chars_after": chars_after,
+    }
+
+
+def load_frame_class_labels(
+    rows: list[dict], cache_names: list[str], *, archives: list[str]
+) -> tuple[dict[tuple[int, str], np.ndarray], dict[str, object]]:
+    """Dense three-class frame labels, keyed like every other per-row lookup.
+
+    The archive keys are `cache/audio_id`, so a cache the run did not load is
+    simply absent rather than silently matched by id - the same collision the
+    shard key and `_row_key` exist to prevent.
+
+    Partial coverage is expected and reported, not refused. Unlike the teacher
+    archives, this supervision is per clip and there is no source that covers
+    every corpus: L3 has no vocalisation labels at all by design, and a clip that
+    failed the L1 quality gate has none on purpose. Requiring coverage would mean
+    the gate could only ever be all-or-nothing.
+    """
+    cache_index_by_name = {name: index for index, name in enumerate(cache_names)}
+    labels: dict[tuple[int, str], np.ndarray] = {}
+    unknown_caches: Counter[str] = Counter()
+    for archive in archives:
+        with np.load(Path(archive)) as payload:
+            for key in payload.files:
+                cache_name, _, audio_id = str(key).partition("/")
+                index = cache_index_by_name.get(cache_name)
+                if index is None:
+                    unknown_caches[cache_name] += 1
+                    continue
+                labels[(index, audio_id)] = np.asarray(payload[key], dtype=np.int8)
+
+    covered = {_row_key(row) for row in rows} & set(labels)
+    counts = Counter()
+    for key in covered:
+        array = labels[key]
+        for value, name in enumerate(FRAME_CLASSES):
+            counts[name] += int(np.sum(array == value))
+        counts["ignore"] += int(np.sum(array == IGNORE_LABEL))
+    labelled = sum(counts[name] for name in FRAME_CLASSES)
+    if not labelled:
+        raise SystemExit(
+            "frame class archives contributed no labelled frames to these caches"
+        )
+    unique_rows = {_row_key(row) for row in rows}
+    summary = {
+        "archives": list(archives),
+        "archive_rows": len(labels),
+        "train_rows_covered": len(covered),
+        "train_rows_without_frame_classes": len(unique_rows) - len(covered),
+        "frames": {name: counts[name] for name in FRAME_CLASSES},
+        "ignored_frames": counts["ignore"],
+        "class_share_of_labelled": {
+            name: round(counts[name] / labelled, 6) for name in FRAME_CLASSES
+        },
+        "labelled_frame_share": round(labelled / max(1, labelled + counts["ignore"]), 6),
+        "rows_in_caches_not_loaded": dict(unknown_caches),
+    }
+    return {key: labels[key] for key in covered}, summary
 
 
 def _row_key(row: dict) -> tuple[int, str]:
@@ -390,6 +547,40 @@ def main() -> None:
         "--cache-dir whose rows this archive covers, by directory name. Every "
         "train row in that cache must have an accepted teacher or the run stops.",
     )
+    parser.add_argument(
+        "--text-override-manifest",
+        action="append",
+        default=None,
+        help="repeatable; a manifest whose `text` replaces the cached target "
+        "for the matching `audio_id`. For revisions that change only the target "
+        "- a corrected vocalisation lexicon - the encoder features are still "
+        "valid, so this avoids rebuilding the cache to edit one column.",
+    )
+    parser.add_argument(
+        "--text-override-cache",
+        action="append",
+        default=None,
+        help="repeatable, parallel to --text-override-manifest. Names the "
+        "--cache-dir the manifest applies to, by directory name. Every cached "
+        "row of that cache must appear in its manifests or the run stops.",
+    )
+    parser.add_argument(
+        "--frame-class-labels",
+        action="append",
+        default=None,
+        help="repeatable; an .npz from build_frame_class_labels.py keyed "
+        "`cache/audio_id`. Trains the v2 three-class frame head "
+        f"({'/'.join(FRAME_CLASSES)}) alongside CTC and writes a v2 checkpoint. "
+        "Replaces --frame-loss-weight's two-class objective rather than adding "
+        "to it: that one asked the CTC distribution whether a frame was blank, "
+        "which is the question that had no answer for moaning.",
+    )
+    parser.add_argument(
+        "--frame-class-loss-weight",
+        type=float,
+        default=0.05,
+        help="weight on the three-class loss; the two-class version used 0.05",
+    )
     parser.add_argument("--frame-loss-weight", type=float, default=0.0)
     parser.add_argument("--frame-positive-merge-gap-s", type=float, default=0.15)
     parser.add_argument("--frame-boundary-ignore-s", type=float, default=0.10)
@@ -414,6 +605,25 @@ def main() -> None:
             "--frame-teacher-results, --frame-teacher-manifest and "
             "--frame-teacher-cache must be given the same number of times"
         )
+    override_manifests = list(args.text_override_manifest or [])
+    override_caches = list(args.text_override_cache or [])
+    if len(override_manifests) != len(override_caches):
+        raise SystemExit(
+            "--text-override-manifest and --text-override-cache must be given "
+            "the same number of times"
+        )
+    frame_class_archives = list(args.frame_class_labels or [])
+    if frame_class_archives and teacher_results:
+        # Both would supervise the same frames with different class systems, and
+        # the two-class one reads the CTC output while the three-class one reads
+        # its own head. Running them together would train a head whose two
+        # answers about a moan disagree by construction.
+        raise SystemExit(
+            "--frame-class-labels replaces the two-class frame teacher; give "
+            "one or the other, not both"
+        )
+    if args.frame_class_loss_weight < 0.0:
+        raise SystemExit("--frame-class-loss-weight must be non-negative")
     if args.frame_loss_weight < 0.0:
         raise SystemExit("--frame-loss-weight must be non-negative")
     if bool(teacher_results) != (args.frame_loss_weight > 0.0):
@@ -439,6 +649,19 @@ def main() -> None:
         args.cache_repeat,
         args.cache_domain,
     )
+    # Before the partition split: which rows count as empty decides the blank
+    # cap, and the vocabulary is counted from the text below. An override that
+    # landed after either would leave the run describing the old targets.
+    text_override_summary: dict[str, object] = {}
+    if override_manifests:
+        text_override_summary = apply_text_overrides(
+            cache.rows,
+            [path.name for path in cache.cache_dirs],
+            manifests=override_manifests,
+            caches=override_caches,
+        )
+        print(f"text override: {text_override_summary}", flush=True)
+
     train_rows = [r for r in cache.rows if r["partition"] == "train"]
     val_rows = [r for r in cache.rows if r["partition"] == "val"]
     empty_excluded = Counter()
@@ -495,6 +718,7 @@ def main() -> None:
         upsample=args.upsample,
         blocks=args.blocks,
         dropout=args.dropout,
+        frame_classes=len(FRAME_CLASSES) if frame_class_archives else 0,
     ).to(device)
     parameters = sum(p.numel() for p in head.parameters())
 
@@ -532,6 +756,16 @@ def main() -> None:
             negative_minimum_s=args.frame_negative_min_s,
         )
         print(f"frame teacher: {frame_teacher_summary}", flush=True)
+
+    frame_class_labels: dict[tuple[int, str], np.ndarray] = {}
+    frame_class_summary: dict[str, object] = {}
+    if frame_class_archives:
+        frame_class_labels, frame_class_summary = load_frame_class_labels(
+            train_rows,
+            [path.name for path in cache.cache_dirs],
+            archives=frame_class_archives,
+        )
+        print(f"frame classes: {frame_class_summary}", flush=True)
 
     # What `zero_infinity` is actually hiding. A row whose frames cannot hold its
     # targets contributes a zero loss, not an error: it trains on nothing while
@@ -604,7 +838,9 @@ def main() -> None:
                 # a clip's tail, so a clip's own output depends on what it was
                 # batched with - and none of that happens at inference, where
                 # clips arrive one at a time.
-                log_probs = head(features, frame_lengths)
+                log_probs, frame_log_probs = head.forward_with_frames(
+                    features, frame_lengths
+                )
                 # CTCLoss wants (T, B, V).
                 ctc_loss = criterion(
                     log_probs.transpose(0, 1),
@@ -613,7 +849,28 @@ def main() -> None:
                     target_lengths.to(device),
                 )
                 frame_loss = None
-                if train and frame_labels:
+                if train and frame_class_labels and frame_log_probs is not None:
+                    label_array = np.full(
+                        tuple(frame_log_probs.shape[:2]), IGNORE_LABEL, dtype=np.int8
+                    )
+                    for index, row in enumerate(chunk):
+                        labels = frame_class_labels.get(_key(row))
+                        if labels is not None:
+                            width = min(len(labels), label_array.shape[1])
+                            label_array[index, :width] = labels[:width]
+                    label_tensor = torch.from_numpy(label_array).to(device)
+                    frame_loss, frame_counts = balanced_frame_class_loss(
+                        frame_log_probs,
+                        label_tensor,
+                        torch,
+                        classes=len(FRAME_CLASSES),
+                    )
+                    if sum(frame_counts.values()):
+                        frame_seen += features.shape[0]
+                        total_frame_loss += (
+                            float(frame_loss.detach().item()) * features.shape[0]
+                        )
+                elif train and frame_labels:
                     label_array = np.full(
                         tuple(log_probs.shape[:2]), IGNORE_LABEL, dtype=np.int8
                     )
@@ -630,10 +887,13 @@ def main() -> None:
                         total_frame_loss += (
                             float(frame_loss.detach().item()) * features.shape[0]
                         )
+                frame_weight = (
+                    args.frame_class_loss_weight
+                    if frame_class_archives
+                    else args.frame_loss_weight
+                )
                 loss = ctc_loss + (
-                    args.frame_loss_weight * frame_loss
-                    if frame_loss is not None
-                    else 0.0
+                    frame_weight * frame_loss if frame_loss is not None else 0.0
                 )
             if train:
                 nonlocal step
@@ -742,24 +1002,36 @@ def main() -> None:
         )
         if not math.isnan(selected) and selected < best_val:
             best_val = selected
-            torch.save(
-                {
-                    "schema": ALIGNMENT_MODEL_SCHEMA,
-                    "state_dict": head.state_dict(),
-                    "vocab": vocab.to_payload(),
-                    "upsample": args.upsample,
-                    "hidden_dim": args.hidden_dim,
-                    "blocks": args.blocks,
-                    "input_dim": 2048,
-                    "epoch": epoch,
-                    "val_loss": val_loss,
-                    "val_loss_by_domain": dict(per_domain),
-                    "selection_domain": args.select_domain or "",
-                    "frame_teacher": frame_teacher_summary,
-                    "frame_loss_weight": float(args.frame_loss_weight),
-                },
-                checkpoint_path,
-            )
+            payload = {
+                "schema": (
+                    ALIGNMENT_MODEL_SCHEMA_V2
+                    if frame_class_archives
+                    else ALIGNMENT_MODEL_SCHEMA
+                ),
+                "state_dict": head.state_dict(),
+                "vocab": vocab.to_payload(),
+                "upsample": args.upsample,
+                "hidden_dim": args.hidden_dim,
+                "blocks": args.blocks,
+                "input_dim": 2048,
+                "epoch": epoch,
+                "val_loss": val_loss,
+                "val_loss_by_domain": dict(per_domain),
+                "selection_domain": args.select_domain or "",
+                "frame_teacher": frame_teacher_summary,
+                "frame_loss_weight": float(args.frame_loss_weight),
+            }
+            if frame_class_archives:
+                # Named in the file, not implied by the schema: the classifier's
+                # output columns are positional, so a checkpoint that does not
+                # say which class each column is cannot be read safely by any
+                # later build.
+                payload["frame_classes"] = list(FRAME_CLASSES)
+                payload["frame_class_loss_weight"] = float(
+                    args.frame_class_loss_weight
+                )
+                payload["frame_class_summary"] = frame_class_summary
+            torch.save(payload, checkpoint_path)
 
     summary = {
         "schema": "asr_ctc_aligner_training_v1",
@@ -772,6 +1044,7 @@ def main() -> None:
         "empty_target_cap_by_domain": empty_cap_report,
         "empty_targets_excluded": dict(empty_excluded),
         "vocab_checkpoint": str(args.vocab_checkpoint or ""),
+        "text_override": text_override_summary,
         "frame_teacher_results": list(teacher_results),
         "frame_teacher_manifest": list(teacher_manifests),
         "frame_teacher_cache": list(teacher_caches),
@@ -780,6 +1053,12 @@ def main() -> None:
         "frame_boundary_ignore_s": float(args.frame_boundary_ignore_s),
         "frame_negative_min_s": float(args.frame_negative_min_s),
         "frame_teacher_summary": frame_teacher_summary,
+        "frame_class_labels": list(frame_class_archives),
+        "frame_class_loss_weight": float(args.frame_class_loss_weight),
+        "frame_class_summary": frame_class_summary,
+        "head_schema": (
+            ALIGNMENT_MODEL_SCHEMA_V2 if frame_class_archives else ALIGNMENT_MODEL_SCHEMA
+        ),
         "train_rows_by_domain": dict(Counter(row["domain"] for row in train_rows)),
         "cached_seconds_by_domain": {
             domain: round(seconds, 1)

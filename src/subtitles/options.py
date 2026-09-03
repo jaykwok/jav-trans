@@ -69,6 +69,32 @@ class SubtitleOptions:
     # 224 of 1983 cues (11.3%).
     drop_vocalisation_only_cues: bool = True
     vocalisation_min_run: int = 2
+    # The acoustic half of the verdict, from the v2 head's three-class frame
+    # output. It only ever ADDS drops: requiring acoustic confirmation before
+    # honouring the text rule put 457 cues of plain moaning back on eight films,
+    # because text evidence for a run of pure-vocalisation cues is already
+    # strong and the acoustics are here to reach what text cannot see - the
+    # isolated cue and the onomatopoeia no allow-list spells.
+    #
+    # Off by default is NOT an option here: a v1 head simply produces no
+    # acoustics and every cue falls back to the text rule, so this switch is for
+    # turning the addition off deliberately, not for the absence of a head.
+    vocalisation_use_acoustics: bool = True
+    # Thresholds, not hard-coded in the classifier, because they reach the cache
+    # signature through `asdict` - a rerun after retuning one must not serve the
+    # cues the previous value produced.
+    vocalisation_vocal_speech_max: float = 0.10
+    vocalisation_vocal_speech_run_max_s: float = 0.30
+    vocalisation_kana_speech_max: float = 0.05
+    vocalisation_kana_vocalisation_min: float = 0.60
+    vocalisation_vocal_text_speech_min: float = 0.30
+    # Take a purely-vocal head or tail off a cue that also holds real speech.
+    # This is the one place the filter edits text inside a cue rather than
+    # keeping or dropping the whole of it, which is why it has its own switch -
+    # but the criterion is not new: a fragment goes only when the same joint
+    # verdict applied to that fragment's own re-measured frames says drop, so
+    # nothing can be removed here that would have been kept as a cue.
+    vocalisation_split_mixed_cues: bool = True
 
     def __post_init__(self) -> None:
         for value, expected, name in (
@@ -145,6 +171,27 @@ class SubtitleOptions:
             ),
             vocalisation_min_run=max(
                 1, int(os.getenv("SUBTITLE_VOCALISATION_MIN_RUN", "2"))
+            ),
+            vocalisation_use_acoustics=_env_bool(
+                "SUBTITLE_VOCALISATION_USE_ACOUSTICS", True
+            ),
+            vocalisation_vocal_speech_max=float(
+                os.getenv("SUBTITLE_VOCALISATION_VOCAL_SPEECH_MAX", "0.10")
+            ),
+            vocalisation_vocal_speech_run_max_s=float(
+                os.getenv("SUBTITLE_VOCALISATION_VOCAL_SPEECH_RUN_MAX_S", "0.30")
+            ),
+            vocalisation_kana_speech_max=float(
+                os.getenv("SUBTITLE_VOCALISATION_KANA_SPEECH_MAX", "0.05")
+            ),
+            vocalisation_kana_vocalisation_min=float(
+                os.getenv("SUBTITLE_VOCALISATION_KANA_VOCALISATION_MIN", "0.60")
+            ),
+            vocalisation_vocal_text_speech_min=float(
+                os.getenv("SUBTITLE_VOCALISATION_VOCAL_TEXT_SPEECH_MIN", "0.30")
+            ),
+            vocalisation_split_mixed_cues=_env_bool(
+                "SUBTITLE_VOCALISATION_SPLIT_MIXED_CUES", True
             ),
         )
 

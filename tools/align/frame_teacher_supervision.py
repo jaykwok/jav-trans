@@ -217,6 +217,44 @@ def balanced_sparse_frame_loss(log_probs, labels, torch):
     }
 
 
+def balanced_frame_class_loss(frame_log_probs, labels, torch, *, classes: int = 3):
+    """Per-class-mean NLL over the three-class frame head, labelled frames only.
+
+    Read off the frame classifier, not off the CTC output. Its two-class
+    predecessor asked the CTC distribution whether a frame was blank, which was
+    the only question available when moaning had no class - and is exactly why
+    more of that supervision made the head deafer to breathy speech rather than
+    better at moaning.
+
+    Per-class mean rather than a frame mean, and no resampling. `vocalisation`
+    is roughly a tenth of the labelled frames; weighting by frequency would let
+    the class the whole change exists for contribute a tenth of the gradient,
+    and resampling to fix that would distort the trunk the CTC loss shares.
+    """
+
+    if labels.shape != frame_log_probs.shape[:2]:
+        raise ValueError(
+            f"frame label shape {tuple(labels.shape)} != "
+            f"frame logits {tuple(frame_log_probs.shape[:2])}"
+        )
+    if int(frame_log_probs.shape[-1]) != int(classes):
+        raise ValueError(
+            f"frame head emits {int(frame_log_probs.shape[-1])} classes, "
+            f"expected {int(classes)}"
+        )
+    parts = []
+    counts: dict[str, int] = {}
+    for index in range(int(classes)):
+        mask = labels == index
+        present = int(mask.sum().item())
+        counts[f"class_{index}_frames"] = present
+        if present:
+            parts.append(-frame_log_probs[..., index][mask].mean())
+    if not parts:
+        return frame_log_probs.sum() * 0.0, counts
+    return torch.stack(parts).mean(), counts
+
+
 def summarize_sparse_frame_probabilities(
     blank_probabilities: np.ndarray, labels: np.ndarray
 ) -> dict[str, float | int]:

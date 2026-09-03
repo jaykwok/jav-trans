@@ -51,7 +51,10 @@ def test_default_is_a_pinned_hf_reference():
     repo, revision, filename = alignment._parse_hf_reference(DEFAULT_REFERENCE)
 
     assert repo == DEFAULT_SETTINGS["ASR_BACKEND"], "head must track its own encoder"
-    assert filename == "ctc_aligner_jav_vocalisation_v2.pt"
+    # Named literally rather than pattern-matched: the general `ctc_aligner.pt`
+    # lives in the same repo and is a valid file, so a typo in the default would
+    # resolve and load, and only the timings would be wrong.
+    assert filename == "ctc_aligner_jav_vocalisation_v3.pt"
     assert len(revision) == 40 and set(revision) <= set("0123456789abcdef"), (
         f"revision must be a commit sha, not a branch: {revision!r}"
     )

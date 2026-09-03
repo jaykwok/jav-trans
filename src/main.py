@@ -822,12 +822,45 @@ def _build_japanese_srt_blocks(segments: list[dict]) -> list[dict]:
     ]
 
 
+def _frame_class_reader(asr_details: dict | None):
+    """A `(start_s, end_s) -> shares` callable, or None without a v2 head.
+
+    Built here because this is where the ASR stage and the subtitle stage meet.
+    Neither imports the other, and neither should: the arithmetic lives in
+    `asr.alignment`, the decision lives in `subtitles.vocalisation`, and the
+    integration is main.py's job.
+    """
+    if not isinstance(asr_details, dict):
+        return None
+    from asr.alignment import ENCODER_FRAME_S, span_class_shares
+    from asr.pipeline import decode_frame_class_track
+
+    decoded = decode_frame_class_track(asr_details.get("frame_class_track"))
+    if decoded is None:
+        return None
+    posteriors, frame_s = decoded
+    # `span_class_shares` takes an upsample factor and derives the frame width
+    # from the encoder rate; the track already knows its own width, so the
+    # factor is recovered rather than assumed - a head trained at a different
+    # upsample would otherwise silently index the wrong frames.
+    upsample = max(1, int(round(ENCODER_FRAME_S / frame_s))) if frame_s > 0 else 1
+
+    def shares(start_s: float, end_s: float) -> dict | None:
+        measured = span_class_shares(
+            posteriors, start_s, end_s, upsample=upsample
+        )
+        return measured if measured.get("frames") else None
+
+    return shares
+
+
 def _prepare_translation_cues(
     segments: list[dict],
     *,
     subtitle_options,
     bilingual: bool,
     on_stage=None,
+    asr_details: dict | None = None,
 ) -> tuple[list[dict], dict]:
     source_blocks = _build_japanese_srt_blocks(segments)
     mode = "bilingual" if bilingual else "srt"
@@ -838,6 +871,7 @@ def _prepare_translation_cues(
         mode=mode,
         on_stage=on_stage,
         diagnostics=prepare_diagnostics,
+        acoustic_classes=_frame_class_reader(asr_details),
     )
     normalized: list[dict] = []
     for cue_id, cue in enumerate(cues):
@@ -1703,6 +1737,7 @@ def _run_translation_and_write_impl(
                 logger,
                 f"subtitle_cue_plan stage={stage} {current}/{total}",
             ),
+            asr_details=asr_details,
         )
         pipeline_timings["subtitle_cue_plan_s"] = (
             time.perf_counter() - cue_plan_started
@@ -1858,6 +1893,7 @@ def _run_translation_and_write_impl(
             logger,
             f"subtitle_cue_plan stage={stage} {current}/{total}",
         ),
+        asr_details=asr_details,
     )
     pipeline_timings["subtitle_cue_plan_s"] = (
         time.perf_counter() - cue_plan_started

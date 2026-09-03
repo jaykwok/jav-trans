@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 import main
 from helpers import ASR_17B_BACKEND, make_job_context
 from pipeline import audio as pipeline_audio
@@ -287,13 +289,30 @@ def test_an_empty_forwarded_knob_falls_back_instead_of_crashing(monkeypatch):
         monkeypatch.setenv("ASR_CHUNK_MIN_S", value)
         monkeypatch.setenv("ASR_CHUNK_MIN_PAUSE_S", value)
         monkeypatch.setenv("ASR_FEATURE_BATCH_SIZE", value)
+        # The pause reading is a forwarded knob like the rest, so an empty line
+        # in the tuning box has to name the shipped reading rather than select
+        # nothing - a blank `pause_reading` would match neither branch and turn
+        # the cut points off silently.
+        monkeypatch.setenv("ASR_CHUNK_SPEECH_THRESHOLD", value)
         assert asr_pipeline._chunking_config() == {
             "max_chunk_s": 30.0,
             "min_chunk_s": 2.0,
             "min_blank_s": 0.6,
+            "pause_reading": "blank",
+            "speech_threshold": 0.5,
         }
         assert asr_pipeline._env_int("ASR_FEATURE_BATCH_SIZE", "4") == 4
 
     # A real value still wins, or the fallback would be hiding the setting.
     monkeypatch.setenv("ASR_CHUNK_MAX_S", "18.5")
     assert asr_pipeline._chunking_config()["max_chunk_s"] == 18.5
+
+    # The pause reading does NOT fall back on a bad value. A typo would
+    # otherwise run the shipped reading while the operator believed they were
+    # testing the other one, and the A/B would compare an arm against itself.
+    monkeypatch.setenv("ASR_CHUNK_PAUSE_READING", "speach")
+    with pytest.raises(ValueError, match="ASR_CHUNK_PAUSE_READING"):
+        asr_pipeline._chunking_config()
+
+    monkeypatch.setenv("ASR_CHUNK_PAUSE_READING", "SPEECH")
+    assert asr_pipeline._chunking_config()["pause_reading"] == "speech"

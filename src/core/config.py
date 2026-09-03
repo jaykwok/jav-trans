@@ -60,7 +60,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # afterwards; a plain path still works as a local override. The sha is
     # pinned deliberately - under a moving branch a retrained head would change
     # every subtitle's timing with nothing in the run saying so.
-    "ASR_ALIGNMENT_HEAD_PATH": "hf:jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf@5a6a789ceb2f22d2b8606743b13a8159af218362#ctc_aligner_jav_vocalisation_v2.pt",
+    "ASR_ALIGNMENT_HEAD_PATH": "hf:jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf@368788ce95dbd10fc47717442cd5bb63a0e00769#ctc_aligner_jav_vocalisation_v3.pt",
     # Optional observation-only candidate. It reuses the production encoder
     # frames, records boundary disagreements under tmp/cache, and never changes
     # the words or timestamps returned to the subtitle pipeline.

@@ -351,6 +351,249 @@ class TestBlankRuns:
         assert runs == [(pytest.approx(0.0), pytest.approx(1.0))]
 
 
+def _frames(classes: list[int], *, confidence: float = 0.9):
+    """Per-frame class posteriors putting `confidence` on the class named."""
+    import numpy as np
+
+    spread = (1.0 - confidence) / (len(alignment.FRAME_CLASSES) - 1)
+    posteriors = np.full((len(classes), len(alignment.FRAME_CLASSES)), spread)
+    for frame, klass in enumerate(classes):
+        posteriors[frame, klass] = confidence
+    return posteriors
+
+
+class TestTheFrameClassHead:
+    """Three classes where there was one, and what that buys.
+
+    Until v2 the head could only say "word" or "not word", so moaning shared
+    blank with silence. Every attempt to push moaning further into blank pushed
+    breathy speech with it - the 21 mixed cues whose blank share was exactly
+    1.0000 are that failure at full strength. No threshold reaches a class that
+    does not exist, so the class was added instead.
+    """
+
+    SILENCE = alignment.FRAME_CLASS_SILENCE
+    VOCAL = alignment.FRAME_CLASS_VOCALISATION
+    SPEECH = alignment.FRAME_CLASS_SPEECH
+
+    def test_the_class_order_is_part_of_the_checkpoint_contract(self) -> None:
+        # The classifier's columns are positional; renaming or reordering them
+        # would silently reinterpret every trained head.
+        assert alignment.FRAME_CLASSES == ("silence", "vocalisation", "speech")
+        assert (self.SILENCE, self.VOCAL, self.SPEECH) == (0, 1, 2)
+
+    def test_one_trunk_pass_produces_both_outputs(self) -> None:
+        head = alignment.build_head(
+            vocab_size=VOCAB.size, input_dim=8, hidden_dim=8, blocks=1,
+            dropout=0.0, frame_classes=3,
+        ).eval()
+        features = torch.randn(1, 7, 8)
+
+        with torch.inference_mode():
+            ctc, frames = head.forward_with_frames(features)
+
+        assert ctc.shape == (1, 14, VOCAB.size)
+        assert frames.shape == (1, 14, 3)
+        assert torch.allclose(frames.exp().sum(dim=-1), torch.ones(1, 14), atol=1e-5)
+        # `forward` still returns the CTC output alone: every existing caller
+        # indexes it by batch position, so a tuple would have been a silent
+        # shape error rather than a loud one.
+        with torch.inference_mode():
+            assert torch.allclose(head(features), ctc)
+
+    def test_a_head_without_frame_classes_is_exactly_the_old_head(self) -> None:
+        head = alignment.build_head(
+            vocab_size=VOCAB.size, input_dim=8, hidden_dim=8, blocks=1, dropout=0.0
+        ).eval()
+        features = torch.randn(1, 5, 8)
+
+        with torch.inference_mode():
+            ctc, frames = head.forward_with_frames(features)
+
+        assert frames is None
+        assert head.frame_classifier is None
+        assert ctc.shape == (1, 10, VOCAB.size)
+
+    def test_the_frame_classifier_is_small_beside_the_trunk(self) -> None:
+        """The argument for one model rather than two: the second reading costs
+        a linear layer, not an encoder pass."""
+        plain = alignment.build_head(vocab_size=VOCAB.size, frame_classes=0)
+        with_frames = alignment.build_head(vocab_size=VOCAB.size, frame_classes=3)
+
+        added = sum(p.numel() for p in with_frames.parameters()) - sum(
+            p.numel() for p in plain.parameters()
+        )
+        assert added == 512 * 3 + 3
+
+
+class TestCheckpointCompatibility:
+    """A head outlives the code that trained it, so v1 must keep loading.
+
+    Rolling back to the previous checkpoint is the response to a bad promotion,
+    and a pipeline that refuses to run against it has removed that option. So the
+    v2 readings answer "unavailable" on a v1 file rather than raising, and every
+    caller is expected to degrade rather than stop.
+    """
+
+    @staticmethod
+    def _save(tmp_path, name: str, *, frame_classes: list[str] | None):
+        head = alignment.build_head(
+            vocab_size=VOCAB.size, input_dim=8, hidden_dim=8, upsample=2, blocks=1,
+            dropout=0.0, frame_classes=len(frame_classes or []),
+        )
+        payload = {
+            "schema": (
+                alignment.ALIGNMENT_MODEL_SCHEMA_V2
+                if frame_classes
+                else alignment.ALIGNMENT_MODEL_SCHEMA
+            ),
+            "state_dict": head.state_dict(),
+            "vocab": VOCAB.to_payload(),
+            "upsample": 2,
+            "hidden_dim": 8,
+            "blocks": 1,
+            "input_dim": 8,
+        }
+        if frame_classes is not None:
+            payload["frame_classes"] = frame_classes
+        path = tmp_path / name
+        torch.save(payload, path)
+        return path
+
+    def test_a_v1_checkpoint_loads_and_reports_no_frame_head(self, tmp_path) -> None:
+        path = self._save(tmp_path, "v1.pt", frame_classes=None)
+
+        head = alignment.AlignmentHead.load(str(path), device=torch.device("cpu"))
+
+        assert head.frame_head_available is False
+        assert head.frame_posteriors(torch.randn(6, 8).numpy()) is None
+        # And the reading that did exist is untouched.
+        assert head.log_probs(torch.randn(6, 8).numpy()).shape == (12, VOCAB.size)
+
+    def test_a_v2_checkpoint_carries_the_three_classes(self, tmp_path) -> None:
+        path = self._save(
+            tmp_path, "v2.pt", frame_classes=list(alignment.FRAME_CLASSES)
+        )
+
+        head = alignment.AlignmentHead.load(str(path), device=torch.device("cpu"))
+        posteriors = head.frame_posteriors(torch.randn(6, 8).numpy())
+
+        assert head.frame_head_available is True
+        assert posteriors.shape == (12, 3)
+        assert posteriors.sum(axis=-1) == pytest.approx([1.0] * 12, abs=1e-5)
+
+    def test_reordered_classes_are_refused_rather_than_reinterpreted(
+        self, tmp_path
+    ) -> None:
+        """The columns are positional, so a different order is a different
+        model wearing the same schema name."""
+        path = self._save(
+            tmp_path, "shuffled.pt", frame_classes=["speech", "silence", "vocalisation"]
+        )
+
+        with pytest.raises(ValueError, match="are not"):
+            alignment.AlignmentHead.load(str(path), device=torch.device("cpu"))
+
+    def test_an_unknown_schema_is_still_refused(self, tmp_path) -> None:
+        path = self._save(tmp_path, "future.pt", frame_classes=None)
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        payload["schema"] = "asr_ctc_alignment_head_v9"
+        torch.save(payload, path)
+
+        with pytest.raises(ValueError, match="expected one of"):
+            alignment.AlignmentHead.load(str(path), device=torch.device("cpu"))
+
+
+class TestNonSpeechRuns:
+    SILENCE = alignment.FRAME_CLASS_SILENCE
+    VOCAL = alignment.FRAME_CLASS_VOCALISATION
+    SPEECH = alignment.FRAME_CLASS_SPEECH
+
+    def test_moaning_and_silence_both_count_as_cuttable(self) -> None:
+        """The chunker's question is "is anyone talking", and a moan is not
+        talking - so a cut is still allowed there, as it was when moaning was
+        blank. What changed is that the two are now distinguishable."""
+        frames = [self.SPEECH, self.SPEECH, self.VOCAL, self.VOCAL,
+                  self.SILENCE, self.SPEECH]
+        runs = alignment.non_speech_runs(_frames(frames), upsample=1)
+
+        assert runs == [(pytest.approx(2 / 13.0), pytest.approx(5 / 13.0))]
+
+    def test_short_runs_can_be_filtered_out(self) -> None:
+        frames = [self.SPEECH, self.SILENCE, self.SPEECH] + [self.SILENCE] * 20 + [
+            self.SPEECH
+        ]
+        runs = alignment.non_speech_runs(_frames(frames), upsample=1, min_seconds=0.5)
+
+        assert len(runs) == 1
+        assert runs[0][1] - runs[0][0] == pytest.approx(20 / 13.0)
+
+    def test_the_test_is_on_the_speech_posterior_not_the_argmax(self) -> None:
+        """Confusing the three classes is not equally costly in each direction:
+        cutting inside speech is the one that damages a decode, so the guard is
+        on the speech posterior alone."""
+        import numpy as np
+
+        # Argmax says vocalisation, but speech still holds 0.45 of the mass.
+        uncertain = np.array([[0.1, 0.45, 0.45], [0.1, 0.45, 0.45]])
+        assert alignment.non_speech_runs(uncertain, upsample=1) == [
+            (pytest.approx(0.0), pytest.approx(2 / 13.0))
+        ]
+        assert alignment.non_speech_runs(
+            uncertain, upsample=1, speech_threshold=0.4
+        ) == []
+
+    def test_a_malformed_posterior_is_refused(self) -> None:
+        import numpy as np
+
+        with pytest.raises(ValueError, match="frame posteriors must be"):
+            alignment.non_speech_runs(np.zeros((4, 2)), upsample=1)
+
+
+class TestSpanClassShares:
+    SILENCE = alignment.FRAME_CLASS_SILENCE
+    VOCAL = alignment.FRAME_CLASS_VOCALISATION
+    SPEECH = alignment.FRAME_CLASS_SPEECH
+
+    def test_the_longest_speech_run_separates_a_mixed_cue_from_a_moan(self) -> None:
+        """The reason a share alone was never enough.
+
+        One second of speech before five of moaning averages to the same
+        non-speech share as six seconds of moaning, and the old blank-share
+        reading could not tell them apart at all. The run length can.
+        """
+        # Same 13 speech frames in 78, contiguous in one and scattered in the
+        # other, so the share is identical by construction.
+        mixed = [self.SPEECH] * 13 + [self.VOCAL] * 65
+        moaning = ([self.SPEECH] + [self.VOCAL] * 5) * 13
+
+        first = alignment.span_class_shares(_frames(mixed), 0.0, 6.0, upsample=1)
+        second = alignment.span_class_shares(_frames(moaning), 0.0, 6.0, upsample=1)
+
+        assert first["speech"] == pytest.approx(second["speech"], abs=1e-6)
+        assert first["speech_max_run_s"] == pytest.approx(1.0, abs=0.05)
+        assert second["speech_max_run_s"] < 0.15
+
+    def test_the_shares_are_read_over_the_requested_span_only(self) -> None:
+        frames = [self.SPEECH] * 13 + [self.VOCAL] * 13
+        shares = alignment.span_class_shares(_frames(frames), 1.0, 2.0, upsample=1)
+
+        assert shares["vocalisation"] == pytest.approx(0.9, abs=1e-6)
+        assert shares["speech"] == pytest.approx(0.05, abs=1e-6)
+        assert shares["frames"] == 13
+
+    def test_an_empty_span_answers_zero_rather_than_raising(self) -> None:
+        """A cue can legitimately have no acoustic extent, and the caller's
+        answer there is to fall back to text, not to fail."""
+        shares = alignment.span_class_shares(
+            _frames([self.SPEECH] * 4), 3.0, 1.0, upsample=1
+        )
+
+        assert shares["frames"] == 0
+        assert shares["speech"] == 0.0
+        assert shares["speech_max_run_s"] == 0.0
+
+
 class TestSpeechExtent:
     """The onset correction that the 2026-07-31 listening pass forced.
 

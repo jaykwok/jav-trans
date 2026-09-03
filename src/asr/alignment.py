@@ -66,6 +66,30 @@ ALIGNMENT_VOCAB_SCHEMA = "asr_ctc_alignment_char_vocab_v1"
 # for the same text.
 ACOUSTIC_VOCAB_SCHEMA = "asr_ctc_alignment_char_vocab_v2"
 ALIGNMENT_MODEL_SCHEMA = "asr_ctc_alignment_head_v1"
+# v2 adds a second output over the same trunk: a per-frame three-class posterior.
+# The CTC side is unchanged and a v2 checkpoint aligns identically to a v1 one,
+# so the schema is a statement about what the file *contains*, not about how the
+# timing behaves.
+ALIGNMENT_MODEL_SCHEMA_V2 = "asr_ctc_alignment_head_v2"
+SUPPORTED_ALIGNMENT_MODEL_SCHEMAS = (
+    ALIGNMENT_MODEL_SCHEMA,
+    ALIGNMENT_MODEL_SCHEMA_V2,
+)
+
+# Order is part of the checkpoint contract - the classifier's output columns are
+# these, positionally - so it is fixed here rather than passed around.
+#
+# The class that did not exist before is `vocalisation`. Until v2 the head had
+# exactly one way to say "not a word", and moaning had to share it with silence:
+# the stripped targets left CTC nothing to place over a moan, so blank was the
+# only reading available. That conflation is what made every attempt to suppress
+# moaning also deafen the head to breathy speech - measured as 21 mixed cues
+# whose blank share was exactly 1.0000, "not one frame of a character". A dose
+# cannot fix a missing class, which is why three arrived instead of a threshold.
+FRAME_CLASS_SILENCE = 0
+FRAME_CLASS_VOCALISATION = 1
+FRAME_CLASS_SPEECH = 2
+FRAME_CLASSES = ("silence", "vocalisation", "speech")
 
 
 def minimum_ctc_frames(targets: Sequence) -> int:
@@ -651,6 +675,109 @@ def blank_runs(
     return runs
 
 
+def non_speech_runs(
+    frame_posteriors,
+    *,
+    upsample: int = 2,
+    min_seconds: float = 0.0,
+    speech_threshold: float = 0.5,
+):
+    """Stretches the frame head calls "not speech", as (start_s, end_s).
+
+    The v2 replacement for `blank_runs` as a source of cut points. It reads the
+    same question the chunker was always asking - "is anyone talking here" - but
+    off the class that answers it, rather than off the absence of a character.
+
+    The difference bites exactly where the old reading was wrong. Under stripped
+    targets a moan is blank, so `blank_runs` offers the middle of a moaning
+    passage as a pause and the chunker cuts there; that is harmless for
+    boundaries but it also means blank stopped meaning silence. Here a moan is
+    `vocalisation`, which is not speech either, so a cut is still allowed - but
+    the two are now distinguishable, and callers that want real silence can ask
+    `span_class_shares` instead of inferring it.
+
+    A threshold rather than an argmax, because the three classes are not equally
+    costly to confuse: the chunker must not cut inside speech, so the test is on
+    the speech posterior alone and its default sits at the coin flip.
+    """
+    import numpy as np
+
+    posteriors = np.asarray(frame_posteriors, dtype=np.float64)
+    if posteriors.ndim != 2 or posteriors.shape[1] != len(FRAME_CLASSES):
+        raise ValueError(
+            f"frame posteriors must be (T, {len(FRAME_CLASSES)}), "
+            f"got {posteriors.shape}"
+        )
+    speech = posteriors[:, FRAME_CLASS_SPEECH]
+    runs: list[tuple[float, float]] = []
+    start: int | None = None
+    for frame in range(len(speech) + 1):
+        quiet = frame < len(speech) and speech[frame] < speech_threshold
+        if quiet:
+            if start is None:
+                start = frame
+            continue
+        if start is not None:
+            begin = frame_to_seconds(start, upsample=upsample)
+            end = frame_to_seconds(frame, upsample=upsample)
+            if end - begin >= min_seconds:
+                runs.append((begin, end))
+            start = None
+    return runs
+
+
+def span_class_shares(
+    frame_posteriors,
+    start_s: float,
+    end_s: float,
+    *,
+    upsample: int = 2,
+    speech_threshold: float = 0.5,
+) -> dict:
+    """Mean class posterior over one cue's span, plus its longest speech run.
+
+    The shares alone are a span average, and a span average is what made the old
+    blank-share reading unusable on mixed cues: one second of speech followed by
+    five of moaning reads as 0.83 non-speech, indistinguishable from six seconds
+    of pure moaning. `speech_max_run_s` is what separates them, and it is the
+    quantity the split rule needs - "is there a contiguous piece of speech in
+    here", not "how much speech on average".
+
+    An empty or inverted span returns zero shares rather than raising: a cue can
+    legitimately have no acoustic extent, and the caller's answer there is to
+    fall back to text, not to fail.
+    """
+    import numpy as np
+
+    posteriors = np.asarray(frame_posteriors, dtype=np.float64)
+    if posteriors.ndim != 2 or posteriors.shape[1] != len(FRAME_CLASSES):
+        raise ValueError(
+            f"frame posteriors must be (T, {len(FRAME_CLASSES)}), "
+            f"got {posteriors.shape}"
+        )
+    frame_s = ENCODER_FRAME_S / max(1, int(upsample))
+    first = max(0, int(math.floor(float(start_s) / frame_s)))
+    last = min(len(posteriors), int(math.ceil(float(end_s) / frame_s)))
+    empty = {name: 0.0 for name in FRAME_CLASSES}
+    empty["speech_max_run_s"] = 0.0
+    empty["frames"] = 0
+    if last <= first:
+        return empty
+    window = posteriors[first:last]
+    speech = window[:, FRAME_CLASS_SPEECH]
+    longest = current = 0
+    for value in speech:
+        current = current + 1 if value >= speech_threshold else 0
+        longest = max(longest, current)
+    shares = {
+        name: round(float(window[:, index].mean()), 6)
+        for index, name in enumerate(FRAME_CLASSES)
+    }
+    shares["speech_max_run_s"] = round(longest * frame_s, 6)
+    shares["frames"] = int(last - first)
+    return shares
+
+
 # How far an utterance edge may be walked outward, away from the first/last
 # character, to reach the acoustic boundary. The walk stops at the first
 # non-blank frame, so on a tight boundary the cap never binds and only a real
@@ -995,11 +1122,23 @@ class AlignmentHead:
         resolved_path = resolve_alignment_head_path(checkpoint_path)
         payload = torch.load(resolved_path, map_location="cpu", weights_only=False)
         schema = str(payload.get("schema") or "")
-        if schema != ALIGNMENT_MODEL_SCHEMA:
+        if schema not in SUPPORTED_ALIGNMENT_MODEL_SCHEMAS:
             raise ValueError(
-                f"expected {ALIGNMENT_MODEL_SCHEMA} checkpoint, got {schema!r}"
+                f"expected one of {list(SUPPORTED_ALIGNMENT_MODEL_SCHEMAS)} "
+                f"checkpoint, got {schema!r}"
             )
         vocab = AlignmentVocab.from_payload(payload["vocab"])
+        # Read from the payload rather than from the schema name, so a v2 file is
+        # described by what it carries. A v1 file names no classes and builds a
+        # head with no frame classifier, which is how every v2 reading downstream
+        # comes back "unavailable" instead of raising.
+        frame_classes = list(payload.get("frame_classes") or [])
+        if frame_classes and tuple(frame_classes) != FRAME_CLASSES:
+            raise ValueError(
+                f"checkpoint frame classes {frame_classes!r} are not "
+                f"{list(FRAME_CLASSES)!r}; the classifier's columns are "
+                "positional, so a different order is a different model"
+            )
         module = build_head(
             vocab_size=vocab.size,
             input_dim=int(payload.get("input_dim", 2048)),
@@ -1007,6 +1146,7 @@ class AlignmentHead:
             upsample=int(payload["upsample"]),
             blocks=int(payload["blocks"]),
             dropout=0.0,
+            frame_classes=len(frame_classes),
         )
         module.load_state_dict(payload["state_dict"])
         resolved = device or torch.device(
@@ -1033,14 +1173,52 @@ class AlignmentHead:
             return None
         return cls.load(path, device=device)
 
+    @property
+    def frame_head_available(self) -> bool:
+        """Whether this checkpoint carries the three-class frame output.
+
+        Every v2 reading is gated on this and degrades to the v1 behaviour when
+        it is false, rather than raising. A head is a promoted artifact that
+        outlives the code that trained it, and a pipeline that refuses to run
+        against the previous one is a pipeline that cannot be rolled back.
+        """
+        return getattr(self.module, "frame_classifier", None) is not None
+
     def log_probs(self, features):
         """(T, input_dim) encoder features -> (T*upsample, vocab) log-probs."""
+        return self.log_probs_with_frames(features)[0]
+
+    def log_probs_with_frames(self, features):
+        """`(ctc_log_probs, frame_log_probs)`; the second is None on a v1 head.
+
+        One forward pass. The alignment and the frame classes have to describe
+        the same audio, and running the trunk twice would only create ways for
+        them not to.
+        """
         import numpy as np
         import torch
 
         tensor = torch.as_tensor(np.asarray(features, dtype=np.float32))
         with torch.inference_mode():
-            return self.module(tensor.unsqueeze(0).to(self.device))[0].float().cpu()
+            ctc, frames = self.module.forward_with_frames(
+                tensor.unsqueeze(0).to(self.device)
+            )
+        return (
+            ctc[0].float().cpu(),
+            None if frames is None else frames[0].float().cpu(),
+        )
+
+    def frame_posteriors(self, features):
+        """(T*upsample, 3) class probabilities, or None on a v1 head.
+
+        Probabilities rather than log-probabilities because every consumer
+        averages them over a span or compares them to a threshold, and a mean of
+        log-probabilities is not the log of anything.
+        """
+        _, frames = self.log_probs_with_frames(features)
+        if frames is None:
+            return None
+        return frames.exp().numpy()
 
     def align(self, features, text: str):
         """Character spans for `text`, or None when it cannot be aligned.
@@ -1091,8 +1269,14 @@ def build_head(
     upsample: int = 2,
     blocks: int = 4,
     dropout: float = 0.1,
+    frame_classes: int = 0,
 ):
-    """Construct the head. Imported lazily so this module stays importable."""
+    """Construct the head. Imported lazily so this module stays importable.
+
+    `frame_classes` adds the v2 frame classifier: one `hidden_dim -> 3` linear
+    layer beside the CTC classifier, reading the same trunk output. Zero builds
+    a v1 head, which is what loading a v1 checkpoint does.
+    """
     import torch
     from torch import nn
 
@@ -1100,6 +1284,8 @@ def build_head(
         raise ValueError("vocab_size must exceed the reserved blank/unk indices")
     if upsample < 1:
         raise ValueError("upsample must be >= 1")
+    if frame_classes < 0:
+        raise ValueError("frame_classes must be non-negative")
 
     class ResidualConvBlock(nn.Module):
         """Dilated depthwise-separable conv, pre-norm, residual.
@@ -1162,6 +1348,14 @@ def build_head(
             )
             self.output_norm = nn.LayerNorm(hidden_dim)
             self.classifier = nn.Linear(hidden_dim, vocab_size)
+            # Beside the CTC classifier, not after it, and over the same
+            # normalised trunk output. ~1.5k parameters against the trunk's 4M:
+            # this is a second *reading* of one model, not a second model, so it
+            # costs no extra encoder pass and the checkpoint stays one file.
+            self.frame_classifier = (
+                nn.Linear(hidden_dim, frame_classes) if frame_classes else None
+            )
+            self.frame_classes = int(frame_classes)
 
         @property
         def context_frames(self) -> int:
@@ -1188,6 +1382,12 @@ def build_head(
         def forward(self, features: "torch.Tensor", lengths=None) -> "torch.Tensor":
             """(B, T, input_dim) -> (B, T*upsample, vocab) log-probabilities.
 
+            Returns the CTC output alone, unchanged from v1. The frame classes
+            come from `forward_with_frames`, which is the same computation with
+            the second head read off it - deliberately not folded in here, since
+            every existing caller indexes this result by batch position and a
+            tuple would have been a silent shape error rather than a loud one.
+
             `lengths` is the real frame count of each row. Give it whenever the
             batch is padded: without it a short clip's tail is convolved against
             the padding's LayerNorm bias instead of against silence, so its
@@ -1195,6 +1395,16 @@ def build_head(
             shrinks that contamination but cannot remove it. A single unpadded
             clip - which is every inference call - is unaffected either way, so
             omitting it stays numerically exact there.
+            """
+            return self.forward_with_frames(features, lengths)[0]
+
+        def forward_with_frames(self, features: "torch.Tensor", lengths=None):
+            """`(ctc_log_probs, frame_log_probs)`; the second is None on a v1 head.
+
+            One trunk pass serves both. Training needs the pair, and so does
+            inference: the filter reads frame classes over the same span the
+            alignment timed, and computing them from a second pass would let the
+            two disagree for no reason.
             """
             mask = None
             if lengths is not None:
@@ -1216,7 +1426,13 @@ def build_head(
                 x = x * mask
             for block in self.blocks:
                 x = block(x, mask)
-            logits = self.classifier(self.output_norm(x))
-            return nn.functional.log_softmax(logits, dim=-1)
+            trunk = self.output_norm(x)
+            ctc = nn.functional.log_softmax(self.classifier(trunk), dim=-1)
+            frames = (
+                nn.functional.log_softmax(self.frame_classifier(trunk), dim=-1)
+                if self.frame_classifier is not None
+                else None
+            )
+            return ctc, frames
 
     return CtcAlignmentHead()

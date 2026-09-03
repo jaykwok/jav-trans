@@ -101,7 +101,12 @@ class TestDegradation:
         monkeypatch.setattr(
             asr,
             "_blank_runs_for_audio",
-            lambda _path: ([(19.0, 20.0), (41.0, 42.0)], 95.0, "alignment_head_blank_runs"),
+            lambda _path: (
+                [(19.0, 20.0), (41.0, 42.0)],
+                95.0,
+                "alignment_head_blank_runs",
+                None,
+            ),
         )
         spans = asr._build_processing_spans(str(audio))
         assert asr._LAST_BOUNDARY_SIGNATURE["chunking"]["source"] == (
@@ -193,8 +198,16 @@ class TestWindowSeams:
                 return cls()
 
             def log_probs(self, features):
-                return torch.from_numpy(np.asarray(features)).repeat_interleave(
-                    2, dim=0
+                return self.log_probs_with_frames(features)[0]
+
+            def log_probs_with_frames(self, features):
+                # A v1 head: CTC output only, and `None` where the frame classes
+                # would be. The chunker must still find its pauses - rolling back
+                # to the previous checkpoint is the response to a bad promotion,
+                # and it cannot cost the pipeline its cut points.
+                return (
+                    torch.from_numpy(np.asarray(features)).repeat_interleave(2, dim=0),
+                    None,
                 )
 
         captured: dict = {}
@@ -218,7 +231,9 @@ class TestWindowSeams:
 
     def test_the_windows_handed_to_the_encoder_overlap(self, wired) -> None:
         path, seen, _ = wired
-        runs, _duration, source = asr._blank_runs_for_audio(str(path))
+        runs, _duration, source, frame_track = asr._blank_runs_for_audio(str(path))
+        # A v1 head carries no frame classes, and the pauses must arrive anyway.
+        assert frame_track is None
         assert source == "alignment_head_blank_runs"
         assert runs == [(1.0, 2.0)]
         assert len(seen) > 1

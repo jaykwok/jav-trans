@@ -11,9 +11,12 @@ import numpy as np
 
 from asr import alignment_shadow, chunking, result_cache, transcribe
 from asr.alignment import (
+    ENCODER_FRAME_S,
+    FRAME_CLASSES,
     AlignmentHead,
     alignment_head_configured,
     blank_runs,
+    non_speech_runs,
     overlap_save_slices,
     plan_head_windows,
 )
@@ -145,6 +148,21 @@ def _set_last_chunk_cut_provenance(provenance: dict) -> None:
     _LAST_CHUNK_CUT_PROVENANCE = dict(provenance)
 
 
+# The frame-class posteriors from the same pass that found the pauses. Module
+# state for the same reason the boundary signature is: the chunker is stateless
+# and the value is produced two calls below the stage that has to report it.
+_LAST_FRAME_CLASS_TRACK: dict | None = None
+
+
+def _set_last_frame_class_track(track: dict | None) -> None:
+    global _LAST_FRAME_CLASS_TRACK
+    _LAST_FRAME_CLASS_TRACK = track
+
+
+def last_frame_class_track() -> dict | None:
+    return _LAST_FRAME_CLASS_TRACK
+
+
 def _spans_digest(spans: list[tuple[float, float]]) -> str:
     """Identity of a set of cuts, to millisecond resolution.
 
@@ -225,15 +243,109 @@ def _json_payload(value: Any) -> Any:
     return str(value)
 
 
+PAUSE_READINGS = ("blank", "speech")
+
+
+def _pause_reading() -> str:
+    """Which head output supplies the cut points, refusing anything else.
+
+    An unrecognised value must not fall back. `speach` would then run the
+    shipped reading while the operator believed they were testing the other
+    one, and the A/B would compare an arm against itself - the same silent
+    no-op as `--frame-teacher-domain` and the `medium` reasoning tier, both of
+    which cost this project days before anyone noticed the setting had never
+    applied. Empty is still the default, because a forwarded `KEY=` line is how
+    the tuning box clears a setting.
+    """
+    value = (os.getenv("ASR_CHUNK_PAUSE_READING", "") or "").strip().lower()
+    if not value:
+        return "blank"
+    if value not in PAUSE_READINGS:
+        raise ValueError(
+            f"ASR_CHUNK_PAUSE_READING={value!r} is not one of {list(PAUSE_READINGS)}"
+        )
+    return value
+
+
 def _chunking_config() -> dict:
     return {
         "max_chunk_s": _env_float("ASR_CHUNK_MAX_S", "30.0"),
         "min_chunk_s": _env_float("ASR_CHUNK_MIN_S", "2.0"),
         "min_blank_s": _env_float("ASR_CHUNK_MIN_PAUSE_S", "0.6"),
+        # Which reading of the head supplies the cut points. `blank` is the
+        # shipped one: stretches the CTC argmax covers entirely with blank.
+        # `speech` is the v2 alternative - stretches the frame head says are not
+        # speech - which means the same thing without inferring it from the
+        # absence of a character. Off by default until the A/B says otherwise,
+        # because the pause reading decides chunk placement for every job and a
+        # worse placement is paid on every second of audio.
+        "pause_reading": _pause_reading(),
+        "speech_threshold": _env_float("ASR_CHUNK_SPEECH_THRESHOLD", "0.5"),
     }
 
 
-def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], float, str]:
+FRAME_CLASS_TRACK_SCHEMA = "asr_frame_class_track_v1"
+
+
+def _encode_frame_class_track(posteriors, *, frame_s: float) -> dict:
+    """Whole-film frame-class posteriors, small enough to sit in a JSON cache.
+
+    Quantised to a byte per class. The consumers are a mean over a cue's span and
+    a comparison against a threshold, and 1/255 is far finer than any threshold
+    here - while float32 JSON would be roughly twenty times the size for
+    precision nothing reads.
+
+    Carried rather than recomputed because the cue filter needs the classes over
+    spans that do not exist yet when this runs: cues are cut by the layout DP
+    long after chunking, and re-encoding the film to ask again would be a second
+    pass that could disagree with this one.
+    """
+    import base64
+
+    import numpy as _np
+
+    array = _np.asarray(posteriors, dtype=_np.float32)
+    if array.ndim != 2 or array.shape[1] != len(FRAME_CLASSES):
+        raise ValueError(f"frame posteriors must be (T, {len(FRAME_CLASSES)})")
+    quantised = _np.clip(_np.rint(array * 255.0), 0, 255).astype(_np.uint8)
+    return {
+        "schema": FRAME_CLASS_TRACK_SCHEMA,
+        "classes": list(FRAME_CLASSES),
+        "frame_s": round(float(frame_s), 8),
+        "frames": int(quantised.shape[0]),
+        "scale": 255.0,
+        "data": base64.b64encode(quantised.tobytes()).decode("ascii"),
+    }
+
+
+def decode_frame_class_track(track: dict | None):
+    """`(posteriors, frame_s)` or None. The inverse of the encoder above."""
+    import base64
+
+    import numpy as _np
+
+    if not isinstance(track, dict) or track.get("schema") != FRAME_CLASS_TRACK_SCHEMA:
+        return None
+    classes = list(track.get("classes") or [])
+    if tuple(classes) != FRAME_CLASSES:
+        # Positional columns; a different order is a different meaning.
+        return None
+    try:
+        raw = base64.b64decode(str(track["data"]))
+        frames = int(track["frames"])
+        scale = float(track.get("scale") or 255.0)
+        frame_s = float(track["frame_s"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if frames <= 0 or len(raw) != frames * len(FRAME_CLASSES):
+        return None
+    array = _np.frombuffer(raw, dtype=_np.uint8).reshape(frames, len(FRAME_CLASSES))
+    return array.astype(_np.float32) / scale, frame_s
+
+
+def _blank_runs_for_audio(
+    audio_path: str,
+) -> tuple[list[tuple[float, float]], float, str, dict | None]:
     """Pauses found by the alignment head, or nothing if it is not configured.
 
     Returns `(runs, duration_s, source)`. `source` records which path produced
@@ -246,9 +358,9 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
         head = AlignmentHead.from_env()
     except Exception as error:  # noqa: BLE001
         _pipeline_logger.warning("[chunking] alignment head unavailable: %s", error)
-        return [], duration_s, "fixed_length_head_unavailable"
+        return [], duration_s, "fixed_length_head_unavailable", None
     if head is None:
-        return [], duration_s, "fixed_length_no_head_configured"
+        return [], duration_s, "fixed_length_no_head_configured", None
 
     model = None
     processor = None
@@ -263,7 +375,7 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
         model, processor = _load_asr_model_for_features()
         audio, rate = load_audio_16k_mono(audio_path)
         if rate != 16000:
-            return [], duration_s, "fixed_length_unexpected_sample_rate"
+            return [], duration_s, "fixed_length_unexpected_sample_rate", None
         clip = _np.asarray(audio, dtype=_np.float32)
         duration_s = len(clip) / 16000.0
 
@@ -303,6 +415,7 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
         # on the same GPU moves it.
         batch_size = max(1, _env_int("ASR_FEATURE_BATCH_SIZE", "4"))
         pieces = []
+        frame_pieces: list = []
         returned_frames: list[int] = []
         for start in range(0, len(windows), batch_size):
             group = windows[start : start + batch_size]
@@ -328,11 +441,19 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
             hidden = features.detach().float().cpu().numpy()
             offset = 0
             for length in lengths:
-                pieces.append(head.log_probs(hidden[offset : offset + length]))
+                # Both readings off ONE head pass. The frame classes describe the
+                # same audio the blank runs do, and computing them separately
+                # would let the chunker and the subtitle filter disagree about a
+                # second of film for no reason other than two forward passes.
+                ctc, frames = head.log_probs_with_frames(
+                    hidden[offset : offset + length]
+                )
+                pieces.append(ctc)
+                frame_pieces.append(frames)
                 returned_frames.append(int(length))
                 offset += length
         if not pieces:
-            return [], duration_s, "fixed_length_no_features"
+            return [], duration_s, "fixed_length_no_features", None
         # Drop each window's overlap, then concatenate. Deriving the runs from
         # one tensor rather than per window is load-bearing on its own: a pause
         # straddling a seam would otherwise arrive as two shorter runs, fail the
@@ -347,22 +468,55 @@ def _blank_runs_for_audio(audio_path: str) -> tuple[list[tuple[float, float]], f
             if finish > begin
         ]
         if not kept:
-            return [], duration_s, "fixed_length_no_features"
+            return [], duration_s, "fixed_length_no_features", None
         log_probs = torch.cat(kept, dim=0) if len(kept) > 1 else kept[0]
+        cfg = _chunking_config()
         runs = blank_runs(
             log_probs,
             upsample=head.upsample,
-            min_seconds=_chunking_config()["min_blank_s"],
+            min_seconds=cfg["min_blank_s"],
             # A punctuation frame inside a silence is not evidence of sound, and
             # letting it end the run hides the pause from the cut search below.
             silent_classes=head.silent_classes,
         )
-        return runs, duration_s, "alignment_head_blank_runs"
+        # Same overlap-save trim as the CTC side, or the two readings would be
+        # indexed differently and every cue's class shares would be offset by the
+        # window context.
+        frame_track = None
+        if frame_pieces and all(piece is not None for piece in frame_pieces):
+            kept_frames = [
+                piece[begin * head.upsample : finish * head.upsample]
+                for piece, (begin, finish) in zip(frame_pieces, keep)
+                if finish > begin
+            ]
+            if kept_frames:
+                stacked = (
+                    torch.cat(kept_frames, dim=0)
+                    if len(kept_frames) > 1
+                    else kept_frames[0]
+                )
+                posteriors = stacked.exp().detach().cpu().numpy()
+                frame_track = _encode_frame_class_track(
+                    posteriors,
+                    frame_s=ENCODER_FRAME_S / float(head.upsample),
+                )
+                if cfg["pause_reading"] == "speech":
+                    # The same question the blank runs answer - "is anyone
+                    # talking here" - but read off the class that answers it
+                    # instead of inferred from the absence of a character.
+                    runs = non_speech_runs(
+                        posteriors,
+                        upsample=head.upsample,
+                        min_seconds=cfg["min_blank_s"],
+                        speech_threshold=cfg["speech_threshold"],
+                    )
+                    return runs, duration_s, "alignment_head_speech_runs", frame_track
+        return runs, duration_s, "alignment_head_blank_runs", frame_track
     except Exception as error:  # noqa: BLE001
         # Chunking must never take transcription down with it. Fixed-length
         # cuts are worse placed, not wrong, because nothing is dropped either way.
         _pipeline_logger.warning("[chunking] blank runs unavailable: %s", error)
-        return [], duration_s, "fixed_length_blank_runs_failed"
+        return [], duration_s, "fixed_length_blank_runs_failed", None
     finally:
         if model is not None or processor is not None:
             model = None
@@ -396,7 +550,11 @@ def _build_processing_spans(
     if on_stage is not None:
         on_stage("切分 0/1")
     cfg = _chunking_config()
-    runs, duration_s, source = _blank_runs_for_audio(audio_path)
+    runs, duration_s, source, frame_track = _blank_runs_for_audio(audio_path)
+    # Stashed rather than returned: this function's contract is the spans, and
+    # every caller wants those. The track is picked up by the stage that builds
+    # `asr_details`, which is the only place it can reach the subtitle layer.
+    _set_last_frame_class_track(frame_track)
     spans, cut_provenance = plan_chunk_cuts(
         runs,
         duration_s,
@@ -1243,6 +1401,14 @@ def _transcribe_and_align_local(
             "segment_count": len(segments),
             "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
             "chunk_cuts": dict(_LAST_CHUNK_CUT_PROVENANCE),
+            # Absent on a v1 head, and every reader has to treat it that way: a
+            # promoted head outlives the code that trained it, and rolling back
+            # must not disable the subtitle filter.
+            **(
+                {"frame_class_track": _LAST_FRAME_CLASS_TRACK}
+                if _LAST_FRAME_CLASS_TRACK
+                else {}
+            ),
             "postgate": postgate_report,
             "decode_cap_truncations": decode_cap_truncations,
             **({"alignment_shadow": shadow_details} if shadow_details is not None else {}),

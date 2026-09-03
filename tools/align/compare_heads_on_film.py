@@ -154,27 +154,46 @@ def encode_film(audio_path: str, *, context_frames: int, batch_size: int = 4):
     return hidden_states, returned_frames, bases, duration_s
 
 
-def blank_mask(head, hidden_states, returned_frames, bases):
+def head_readings(head, hidden_states, returned_frames, bases):
+    """`(is_blank, frame_posteriors)` over the whole film, one pass per head.
+
+    The two readings come out of the same forward call because they have to
+    describe the same audio: the point of the comparison is whether the frame
+    classes separate what blank could not, and a second pass would let the two
+    disagree for reasons that have nothing to do with the question.
+
+    `frame_posteriors` is None for a v1 head, which is what makes the old and new
+    readings reportable side by side - the shipped head simply has no column in
+    the new table rather than being excluded from the run.
+    """
     import numpy as np
     import torch
 
     from asr.alignment import BLANK_INDEX, overlap_save_slices
 
     pieces = [
-        head.log_probs(np.asarray(state, dtype=np.float32)) for state in hidden_states
+        head.log_probs_with_frames(np.asarray(state, dtype=np.float32))
+        for state in hidden_states
     ]
     keep = overlap_save_slices(
         list(zip(bases[: len(pieces)], returned_frames)),
         context_frames=head.context_frames,
     )
-    kept = [
-        piece[begin * head.upsample : finish * head.upsample]
-        for piece, (begin, finish) in zip(pieces, keep)
-        if finish > begin
-    ]
-    log_probs = torch.cat(kept, dim=0) if len(kept) > 1 else kept[0]
+
+    def stitch(index: int):
+        kept = [
+            piece[index][begin * head.upsample : finish * head.upsample]
+            for piece, (begin, finish) in zip(pieces, keep)
+            if finish > begin
+        ]
+        return torch.cat(kept, dim=0) if len(kept) > 1 else kept[0]
+
+    log_probs = stitch(0)
     predicted = log_probs.argmax(dim=-1).detach().cpu().numpy()
-    return (predicted == BLANK_INDEX).astype(np.float64)
+    is_blank = (predicted == BLANK_INDEX).astype(np.float64)
+    if pieces[0][1] is None:
+        return is_blank, None
+    return is_blank, stitch(1).exp().detach().cpu().numpy()
 
 
 def main() -> None:
@@ -250,7 +269,9 @@ def main() -> None:
     )
     frame_s = frame_to_seconds(1, upsample=next(iter(upsamples)))
 
-    def spans(is_blank) -> dict[str, list[dict]]:
+    def spans(is_blank, posteriors) -> dict[str, list[dict]]:
+        from asr.alignment import span_class_shares
+
         out: dict[str, list[dict]] = {}
         for name, members in groups.items():
             rows = []
@@ -268,16 +289,30 @@ def main() -> None:
                 if window.size == 0:
                     continue
                 text = block_text(block)
-                rows.append(
-                    {
-                        "index": index,
-                        "text": text,
-                        "blank_share": float(window.mean()),
-                        "duration_s": float(end) - float(start),
-                        "chars_per_second": len(text)
-                        / max(1e-6, float(end) - float(start)),
-                    }
-                )
+                row = {
+                    "index": index,
+                    "text": text,
+                    "blank_share": float(window.mean()),
+                    "duration_s": float(end) - float(start),
+                    "chars_per_second": len(text)
+                    / max(1e-6, float(end) - float(start)),
+                }
+                if posteriors is not None:
+                    shares = span_class_shares(
+                        posteriors,
+                        float(start),
+                        float(end),
+                        upsample=next(iter(upsamples)),
+                    )
+                    row.update(
+                        {
+                            "silence_share": shares["silence"],
+                            "vocalisation_share": shares["vocalisation"],
+                            "speech_share": shares["speech"],
+                            "speech_max_run_s": shares["speech_max_run_s"],
+                        }
+                    )
+                rows.append(row)
             out[name] = rows
         return out
 
@@ -300,8 +335,10 @@ def main() -> None:
     control_done = False
     for label, head in heads:
         print(f"\n=== {label} ===", flush=True)
-        is_blank = blank_mask(head, hidden_states, returned_frames, bases)
-        measured = spans(is_blank)
+        is_blank, posteriors = head_readings(
+            head, hidden_states, returned_frames, bases
+        )
+        measured = spans(is_blank, posteriors)
         for name, rows in measured.items():
             for row in rows:
                 entry = paired.setdefault(
@@ -313,6 +350,17 @@ def main() -> None:
                     },
                 )
                 entry[label] = round(row["blank_share"], 6)
+                if "speech_share" in row:
+                    entry[f"{label}:speech"] = round(row["speech_share"], 6)
+                    entry[f"{label}:vocalisation"] = round(
+                        row["vocalisation_share"], 6
+                    )
+                    entry[f"{label}:silence"] = round(row["silence_share"], 6)
+                    # Per cue, not only as a group percentile: the joint verdict
+                    # needs it on the individual cue to tell "one second of
+                    # speech then five of moaning" from "six seconds of
+                    # moaning", which the shares alone cannot do.
+                    entry[f"{label}:speech_run"] = round(row["speech_max_run_s"], 6)
         positive = [row["blank_share"] for row in measured["vocalisation_dropped"]]
         negative = [row["blank_share"] for row in measured["dialogue_lexical"]]
         at_one = [
@@ -341,6 +389,108 @@ def main() -> None:
                 for cut in (0.90, 0.93, 0.95, 0.97, 0.98)
             ],
         }
+
+        # The new reading, reported beside the old one rather than instead of it.
+        # A v1 head has no frame classes and simply carries no `frame` block, so
+        # one table holds both generations and the comparison stays paired on the
+        # same cues.
+        entry["frame_head_available"] = posteriors is not None
+        if posteriors is not None:
+            # Scored as "how much of this span is NOT speech", which is the same
+            # question `blank_share` was asked - so the two AUCs are comparable
+            # and any difference is the class system, not the statistic.
+            non_speech_positive = [
+                1.0 - row["speech_share"] for row in measured["vocalisation_dropped"]
+            ]
+            non_speech_negative = [
+                1.0 - row["speech_share"] for row in measured["dialogue_lexical"]
+            ]
+            # The like-for-like counterpart of `dialogue_at_1000`, which counts
+            # cues whose every frame ARGMAXES to blank - a rate, and one that
+            # really can be exactly 1. `speech_share` is a mean posterior and a
+            # softmax never makes it exactly 0, so testing it against zero would
+            # report a triumphant 0 for reasons that have nothing to do with the
+            # head hearing speech. `speech_max_run_s == 0` is the rate version:
+            # not one frame of this cue cleared the speech threshold.
+            deaf = [
+                row
+                for row in measured["dialogue_lexical"]
+                if row["speech_max_run_s"] <= 0.0
+            ]
+            entry["frame"] = {
+                "auc_non_speech": round(
+                    auc(non_speech_positive, non_speech_negative), 4
+                ),
+                "auc_vocalisation": round(
+                    auc(
+                        [
+                            row["vocalisation_share"]
+                            for row in measured["vocalisation_dropped"]
+                        ],
+                        [
+                            row["vocalisation_share"]
+                            for row in measured["dialogue_lexical"]
+                        ],
+                    ),
+                    4,
+                ),
+                "dialogue_speech_median": percentiles(
+                    [row["speech_share"] for row in measured["dialogue_lexical"]]
+                ).get("median"),
+                # The v2 failure in its new spelling: a cue of real words in
+                # which not one frame votes speech.
+                "dialogue_with_zero_speech": len(deaf),
+                "dialogue_with_zero_speech_examples": [row["text"] for row in deaf[:12]],
+                # How near the floor the quietest dialogue gets. v2's failure was
+                # a saturation - 87 cues at exactly 1.0000 blank - so the shape
+                # of this tail is the thing to compare, not only its count.
+                "dialogue_speech_share_floor": round(
+                    min(
+                        (row["speech_share"] for row in measured["dialogue_lexical"]),
+                        default=0.0,
+                    ),
+                    6,
+                ),
+                "dialogue_below_5pc_speech": sum(
+                    1
+                    for row in measured["dialogue_lexical"]
+                    if row["speech_share"] < 0.05
+                ),
+                "groups": {
+                    name: {
+                        "n": len(rows),
+                        "silence": percentiles(
+                            [row["silence_share"] for row in rows]
+                        ).get("median"),
+                        "vocalisation": percentiles(
+                            [row["vocalisation_share"] for row in rows]
+                        ).get("median"),
+                        "speech": percentiles(
+                            [row["speech_share"] for row in rows]
+                        ).get("median"),
+                        "speech_max_run_s": percentiles(
+                            [row["speech_max_run_s"] for row in rows]
+                        ).get("median"),
+                    }
+                    for name, rows in measured.items()
+                },
+                "threshold": [
+                    {
+                        "cut": cut,
+                        "recall": round(
+                            sum(1 for v in non_speech_positive if v >= cut)
+                            / max(len(non_speech_positive), 1),
+                            4,
+                        ),
+                        "false_drop_share": round(
+                            sum(1 for v in non_speech_negative if v >= cut)
+                            / max(len(non_speech_negative), 1),
+                            4,
+                        ),
+                    }
+                    for cut in (0.70, 0.80, 0.90, 0.95, 0.98)
+                ],
+            }
         if not control_done:
             report["auc_density_control"] = round(
                 auc(
@@ -378,6 +528,25 @@ def main() -> None:
             f"{entry['dialogue_at_1000']:>11}  "
             f"{entry['groups']['vocalisation_dropped']['median']:>8.4f}"
         )
+
+    framed = {
+        label: entry["frame"]
+        for label, entry in report["heads"].items()
+        if entry.get("frame")
+    }
+    if framed:
+        print("\n=== frame-class reading (v2 heads only) ===")
+        print(
+            f"{'head':>22}  {'AUC(1-sp)':>10}  {'AUC(voc)':>9}  "
+            f"{'dlg speech':>11}  {'speech=0':>9}"
+        )
+        for label, frame in framed.items():
+            print(
+                f"{label:>22}  {frame['auc_non_speech']:>10.4f}  "
+                f"{frame['auc_vocalisation']:>9.4f}  "
+                f"{frame['dialogue_speech_median']:>11.4f}  "
+                f"{frame['dialogue_with_zero_speech']:>9}"
+            )
     print(f"\nwrote {out}")
 
 

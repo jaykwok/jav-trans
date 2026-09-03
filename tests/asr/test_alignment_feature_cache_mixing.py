@@ -29,6 +29,7 @@ from tools.align.train_ctc_aligner import (  # noqa: E402
     FeatureCache,
     _cap_empty_train_rows,
     _collate,
+    apply_text_overrides,
     compile_frame_labels_by_cache,
 )
 from tools.align.build_alignment_features import (  # noqa: E402
@@ -370,6 +371,138 @@ class TestFrameTeachersAreScopedToACache:
                 boundary_ignore_s=0.10,
                 negative_minimum_s=0.50,
             )
+
+
+class TestTextOverridesReuseTheFeatures:
+    """Revising the target text must not cost 28 GB of encoder output.
+
+    The features are a function of the audio, so a change that only edits what
+    the head is asked to emit - a corrected vocalisation lexicon restoring words
+    the strip had removed - leaves every shard valid and only `index.jsonl`'s
+    text column stale.
+    """
+
+    @staticmethod
+    def _manifest(tmp_path: Path, name: str, rows: list[dict]) -> str:
+        path = tmp_path / f"{name}.jsonl"
+        with path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return str(path)
+
+    def test_the_override_replaces_the_cached_target(self, caches) -> None:
+        galgame, real = caches
+        cache = FeatureCache([galgame, real])
+        manifest = self._manifest(
+            tmp_path=galgame.parent,
+            name="galgame-override",
+            rows=[
+                {"audio_id": "g0", "text": "いい"},
+                {"audio_id": "g1", "text": ""},
+            ],
+        )
+
+        summary = apply_text_overrides(
+            cache.rows,
+            [galgame.name, real.name],
+            manifests=[manifest],
+            caches=[galgame.name],
+        )
+
+        by_id = {row["audio_id"]: row for row in cache.rows}
+        assert by_id["g0"]["text"] == "いい"
+        assert by_id["g1"]["text"] == ""
+        assert by_id["g1"]["target_kind"] == "blank"
+        # The cache that was not named keeps its own text.
+        assert by_id["r0"]["text"] == "あ"
+        assert summary["rows_rewritten"] == 2
+        assert summary["rows_became_empty"] == 1
+
+    def test_a_partial_manifest_stops_the_run(self, caches) -> None:
+        """A mixture of old and new targets trains without complaint and is
+        afterwards indistinguishable from either, so it is refused up front."""
+        galgame, real = caches
+        cache = FeatureCache([galgame, real])
+        manifest = self._manifest(
+            tmp_path=galgame.parent,
+            name="partial",
+            rows=[{"audio_id": "g0", "text": "いい"}],
+        )
+
+        with pytest.raises(SystemExit, match="absent from"):
+            apply_text_overrides(
+                cache.rows,
+                [galgame.name, real.name],
+                manifests=[manifest],
+                caches=[galgame.name],
+            )
+
+    def test_the_manifest_applies_to_its_own_cache_only(self, tmp_path: Path) -> None:
+        """The reason `_row_key` is a pair: the corpora number their clips
+        independently, so an override applied by id alone would silently
+        retarget another cache's clip."""
+        first = _make_cache(
+            tmp_path, "first", fill=1.0, rows=[{"audio_id": "shared", "frames": 3}]
+        )
+        second = _make_cache(
+            tmp_path, "second", fill=7.0, rows=[{"audio_id": "shared", "frames": 3}]
+        )
+        cache = FeatureCache([first, second])
+        manifest = self._manifest(
+            tmp_path=tmp_path, name="first-only", rows=[{"audio_id": "shared", "text": "い"}]
+        )
+
+        apply_text_overrides(
+            cache.rows,
+            ["first", "second"],
+            manifests=[manifest],
+            caches=["first"],
+        )
+
+        texts = {row["cache_index"]: row["text"] for row in cache.rows}
+        assert texts == {0: "い", 1: "あ"}
+
+    def test_an_oversampled_cache_is_counted_once(self, caches) -> None:
+        """`--cache-repeat` puts the same dict in the list several times; the
+        rewrite reaches every copy through one reference, and counting copies
+        would report the change as several times its real size."""
+        galgame, real = caches
+        cache = FeatureCache([galgame, real], [1, 4])
+        manifest = self._manifest(
+            tmp_path=galgame.parent, name="real-override", rows=[{"audio_id": "r0", "text": "はい"}]
+        )
+
+        summary = apply_text_overrides(
+            cache.rows, [galgame.name, real.name], manifests=[manifest], caches=[real.name]
+        )
+
+        assert summary["rows_rewritten"] == 1
+        assert [row["text"] for row in cache.rows if row["audio_id"] == "r0"] == ["はい"] * 4
+
+    def test_an_unknown_cache_name_is_refused(self, caches) -> None:
+        galgame, real = caches
+        cache = FeatureCache([galgame, real])
+        manifest = self._manifest(
+            tmp_path=galgame.parent, name="typo", rows=[{"audio_id": "g0", "text": "い"}]
+        )
+
+        with pytest.raises(SystemExit, match="not one of the"):
+            apply_text_overrides(
+                cache.rows, [galgame.name, real.name], manifests=[manifest], caches=["nope"]
+            )
+
+    def test_the_override_lands_before_the_blank_cap_and_the_vocabulary(self) -> None:
+        """Ordering is the whole correctness argument: which rows count as empty
+        decides the per-domain blank cap, and the vocabulary is counted from the
+        text. An override applied after either would leave the run describing
+        targets it did not train on."""
+        source = (
+            PROJECT_ROOT / "tools" / "align" / "train_ctc_aligner.py"
+        ).read_text(encoding="utf-8")
+        override_at = source.index("text_override_summary = apply_text_overrides")
+        split_at = source.index('train_rows = [r for r in cache.rows')
+        vocab_at = source.index("counts.update(row[\"text\"])")
+        assert override_at < split_at < vocab_at
 
 
 class TestOneFeasibilityJudgment:

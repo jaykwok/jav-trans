@@ -338,6 +338,18 @@ _CUE_CONTINUITY_REPORT_KEYS = {
     "vocalisation_cues_dropped": "vocalisation_cues_dropped",
     "vocalisation_runs_dropped": "vocalisation_runs_dropped",
     "vocalisation_continuity_flags_cleared": "vocalisation_continuity_flags_cleared",
+    # The acoustic half of the verdict, reported apart from the totals above so
+    # the two evidence sources stay separable. `_available` is the denominator
+    # for all of them: it is 0 on a v1 head, and then every other count here
+    # being 0 means "no acoustics" rather than "nothing found".
+    "vocalisation_acoustics_available": "vocalisation_acoustics_available",
+    "vocalisation_cues_dropped_by_acoustics": "vocalisation_cues_dropped_by_acoustics",
+    "vocalisation_acoustic_verdicts": "vocalisation_acoustic_verdicts",
+    "vocalisation_cues_marked": "vocalisation_cues_marked",
+    "vocalisation_mixed_cues_detected": "vocalisation_mixed_cues_detected",
+    "vocalisation_mixed_cues_split": "vocalisation_mixed_cues_split",
+    "vocalisation_split_removed_seconds": "vocalisation_split_removed_seconds",
+    "vocalisation_split_removed_chars": "vocalisation_split_removed_chars",
     "postgate_flagged_cues": "postgate_flagged_cue_count",
     "postgate_cue_flags": "postgate_cue_flag_counts",
 }

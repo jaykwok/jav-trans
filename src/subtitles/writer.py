@@ -997,6 +997,7 @@ def _prepare_subtitle_blocks(
     options: SubtitleOptions | None = None,
     on_stage: Callable[[str, int, int], None] | None = None,
     diagnostics: dict | None = None,
+    acoustic_classes: Callable[[float, float], dict | None] | None = None,
 ) -> list[dict]:
     options = _coerce_options(options)
     def stage(name: str, current: int, total: int) -> None:
@@ -1036,8 +1037,37 @@ def _prepare_subtitle_blocks(
     # 398 of the 1983 finished cues qualified. Translation happens after this
     # function returns, so a cue dropped here still never reaches the translator.
     if options.drop_vocalisation_only_cues:
+        # Asked here and not earlier: these are the spans a viewer will actually
+        # see, and the whole point of the acoustic half is to judge the cue
+        # rather than the segment it was cut from.
+        if acoustic_classes is not None:
+            annotated = []
+            for block in prepared:
+                start = _safe_float(
+                    block.get("acoustic_start"), _safe_float(block.get("start"), 0.0)
+                )
+                end = _safe_float(
+                    block.get("acoustic_end"), _safe_float(block.get("end"), 0.0)
+                )
+                shares = acoustic_classes(start, end) if end > start else None
+                if shares:
+                    block = {**block, "acoustic_classes": shares}
+                annotated.append(block)
+            prepared = annotated
         prepared, vocalisation_diagnostics = drop_vocalisation_runs(
-            prepared, min_run=options.vocalisation_min_run
+            prepared,
+            min_run=options.vocalisation_min_run,
+            use_acoustics=options.vocalisation_use_acoustics,
+            vocal_speech_max=options.vocalisation_vocal_speech_max,
+            vocal_speech_run_max_s=options.vocalisation_vocal_speech_run_max_s,
+            kana_speech_max=options.vocalisation_kana_speech_max,
+            kana_vocalisation_min=options.vocalisation_kana_vocalisation_min,
+            vocal_text_speech_min=options.vocalisation_vocal_text_speech_min,
+            split_mixed_cues=options.vocalisation_split_mixed_cues,
+            # The same reader, asked again about a sub-span. A cue's own shares
+            # cannot answer what a fragment of it sounds like, and re-measuring
+            # is what makes the removal criterion identical to the whole-cue one.
+            acoustic_reader=acoustic_classes,
         )
         if diagnostics is not None:
             diagnostics.update(vocalisation_diagnostics)
@@ -1062,12 +1092,19 @@ def prepare_srt_blocks(
     mode: Literal["srt", "bilingual"] = "srt",
     on_stage: Callable[[str, int, int], None] | None = None,
     diagnostics: dict | None = None,
+    acoustic_classes: Callable[[float, float], dict | None] | None = None,
 ) -> list[dict]:
     """Return the stable cue plan to translate and write as SRT.
 
     `diagnostics`, when given, is filled with counts for anything this stage
     removed. Cues dropped here never reach the caller, so without it the only
     evidence would be a smaller list.
+
+    `acoustic_classes` answers "what did the frame head hear between these two
+    times". It is a callable rather than data on the blocks because the spans it
+    is asked about do not exist until the layout DP has run - a cue is cut from a
+    segment here, several cues deep - and because it is what keeps this module
+    from importing the ASR stage to do the arithmetic itself.
     """
     options = _coerce_options(options)
     del mode
@@ -1076,6 +1113,7 @@ def prepare_srt_blocks(
         options=options,
         on_stage=on_stage,
         diagnostics=diagnostics,
+        acoustic_classes=acoustic_classes,
     )
 
 
