@@ -10,11 +10,147 @@
 
 - **识别与时间轴**：正式流程使用 Qwen3-ASR 1.7B；默认 CTC 对齐头为 `ctc_aligner_jav_vocalisation_v3.pt`（schema `asr_ctc_alignment_head_v2`），字幕按实测字词时间生成，不使用比例时间伪造切点。该头在 CTC 分类器之外还带一个三类帧头（静音／非语义发声／言语），一次前向同时给出「这里是哪个字」和「这里是哪种声音」。分块切点仍读 blank 游程。
 - **字幕布局**：当前引擎为 `measured_safe_boundary_dp_v3_1`。20 个日文源字符与 7 秒是软目标；优先在句末、强停顿、分句标点和可靠词间隙处拆分，没有安全点时保留较长 cue。
+- **展示层**：中日两轨各按自己的网飞 TTSG 规范渲染，写盘时应用，缓存与 prompt 保留原文。中文 `zh_style.py`：逗号句号改单空格、每行 ≤16 单位、最多 2 行；日文 `ja_style.py`：`、`改半角空格、`。`改全角空格、每行 ≤13 单位、最多 2 行。两份指南在这几点上并不一致，所以是两个模块而不是一个参数。
 - **字幕过滤与质检**：判决由文本拆解和帧后验共同给出，且是**加法**——文本规则原有的删除一条不撤，声学只追加。三条追加路径：孤立呻吟 cue、词表拼不出的拟声词、以及「一半真话一半呻吟」的条目切掉呻吟那半。含汉字的 cue 从不被声学删除，允许列表（`うん`/`はい`/`いい`/笑声等）优先于一切。质量报告在 Web 中直接展示时间轴、布局、翻译和格式风险。
 - **API 翻译**：默认组合为 `https://openrouter.ai/api/v1` + `deepseek/deepseek-v4-flash`，协议面只有 Responses（Chat Completions 已于 2026-08-24 退役，只支持 Chat 的端点用不了）。推理强度只保留 `none / low / high`，默认 `low`；复译使用首轮档位且下限为 `low`。Base URL 决定供应商兼容行为，模型 id 必须与端点配套。
 - **翻译成本与一致性**：`TRANSLATION_BATCH_SIZE` 默认 200，和并发数解耦；术语提取同时完成全片前缀预热。用户术语表优先于自动术语，源文回显、假名残留、术语漏用和长度异常会触发选择性复译。
 - **本地翻译**：唯一默认模型为 Hy-MT2-7B Q4_K_M，由 llama.cpp 托管；适合隐私优先和零 API 成本的草稿，不使用 API 路径的术语表、角色参考或全片上下文。
 - **已知边界**：ASR 的自动 batch 与缓存命中会改变批组成，严格对比时应固定 `ASR_BATCH_SIZE`。默认 CTC 头仍保留少量高 blank 风险样例，质量报告与人工复查不能省略。
+
+## 2026-09-04
+
+### 切分处该换行还是空格：规范说空格，但顺带查出顿号断行是错的
+
+起因是一个显示策略上的犹豫：一条 cue 内部被切成两段之后，两段之间该用换行还是空格。查网飞 TTSG 的结论是**空格，而且现有实现已经是对的**：
+
+- General Requirements → Line Treatment：`2 lines maximum`、`Text should usually be kept to one line, unless it exceeds the character limitation`，断行点是 `after punctuation marks, before conjunctions, before prepositions`；
+- CHS 指南：每行 `16 characters`、`Maximum two lines`、`Prefer a bottom-heavy pyramid shape ... but avoid having just one or two words on the top line`、标点一节的 `Do not use commas or periods. Use one single space instead.`、成人节目 9 CPS。
+
+关键是最后两条一起读：**空格就是规范指定的逗号句号替代品**，不是「没换行的将就」；而两行只有在超过 16 字时才允许出现，所以**换行是长度的产物，不是语义的产物**。按语义在每个切分点换行会同时违反两条——把本该一行的做成两行，并且短句容易做出「上行只有两三个字」的形状。唯一强制按语义换行的例外是双人对白（`maximum of one character speaking per line`），管线里没有这个标记，不适用。`wrap_zh_subtitle_text` 本来就只在超过 16 单位时才断行，这部分没有改动。
+
+**但查证过程中量出一个真实缺陷。** CHS 指南对顿号的要求是可以在句中、不可以在行尾或字幕尾，而 `_BREAK_AFTER_FREE` 把 `、` 列成了**代价 0.0 的首选断点**；`_normalize_zh_line` 的去尾顿号又跑在断行之前，于是断行能造出规范禁止的形状，且 `count_banned_punctuation` 不覆盖这条、QC 报 0：
+
+```
+'苹果、香蕉、橘子都要买一些回来给他'  →  '苹果、香蕉、\n橘子都要买一些回来给他'
+```
+
+同一处还有个次序问题：空格代价 0.1，比 `、` 的 0.0 还贵，而按规范空格才是那个 `after punctuation marks` 的正牌断点。
+
+三处改动：`、` 移出自由断点并给 4.0（与「断在 `、` 之前」同档，都属于「做出规范拒绝的形状」）；空格降到 0.0；`count_banned_punctuation` 增加行尾顿号计数。**三处必须一起改**：`spec_zh_banned_punct_count` 是必须保持 0 的闸（`_SPEC_COUNT_THRESHOLDS`），只加检查不改断行会让 QC 开始报错，所以还需要第四件事——断行仍然落在 `、` 后时把它删掉。这个兜底**只修本函数自己造出的那个行尾**，`flat` 里其它行尾早已由 normalize 处理过；把 wrap 做成无条件去顿号会让它在根本没断行的短句上也删标点。
+
+兜底可达但很难触发：`、` 前后都要是长 ASCII 串（串内断行 6.0），且断在 `、` 后仍是下重结构。实测 `'Alexandergreat、Christopherwalk'` 走的是「断在 `、` 之前」（4.233 对 4.270，上行越过中点变成上重而输掉），要凑到 `'Alexanderabc、Christopherwalken'` 才走兜底。
+
+改后前述例子断在 `橘子` 之后（合法的句中断点，8 对 9 仍是下重），四条构造用例 `count_banned_punctuation` 全为 0。平衡权重（上重 0.6／下重 0.15）没有动——那是既有的取舍，不在这次范围内。日文行是另一条路径、另一份指南（13 字/行），当时未动——随后在同日的下一条里单独处理。
+
+复现步骤：
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+uv run pytest tests/subtitles/test_zh_style.py -q
+```
+
+### 日文轨：一直在按中文规范渲染，而且两种模式走的不是同一条路径
+
+顺着上一条查日文侧，发现的问题比中文那个严重。[Japanese TTSG](https://partnerhelp.netflixstudios.com/hc/en-us/articles/215767517-Japanese-Timed-Text-Style-Guide) 的相关条款：
+
+- I.5 横向字幕每行 13 全角；**全角字符、空格、标点算 1，半角算 0.5**；
+- I.14 最多两行；
+- I.17 `Do not use (。) or (、) punctuation`，`、`换半角空格、`。`换全角空格；`？！`用全角，且**仅当同一行内开始新句时**跟一个全角空格；
+- I.19 每秒 4 字。
+
+**最要命的一条是路径分裂。** 日文轨在两种模式下走完全不同的代码：
+
+- 仅日文模式（`skip_translation`）：`main.py` 把日文塞进 `zh_text`，`write_srt` 无条件调 `_render_zh_subtitle_text`，于是**日文是按中文 CHS 规范渲染的**——保留 `、`、`。`变半角空格、按 16 单位折行；
+- 双语模式：走 `_wrap_subtitle_line`，那是个**没有行数上限**的 `while` 循环，按 `len()` 计数、优先断在 `、。` 之后。
+
+同一段文本两条路径两种结果，且都不符合日文指南：
+
+```
+'待って、行こう。本当に!?もうやめてください、お願いします。'
+  旧（zh 渲染器） → '待って、行こう 本当に！\nもうやめてください、お願いします'
+  新（ja 渲染器） → '待って 行こう　本当に！\nもうやめてください お願いします'
+```
+
+新增 `src/subtitles/ja_style.py`，与 `zh_style.py` 平行而非共用：两份指南在「`、`能不能留」「每行几个字」上直接冲突，做成一个带参数的模块会让每个分支都在替另一种语言说谎。`write_srt` 增加 `language` 参数（默认 `zh`），`main.py` 在 `skip_translation` 分支传 `"ja"`。旧的 `_wrap_subtitle_line` / `_wrap_subtitle_text` 一并删除——留着它等于把一个违反 I.14 的日文折行器摆在同一个文件里，它的两个测试断言的还正是现在被禁的行为。
+
+**折行代价表踩了一个坑。** 初版照搬 `zh_style` 的「无证据断点 = 1.0」，结果 `そうですね　わかりました　では行きましょう` 断在 `わかりま|した`——平衡项（上重 0.6/单位）压过了正牌断点。日文没有词间空格，也没有分词器，所以「无证据」的代价必须高到平衡项够不着：改成 3.0，并把片假名连写按 ASCII 单词同价（6.0）。唯一真有证据的断点是**平假名→汉字**（助词/送假名之后接新词），保留 0.5。
+
+计数按 `unicodedata.east_asian_width` 判宽：`W`/`F` 记 1，`Na`/`H`/`N` 记 0.5；`A`（歧义宽度，`…` 属于此类）在日文字面下按全角记 1。
+
+QC 增加 `spec_ja_*`，只在日文轨真会上屏时计算（`ja_track` = 双语或仅日文）——纯中文模式下日文不上屏，为它报警是噪声。`spec_ja_line_over_13_count` / `spec_ja_lines_over_2_count` / `spec_ja_banned_punct_count` 进零阈值闸；**`spec_ja_cps_over_4_share` 故意不设阈值**：I.19 的 4 CPS 预设了会做压缩的译者，本管线是逐字转写，必然大面积超标，没有实测数据前定一个默认值不是「过严就是形同虚设」。它同时不进 `spec_review_examples`，否则会把示例列表冲爆。
+
+**未实现且无法实现**：I.17 对「正式译名本身含标点」（如 `「食べて、祈って、恋をして」`）的例外，文本层面无从判别，这类标题在这里会和其它文本一样丢掉标点。
+
+无法给出真实占比：`tmp/asr_cache` 是分块级（约 27s/条）而非最终 cue，拿它算行数会严重高估，仓库里也没有留存的最终 SRT。
+
+复现步骤：
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+uv run pytest tests/subtitles/test_ja_style.py tests/subtitles/test_subtitle_qc.py -q
+```
+
+### 停顿处该不该换行：规范把这条挂在说话人上，而管线没有说话人
+
+用户观察到切分点「基本上是下一句或者对话人切换」，因此想改成换行。规范确实有按语义强制换行的一条，但键是**说话人**不是停顿：CHS `maximum of one character speaking per line`（配前置连字符），日文 I.8 更严——`One speaker per subtitle event`，换人根本不该在同一条里。
+
+管线没有任何说话人信息（`rg -n 'diariz|speaker|話者' src/` 只命中 `vocalisation.py` 的一句注释）。停顿不是换人的证据，加连字符等于断言「这里有两个说话人」，在多数条目上是假的。而「下一句」这一情形，CHS 明确不给换行——句子边界不是换行理由，只有超行宽才是。
+
+当时的结论是「杠杆在 layout DP 的停顿权重」。**实测把这个结论否掉了，见下一条。**
+
+### 实测：停顿不是换人的可用代理，DP 权重这条路买不到「一条 cue 一个说话人」
+
+用户提示 Grok STT 带 speaker 标签。归档里确实有：`agents/temp/20260811_154632_grok-fullfilm-3films/`，3 部片 14,240 词、412 个换人点，**已付费产物，本轮零 API 零 GPU**。注意 speaker id 只在单个 Grok 请求内有效，所以换人只在同 chunk 相邻词对之间成立。
+
+**第一问：换人时的停顿，和同一个人说话中的停顿，分得开吗？**
+
+| | n | p50 | < 0.12s | 0.12–0.6s | ≥ 0.6s |
+|---|---|---|---|---|---|
+| 换人 | 412 | 0.380s | 36.4% | 20.9% | 42.7% |
+| 同人 | 13,766 | 0.040s | 79.0% | 12.8% | 8.2% |
+
+中位数差 9.5 倍，看起来分得开。但**同人样本是换人的 33 倍**，把富集度整个吞掉了。按阈值扫描，「停顿 ≥ t 即换人」的精确率：
+
+| 阈值 | 命中换人 | 召回 | 误伤同人 | 精确率 |
+|---|---|---|---|---|
+| 0.12s | 262 | 63.6% | 2,892 | 8.3% |
+| 0.60s | 176 | 42.7% | 1,135 | **13.4%** |
+| 2.00s | 104 | 25.2% | 402 | 20.6% |
+| 5.00s | 62 | 15.0% | 190 | 24.6% |
+
+在 DP 自己的强停顿线 0.60s 上，**每抓到 1 个换人要多切 6.4 刀在同一个人的话中间**。没有任何阈值能让它变成可用的检测器。
+
+**第二问：现在换人到底切没切开？** 把 Grok 词轴直接喂进生产 DP（`grok_stt_word` 本来就在 `MEASURED_WORD_TIMESTAMP_KINDS` 里，所以不需要跑 ASR），统计换人点是落在 cue 边界上还是被埋在一条里：
+
+```
+  film    cues   换人   已在边界   埋在条内   覆盖率
+sample-a   174     87      29        58     33.3%
+sample-b   103     15       7         8     46.7%
+sample-c   803    310     100       210     32.3%
+pooled                    136/412            33.0%
+```
+
+**用户的观察成立**：67%（276 条）的换人被埋在一条 cue 里。但把这 276 条按停顿长短拆开，路就断了：
+
+- **150 条（54.3%）停顿 < 0.12s** —— `WORD_GAP_MIN_S` 的地板意味着 DP 根本不会在那里提供边界，改权重够不到；
+- 70 条（25.4%）在 0.12–0.6s，要够到就得把弱间隙整体调重，代价是上表那 2,892 个同人误伤；
+- 56 条（20.3%）**已经算强停顿了却仍被合并**，是长度项赢了。
+
+也就是说停顿权重的天花板是 276 里的 126 条（45.7%），过半结构上不可达。**结论：这条路不走。** 真要「一条 cue 一个说话人」，需要的是 diarization 信号本身，不是重新配权重——而 Grok 的 speaker id 是请求内作用域，也不能直接搬进生产。本轮未改 DP。
+
+**读数时的三条保留**：Grok 自己的 diarization 在本域未经校验；返回的词轴很稀疏（sample-a 全片只有 1,940 词），所以这里的 cue 是 DP 对 **Grok 转写**的读法，绝对条数不是生产值，可迁移的是「给定实测词时间，换人有多大比例落在 DP 自选的边界上」这个关系；sample-b 只有 15 个换人点，单独看没有裁决力。
+
+复现步骤：
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+uv run python agents/temp/20260904_094628_speaker-change-cue-boundary/measure_speaker_change_gaps.py `
+  --words agents/temp/20260811_154632_grok-fullfilm-3films/grok.words.jsonl `
+  --out agents/temp/20260904_094628_speaker-change-cue-boundary/gaps_3films.json
+uv run python agents/temp/20260904_094628_speaker-change-cue-boundary/measure_speaker_change_in_cues.py `
+  --words agents/temp/20260811_154632_grok-fullfilm-3films/grok.words.jsonl `
+  --out agents/temp/20260904_094628_speaker-change-cue-boundary/cue_coverage_3films.json
+```
 
 ## 2026-09-03
 

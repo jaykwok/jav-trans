@@ -81,11 +81,16 @@ def normalize_zh_subtitle_text(text: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
-# Break-point preference for the two-line pyramid: after sentence punctuation
-# is free, after a space cheap, between hiragana→kanji readable, anywhere else
+# Break-point preference for the two-line pyramid: a space is the guide's own
+# break point (it is the replaced comma or period, and General Requirements asks
+# for the break "after punctuation marks"), so it is free; after sentence
+# punctuation is likewise free, between hiragana→kanji readable, anywhere else
 # expensive. Splitting inside an ASCII word or number is effectively forbidden.
-_BREAK_AFTER_FREE = "！？…、”》」』"
+_BREAK_AFTER_FREE = "！？…”》」』"
 _BREAK_BEFORE_BAD = "！？…、”》」』ー～"
+# 、 is not a break point: the guide allows it mid-sentence but not "at the end
+# of a line or subtitle", which is exactly what breaking after one produces.
+_BREAK_AFTER_BANNED = "、"
 
 
 def _zh_break_cost(text: str, position: int) -> float:
@@ -95,10 +100,12 @@ def _zh_break_cost(text: str, position: int) -> float:
         return 4.0
     if previous.isascii() and previous.isalnum() and following.isascii() and following.isalnum():
         return 6.0
+    if previous in _BREAK_AFTER_BANNED:
+        return 4.0
     if previous in _BREAK_AFTER_FREE:
         return 0.0
     if previous.isspace():
-        return 0.1
+        return 0.0
     if "ぁ" <= previous <= "ゟ" and "一" <= following <= "鿿":
         return 0.5
     return 1.0
@@ -155,18 +162,26 @@ def wrap_zh_subtitle_text(
         return flat
     top = flat[:best_position].strip()
     bottom = flat[best_position:].strip()
+    # Only the boundary this function creates is its to repair: `、` is banned at
+    # a line end, and every other line end in `flat` was already normalized.
+    # Breaking here costs 4.0 above, so this fires only when every alternative
+    # break was worse still.
+    top = _TRAILING_ENUM_COMMA_RE.sub("", top).strip()
     if not top or not bottom:
         return flat
     return f"{top}\n{bottom}"
 
 
 _BANNED_DISPLAY_RE = re.compile(r"[，。,⋯‥]|\.{3,}|…{2,}|[?!]|[？！]{2,}|</?\s*i\s*>", re.IGNORECASE)
+# The one positional rule in the set: 、 is legal mid-sentence and banned "at the
+# end of a line or subtitle", so it is counted by where it sits, not by glyph.
+_LINE_FINAL_ENUM_COMMA_RE = re.compile(r"、[ \t　]*(?:\n|$)")
 
 
 def count_banned_punctuation(text: str) -> int:
-    """Occurrences of glyphs the guide forbids in final zh output (QC hook)."""
+    """Occurrences of punctuation the guide forbids in final zh output (QC hook)."""
     source = str(text or "")
-    matches = 0
+    matches = len(_LINE_FINAL_ENUM_COMMA_RE.findall(source))
     for match in _BANNED_DISPLAY_RE.finditer(source):
         if (
             match.group(0) == ","

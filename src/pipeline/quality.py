@@ -266,6 +266,7 @@ def write_quality_report(
     glossary: str | None = None,
     report_dir: Path | str | None = None,
     hard_fail: bool | None = None,
+    ja_track: bool = False,
 ) -> str | None:
     if enabled is None:
         enabled = env_flag("QUALITY_REPORT_ENABLED")
@@ -294,6 +295,7 @@ def write_quality_report(
             chunk_cuts=(asr_details or {}).get("chunk_cuts"),
             cue_plan=(asr_details or {}).get("subtitle_cue_plan"),
             postgate=(asr_details or {}).get("postgate"),
+            ja_track=ja_track,
         )
         explicit_report_dir = str(report_dir).strip() if report_dir is not None else ""
         env_report_dir = os.getenv("QUALITY_REPORT_DIR", "").strip()

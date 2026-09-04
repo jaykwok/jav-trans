@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from subtitles.options import SubtitleOptions
+from subtitles.ja_style import normalize_ja_subtitle_text, wrap_ja_subtitle_text
 from subtitles.vocalisation import drop_vocalisation_runs
 from subtitles.zh_style import normalize_zh_subtitle_text, wrap_zh_subtitle_text
 
@@ -20,7 +21,6 @@ def format_timestamp(seconds: float) -> str:
 
 
 _COMPACT_SPACE_RE = re.compile(r"\s+")
-_WRAP_PUNCTUATION = "，、。！？…"
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -139,47 +139,16 @@ def _resolve_subtitle_window(
     return start, end
 
 
-def _wrap_subtitle_line(text: str, max_chars: int = 25) -> str:
-    normalized = str(text or "")
-    if max_chars <= 0 or len(normalized) <= max_chars:
-        return normalized
+def _render_ja_subtitle_text(text: str, *, options: SubtitleOptions) -> str:
+    """Netflix Japanese TTSG presentation pass: replace 、。, wrap ≤2 lines.
 
-    lines: list[str] = []
-    remaining = normalized
-    while len(remaining) > max_chars:
-        split_at = -1
-        for index in range(min(max_chars, len(remaining) - 1), 0, -1):
-            if remaining[index] in _WRAP_PUNCTUATION:
-                split_at = index + 1
-                break
-        if split_at <= 0:
-            prefix = remaining[: min(max_chars, len(remaining))]
-            matches = list(re.finditer(r"(?<=[ぁ-ゟ])(?=[一-鿿])", prefix))
-            if matches:
-                split_at = matches[-1].start()
-        if split_at <= 0:
-            split_at = max_chars
-
-        lines.append(remaining[:split_at].strip())
-        remaining = remaining[split_at:].strip()
-
-    if remaining:
-        lines.append(remaining)
-    return "\n".join(line for line in lines if line)
-
-
-def _wrap_subtitle_text(
-    text: str,
-    *,
-    options: SubtitleOptions | None = None,
-) -> str:
-    options = _coerce_options(options)
-    lines = str(text or "").replace("\\n", "\n").split("\n")
-    return "\n".join(
-        wrapped
-        for line in lines
-        for wrapped in [_wrap_subtitle_line(line.strip(), options.line_max_chars)]
-        if wrapped.strip()
+    Replaces the older generic wrapper, which had no line cap at all and broke
+    after 、 and 。 - the two glyphs I.17 removes.
+    """
+    normalized = normalize_ja_subtitle_text(text)
+    return wrap_ja_subtitle_text(
+        normalized,
+        line_max_units=float(options.ja_line_max_chars),
     )
 
 
@@ -1122,10 +1091,16 @@ def write_srt(
     path: str,
     *,
     options: SubtitleOptions | None = None,
+    language: Literal["zh", "ja"] = "zh",
 ):
     """
     blocks: [{start, end, zh_text}]
     zh_text may contain \\n to preserve manual line breaks within one subtitle block.
+
+    `language` selects the style guide to render under. In Japanese-only mode
+    the pipeline puts the Japanese text in `zh_text`, so without this the CHS
+    rules would be applied to Japanese - wrapping at 16 units instead of 13 and
+    keeping the 、 and 。 that the Japanese guide replaces with spaces.
     """
     options = _coerce_options(options)
     blocks = [dict(block) for block in blocks]
@@ -1149,10 +1124,14 @@ def write_srt(
             block["display_duration"] = max(0.0, end - start)
 
             zh_text = str(block.get("zh_text", "")).strip()
-            wrapped = _render_zh_subtitle_text(zh_text, options=options)
+            wrapped = (
+                _render_ja_subtitle_text(zh_text, options=options)
+                if language == "ja"
+                else _render_zh_subtitle_text(zh_text, options=options)
+            )
             if not wrapped:
                 # Nothing displayable: either the translation was empty, or it
-                # was punctuation only and the CHS style rules (no periods or
+                # was punctuation only and the style rules (no periods or
                 # commas, no trailing 、) legitimately cleared it. A placeholder
                 # line here read as a translation failure to the viewer; the cue
                 # is dropped instead, and the returned list is what the quality
@@ -1196,7 +1175,10 @@ def write_bilingual_srt(
             block["display_end"] = end
             block["display_duration"] = max(0.0, end - start)
 
-            ja_line = _wrap_subtitle_text(block.get("ja_text", ""), options=options)
+            ja_line = _render_ja_subtitle_text(
+                str(block.get("ja_text", "")).strip(),
+                options=options,
+            )
             zh_line = _render_zh_subtitle_text(
                 str(block.get("zh_text", "")).strip(),
                 options=options,

@@ -113,9 +113,41 @@ def test_display_units_weights_ascii_lighter():
     assert zh_display_units("ab") < 2.0
 
 
+def test_wrap_does_not_end_a_line_with_enumeration_comma():
+    # The guide allows 、 mid-sentence but not at the end of a line, and a break
+    # is the one place the wrap can create such a line end for itself.
+    wrapped = wrap_zh_subtitle_text("苹果、香蕉、橘子都要买一些回来给他")
+    top, bottom = wrapped.split("\n")
+    assert not top.endswith("、")
+    assert count_banned_punctuation(wrapped) == 0
+
+
+def test_wrap_strips_an_enumeration_comma_it_cannot_avoid():
+    # Breaking after 、 costs the same as breaking before one and more than any
+    # ordinary position, so this needs ASCII runs on both sides to win at all.
+    # When it does win, the 、 goes rather than the rule.
+    assert wrap_zh_subtitle_text("Alexanderabc、Christopherwalken") == (
+        "Alexanderabc\nChristopherwalken"
+    )
+
+
+def test_wrap_breaks_at_the_space_that_replaced_a_comma():
+    assert wrap_zh_subtitle_text(
+        normalize_zh_subtitle_text("你去买苹果、香蕉，我留在这里等他们回来")
+    ) == "你去买苹果、香蕉\n我留在这里等他们回来"
+
+
 def test_count_banned_punctuation():
     assert count_banned_punctuation("你好，世界。") == 2
     assert count_banned_punctuation("等等……") == 1
     assert count_banned_punctuation("真的?") == 1
     assert count_banned_punctuation("一共1,000元") == 0
     assert count_banned_punctuation("好 我们走") == 0
+
+
+def test_count_banned_punctuation_flags_line_final_enumeration_comma():
+    assert count_banned_punctuation("苹果、香蕉、\n橘子都要买") == 1
+    assert count_banned_punctuation("苹果、") == 1
+    assert count_banned_punctuation("苹果、\n香蕉、") == 2
+    # Mid-sentence and mid-line is where the guide permits it.
+    assert count_banned_punctuation("苹果、香蕉和橘子") == 0

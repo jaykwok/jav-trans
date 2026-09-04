@@ -2,6 +2,12 @@ import os
 import re
 
 from subtitles.options import BASE_FPS
+from subtitles.ja_style import (
+    count_banned_ja_punctuation,
+    ja_display_units,
+    normalize_ja_subtitle_text,
+    wrap_ja_subtitle_text,
+)
 from subtitles.zh_style import (
     count_banned_punctuation,
     normalize_zh_subtitle_text,
@@ -128,6 +134,11 @@ _SPEC_LINE_MAX_UNITS = 16.0
 _SPEC_MAX_LINES = 2
 _SPEC_MAX_ZH_CPS = 9.0
 _SPEC_MAX_DURATION_S = 7.0
+# Japanese TTSG I.5 and I.19. Only measured when the Japanese track is actually
+# written (bilingual or Japanese-only); in Chinese-only mode the ja text is not
+# on screen and a gate about it would be noise.
+_SPEC_JA_LINE_MAX_UNITS = 13.0
+_SPEC_MAX_JA_CPS = 4.0
 # The last two are a known, deliberate deviation, not a target. Layout v3 ends a
 # cue at the last character actually spoken, so reaching either would mean
 # moving a boundary to a time with no speech evidence behind it. Measured over
@@ -146,13 +157,33 @@ def _rendered_zh_lines(segment: dict) -> list[str]:
     return [line for line in rendered.split("\n") if line]
 
 
-def _subtitle_spec_compliance_stats(segments: list[dict]) -> dict:
+def _ja_text(segment: dict) -> str:
+    # Same order the rest of this module uses: `quality_segments_from_blocks`
+    # fills both, but fixtures and older callers only carry `text`.
+    return str(segment.get("text") or segment.get("ja") or "")
+
+
+def _rendered_ja_lines(segment: dict) -> list[str]:
+    rendered = wrap_ja_subtitle_text(
+        normalize_ja_subtitle_text(_ja_text(segment)),
+        line_max_units=_SPEC_JA_LINE_MAX_UNITS,
+    )
+    return [line for line in rendered.split("\n") if line]
+
+
+def _subtitle_spec_compliance_stats(segments: list[dict], *, ja_track: bool = False) -> dict:
     line_over_count = 0
     lines_over_count = 0
     banned_punct_count = 0
     raw_banned_punct_count = 0
     cps_over_count = 0
     max_cps = 0.0
+    ja_line_over_count = 0
+    ja_lines_over_count = 0
+    ja_banned_punct_count = 0
+    ja_raw_banned_punct_count = 0
+    ja_cps_over_count = 0
+    ja_max_cps = 0.0
     duration_over_count = 0
     duration_under_count = 0
     gap_under_count = 0
@@ -202,6 +233,32 @@ def _subtitle_spec_compliance_stats(segments: list[dict]) -> dict:
                 cps_over_count += 1
                 issues.append(f"cps={cps:.1f}")
 
+        if ja_track:
+            ja_lines = _rendered_ja_lines(segment)
+            ja_raw_banned_punct_count += count_banned_ja_punctuation(_ja_text(segment))
+            if ja_lines:
+                if len(ja_lines) > _SPEC_MAX_LINES:
+                    ja_lines_over_count += 1
+                    issues.append(f"ja_lines={len(ja_lines)}")
+                over_ja_lines = sum(
+                    1
+                    for line in ja_lines
+                    if ja_display_units(line) > _SPEC_JA_LINE_MAX_UNITS + 1e-6
+                )
+                if over_ja_lines:
+                    ja_line_over_count += over_ja_lines
+                    issues.append("ja_line>13")
+                ja_banned = count_banned_ja_punctuation("\n".join(ja_lines))
+                if ja_banned:
+                    ja_banned_punct_count += ja_banned
+                    issues.append(f"ja_banned_punct={ja_banned}")
+                # I.5 counts spaces, so unlike the zh reading-speed counter the
+                # replaced 、 and 。 stay in: they are what the eye crosses.
+                ja_cps = ja_display_units("".join(ja_lines)) / max(duration, 0.001)
+                ja_max_cps = max(ja_max_cps, ja_cps)
+                if ja_cps > _SPEC_MAX_JA_CPS + 1e-6:
+                    ja_cps_over_count += 1
+
         if issues and len(examples) < 20:
             examples.append(
                 {
@@ -227,6 +284,21 @@ def _subtitle_spec_compliance_stats(segments: list[dict]) -> dict:
         "spec_zh_raw_banned_punct_count": raw_banned_punct_count,
         "spec_zh_cps_over_9_count": cps_over_count,
         "spec_zh_cps_max": round(max_cps, 3),
+        "spec_ja_measured": bool(ja_track),
+        "spec_ja_line_over_13_count": ja_line_over_count,
+        "spec_ja_lines_over_2_count": ja_lines_over_count,
+        "spec_ja_banned_punct_count": ja_banned_punct_count,
+        "spec_ja_raw_banned_punct_count": ja_raw_banned_punct_count,
+        "spec_ja_cps_over_4_count": ja_cps_over_count,
+        "spec_ja_cps_max": round(ja_max_cps, 3),
+        # A share, not a zero gate, and not added to `spec_review_examples`.
+        # I.19's 4 CPS assumes a subtitler who condenses; this pipeline
+        # transcribes verbatim, so most cues exceed it by construction and a
+        # count threshold would fire on every film while flooding the examples
+        # list. Watched for movement instead, like the two timing deviations.
+        "spec_ja_cps_over_4_share": (
+            round(ja_cps_over_count / cue_count, 4) if cue_count and ja_track else 0.0
+        ),
         "spec_duration_over_7s_count": duration_over_count,
         "spec_duration_under_min_count": duration_under_count,
         "spec_gap_under_2frames_count": gap_under_count,
@@ -253,6 +325,9 @@ _SPEC_COUNT_THRESHOLDS = {
     "spec_zh_banned_punct_count": "QC_MAX_SPEC_BANNED_PUNCT",
     "spec_zh_cps_over_9_count": "QC_MAX_SPEC_CPS_OVER",
     "spec_duration_over_7s_count": "QC_MAX_SPEC_DURATION_OVER",
+    "spec_ja_line_over_13_count": "QC_MAX_SPEC_JA_LINE_OVER",
+    "spec_ja_lines_over_2_count": "QC_MAX_SPEC_JA_LINES_OVER",
+    "spec_ja_banned_punct_count": "QC_MAX_SPEC_JA_BANNED_PUNCT",
 }
 
 # The two TTSG timing rules Layout v3 deliberately does not satisfy (see
@@ -267,6 +342,9 @@ _SPEC_SHARE_THRESHOLDS = {
     "spec_duration_under_min_share": ("QC_MAX_SPEC_DURATION_UNDER_SHARE", 0.15),
     "spec_gap_under_2frames_share": ("QC_MAX_SPEC_GAP_UNDER_SHARE", 0.15),
 }
+# `spec_ja_cps_over_4_share` is deliberately absent: no film has been measured
+# through it yet, and a default picked without data would either fire on every
+# run or never fire at all. It is reported so the first real runs can calibrate.
 
 
 def _append_spec_warnings(warnings: list[str], spec_stats: dict) -> None:
@@ -545,8 +623,14 @@ def compute_quality_report(
     chunk_cuts: dict | None = None,
     cue_plan: dict | None = None,
     postgate: dict | None = None,
+    ja_track: bool = False,
 ) -> dict:
-    """Compute SRT quality metrics and flag threshold violations."""
+    """Compute SRT quality metrics and flag threshold violations.
+
+    `ja_track` says whether the Japanese line is actually written (bilingual or
+    Japanese-only output). The Japanese TTSG metrics are skipped otherwise -
+    in Chinese-only mode that text never reaches the screen.
+    """
     asr_generation = asr_generation or {}
     asr_generation_error_count = int(asr_generation.get("generation_error_count") or 0)
     asr_generation_overflow_count = int(asr_generation.get("generation_overflow_count") or 0)
@@ -555,7 +639,7 @@ def compute_quality_report(
     overlap_stats = _subtitle_overlap_stats(segments)
     duration_stats = _subtitle_duration_stats(segments)
     density_stats = _subtitle_density_audit_stats(segments)
-    spec_stats = _subtitle_spec_compliance_stats(segments)
+    spec_stats = _subtitle_spec_compliance_stats(segments, ja_track=ja_track)
     chunk_cut_stats = _chunk_cut_stats(chunk_cuts)
     cue_continuity_stats = _cue_continuity_stats(cue_plan)
     postgate_stats = _postgate_chunk_stats(postgate)

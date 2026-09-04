@@ -2,6 +2,7 @@ import re
 
 import pytest
 
+from subtitles.ja_style import wrap_ja_subtitle_text
 from subtitles.options import BASE_FPS, SubtitleOptions
 from subtitles import writer as subtitle
 
@@ -126,8 +127,10 @@ def test_write_bilingual_srt_returned_blocks_match_min_written_duration(tmp_path
     assert "00:00:02,000 --> 00:00:02,049" in path.read_text(encoding="utf-8")
 
 
-def test_wrap_subtitle_line_uses_hiragana_kanji_boundary():
-    assert subtitle._wrap_subtitle_line("あいうえ漢字テスト", max_chars=5) == (
+def test_ja_wrap_uses_hiragana_kanji_boundary():
+    # The one boundary an unspaced script actually evidences: trailing kana,
+    # then a new content word.
+    assert wrap_ja_subtitle_text("あいうえ漢字テスト", line_max_units=5) == (
         "あいうえ\n漢字テスト"
     )
 

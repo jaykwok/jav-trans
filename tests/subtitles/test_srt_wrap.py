@@ -1,4 +1,5 @@
 from subtitles import writer as subtitle
+from subtitles.options import SubtitleOptions
 from subtitles.zh_style import wrap_zh_subtitle_text, zh_display_units
 
 
@@ -44,13 +45,23 @@ def test_wrap_zh_flattens_manual_breaks_before_wrapping():
     assert wrapped == "短句 另一段"
 
 
-# The ja line of bilingual output keeps the legacy wrapper and its
-# hiragana→kanji boundary heuristic.
-def test_wrap_subtitle_line_uses_punctuation_then_hard_split():
-    punctuated = "これはとても長い字幕で、句読点で折り返す必要がある"
-    hard = "この字幕には句読点がないので強制的に折り返す"
-
-    assert subtitle._wrap_subtitle_line(punctuated, max_chars=12).startswith(
-        "これはとても長い字幕で、\n"
+# The ja line renders under the Japanese guide, which replaces 、 and 。 with
+# spaces rather than breaking after them.
+def test_ja_render_replaces_punctuation_and_breaks_at_the_space():
+    rendered = subtitle._render_ja_subtitle_text(
+        "これはとても長い字幕で、句読点で折り返す必要がある",
+        options=SubtitleOptions(),
     )
-    assert "\n" in subtitle._wrap_subtitle_line(hard, max_chars=10)
+
+    assert "、" not in rendered
+    assert rendered == "これはとても長い字幕で\n句読点で折り返す必要がある"
+
+
+def test_ja_render_never_exceeds_two_lines():
+    """I.14. The wrapper this replaced looped instead, and produced three."""
+    rendered = subtitle._render_ja_subtitle_text(
+        "お兄さまの、すごく気持ちいいの、もうだめかもしれない、やめてください",
+        options=SubtitleOptions(),
+    )
+
+    assert rendered.count("\n") == 1

@@ -265,6 +265,7 @@ _SUBTITLE_OPTION_KEYS = {
     "SUBTITLE_BILINGUAL_SECONDARY_WEIGHT",
     "SUBTITLE_ASCII_CHAR_WEIGHT",
     "SRT_LINE_MAX_CHARS",
+    "SRT_JA_LINE_MAX_CHARS",
     "SUBTITLE_TIMING_POLISH_ENABLED",
     "SUBTITLE_SHORT_GAP_COLLAPSE_S",
     "SUBTITLE_LINGER_S",
@@ -777,6 +778,7 @@ def _write_quality_report_for_ctx(
     video_duration_s: float | None = None,
     enabled: bool | None = None,
     glossary: str | None = None,
+    ja_track: bool = False,
 ) -> str | None:
     return quality_module.write_quality_report(
         video_stem=video_stem,
@@ -792,6 +794,7 @@ def _write_quality_report_for_ctx(
         glossary=glossary,
         report_dir=_quality_report_dir_for_ctx(ctx),
         hard_fail=_quality_hard_fail_for_ctx(ctx),
+        ja_track=ja_track,
     )
 
 
@@ -1615,6 +1618,7 @@ def _run_translation_and_write_impl(
                 [],
                 srt_path,
                 options=subtitle_options,
+                language="ja" if skip_translation else "zh",
             )
         _write_json(
             transcript_path,
@@ -1672,6 +1676,7 @@ def _run_translation_and_write_impl(
             video_duration_s=video_duration_s,
             enabled=_ctx_flag(ctx, "QUALITY_REPORT_ENABLED"),
             glossary=ctx.translation_glossary,
+            ja_track=bilingual or skip_translation,
         )
         timings_payload = {
             "video_path": video_path,
@@ -1758,10 +1763,13 @@ def _run_translation_and_write_impl(
         write_started = time.perf_counter()
         _log_stage(logger, "stage_start write_output")
         _raise_if_cancelled(cancel_event)
+        # Japanese-only output: the cues carry Japanese in `zh_text`, so the
+        # writer has to be told which style guide applies.
         srt_blocks = subtitle_module.write_srt(
             srt_blocks,
             srt_path,
             options=subtitle_options,
+            language="ja",
         )
         _write_json(
             transcript_path,
@@ -1822,6 +1830,8 @@ def _run_translation_and_write_impl(
             video_duration_s=video_duration_s,
             enabled=_ctx_flag(ctx, "QUALITY_REPORT_ENABLED"),
             glossary=ctx.translation_glossary,
+            # Japanese-only output: the ja line is the whole subtitle.
+            ja_track=True,
         )
         timings_payload = {
             "video_path": video_path,
@@ -2144,6 +2154,7 @@ def _run_translation_and_write_impl(
         video_duration_s=video_duration_s,
         enabled=_ctx_flag(ctx, "QUALITY_REPORT_ENABLED"),
         glossary=ctx.translation_glossary,
+        ja_track=bilingual,
     )
 
     timings_payload = {

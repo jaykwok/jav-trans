@@ -57,6 +57,10 @@ class SubtitleOptions:
     bilingual_secondary_weight: float = 0.4
     ascii_char_weight: float = 0.55
     line_max_chars: int = 16
+    # Separate from `line_max_chars` because the two style guides disagree: CHS
+    # allows 16 full-width per line, the Japanese guide 13 for horizontal
+    # subtitles. One shared number would put one of the two tracks out of spec.
+    ja_line_max_chars: int = 13
     timing_polish_enabled: bool = True
     short_gap_collapse_s: float = 0.5
     linger_s: float = 0.5
@@ -156,6 +160,7 @@ class SubtitleOptions:
             ),
             ascii_char_weight=float(os.getenv("SUBTITLE_ASCII_CHAR_WEIGHT", "0.55")),
             line_max_chars=max(0, int(os.getenv("SRT_LINE_MAX_CHARS", "16"))),
+            ja_line_max_chars=max(0, int(os.getenv("SRT_JA_LINE_MAX_CHARS", "13"))),
             timing_polish_enabled=_env_bool("SUBTITLE_TIMING_POLISH_ENABLED", True),
             short_gap_collapse_s=max(
                 0.0,

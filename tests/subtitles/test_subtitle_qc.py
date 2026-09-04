@@ -267,6 +267,43 @@ def test_spec_compliance_clean_output_has_no_spec_warnings():
     assert not [w for w in report["warnings"] if w.startswith("spec_")]
 
 
+def test_ja_spec_metrics_are_skipped_when_the_ja_track_is_not_written():
+    """In Chinese-only mode the Japanese text never reaches the screen, so a
+    gate about its line width would be a warning about nothing."""
+    segs = [_seg("待って、行こう。", "等等 我们走吧", 0.0, 2.0)]
+
+    report = compute_quality_report(segs, 60.0, [], 0, 1)
+
+    assert report["spec_ja_measured"] is False
+    assert report["spec_ja_raw_banned_punct_count"] == 0
+    assert report["spec_ja_cps_over_4_share"] == 0.0
+
+
+def test_ja_spec_metrics_read_the_rendered_japanese_when_it_is_written():
+    segs = [_seg("待って、行こう。", "等等 我们走吧", 0.0, 2.0)]
+
+    report = compute_quality_report(segs, 60.0, [], 0, 1, ja_track=True)
+
+    assert report["spec_ja_measured"] is True
+    # The raw text carries 、 and 。; the rendered text must not (I.17).
+    assert report["spec_ja_raw_banned_punct_count"] == 2
+    assert report["spec_ja_banned_punct_count"] == 0
+    assert report["spec_ja_lines_over_2_count"] == 0
+    assert report["spec_ja_line_over_13_count"] == 0
+
+
+def test_ja_reading_speed_is_reported_but_does_not_warn():
+    """I.19's 4 CPS assumes a subtitler who condenses; this pipeline transcribes
+    verbatim, so it is a scale to watch rather than a pass/fail line."""
+    segs = [_seg("あいうえおかきくけこさしす", "很短", 0.0, 1.0)]
+
+    report = compute_quality_report(segs, 60.0, [], 0, 1, ja_track=True)
+
+    assert report["spec_ja_cps_over_4_count"] == 1
+    assert report["spec_ja_cps_max"] > 4.0
+    assert not [w for w in report["warnings"] if "spec_ja_cps" in w]
+
+
 def test_the_report_carries_the_chunk_cut_provenance_it_is_given():
     """Neither how the audio was cut nor what the layout claimed about split
     sentences can be read back off the finished subtitles, so the report is the
