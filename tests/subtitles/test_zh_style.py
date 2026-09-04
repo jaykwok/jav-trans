@@ -137,6 +137,21 @@ def test_wrap_breaks_at_the_space_that_replaced_a_comma():
     ) == "你去买苹果、香蕉\n我留在这里等他们回来"
 
 
+def test_a_split_that_fits_beats_a_free_break_that_overflows():
+    """Same defect as `ja_style`, reachable here only by construction.
+
+    Breaking after ？ is free but leaves a 16.5-unit line; every break that fits
+    is inside the ASCII run and costs 6.0. At the old overflow weight half a unit
+    over the cap was worth 1.5, so the free break won and produced a line the
+    `spec_zh_line_over_16_count` gate forbids.
+    """
+    text = "你好？abcdefghijklmnopqrstuvwxyz0123"
+    assert round(zh_display_units(text), 6) == 19.5
+    lines = wrap_zh_subtitle_text(text).split("\n")
+    assert len(lines) == 2
+    assert max(zh_display_units(line) for line in lines) <= 16.0
+
+
 def test_count_banned_punctuation():
     assert count_banned_punctuation("你好，世界。") == 2
     assert count_banned_punctuation("等等……") == 1

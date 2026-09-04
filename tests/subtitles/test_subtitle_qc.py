@@ -292,6 +292,22 @@ def test_ja_spec_metrics_read_the_rendered_japanese_when_it_is_written():
     assert report["spec_ja_line_over_13_count"] == 0
 
 
+def test_a_cue_wider_than_two_lines_is_not_charged_to_the_renderer():
+    """27 units cannot fit 2x13 without dropping text, which the layout refuses.
+
+    Before this split the width gate blamed the renderer for the layout's
+    escape hatch and fired on 4 of 11 films; the gate has to stay at zero to
+    mean anything, so the unfittable cues are counted on their own line.
+    """
+    segs = [_seg("あいうえおかきくけこさしすせそたちつてとなにぬねのはひふ", "很长", 0.0, 8.0)]
+
+    report = compute_quality_report(segs, 60.0, [], 0, 1, ja_track=True)
+
+    assert report["spec_ja_over_budget_count"] == 1
+    assert report["spec_ja_line_over_13_count"] == 0
+    assert not [w for w in report["warnings"] if "spec_ja_line_over_13" in w]
+
+
 def test_ja_reading_speed_is_reported_but_does_not_warn():
     """I.19's 4 CPS assumes a subtitler who condenses; this pipeline transcribes
     verbatim, so it is a scale to watch rather than a pass/fail line."""

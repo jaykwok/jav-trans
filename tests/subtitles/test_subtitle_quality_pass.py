@@ -92,6 +92,70 @@ def test_bilingual_drops_a_cue_only_when_both_lines_are_empty(tmp_path):
     assert _cue_count(path.read_text(encoding="utf-8")) == 1
 
 
+def _silent(**extra) -> dict:
+    return {"acoustic_classes": {"silence": 0.79, "vocalisation": 0.20,
+                                 "speech": 0.01, "speech_max_run_s": 0.0}, **extra}
+
+
+def test_a_music_marker_over_silent_audio_is_dropped(tmp_path):
+    """The ASR writes `...♪` where it hears music and no dialogue.
+
+    It is not empty, so the drop above never caught it, and it is not a
+    vocalisation, so the filter kept it: on one film it shipped as a 28-second
+    subtitle over the opening credits.
+    """
+    path = tmp_path / "music.srt"
+
+    written = subtitle.write_srt(
+        [
+            _silent(start=0.0, end=27.9, ja_text="...♪", zh_text="...♪"),
+            _silent(start=30.0, end=31.0, ja_text="はい", zh_text="好"),
+        ],
+        str(path),
+    )
+
+    assert [block["zh_text"] for block in written] == ["好"]
+    assert _cue_count(path.read_text(encoding="utf-8")) == 1
+
+
+def test_a_decoration_only_cue_goes_even_when_the_frames_say_speech(tmp_path):
+    """`...、...、...` at 48% speech, 0.62s, between two lines of dialogue.
+
+    Listening to it settled what the frame shares could not: it is the tail of
+    the previous line bleeding into the gap, not speech of its own. Text alone
+    decides, so no frame reading is consulted here.
+    """
+    path = tmp_path / "speechy.srt"
+
+    written = subtitle.write_srt(
+        [
+            {
+                "start": 0.0,
+                "end": 0.62,
+                "ja_text": "...、...、...",
+                "zh_text": "...、...、...",
+                "acoustic_classes": {"silence": 0.4, "vocalisation": 0.12,
+                                     "speech": 0.48, "speech_max_run_s": 0.115},
+            }
+        ],
+        str(path),
+    )
+
+    assert written == []
+
+
+def test_a_decoration_only_cue_needs_no_frame_reading_to_go(tmp_path):
+    """A v1 head carries no frame shares, and the rule does not ask for any."""
+    path = tmp_path / "v1.srt"
+
+    written = subtitle.write_srt(
+        [{"start": 0.0, "end": 2.0, "ja_text": "...♪", "zh_text": "...♪"}],
+        str(path),
+    )
+
+    assert written == []
+
+
 def test_write_bilingual_srt_does_not_normalize_unprepared_blocks(tmp_path):
     path = tmp_path / "raw.srt"
     blocks = [
@@ -831,6 +895,72 @@ def test_long_cue_splits_at_measured_word_gap_not_mid_word():
         "measured_safe_boundary_dp"
     )
     assert prepared[0]["text_break_type"] == "strong_gap"
+
+
+def test_a_cue_just_over_seven_seconds_splits_instead_of_overflowing():
+    """7s is the TTSG limit and `spec_duration_over_7s_count` gates it at zero.
+
+    A quadratic overflow is taken whenever it undercuts the 1.0 an extra cue
+    costs, so the old weight of 25 left the cap soft by 0.2s and the gate could
+    not be met: eight films produced 55 cues over 7s, 54 of them by at most that
+    much. Here a sentence end sits in the middle and the span is 7.1s, so the
+    layout has a legal alternative and has to take it.
+    """
+    words = _aligned_words("あいうえお。", 0.0, 0.6)
+    words += _aligned_words("かきくけこさ", 3.6, 3.5 / 6)
+    block = {
+        "start": 0.0,
+        "end": words[-1]["end"],
+        "ja_text": "あいうえお。かきくけこさ",
+        "zh_text": "あいうえお。かきくけこさ",
+        "words": words,
+    }
+
+    prepared = subtitle.prepare_srt_blocks([block], options=SubtitleOptions())
+
+    assert len(prepared) == 2
+    assert prepared[0]["text_break_type"] == "sentence_punctuation"
+
+
+def test_the_duration_cap_tolerance_is_under_one_frame():
+    """The weight is the cap's softness, so it is the thing to assert on."""
+    duration_tolerance_s = (1.0 / subtitle._DURATION_OVERFLOW_WEIGHT) ** 0.5
+    assert duration_tolerance_s < SubtitleOptions().frame_duration_s
+    # The character cap stays soft by design - it is a project target rather
+    # than a spec limit - but softer than one whole character is still hard.
+    assert 0.0 < (1.0 / subtitle._CHAR_OVERFLOW_WEIGHT) ** 0.5 < 1.0
+
+
+def test_a_comma_the_speaker_paused_at_is_not_labelled_a_bare_pause():
+    """The kind order used to test the pause first, which threw the comma away.
+
+    A written clause end the speaker also paused at is the one boundary where
+    the transcript and the acoustics corroborate each other, and it was priced
+    identically to a pause with no punctuation at all.
+    """
+    words = _aligned_words("まって、", 0.0, 0.20)
+    gap_start = words[-1]["end"]
+    words += _aligned_words("いこう", gap_start + 0.8, 0.20)
+
+    assert subtitle._exact_boundary_kind(words, 4) == ("clause_with_pause", pytest.approx(0.8))
+    # Ranked between a sentence end and a bare pause, in that order.
+    assert (
+        subtitle._boundary_penalty("sentence_punctuation", 0.8)
+        < subtitle._boundary_penalty("clause_with_pause", 0.8)
+        < subtitle._boundary_penalty("strong_gap", 0.8)
+    )
+
+
+def test_the_pause_penalty_is_continuous_across_the_strong_gap_threshold():
+    """0.599s and 0.601s used to cost 0.2003 and 0.05 - a fourfold step across
+    2ms of silence, at a threshold that is a labelling convenience."""
+    just_under = subtitle._boundary_penalty("word_gap", 0.599)
+    just_over = subtitle._boundary_penalty("strong_gap", 0.601)
+
+    assert just_under == pytest.approx(just_over, abs=0.005)
+    # And it still reaches the flat base once the pause is unambiguous.
+    assert subtitle._boundary_penalty("strong_gap", 2.0) == pytest.approx(0.05)
+    assert subtitle._boundary_penalty("strong_gap", 0.6) == pytest.approx(0.20)
 
 
 def test_long_grok_cue_splits_at_measured_word_gap_not_mid_word():

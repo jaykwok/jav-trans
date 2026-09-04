@@ -121,6 +121,20 @@ def _strip_decoration(text: str) -> str:
     )
 
 
+def is_decoration_only(text: str) -> bool:
+    """True when nothing but punctuation, spaces and music marks remains.
+
+    Public because the writer needs the same reading: a cue that renders to
+    `…♪` has nothing for a viewer to read, and the answer has to come from the
+    one `_DECORATION` set rather than a second list that drifts away from it.
+
+    Note this is not the vocalisation verdict. `_cue_verdict` keeps such a cue
+    (empty body, nothing to judge) because it decides whether kana are moaning;
+    whether an unreadable cue should reach the screen is the writer's question.
+    """
+    return bool(str(text or "").strip()) and not _strip_decoration(text)
+
+
 def _carries_lexical_content(text: str) -> bool:
     """Kanji, latin or digits settle it immediately, without decomposition."""
     for ch in text:

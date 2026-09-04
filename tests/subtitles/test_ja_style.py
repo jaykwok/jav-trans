@@ -98,6 +98,21 @@ def test_wrap_keeps_a_katakana_word_whole_when_it_can():
     assert "コンピューター" in top or "コンピューター" in bottom
 
 
+def test_a_split_that_fits_beats_a_free_break_that_overflows():
+    """I.5 is a must-stay-zero QC gate, so width outranks break quality.
+
+    A free break after ？ leaves a 14-unit bottom line; the only breaks that fit
+    are inside the katakana run, which costs 6.0. At the old overflow weight the
+    overflow was worth 3.0 and won. Found on a real film, where a 13.5-unit line
+    shipped because a free break and a fitting one tied at 3.00.
+    """
+    text = "あい？アイウエオカキクケコサシスセ"
+    assert ja_display_units(text) == 17.0
+    lines = wrap_ja_subtitle_text(text).split("\n")
+    assert len(lines) == 2
+    assert max(ja_display_units(line) for line in lines) <= 13.0
+
+
 def test_count_banned_ja_punctuation():
     # I.17 bans the glyphs outright, so position is irrelevant - unlike CHS,
     # where 、 is legal mid-sentence.

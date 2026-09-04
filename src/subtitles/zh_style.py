@@ -111,6 +111,17 @@ def _zh_break_cost(text: str, position: int) -> float:
     return 1.0
 
 
+# Same weight, and the same reason, as `ja_style._LINE_OVERFLOW_WEIGHT`: the
+# 16-unit line is a must-stay-zero QC gate (`spec_zh_line_over_16_count`), so a
+# split that fits has to beat one that does not. At 3.0 per unit it did not - a
+# free break leaving a line half a unit over cost 1.5, less than breaking inside
+# an ASCII word (6.0) or after a 、 (4.0). Unlike the Japanese track this was
+# never observed in production: measured Chinese cues top out around 14.5 units
+# against a 32-unit two-line budget, so `wrap_zh_subtitle_text` does not wrap at
+# all on real output and the defect is reachable only by construction.
+_LINE_OVERFLOW_WEIGHT = 100.0
+
+
 def wrap_zh_subtitle_text(
     text: str,
     *,
@@ -152,8 +163,8 @@ def wrap_zh_subtitle_text(
             cost += (bottom_units - top_units) * 0.15
         if top_units <= 2.0 or bottom_units <= 2.0:
             cost += 8.0
-        cost += max(0.0, top_units - line_max_units) * 3.0
-        cost += max(0.0, bottom_units - line_max_units) * 3.0
+        cost += max(0.0, top_units - line_max_units) * _LINE_OVERFLOW_WEIGHT
+        cost += max(0.0, bottom_units - line_max_units) * _LINE_OVERFLOW_WEIGHT
         if cost < best_cost:
             best_cost = cost
             best_position = position

@@ -132,6 +132,22 @@ def _ja_break_cost(text: str, position: int) -> float:
     return 3.0
 
 
+# I.5 line width is a must-stay-zero QC gate (`spec_ja_line_over_13_count`), so
+# a split that fits must always beat one that does not. The weight this replaced
+# was 3.0 per unit, which did not buy that: the smallest overflow possible is
+# half a unit - one half-width space, the glyph I.17 puts where `、` was - and
+# 0.5 x 3.0 = 1.5 is cheaper than the 3.0 charged for a break with no evidence.
+# A real film hit exactly that tie: a free break leaving a 13.5-unit line scored
+# 3.00, the balanced break that fit also scored 3.00, and the earlier position
+# won. Every competing term is bounded (break <= 6.0, fragment 8.0, imbalance
+# <= 0.6 per unit), so 100 makes even the smallest overflow decisive.
+#
+# Text that cannot fit two lines at all still behaves as the docstring says: once
+# both lines are over the cap the two overflow terms sum to `total - 26` for
+# every such split, the weight cancels, and the break and balance terms decide.
+_LINE_OVERFLOW_WEIGHT = 100.0
+
+
 def wrap_ja_subtitle_text(text: str, *, line_max_units: float = 13.0) -> str:
     """Wrap normalized ja text into at most two lines of ≤13 display units.
 
@@ -165,8 +181,8 @@ def wrap_ja_subtitle_text(text: str, *, line_max_units: float = 13.0) -> str:
             cost += (bottom_units - top_units) * 0.15
         if top_units <= 2.0 or bottom_units <= 2.0:
             cost += 8.0
-        cost += max(0.0, top_units - line_max_units) * 3.0
-        cost += max(0.0, bottom_units - line_max_units) * 3.0
+        cost += max(0.0, top_units - line_max_units) * _LINE_OVERFLOW_WEIGHT
+        cost += max(0.0, bottom_units - line_max_units) * _LINE_OVERFLOW_WEIGHT
         if cost < best_cost:
             best_cost = cost
             best_position = position

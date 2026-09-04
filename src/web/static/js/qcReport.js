@@ -29,6 +29,7 @@ const METRIC_GROUPS = [
       ['spec_zh_raw_banned_punct_count', '禁用标点（清洗前）'],
       ['spec_ja_measured', '日文轨已计入'],
       ['spec_ja_line_over_13_count', '日文单行 > 13 字条数'],
+      ['spec_ja_over_budget_count', '日文超双行预算条数'],
       ['spec_ja_lines_over_2_count', '日文超过 2 行条数'],
       ['spec_ja_banned_punct_count', '日文禁用标点（成品）'],
       ['spec_ja_raw_banned_punct_count', '日文禁用标点（清洗前）'],

@@ -6,7 +6,7 @@ from typing import Callable, Literal
 
 from subtitles.options import SubtitleOptions
 from subtitles.ja_style import normalize_ja_subtitle_text, wrap_ja_subtitle_text
-from subtitles.vocalisation import drop_vocalisation_runs
+from subtitles.vocalisation import drop_vocalisation_runs, is_decoration_only
 from subtitles.zh_style import normalize_zh_subtitle_text, wrap_zh_subtitle_text
 
 logger = logging.getLogger(__name__)
@@ -267,6 +267,14 @@ def _exact_boundary_kind(words: list[dict], index: int) -> tuple[str, float]:
     gap = max(0.0, float(right["start"]) - float(left["end"]))
     if left_text[-1] in _SENTENCE_END_CHARS:
         return "sentence_punctuation", gap
+    # Tested before the bare pause, because the order used to be the other way
+    # round and a comma the speaker also paused at came back as `strong_gap`
+    # with the comma discarded. Measured on eight films, 2,621 of 38,708
+    # candidate boundaries are in that state - the strongest evidence short of
+    # a sentence end, and the one place where the written syntax and the
+    # measured silence corroborate each other rather than standing alone.
+    if left_text[-1] in _CLAUSE_END_CHARS and gap >= WORD_GAP_STRONG_S:
+        return "clause_with_pause", gap
     if gap >= WORD_GAP_STRONG_S:
         return "strong_gap", gap
     if left_text[-1] in _CLAUSE_END_CHARS:
@@ -307,41 +315,84 @@ def _exact_lexical_extent(
 
 _BOUNDARY_BASE_PENALTY = {
     "sentence_punctuation": 0.0,
+    "clause_with_pause": 0.04,
     "strong_gap": 0.05,
     "clause_punctuation": 0.10,
     "word_gap": 0.20,
     "end": 0.0,
 }
 
+# Beyond this a pause is simply a pause and scores the `strong_gap` base. Between
+# WORD_GAP_STRONG_S and here it is graded down to it, so that the label boundary
+# at 0.60s is continuous rather than a cliff.
+STRONG_GAP_PLATEAU_S = 1.20
+
+# Overflow past a cap is quadratic, and the weight decides how soft the cap is:
+# an overflow is taken whenever `weight * overflow^2` is cheaper than the 1.0 a
+# extra cue costs, i.e. whenever the overflow is under `sqrt(1/weight)`.
+#
+# The character cap is a project target, so 25.0 leaves it soft by ~0.2 of a
+# character - which, being sub-integer, makes it hard in practice.
+#
+# The duration cap is not a project target: 7s is the TTSG limit, and
+# `spec_duration_over_7s_count` gates it at zero. At 25.0 the same arithmetic
+# left it soft by 0.2s, and measured on eight films that is exactly what it
+# produced - 55 cues over 7s, 54 of them by at most 0.2s (median 0.077s). So the
+# gate and the layout disagreed by construction. 1000.0 puts the tolerance at
+# 0.032s, under one frame at 23.976fps, which takes those 54 to 0 for +41 cues
+# on 9,013 (+0.45%) with character-cap violations unchanged at 51 and
+# sentence-end cuts up 8. The 55th survives and should: it is a 20s span with no
+# safe boundary anywhere inside it, and v3 keeps the measured extent rather than
+# cutting at a time nothing was spoken at.
+_CHAR_OVERFLOW_WEIGHT = 25.0
+_DURATION_OVERFLOW_WEIGHT = 1000.0
+
 
 def _boundary_penalty(kind: str, gap_s: float) -> float:
     """What a cut at this boundary costs the DP.
 
-    The kinds are ranked by what justifies the cut: written sentence end, a
-    pause long enough to be a pause, written clause end, and last a gap that is
-    merely wider than the space between syllables.
+    The kinds are ranked by what justifies the cut: a written sentence end, a
+    written clause end the speaker also paused at, a bare pause, a written
+    clause end alone, and last a gap merely wider than the space between
+    syllables. Note that a wide bare pause no longer outranks a written comma
+    across the whole range - see the grading below.
 
-    `word_gap` is the only kind whose entire evidence is the silence, and its
-    0.12s floor admits boundaries barely distinguishable from continuous speech.
-    So inside that kind the measured gap is read as a strength rather than
-    discarded: 0.12s costs 0.36, 0.60s costs 0.20, continuously in between.
-    Without this the DP scores every word gap alike and the choice falls to the
-    length terms, i.e. to whichever gap fills the character cap best.
+    Two kinds are graded rather than flat, and for the same reason: the label is
+    a threshold, and a threshold crossed by a millisecond should not change the
+    price by a quarter of a cue.
 
-    Measured on eight films, 7,257 internal cuts (`agents/temp/
-    20260812_180000_cut-tracking/evaluate_layout_boundary_policy.py`): cuts
-    sitting in a marginal 0.12-0.20s gap fall 432 -> 330 (-23.6%), while cue
-    count moves 9,008 -> 9,012, characters p50/p90 stay 16/20 with the same 51
-    over the cap, and duration p50 stays 2.615s. The same grading applied to
-    every kind was also measured and rejected: it reaches only 353 and pays for
-    it by moving 134 cuts off written commas onto acoustic gaps, which trades
-    syntax for silence.
+    `word_gap` is the kind whose entire evidence is the silence, and its 0.12s
+    floor admits boundaries barely distinguishable from continuous speech, so
+    the measured gap is read as a strength: 0.12s costs 0.36, 0.60s costs 0.20.
+    `strong_gap` continues that curve upward instead of dropping to its base the
+    instant the label changes: 0.60s costs 0.20, falling to the 0.05 base at
+    STRONG_GAP_PLATEAU_S. Before this the pair was discontinuous - 0.599s cost
+    0.2003 and 0.601s cost 0.05, a fourfold step across 2ms.
+
+    Measured on eight films (`agents/temp/20260812_180000_cut-tracking/` for the
+    `word_gap` grading, `agents/temp/20260904_100616_dp-weight-tuning/` for the
+    rest). The `word_gap` grading took marginal 0.12-0.20s cuts from 432 to 330
+    (-23.6%). Adding `clause_with_pause` at 0.04 plus the `strong_gap` grading
+    then moved 279 more cuts onto boundaries backed by written syntax (3,891 ->
+    4,170) and 149 more onto a corroborated comma (758 -> 907), while
+    sentence-end cuts held at 1,999 -> 2,000, continuation claims at 7,012, cues
+    at 9,012 -> 9,013, characters p50 at 16 and cap violations at 51.
+
+    0.04 is where the sweep stops being free: at 0.02 the tier is cheap enough
+    to pull cuts off sentence ends (-10) and raise continuation claims (+11).
+    Grading every kind was measured earlier and rejected - it moves 134 cuts off
+    written commas onto acoustic gaps, trading syntax for silence.
     """
     base = _BOUNDARY_BASE_PENALTY[kind]
-    if kind != "word_gap":
-        return base
-    shortfall = max(0.0, WORD_GAP_STRONG_S - float(gap_s)) / WORD_GAP_STRONG_S
-    return base + 0.20 * shortfall
+    if kind == "word_gap":
+        shortfall = max(0.0, WORD_GAP_STRONG_S - float(gap_s)) / WORD_GAP_STRONG_S
+        return base + 0.20 * shortfall
+    if kind == "strong_gap":
+        span = STRONG_GAP_PLATEAU_S - WORD_GAP_STRONG_S
+        excess = min(1.0, max(0.0, float(gap_s) - WORD_GAP_STRONG_S) / span)
+        # 0.20 where `word_gap` leaves off, decaying to the base.
+        return 0.20 - (0.20 - base) * excess
+    return base
 
 
 def _exact_safe_dp_plan(
@@ -412,8 +463,9 @@ def _exact_safe_dp_plan(
                 + 1.0
                 + _boundary_penalty(kind, gap)
                 + underfill * 0.25
-                + float(char_overflow * char_overflow) * 25.0
-                + float(duration_overflow * duration_overflow) * 25.0
+                + float(char_overflow * char_overflow) * _CHAR_OVERFLOW_WEIGHT
+                + float(duration_overflow * duration_overflow)
+                * _DURATION_OVERFLOW_WEIGHT
             )
             if cost < best_cost:
                 best_cost = cost
@@ -1129,13 +1181,22 @@ def write_srt(
                 if language == "ja"
                 else _render_zh_subtitle_text(zh_text, options=options)
             )
-            if not wrapped:
-                # Nothing displayable: either the translation was empty, or it
-                # was punctuation only and the style rules (no periods or
-                # commas, no trailing 、) legitimately cleared it. A placeholder
-                # line here read as a translation failure to the viewer; the cue
-                # is dropped instead, and the returned list is what the quality
-                # report and the sidecar see, so all three agree.
+            if not wrapped or is_decoration_only(wrapped):
+                # Nothing displayable: the translation was empty, the style
+                # rules (no periods or commas, no trailing 、) legitimately
+                # cleared it, or what survived is punctuation and music marks -
+                # the `...♪` the ASR writes over an opening with no dialogue.
+                # A placeholder line here read as a translation failure to the
+                # viewer; the cue is dropped instead, and the returned list is
+                # what the quality report and the sidecar see, so all three
+                # agree.
+                #
+                # Text alone decides. An earlier version also required the frame
+                # head to report zero continuous speech, to spare a 0.62s
+                # `...、...、...` sitting at 48% speech between two lines of
+                # dialogue; listening to that cue settled it - it is the tail of
+                # the previous line bleeding into the gap, not speech of its
+                # own, and it has nothing to read either way.
                 dropped += 1
                 continue
             kept.append(block)
@@ -1189,7 +1250,7 @@ def write_bilingual_srt(
             content = "\n".join(
                 line for line in (ja_line + "\n" + zh_line).split("\n") if line.strip()
             )
-            if not content.strip():
+            if not content.strip() or is_decoration_only(content):
                 dropped += 1
                 continue
             kept.append(block)

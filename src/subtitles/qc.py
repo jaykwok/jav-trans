@@ -163,12 +163,19 @@ def _ja_text(segment: dict) -> str:
     return str(segment.get("text") or segment.get("ja") or "")
 
 
-def _rendered_ja_lines(segment: dict) -> list[str]:
+def _rendered_ja_lines(segment: dict) -> tuple[list[str], float]:
+    """Rendered lines, plus the width of the text they were rendered from.
+
+    The width comes from the normalized source rather than from re-joining the
+    lines: the wrapper strips the space it broke at, so a re-join reads up to
+    half a unit short - enough to move a 26.5-unit cue to exactly the two-line
+    budget and misclassify it.
+    """
+    normalized = normalize_ja_subtitle_text(_ja_text(segment))
     rendered = wrap_ja_subtitle_text(
-        normalize_ja_subtitle_text(_ja_text(segment)),
-        line_max_units=_SPEC_JA_LINE_MAX_UNITS,
+        normalized, line_max_units=_SPEC_JA_LINE_MAX_UNITS
     )
-    return [line for line in rendered.split("\n") if line]
+    return [line for line in rendered.split("\n") if line], ja_display_units(normalized)
 
 
 def _subtitle_spec_compliance_stats(segments: list[dict], *, ja_track: bool = False) -> dict:
@@ -179,6 +186,7 @@ def _subtitle_spec_compliance_stats(segments: list[dict], *, ja_track: bool = Fa
     cps_over_count = 0
     max_cps = 0.0
     ja_line_over_count = 0
+    ja_over_budget_count = 0
     ja_lines_over_count = 0
     ja_banned_punct_count = 0
     ja_raw_banned_punct_count = 0
@@ -234,18 +242,27 @@ def _subtitle_spec_compliance_stats(segments: list[dict], *, ja_track: bool = Fa
                 issues.append(f"cps={cps:.1f}")
 
         if ja_track:
-            ja_lines = _rendered_ja_lines(segment)
+            ja_lines, ja_units = _rendered_ja_lines(segment)
             ja_raw_banned_punct_count += count_banned_ja_punctuation(_ja_text(segment))
             if ja_lines:
                 if len(ja_lines) > _SPEC_MAX_LINES:
                     ja_lines_over_count += 1
                     issues.append(f"ja_lines={len(ja_lines)}")
+                # A cue wider than two full lines cannot be rendered inside I.5
+                # without dropping text, which the layout refuses to do. Those
+                # cues are the layout's escape hatch for spans with no safe
+                # boundary, so they are counted separately and the width gate
+                # below stays at zero and stays about the renderer.
+                over_budget = ja_units > _SPEC_JA_LINE_MAX_UNITS * _SPEC_MAX_LINES + 1e-6
+                if over_budget:
+                    ja_over_budget_count += 1
+                    issues.append(f"ja_units={ja_units:.1f}")
                 over_ja_lines = sum(
                     1
                     for line in ja_lines
                     if ja_display_units(line) > _SPEC_JA_LINE_MAX_UNITS + 1e-6
                 )
-                if over_ja_lines:
+                if over_ja_lines and not over_budget:
                     ja_line_over_count += over_ja_lines
                     issues.append("ja_line>13")
                 ja_banned = count_banned_ja_punctuation("\n".join(ja_lines))
@@ -286,6 +303,10 @@ def _subtitle_spec_compliance_stats(segments: list[dict], *, ja_track: bool = Fa
         "spec_zh_cps_max": round(max_cps, 3),
         "spec_ja_measured": bool(ja_track),
         "spec_ja_line_over_13_count": ja_line_over_count,
+        # Cues the two-line budget cannot hold. Reported, never gated: on eleven
+        # films this is 6 of 10,447 cues, every one of them a span the layout
+        # found no safe boundary in, and the only way to zero it is to drop text.
+        "spec_ja_over_budget_count": ja_over_budget_count,
         "spec_ja_lines_over_2_count": ja_lines_over_count,
         "spec_ja_banned_punct_count": ja_banned_punct_count,
         "spec_ja_raw_banned_punct_count": ja_raw_banned_punct_count,
@@ -332,19 +353,32 @@ _SPEC_COUNT_THRESHOLDS = {
 
 # The two TTSG timing rules Layout v3 deliberately does not satisfy (see
 # `_SPEC_MIN_DURATION_S`). Zero is unreachable by construction, so they are
-# watched as rates instead: the defaults sit above the highest per-film rate
-# measured on the shipped head (10.6% and 9.7% over eight films) with room for
-# ordinary variation, so a warning here means the cue shape moved, not that the
-# layout is doing what it was designed to do. A head change can move the whole
-# distribution - the retained punctuated head runs 12.6-23.8% on the gap rate -
-# so these are recalibrated when the head is, not treated as universal.
+# watched as rates instead: a warning here means the cue shape moved, not that
+# the layout is doing what it was designed to do. A head change can move the
+# whole distribution - the retained punctuated head runs 12.6-23.8% on the gap
+# rate - so these are recalibrated when the head is, not treated as universal.
+#
+# Recalibrated 2026-09-04 for the v3 head on eleven films / 10,447 cues, every
+# film run through this exact path:
+#
+#   spec_gap_under_2frames_share   per-film 2.4-7.1%, pooled 5.2%
+#   spec_duration_under_min_share  per-film 1.2-2.7%, pooled 2.0%
+#
+# The convention is roughly twice the worst film, so ordinary variation fits and
+# a real move still trips. That leaves the gap default where it was - 0.15 is
+# 2.1x the worst film, and the v3 numbers land on the 2026-08-12 shipped
+# baseline (1.7-8.0%) the default was built for. The duration rate does move:
+# 0.15 was 5.5x its worst film and could not have detected anything.
 _SPEC_SHARE_THRESHOLDS = {
-    "spec_duration_under_min_share": ("QC_MAX_SPEC_DURATION_UNDER_SHARE", 0.15),
+    "spec_duration_under_min_share": ("QC_MAX_SPEC_DURATION_UNDER_SHARE", 0.06),
     "spec_gap_under_2frames_share": ("QC_MAX_SPEC_GAP_UNDER_SHARE", 0.15),
 }
-# `spec_ja_cps_over_4_share` is deliberately absent: no film has been measured
-# through it yet, and a default picked without data would either fire on every
-# run or never fire at all. It is reported so the first real runs can calibrate.
+# `spec_ja_cps_over_4_share` stays absent, now with the data to say why: eleven
+# films run 53.6-83.8% per film (median 64.5%). The metric is bounded at 1.0, so
+# the usual "twice the worst film" has nowhere to go - any usable threshold sits
+# within 1.2x of the worst film and would fire on ordinary variation instead of
+# on a real move. I.19 assumes a subtitler who condenses; this pipeline
+# transcribes verbatim, so the rate measures the source, not a defect.
 
 
 def _append_spec_warnings(warnings: list[str], spec_stats: dict) -> None:
