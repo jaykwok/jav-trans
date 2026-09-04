@@ -84,7 +84,13 @@ def grok_words(film_id: str, word_files: list[str]) -> list[tuple[float, float, 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--acceptance", required=True, help="compare_heads_on_film output")
-    parser.add_argument("--film-id", default="sample-v")
+    # Required rather than defaulted: this filters `grok.words.jsonl` rows by
+    # `film_id`, so a default that names one film is either wrong for every
+    # other film or a real id sitting in the repository. It used to be the
+    # latter.
+    parser.add_argument(
+        "--film-id", required=True, help="film_id to select in the Grok word files"
+    )
     parser.add_argument("--head", required=True, help="which head's failures to judge")
     parser.add_argument("--threshold", type=float, default=0.99999)
     parser.add_argument(
