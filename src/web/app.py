@@ -33,9 +33,26 @@ def _events_port() -> int:
         return 2234
 
 
+def _warn_translation_budget() -> None:
+    """Say it once at startup, where a config mistake is still cheap to fix.
+
+    Import is local because this is the only thing app startup needs from the
+    translation stack, and pulling the profiles in at module scope would put
+    them on the import path of every web test.
+    """
+    try:
+        from llm.preflight import translation_budget_warnings
+
+        for warning in translation_budget_warnings():
+            print(f"[WARN] {warning}", flush=True)
+    except Exception as exc:  # never let a warning stop the server
+        log.debug("translation budget warning skipped: %r", exc)
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     load_config()
+    _warn_translation_budget()
     listener_task: asyncio.Task | None = None
     worker_tasks: list[asyncio.Task] = []
     try:

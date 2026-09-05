@@ -72,4 +72,59 @@ def require_translation_config(backend: str | None = None) -> None:
         raise RuntimeError("\n".join(problems))
 
 
-__all__ = ["require_translation_config", "translation_config_problems"]
+def translation_budget_warnings() -> list[str]:
+    """Where the `max_tokens` fallback would silently clamp every batch.
+
+    Warnings, never errors: the numbers involved are all legal, and a run that
+    is merely sending less room than it asked for should not be blocked from
+    starting. But it should not be silent either. The ceiling is a fallback
+    nobody tuned, so it shrinking a computed budget is an accident rather than
+    a decision - the request goes out short, and if the reply is then cut off
+    the truncation escalation cannot raise it back past the same line.
+
+    Measured against a batch of *empty* cues, so what it compares is the part of
+    the budget that comes from configuration alone (per-item structure plus the
+    reasoning allowance). Whatever the source text adds is on top, which makes
+    this a floor: if it already exceeds the ceiling, every real batch does. The
+    converse does not hold, which is why the per-request warning in
+    `translator._max_tokens_budget` exists as well - this one is early, that one
+    is exact.
+
+    Compared against the budget the endpoint would actually get, not against the
+    configured fallback: once an endpoint has named a ceiling, the fallback is
+    not what binds, and warning about it would be describing a number nothing
+    uses.
+    """
+    from llm import profiles as profiles_module
+    from llm import settings as llm_settings
+    from llm import translator as translator_module
+
+    batch_size = max(1, int(llm_settings.TRANSLATION_BATCH_SIZE))
+    floor = profiles_module.select_profile().response_token_budget(
+        [{"text": ""} for _ in range(batch_size)],
+        reasoning_effort=llm_settings.LLM_REASONING_EFFORT,
+    )
+    if floor is None:
+        return []
+    floor = int(floor)
+    # The pure one: the warning-emitting variant would print here at startup and
+    # then mark the endpoint as already-warned, so the run-time clamp - the one
+    # that sees the real source text - would never say anything.
+    effective = translator_module._plain_max_tokens_budget(floor)
+    if effective >= floor:
+        return []
+    return [
+        f"翻译预算下限 {floor} tokens 超过本端点实际可用的 {effective}，"
+        "每个批次都会被压到这个上限，且回复被切断后无法再向上重试。"
+        f"（batch={batch_size}，推理档={llm_settings.LLM_REASONING_EFFORT}，"
+        f"推理配额={llm_settings.TRANSLATION_REASONING_TOKEN_ALLOWANCE}，"
+        f"TRANSLATION_MAX_TOKENS={int(translator_module.TRANSLATION_MAX_TOKENS)}）"
+        "调高 TRANSLATION_MAX_TOKENS，或调小批次/推理配额。"
+    ]
+
+
+__all__ = [
+    "require_translation_config",
+    "translation_budget_warnings",
+    "translation_config_problems",
+]

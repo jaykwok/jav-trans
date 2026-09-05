@@ -205,6 +205,20 @@ def _new_cancel_event() -> threading.Event:
     return threading.Event()
 
 
+def _discard_cancel_event(job_id: str) -> None:
+    """Drop a job's cancel event, setting it on the way out.
+
+    "Finished" is the job's view, not the worker threads'. A failed translation
+    can leave batch workers mid-request, and they hold this event object
+    directly - dropping it without setting it strands them with no stop signal
+    at all, including the one `shutdown_executor` would have sent. Setting a
+    finished job's event costs nothing: nobody reads it again.
+    """
+    event = _cancel_events.pop(job_id, None)
+    if event is not None:
+        event.set()
+
+
 def _is_pipeline_cancelled(exc: BaseException) -> bool:
     cancelled_type = getattr(pipeline_main, "PipelineCancelledError", None)
     return bool(cancelled_type is not None and isinstance(exc, cancelled_type))
@@ -618,6 +632,10 @@ async def retry_job(job_id: str) -> JobState | None:
                 "error": None,
             },
         )
+        # Same reason removal sets it: whatever was still holding the previous
+        # run's event must be told to stop before the retry replaces it, or the
+        # old worker keeps running under the same job id as the new one.
+        _discard_cancel_event(job_id)
         _cancel_events[job_id] = _new_cancel_event()
         _jobs[job_id] = retried
         _write_jobs_unlocked()
@@ -636,7 +654,7 @@ async def remove_job(job_id: str) -> bool:
             return False
         if job.status in _FINISHED_STATUSES:
             _jobs.pop(job_id, None)
-            _cancel_events.pop(job_id, None)
+            _discard_cancel_event(job_id)
             _last_progress_write_ts.pop(job_id, None)
             _write_jobs_unlocked()
             removed_job = job
@@ -658,7 +676,7 @@ async def remove_finished_jobs() -> int:
         ]
         for job in removed_jobs:
             _jobs.pop(job.id, None)
-            _cancel_events.pop(job.id, None)
+            _discard_cancel_event(job.id)
             _last_progress_write_ts.pop(job.id, None)
         if removed_jobs:
             _write_jobs_unlocked()
@@ -681,7 +699,7 @@ async def evict_old_jobs(max_age_hours: int = 48) -> int:
         ]
         for job in removed_jobs:
             _jobs.pop(job.id, None)
-            _cancel_events.pop(job.id, None)
+            _discard_cancel_event(job.id)
             _last_progress_write_ts.pop(job.id, None)
         if removed_jobs:
             _write_jobs_unlocked()

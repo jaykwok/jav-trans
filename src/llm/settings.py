@@ -58,11 +58,27 @@ LLM_REASONING_EFFORT = (
 # per-job choice.
 LLM_STRUCTURED_OUTPUT = os.getenv("LLM_STRUCTURED_OUTPUT", "").strip().lower()
 
-TRANSLATION_MAX_TOKENS = 384000
+# Fallback ceiling on `max_tokens`, used only until the endpoint tells us its
+# real one (`llm.max_tokens_limits`). Not a target either: every real request is
+# sized by `response_token_budget` and only ever `min()`ed against this.
+#
+# 384000 was not a legal value everywhere: it is exactly what the default
+# OpenRouter deployment's deepseek-v4-flash accepts, and it was carried over to
+# an endpoint capping the parameter at 131072, which rejects the request
+# outright. That broke the prefix warmup - the one call that passes no budget -
+# on every run from 2026-09-04, silently costing each film its prompt-cache
+# priming. 65536 is accepted by both and still far above what a batch asks for:
+# 200 cues at the default reasoning allowance computes to about 46k (32000
+# thinking + 28/item structure + 1.5x source chars), so the fallback does not
+# bind at defaults. Raising it is what the env override is for; raise it too far
+# and the endpoint's refusal teaches the real number.
+TRANSLATION_MAX_TOKENS = _env_int_clamped(
+    "TRANSLATION_MAX_TOKENS", 65536, 1024, 1_000_000
+)
 # Arithmetic bound on how long a reply may legitimately get, so a model that
 # falls into a repetition loop stops at the bound instead of at
-# TRANSLATION_MAX_TOKENS (a ceiling sized for API models, i.e. no bound at all
-# locally). Measured 2026-08-04 over 1098 clean translations from three local
+# TRANSLATION_MAX_TOKENS (a ceiling that only has to be legal at the endpoint,
+# i.e. no bound at all locally). Measured 2026-08-04 over 1098 clean translations from three local
 # models: output/source character ratio p50 0.69, p95 0.88, p99 0.97, max 1.27.
 # Chinese is denser than Japanese kana, so a translation is essentially never
 # longer than its source; the ratio below leaves margin over the observed max

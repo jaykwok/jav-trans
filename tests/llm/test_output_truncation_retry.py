@@ -101,17 +101,47 @@ class TestEscalation:
             _chat(max_tokens=500)
         assert transport.budgets == [500, 1000]
 
-    def test_no_retry_when_the_ceiling_leaves_no_room(self, monkeypatch):
-        """A budget already at `TRANSLATION_MAX_TOKENS` cannot be raised, so
-        reissuing would be the identical request the old comment ruled out."""
+    def test_no_retry_when_the_ceiling_leaves_no_room(self, monkeypatch, tmp_path):
+        """A budget already at the endpoint's ceiling cannot be raised, so
+        reissuing would be the identical request the old comment ruled out.
+
+        The ceiling that binds here is the endpoint's own, not
+        `TRANSLATION_MAX_TOKENS`: that one is a fallback for callers with no
+        budget of their own, and letting it cap an explicit escalation is how a
+        truncated reply used to become a dead film with no retry at all.
+        """
+        from llm import max_tokens_limits
+
+        monkeypatch.setenv(
+            "TRANSLATION_MAX_TOKENS_CACHE_PATH", str(tmp_path / "limits.json")
+        )
+        monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://example.test/v1")
+        monkeypatch.setenv("LLM_MODEL_NAME", "test-model")
+        max_tokens_limits.record_exact_ceiling(
+            "https://example.test/v1", "test-model", 500
+        )
         transport = _Transport(truncate_first=99)
         _install(monkeypatch, transport)
-        monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 500)
         monkeypatch.setattr(llm_settings, "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0)
 
         with pytest.raises(ResponseTruncatedError):
             _chat(max_tokens=500)
         assert transport.budgets == [500]
+
+    def test_the_fallback_alone_does_not_block_an_escalation(self, monkeypatch, tmp_path):
+        """An endpoint that has never refused anything gets what it was asked."""
+        monkeypatch.setenv(
+            "TRANSLATION_MAX_TOKENS_CACHE_PATH", str(tmp_path / "limits.json")
+        )
+        monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://example.test/v1")
+        monkeypatch.setenv("LLM_MODEL_NAME", "test-model")
+        transport = _Transport(truncate_first=1)
+        _install(monkeypatch, transport)
+        monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 500)
+        monkeypatch.setattr(llm_settings, "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0)
+
+        _chat(max_tokens=500)
+        assert transport.budgets == [500, 1000]
 
 class TestMessage:
     def test_the_final_message_names_the_knob_that_actually_bound(self, monkeypatch):

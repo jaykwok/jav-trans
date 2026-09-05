@@ -17,7 +17,11 @@ from typing import Callable
 from llm import cache as translation_cache
 from llm import transport_util
 from llm import zh_variant
-from llm.errors import RetryableTranslationFormatError, TranslationCancelledError
+from llm.errors import (
+    ContentPolicyRefusalError,
+    RetryableTranslationFormatError,
+    TranslationCancelledError,
+)
 from llm.profiles.base import ProfileContext, TranslationProfile
 
 _cancel_requested = transport_util._cancel_requested
@@ -34,6 +38,37 @@ def _split_into_batches(segments: list[dict], batch_size: int) -> list[list[dict
         segments[index : index + batch_size]
         for index in range(0, len(segments), batch_size)
     ]
+
+
+class _SiblingBatchAborted(Exception):
+    """A batch that stopped because another batch had already failed the call.
+
+    Internal to `run_batched` and never surfaced: it exists so the abort a
+    failure causes cannot be confused with the failure itself, nor with the
+    user cancelling the job.
+    """
+
+    def __init__(self, batch_index: int) -> None:
+        super().__init__(f"batch {batch_index} aborted alongside a failed sibling")
+        self.batch_index = batch_index
+
+
+class _CombinedCancel:
+    """`is_set()` over several cancel sources at once.
+
+    The batch pool needs a stop signal of its own - one batch failing must not
+    be reported to the job as "cancelled" - but the transports below take a
+    single event. They only ever ask it `is_set()`, so an OR view is enough and
+    keeps the job's own event untouched.
+    """
+
+    __slots__ = ("_events",)
+
+    def __init__(self, *events) -> None:
+        self._events = [event for event in events if event is not None]
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self._events)
 
 
 def _batch_cost(batch_segments: list[dict]) -> int:
@@ -421,6 +456,8 @@ def run_batched(
             )
         pending_batches.append((batch_index, batch_segments))
 
+    pending_by_index = {batch_index: batch for batch_index, batch in pending_batches}
+
     _raise_if_cancelled(cancel_event)
     # Warmup exists to prime the provider prefix cache before PARALLEL batches
     # land; with a single pending batch it is a pure extra request.
@@ -482,10 +519,67 @@ def run_batched(
             }
             print(f"[WARN] translation prefix warmup failed: {exc}", flush=True)
 
+    # Set when one batch has already failed the whole call. Workers check it
+    # alongside the job's cancel event, so a batch that is mid-request - or one
+    # a freed worker has just picked up off the queue - stops instead of
+    # streaming on into a run nobody is listening to any more.
+    batch_abort = threading.Event()
+    worker_cancel = _CombinedCancel(cancel_event, batch_abort)
+    # The failure that started the abort, kept apart from the sibling
+    # cancellations it causes so the run can report what actually broke.
+    failure_lock = threading.Lock()
+    root_failure: BaseException | None = None
+
+    def persist_batch(batch_index: int, batch_results: list[str | None]) -> None:
+        """Commit a finished batch: fill in its cues and write its cache.
+
+        Called on the worker, before the batch is handed back. It used to run on
+        the main thread after harvesting, which meant a batch that had been
+        generated and paid for was thrown away whenever the main thread unwound
+        before getting to it - and no amount of sweeping already-finished
+        futures closes that, because one can always finish just after the sweep.
+        Committing where the work was done removes the window instead of
+        narrowing it.
+        """
+        segments = pending_by_index[batch_index]
+        start_index = batch_index * batch_size
+        local_texts: list[str] = []
+        memory_entries: list[tuple[str, str]] = []
+        for offset in range(len(segments)):
+            global_index = start_index + offset
+            text = batch_results[global_index] or zh_texts[global_index] or ""
+            # Each index belongs to exactly one batch, so no two workers ever
+            # write the same slot.
+            zh_texts[global_index] = text
+            local_texts.append(text)
+            source_text = str(segments[offset].get("text", ""))
+            if (
+                cache_path
+                and text
+                and translation_cache._translation_memory_source_is_cacheable(
+                    source_text
+                )
+            ):
+                memory_entries.append((_memory_key_for(source_text), text))
+        if not cache_path:
+            return
+        batch_key = _batch_key_for(batch_index, segments)
+        translation_cache._save_cache_entry(
+            cache_path, batch_key, local_texts, cache_lock
+        )
+        cache_map[batch_key] = local_texts
+        if memory_entries:
+            translation_cache._save_memory_entries(
+                cache_path, memory_entries, cache_lock
+            )
+            for memory_key, memory_text in memory_entries:
+                memory_map[memory_key] = memory_text
+        print(f"[translation-cache] saved batch {batch_index} cache_key={batch_key}")
+
     def run_batch(
         batch_index: int, batch_segments: list[dict]
     ) -> tuple[int, list[str | None], dict, list[dict]]:
-        _raise_if_cancelled(cancel_event)
+        _raise_if_cancelled(worker_cancel)
         # Worker threads do not inherit the caller's thread-local retry events,
         # so retry recording would silently no-op. Bind a per-batch container
         # here and merge it back on the main thread.
@@ -587,7 +681,7 @@ def run_batched(
             )
 
         while True:
-            _raise_if_cancelled(cancel_event)
+            _raise_if_cancelled(worker_cancel)
             if request_count >= batch_max_requests:
                 raise RuntimeError(
                     "Batch translation exceeded hard request cap "
@@ -612,7 +706,7 @@ def run_batched(
             active_requested_ids = list(requested_ids)
             trace_progress({"phase": "reset", "attempt": request_count})
             try:
-                _raise_if_cancelled(cancel_event)
+                _raise_if_cancelled(worker_cancel)
                 request_segments = [
                     batch_segments[index - start_index] for index in requested_ids
                 ]
@@ -649,10 +743,16 @@ def run_batched(
                     expected_count=request_expected_count,
                     on_progress=trace_progress,
                     on_usage=request_usages.append,
-                    cancel_event=cancel_event,
+                    cancel_event=worker_cancel,
                     **request_kwargs,
                 )
-                _raise_if_cancelled(cancel_event)
+                # No cancel check here on purpose. The reply is already
+                # generated and already billed, so parsing it costs nothing the
+                # run has not paid for, and a batch completed by this reply then
+                # reaches `persist_batch` and survives. Standing down on the line
+                # above threw that away and made the resume buy it a second time.
+                # The abort is still honoured one parse later: an incomplete
+                # batch loops back to the check at the top.
                 parsed = profile.parse_response(raw_output, ids=requested_ids)
                 for idx in requested_ids:
                     if parsed.get(idx):
@@ -688,6 +788,14 @@ def run_batched(
                 else:
                     attempts_for_pending += 1
                     narrow_request_span()
+            except ContentPolicyRefusalError as refusal:
+                # Terminal by design (see the exception), so the only thing to
+                # add is which cues were on the wire - without it the message
+                # names a filter verdict and nothing to act on.
+                raise ContentPolicyRefusalError(
+                    f"{refusal} (batch={batch_index}, start_index={start_index}, "
+                    f"size={expected_count}, requested_ids={requested_ids[:50]})"
+                ) from refusal
             except RetryableTranslationFormatError as exc:
                 last_retry_error = exc
                 attempts_for_pending += 1
@@ -698,7 +806,7 @@ def run_batched(
                 backoff_sleep(
                     sleep_attempt,
                     last_retry_error,
-                    cancel_event=cancel_event,
+                    cancel_event=worker_cancel,
                 )
                 continue
 
@@ -749,91 +857,114 @@ def run_batched(
             "translation_memory_hit_count": expected_count - len(expected_ids),
             "cache_hit_type": "mixed" if len(expected_ids) < expected_count else "miss",
         }
+        persist_batch(batch_index, batch_results)
         return batch_index, batch_results, timing, batch_retry_events
+
+    def run_batch_guarded(
+        batch_index: int, batch_segments: list[dict]
+    ) -> tuple[int, list[str | None], dict, list[dict]]:
+        nonlocal root_failure
+        try:
+            return run_batch(batch_index, batch_segments)
+        except TranslationCancelledError:
+            if batch_abort.is_set() and not _cancel_requested(cancel_event):
+                # Standing down because a sibling already failed. That is a
+                # consequence, not a reason, and the two must not look alike:
+                # the main thread harvests batches in index order, so a low
+                # sibling's cancellation would otherwise be the first exception
+                # it sees and the run would report a cancellation for a failure
+                # nobody could see.
+                raise _SiblingBatchAborted(batch_index) from None
+            raise
+        except BaseException as exc:
+            with failure_lock:
+                if root_failure is None:
+                    root_failure = exc
+            # Raise the flag on the failing thread, not on the main one. The
+            # worker that just failed is the very worker the pool hands the
+            # next queued batch to, and it does that before the main thread
+            # has even been scheduled to see the exception - which is how a
+            # dead run started a fresh batch 1 ms after failing.
+            batch_abort.set()
+            raise
 
     if pending_batches:
         executor = ThreadPoolExecutor(max_workers=min(max_workers, len(pending_batches)))
+        # Bound before the try: the cancel check below can raise before any
+        # batch is submitted, and the handler walks this.
+        futures: dict = {}
         try:
             _raise_if_cancelled(cancel_event)
-            pending_by_index = {
-                batch_index: batch for batch_index, batch in pending_batches
-            }
             futures = {
-                executor.submit(run_batch, batch_index, batch): batch_index
+                executor.submit(run_batch_guarded, batch_index, batch): batch_index
                 for batch_index, batch in _submission_order(pending_batches)
             }
-            try:
-                remaining = set(futures)
-                while remaining:
+            def harvest(result, source_future) -> None:
+                """Main-thread bookkeeping for a batch the worker already committed."""
+                batch_index, _batch_results, timing, batch_retry_events = result
+                worker_retry_events.extend(batch_retry_events)
+                timings_by_batch[batch_index] = timing
+                if cache_path and crash_probe() == batch_index + 1:
+                    for pending_future in futures:
+                        if pending_future is not source_future:
+                            pending_future.cancel()
+                    raise SystemExit(1)
+                if on_batch_done:
                     _raise_if_cancelled(cancel_event)
-                    done, remaining = wait(
-                        remaining,
-                        timeout=0.1,
-                        return_when=FIRST_COMPLETED,
-                    )
-                    if not done:
-                        continue
-                    for future in sorted(done, key=lambda item: futures[item]):
-                        _raise_if_cancelled(cancel_event)
-                        batch_index, batch_results, timing, batch_retry_events = future.result()
-                        worker_retry_events.extend(batch_retry_events)
-                        timings_by_batch[batch_index] = timing
-                        start_index = int(timing["start_index"])
-                        segment_count = int(timing["segment_count"])
-                        local_texts: list[str] = []
-                        memory_entries: list[tuple[str, str]] = []
-                        for offset in range(segment_count):
-                            global_index = start_index + offset
-                            text = batch_results[global_index] or zh_texts[global_index] or ""
-                            zh_texts[global_index] = text
-                            local_texts.append(text)
-                            source_text = str(
-                                pending_by_index[batch_index][offset].get("text", "")
-                            )
-                            if (
-                                cache_path
-                                and text
-                                and translation_cache._translation_memory_source_is_cacheable(
-                                    source_text
-                                )
-                            ):
-                                memory_entries.append((_memory_key_for(source_text), text))
-                        if cache_path:
-                            batch_key = _batch_key_for(
-                                batch_index,
-                                pending_by_index[batch_index],
-                            )
-                            translation_cache._save_cache_entry(
-                                cache_path,
-                                batch_key,
-                                local_texts,
-                                cache_lock,
-                            )
-                            cache_map[batch_key] = local_texts
-                            if memory_entries:
-                                translation_cache._save_memory_entries(
-                                    cache_path,
-                                    memory_entries,
-                                    cache_lock,
-                                )
-                                for memory_key, memory_text in memory_entries:
-                                    memory_map[memory_key] = memory_text
-                            print(f"[translation-cache] saved batch {batch_index} cache_key={batch_key}")
-                            if crash_probe() == batch_index + 1:
-                                for pending_future in futures:
-                                    if pending_future is not future:
-                                        pending_future.cancel()
-                                raise SystemExit(1)
-                        if on_batch_done:
-                            _raise_if_cancelled(cancel_event)
-                            on_batch_done(timing)
-            except BaseException:
-                raise
-        except BaseException:
+                    on_batch_done(timing)
+
+            remaining = set(futures)
+            while remaining:
+                _raise_if_cancelled(cancel_event)
+                done, remaining = wait(
+                    remaining,
+                    timeout=0.1,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    continue
+                # Successes first, failure last. Nothing is at stake for the
+                # translations any more - each worker committed its own batch
+                # before handing it back - but the timings and `on_batch_done`
+                # of a batch that finished alongside a failure are still worth
+                # recording before the run unwinds.
+                harvested: list[tuple] = []
+                failure: BaseException | None = None
+                for future in sorted(done, key=lambda item: futures[item]):
+                    try:
+                        harvested.append((future.result(), future))
+                    except BaseException as exc:
+                        if failure is None:
+                            failure = exc
+                for result, source_future in harvested:
+                    harvest(result, source_future)
+                if failure is not None:
+                    raise failure
+        except BaseException as exc:
+            # Order matters. `cancel()` only drops a future still queued, and
+            # `shutdown(wait=False)` does not interrupt a worker already inside
+            # a request - so on 2026-09-04 one batch failing left three others
+            # streaming, and the worker it freed picked the next queued batch
+            # off and started translating it 1 ms later. Both kept billing long
+            # after the job was reported failed. The flag is what the workers
+            # can actually see, so it goes first.
+            batch_abort.set()
             for pending_future in futures:
                 pending_future.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
-            raise
+            with failure_lock:
+                root = root_failure
+            if _cancel_requested(cancel_event) or root is None or root is exc:
+                if isinstance(exc, _SiblingBatchAborted):
+                    raise RuntimeError(
+                        "a batch stood down for a sibling failure that was "
+                        "never recorded"
+                    ) from exc
+                raise
+            # `exc` is a sibling standing down, or a second batch that fell over
+            # after the first. Either way it is downstream of `root`, and `root`
+            # is the only one that says why the run ended.
+            raise root
         else:
             executor.shutdown(wait=True)
 

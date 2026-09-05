@@ -17,6 +17,7 @@ OpenRouter), and it reports no `reasoning_tokens` at all - the number that is
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from typing import Callable
@@ -28,7 +29,12 @@ from core.stage_errors import MISSING_MODEL
 from llm import settings as llm_settings
 from llm import transport_util
 from llm.backends.base import BaseTranslationBackend
-from llm.errors import ResponseTruncatedError, RetryableTranslationFormatError
+from llm.errors import (
+    ContentPolicyRefusalError,
+    MaxTokensRejectedError,
+    ResponseTruncatedError,
+    RetryableTranslationFormatError,
+)
 from llm.preflight import require_translation_config
 
 _raise_if_cancelled = transport_util._raise_if_cancelled
@@ -307,6 +313,233 @@ def _response_event_response(event):
     return value
 
 
+def _response_error(response) -> tuple[str, str]:
+    """`(code, message)` off a failed Responses API event; empty when absent."""
+    error = getattr(response, "error", None)
+    if error is None and isinstance(response, dict):
+        error = response.get("error")
+    if error is None:
+        return "", ""
+    if isinstance(error, dict):
+        code, message = error.get("code"), error.get("message")
+    else:
+        code, message = getattr(error, "code", None), getattr(error, "message", None)
+    return str(code or ""), str(message or "")
+
+
+# Codes that mean "we read what you sent and refused it", as opposed to "we
+# mishandled it". Only what has actually been observed on the wire belongs
+# here - a retryable failure misfiled as terminal kills a film that would have
+# recovered. Zhipu/GLM answers `cyber_policy`; add others as they show up.
+_CONTENT_POLICY_ERROR_CODES = frozenset({"cyber_policy"})
+
+# The three spellings of the same parameter across OpenAI-compatible endpoints.
+_MAX_TOKENS_PARAM_NAMES = ("max_tokens", "max_output_tokens", "max_completion_tokens")
+
+# An inclusive range, as in `限制数值范围[1,131072]` or `(1, 131072)`. The upper
+# bound is the second number.
+_RANGE_RE = re.compile(r"[\[(]\s*\d+\s*[,，]\s*(\d+)\s*[\])]")
+# A comparison or a named bound. Only a short run of non-digits may sit between
+# the phrase and its number, so the number belongs to the phrase rather than to
+# whatever the message says next.
+# Only phrases that can *only* introduce an upper bound. `must be ...` is
+# deliberately absent: it introduces `must be <= 131072` and `must be at least
+# 100` alike, and reading the second as a ceiling would teach the endpoint's
+# floor as its cap.
+_UPPER_BOUND_RE = re.compile(
+    r"(?:<=?|≤|不得超过|不能超过|不超过|至多|最多|最大(?:值|为)?|上限(?:为|是)?|"
+    r"less than or equal to|no more than|at most|maximum(?:\s+of)?|max(?:imum)?"
+    r"(?:\s+value)?|limit(?:ed)?(?:\s+to|\s+of)?)"
+    r"\D{0,4}(\d+)",
+    re.IGNORECASE,
+)
+
+
+# A floor, not a ceiling. Same shape as `_UPPER_BOUND_RE` and read for the
+# opposite reason: to recognise the message and *stop*, because the retry ladder
+# only ever goes down and down is the wrong direction for these.
+_LOWER_BOUND_RE = re.compile(
+    r"(?:>=?|≥|at least|not less than|no less than|greater than|"
+    r"minimum(?:\s+of)?|min(?:imum)?(?:\s+value)?|"
+    r"不少于|不小于|不能小于|至少|最小(?:值|为)?|下限(?:为|是)?)"
+    r"\D{0,4}(\d+)",
+    re.IGNORECASE,
+)
+# The parameter is not a parameter here. No number helps, so neither does the
+# ladder.
+_UNSUPPORTED_PARAM_RE = re.compile(
+    r"(?:not supported|unsupported parameter|unknown parameter|unrecognized|"
+    r"not permitted|不支持)",
+    re.IGNORECASE,
+)
+# The number in the message bounds input *plus* output. A smaller budget still
+# helps this request, so the retry is worth making - but the number is a
+# property of this batch's prompt, not of the endpoint, and writing it down as
+# an output ceiling under-books every shorter batch for the next 30 days.
+_COMBINED_BUDGET_RE = re.compile(
+    r"(?:input|prompt|context|combined|together with|sum of|plus|total)"
+    r"|输入|上下文|提示词|总和",
+    re.IGNORECASE,
+)
+# "The number you sent is too big", without a number attached. Enough to retry
+# on, and - unlike a message that merely names the parameter - enough to write
+# down, because it does claim the magnitude was the problem.
+_TOO_LARGE_RE = re.compile(
+    r"(?:out of range|too (?:large|big|high|long)|exceed(?:s|ed|ing)?|"
+    r"over the limit|beyond the limit)"
+    r"|超出|超过|过大|范围",
+    re.IGNORECASE,
+)
+
+
+def _mentions_max_tokens(message: str) -> bool:
+    """Whether the message is about the `max_tokens` parameter at all.
+
+    Keyed on the parameter name rather than on an error code, because the codes
+    are not portable (`invalid_request` here, `invalid_request_error` and bare
+    `400` elsewhere) while the parameter name is the parameter name.
+    """
+    lowered = message.lower()
+    return any(name in lowered for name in _MAX_TOKENS_PARAM_NAMES)
+
+
+def _max_tokens_refusal_kind(message: str) -> str:
+    """Which of the refusals that name this parameter it actually is.
+
+    Four answers. `"output"` is the endpoint's own output cap and the only one
+    worth remembering; `"request"` is a limit on input plus output, real but
+    sized by this prompt; `"unclear"` names the parameter without ever claiming
+    the number was too big; `""` is the ones no smaller number can satisfy.
+    Naming the parameter says it is involved, nothing more, and each of the
+    other three costs something specific when it is treated as `"output"`:
+
+    * `max_tokens must be at least 100000` is a floor. The ladder halves away
+      from the only value that could have worked, three times, and then writes
+      `rejected_at` for numbers the endpoint never refused.
+    * `max_output_tokens is not supported for this model` is answered the same
+      way by every number, so the three retries are pure round trips.
+    * `input tokens plus max_output_tokens must be <= 131072` names a real
+      number, but it is this prompt's ceiling, not the endpoint's. Learned as
+      `exact_ceiling` it would clamp a 200-cue batch by what a 1500-cue one
+      could not have.
+    * `max_tokens is invalid` claims nothing at all. Halving is still the only
+      move available, but the 30-day `rejected_at` it would leave behind is an
+      inference from a message that never said the value was too large.
+
+    Which is the asymmetry the default turns on. Not learning costs one refused
+    round trip on the next run, and that request generates nothing; learning a
+    wrong bracket clamps every budget to a midpoint for a month, and a clamped
+    budget is paid for in generated tokens the moment a reply is cut off. So
+    persistence needs positive evidence of magnitude - a bound, a range, or a
+    phrase that says too large - and everything else is retried in memory.
+
+    Upper-bound evidence is read first: a message can say both `unsupported
+    value` and `must be <= 131072`, and the second is the one that is actionable.
+    """
+    if _COMBINED_BUDGET_RE.search(message):
+        return "request"
+    if _RANGE_RE.search(message) or _UPPER_BOUND_RE.search(message):
+        return "output"
+    if _UNSUPPORTED_PARAM_RE.search(message):
+        return ""
+    if _LOWER_BOUND_RE.search(message):
+        return ""
+    if _TOO_LARGE_RE.search(message):
+        return "output"
+    return "unclear"
+
+
+def _accepted_max_tokens(message: str, sent: int) -> int | None:
+    """The ceiling the endpoint named, read out of its refusal - or None.
+
+    Provider-agnostic but not credulous. An earlier version took the largest
+    integer below what was sent, which reads `131072` correctly out of
+    `限制数值范围[1,131072]` and just as happily reads `12345` out of
+    `max_tokens invalid; request id req_12345`. So a number only counts when it
+    sits inside a range or immediately after a bound phrase, and anything else
+    returns None - the caller then halves, which is slower but never learns a
+    request id as a token ceiling.
+    """
+    candidates = [
+        int(match)
+        for pattern in (_RANGE_RE, _UPPER_BOUND_RE)
+        for match in pattern.findall(message)
+    ]
+    usable = [value for value in candidates if 0 < value < sent]
+    return max(usable) if usable else None
+
+
+def _provider_error_reason(code: str, message: str, sent: int) -> Exception | None:
+    """The terminal/learnable meaning of a provider error, if it has one.
+
+    One classifier for both shapes a refusal arrives in - a `response.failed`
+    event mid-stream, and an exception raised while the stream is still being
+    opened. Splitting them is how an endpoint that answers 400 before the first
+    SSE frame used to bypass every rule below.
+    """
+    if code in _CONTENT_POLICY_ERROR_CODES:
+        return ContentPolicyRefusalError(
+            "OpenAI Responses API refused this request on content policy "
+            f"(code={code}): {message}"
+        )
+    if sent > 0 and _mentions_max_tokens(message):
+        kind = _max_tokens_refusal_kind(message)
+        if kind == "output":
+            return MaxTokensRejectedError(
+                f"OpenAI Responses API rejected max_tokens={sent} "
+                f"(code={code}): {message}",
+                sent=sent,
+                limit=_accepted_max_tokens(message, sent),
+            )
+        if kind == "request":
+            # Retried, never recorded: the ladder can find a budget that fits
+            # this prompt, but the number that bound is this prompt's, and the
+            # cache is read by every other batch of the film.
+            return MaxTokensRejectedError(
+                f"OpenAI Responses API rejected max_tokens={sent} against a "
+                f"combined input+output limit (code={code}): {message}",
+                sent=sent,
+                learnable=False,
+            )
+        if kind == "unclear":
+            # Same treatment for the same reason: bisect now, remember nothing.
+            # The words are carried along so the retry log keeps them - this
+            # classifier is built out of a handful of observed messages, and the
+            # ones it cannot place are exactly the ones worth collecting.
+            return MaxTokensRejectedError(
+                f"OpenAI Responses API rejected max_tokens={sent} without "
+                f"saying the value was too large (code={code}): {message}",
+                sent=sent,
+                learnable=False,
+            )
+    # Floors, unsupported parameters and everything unrecognised fall through to
+    # the generic retry rather than into the ladder. Reissuing is not useful for
+    # any of them either, but it is at least not *wrong*, and it leaves nothing
+    # behind in the capability cache.
+    return None
+
+
+def _exception_error_fields(exc: BaseException) -> tuple[str, str]:
+    """`(code, message)` off an SDK exception, best effort.
+
+    The parsed body wins over the exception's own attributes, which is the whole
+    point of looking at it: `exc.message` is often the SDK's own summary
+    (`Error code: 400`) while `body["error"]` holds what the provider actually
+    said - and the rules above read the provider's words.
+    """
+    code = ""
+    message = ""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            code = str(error.get("code") or "")
+            message = str(error.get("message") or "")
+    code = code or str(getattr(exc, "code", "") or "")
+    message = message or str(getattr(exc, "message", "") or "")
+    return code, message or str(exc)
+
+
 def _response_incomplete_reason(response) -> str:
     details = getattr(response, "incomplete_details", None)
     if isinstance(details, dict):
@@ -361,7 +594,18 @@ def _chat_responses(
     if effective_max_tokens > 0:
         request["max_output_tokens"] = effective_max_tokens
 
-    response_stream = _call_create_response(request, cancel_event=cancel_event)
+    try:
+        response_stream = _call_create_response(request, cancel_event=cancel_event)
+    except Exception as exc:
+        # An endpoint that validates before opening the stream answers 400 here
+        # instead of with a `response.failed` frame, and the same refusal has to
+        # mean the same thing on both paths.
+        reason = _provider_error_reason(
+            *_exception_error_fields(exc), effective_max_tokens
+        )
+        if reason is not None:
+            raise reason from exc
+        raise
 
     completed_response = None
     incomplete_response = None
@@ -431,6 +675,14 @@ def _chat_responses(
 
     _raise_if_cancelled(cancel_event)
     if failed_error is not None:
+        error_code, error_message = _response_error(
+            _response_event_response(failed_error)
+        )
+        reason = _provider_error_reason(
+            error_code, error_message or str(failed_error), effective_max_tokens
+        )
+        if reason is not None:
+            raise reason
         raise RetryableTranslationFormatError(
             f"OpenAI Responses API failed: {failed_error}"
         )
@@ -495,7 +747,7 @@ class OpenAICompatBackend(BaseTranslationBackend):
         *,
         temperature: float = 0.6,
         top_p: float = 0.9,
-        max_tokens: int = 384000,
+        max_tokens: int = 65536,
         response_format: dict | None = None,
         stream: bool = True,
         reasoning_effort: str | None = None,

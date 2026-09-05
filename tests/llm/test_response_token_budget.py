@@ -1,7 +1,7 @@
 """The runaway guard: an arithmetic bound on how long a reply may get.
 
-`TRANSLATION_MAX_TOKENS` is 384000 - a ceiling sized for API models, which
-locally is no bound at all. Measured 2026-08-04 on the 300-cue benchmark, three
+`TRANSLATION_MAX_TOKENS` is 65536 - a ceiling sized to be legal at the endpoint
+rather than to bound anything, which locally is no bound at all. Measured 2026-08-04 on the 300-cue benchmark, three
 local GGUF models all produced repetition loops that ran to that ceiling: the
 echo-mtp fine-tune hit exactly 4096 generated tokens on 21 of 25 twelve-line
 batches (`truncated=0`, so context was not the limit), and even the clean

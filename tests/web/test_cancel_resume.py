@@ -499,6 +499,40 @@ async def _test_remove_finished_job_deletes_job_temp_dir(tmp_path, monkeypatch):
     await _reset_pm_state()
 
 
+def test_remove_failed_job_signals_its_cancel_event(tmp_path, monkeypatch):
+    asyncio.run(_test_remove_failed_job_signals_its_cancel_event(tmp_path, monkeypatch))
+
+
+async def _test_remove_failed_job_signals_its_cancel_event(tmp_path, monkeypatch):
+    # "failed" is the job's status, not the worker threads'. Removal used to
+    # pop the cancel event without setting it, so batch workers still running
+    # after a failed translation lost their only stop signal - on 2026-09-04
+    # three of them kept billing against the API minutes after the job was
+    # deleted from the UI, and even shutdown could no longer reach them because
+    # it signals by walking `_cancel_events`.
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    monkeypatch.setattr(pm, "_job_temp_dir", lambda job_id: str(tmp_path / "jobs" / job_id))
+    await _reset_pm_state()
+
+    job = JobState(
+        id="failed-job",
+        spec=JobSpec(video_paths=["sample.mp4"]),
+        created_at="2026-05-04T00:00:00.000+00:00",
+        status="failed",
+        current_stage="translation",
+    )
+    orphan_event = threading.Event()
+    async with pm._state_lock:
+        pm._jobs[job.id] = job
+        pm._cancel_events[job.id] = orphan_event
+        pm._write_jobs_unlocked()
+
+    assert await pm.remove_job(job.id)
+    assert orphan_event.is_set()
+    assert job.id not in pm._cancel_events
+    await _reset_pm_state()
+
+
 async def _test_remove_finished_job_leaves_retired_boundary_cache_alone(tmp_path, monkeypatch):
     # Job removal used to purge `tmp/cache/boundary/`. The chain that wrote that
     # cache was retired on 2026-07-31, so the purge deleted files nothing

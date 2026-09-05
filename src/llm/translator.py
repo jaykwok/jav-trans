@@ -9,6 +9,7 @@ from core.config import DEFAULT_REASONING_EFFORT, REASONING_EFFORTS, load_config
 from llm import cache as translation_cache
 from llm import engine as engine_module
 from llm import global_glossary
+from llm import max_tokens_limits
 from llm import repair as repair_module
 from llm import profiles as profiles_module
 from llm.profiles import json_v3
@@ -21,6 +22,7 @@ from llm.glossary import normalize_glossary_text
 from llm import prompt as prompt_module
 from utils import hf_progress
 from llm.errors import (
+    MaxTokensRejectedError,
     ResponseTruncatedError,
     RetryableTranslationFormatError,
     # Re-exported, not used here: callers and tests catch
@@ -728,6 +730,262 @@ def _warn_about_inert_context(profile, *, glossary: str, character_reference: st
         )
 
 
+# Below this a budget is too small to translate a batch with, so a further
+# halving would trade one useless request for another.
+_MIN_MAX_TOKENS_RETRY = 4096
+
+
+def _refusal_note(exc: BaseException, limit: int = 240) -> str:
+    """The provider's own words, on one line and trimmed.
+
+    The ladder used to log only its own numbers, so a refusal that was then
+    retried successfully left no record anywhere of *what the endpoint said*.
+    The classifier deciding whether those words are worth learning from is built
+    out of a handful of observed messages, and the ones it cannot place are the
+    ones worth collecting - which needs them in the job log, not only in the
+    exception of a batch that happened to fail.
+    """
+    text = " ".join(str(exc).split())
+    return text if len(text) <= limit else f"{text[:limit]}…"
+
+
+def _usable_retry_budget(candidate: int, *, below: int, above: int) -> bool:
+    """Whether `candidate` is worth spending a request on.
+
+    `below` is the value just refused: a retry has to be smaller or it collects
+    the same refusal. `above` is the largest budget a truncated reply has
+    already outgrown during this call, and it is the constraint that costs money
+    to get wrong - at or under it the reply is cut off again, and unlike a
+    refusal that request *generates*, so it is billed in full for an answer
+    already known to be unusable.
+    """
+    return above < candidate < below and candidate >= _MIN_MAX_TOKENS_RETRY
+
+
+def _endpoint_identity() -> tuple[str, str] | None:
+    """`(base_url, model)` for the API backend, or None when it is not in use.
+
+    Local backends never refuse a `max_tokens`, and keying a learned limit on
+    their empty base URL would let one endpoint's ceiling answer for another.
+    """
+    if selected_backend_name() != "openai":
+        return None
+    model = os.getenv("LLM_MODEL_NAME", llm_settings.LLM_MODEL_NAME).strip()
+    if not model:
+        return None
+    return os.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip(), model
+
+
+_clamp_warned: set[str] = set()
+
+
+def _resolved_max_tokens(desired: int | None, limits) -> int:
+    """The budget the caller wants, with "no preference" turned into a number.
+
+    `desired=None` is the prefix warmup and anything else with no arithmetic
+    bound of its own: it means "as much as this endpoint allows", which is the
+    named ceiling when there is one and the configured fallback only otherwise.
+    That is the *whole* job of the fallback - it stands in for a missing budget,
+    never for a ceiling, so an explicit budget is never trimmed to it.
+    """
+    if desired is not None:
+        return max(1, int(desired))
+    return int(getattr(limits, "exact_ceiling", None) or TRANSLATION_MAX_TOKENS)
+
+
+def _local_max_tokens_budget(desired: int | None) -> int:
+    """The no-endpoint case, where the configured value really is a ceiling.
+
+    A local model cannot refuse a `max_tokens`, so there is nothing to learn
+    from and nothing to fall back to - `TRANSLATION_MAX_TOKENS` is the runaway
+    backstop it has always been, and a caller-supplied budget may only lower it.
+    """
+    return min(_resolved_max_tokens(desired, None), TRANSLATION_MAX_TOKENS)
+
+
+class _EndpointCapability:
+    """What one call knows about its endpoint's `max_tokens` ceiling.
+
+    The live copy is this object; the cache file is where it is left for the
+    next call. That order is the point. Reading the state back from disk after
+    every refusal made the probe ladder depend on the cache being writable, and
+    a cache that is not - a read-only directory, a full disk - reads back as
+    "nothing known", where the next step is `budget_for(nothing, sent - 1)`,
+    i.e. `sent - 1`. The ladder then walks down one token per round trip and the
+    request fails at a budget the endpoint would have taken two halvings later.
+    A capability cache is an optimisation; a request must not need it to work.
+    """
+
+    def __init__(self, identity: tuple[str, str] | None) -> None:
+        self.identity = identity
+        self.limits = (
+            max_tokens_limits.load_limits(*identity)
+            if identity is not None
+            else max_tokens_limits.EndpointLimits()
+        )
+        # Ceiling-side observations wait here until this call generates at a
+        # smaller budget. See `_corroborate`.
+        self._staged: list[tuple[str, int]] = []
+        self._corroborated = False
+
+    def _stage(self, kind: str, value: int) -> None:
+        """Hold a refusal, or write it if this call has already been convinced."""
+        if self.identity is None:
+            return
+        if self._corroborated:
+            self._write(kind, value)
+        else:
+            self._staged.append((kind, value))
+
+    def _write(self, kind: str, value: int) -> None:
+        if kind == "exact_ceiling":
+            max_tokens_limits.record_exact_ceiling(*self.identity, value)
+        else:
+            max_tokens_limits.record_rejection(*self.identity, value)
+
+    def _corroborate(self) -> None:
+        """A budget under the refusal just generated, so the refusal can be kept.
+
+        Nothing expires any more, so the cache has no way to walk back a number
+        that should not have gone in. The check that replaces it is behavioural:
+        refuse high, generate low is what a real ceiling looks like, and a
+        message whose wording was merely read as a ceiling will not produce it.
+        Until that happens the refusal steers this call and nothing else.
+
+        The merge keeps every floor strictly under `rejected_at` and at or under
+        `exact_ceiling`, so any recorded success is by construction the one this
+        is asking about - `131072` accepted against a named `131072` corroborates
+        it exactly as much as `32768` accepted under a refused `65536` does.
+        """
+        if self._corroborated or not (
+            self.limits.rejected_at or self.limits.exact_ceiling
+        ):
+            return
+        self._corroborated = True
+        for kind, value in self._staged:
+            self._write(kind, value)
+        self._staged.clear()
+
+    def _observe(
+        self,
+        *,
+        exact_ceiling: int | None = None,
+        rejection: int | None = None,
+        success: int | None = None,
+    ) -> None:
+        self.limits = max_tokens_limits.merge_observation(
+            self.limits,
+            exact_ceiling=exact_ceiling,
+            rejection=rejection,
+            success=success,
+        )
+
+    def record_exact_ceiling(self, ceiling: int, *, persist: bool = True) -> None:
+        """The endpoint named its ceiling. The one kind that clamps."""
+        if ceiling <= 0:
+            return
+        self._observe(exact_ceiling=int(ceiling))
+        if persist:
+            self._stage("exact_ceiling", int(ceiling))
+
+    def record_rejection(self, sent: int, *, persist: bool = True) -> None:
+        """`sent` was refused, so everything at or above it is out.
+
+        `persist=False` keeps a refusal that is about this request rather than
+        about the endpoint - a combined input+output limit - inside this call.
+        It still drives the bisection, because a smaller budget really does fit;
+        it just never becomes a fact about an endpoint that will see shorter
+        prompts than this one.
+        """
+        if sent <= 0:
+            return
+        self._observe(rejection=int(sent))
+        if persist:
+            self._stage("rejection", int(sent))
+
+    def record_success(self, accepted: int, *, persist: bool = True) -> None:
+        """`accepted` went out and was generated against. A lower bound.
+
+        `persist=False` is the first-try case: the endpoint took the number, so
+        this call now knows a floor, but writing "at least this much works" on
+        every batch would be a disk write per request to store something no
+        refusal has bounded. The memory half is never optional - it is what the
+        rest of this call bisects against.
+        """
+        if accepted <= 0:
+            return
+        self._observe(success=int(accepted))
+        # Before the floor itself: whatever was refused above it is what makes
+        # this number worth having on disk at all.
+        self._corroborate()
+        if persist and self.identity is not None:
+            max_tokens_limits.record_success(*self.identity, int(accepted))
+
+    def budget(self, desired: int | None, *, warn: bool = False) -> int:
+        """What to actually ask for, given what this endpoint has said so far."""
+        if self.identity is None:
+            return _local_max_tokens_budget(desired)
+        resolved = _resolved_max_tokens(desired, self.limits)
+        budget = max_tokens_limits.budget_for(self.limits, resolved)
+        if warn and budget < resolved and desired is not None:
+            self._warn_clamped(resolved, budget)
+        return budget
+
+    def _warn_clamped(self, resolved: int, budget: int) -> None:
+        """Shrinking a computed budget is the silent half of this: the request
+        simply goes out with less room, and if the reply is then cut off the
+        truncation escalation cannot raise it back past the same line. Said once
+        per endpoint per process - a per-batch line would be noise."""
+        key = max_tokens_limits.endpoint_key(*self.identity)
+        if key in _clamp_warned:
+            return
+        _clamp_warned.add(key)
+        source = (
+            f"端点上限 {self.limits.exact_ceiling}"
+            if self.limits.exact_ceiling
+            else (
+                f"端点已拒绝过 {self.limits.rejected_at}"
+                if self.limits.rejected_at
+                else f"TRANSLATION_MAX_TOKENS={TRANSLATION_MAX_TOKENS}"
+            )
+        )
+        print(
+            f"[WARN] 本次翻译预算 {resolved} 被压到 {budget}（{source}）。"
+            "回复被切断时将无法再向上重试；如需更大预算请调高 "
+            "TRANSLATION_MAX_TOKENS 或调小批次/推理配额。",
+            flush=True,
+        )
+
+    def next_probe_after(self, sent: int) -> int:
+        """The next value to try after `sent` was refused.
+
+        Read off the bracket this call has already narrowed, so the step is the
+        midpoint of what is still possible. Only an endpoint that has said
+        nothing at all - a local backend - falls back to halving, which is the
+        same thing with no information.
+        """
+        if not self.limits.known_anything:
+            return sent // 2
+        candidate = max_tokens_limits.budget_for(self.limits, sent - 1)
+        return candidate if 0 < candidate < sent else sent // 2
+
+
+def _plain_max_tokens_budget(desired: int | None) -> int:
+    """`_max_tokens_budget` without the warning. Safe to call for a preview."""
+    return _EndpointCapability(_endpoint_identity()).budget(desired)
+
+
+def _max_tokens_budget(desired: int | None) -> int:
+    """What to actually ask for, and say so the first time it is less.
+
+    Reads the cache, so this answers for a request that has not started yet.
+    Within one `_chat` the same question goes to that call's own capability
+    state instead, which knows what this one cannot: what the endpoint has said
+    in the last few seconds.
+    """
+    return _EndpointCapability(_endpoint_identity()).budget(desired, warn=True)
+
+
 def _chat(
     messages: list[dict],
     expected_count: int = 0,
@@ -743,12 +1001,14 @@ def _chat(
     _raise_if_cancelled(cancel_event)
     if response_schema is _SCHEMA_UNSET:
         response_schema = _translation_output_schema()
-    # The configured value is a ceiling for API models; a caller-supplied budget
-    # is an upper bound on what this particular reply can legitimately need, and
-    # is what stops a local model looping to the ceiling.
-    effective_max_tokens = min(
-        TRANSLATION_MAX_TOKENS, max_tokens if max_tokens is not None else TRANSLATION_MAX_TOKENS
-    )
+    # A caller-supplied budget is an upper bound on what this particular reply
+    # can legitimately need, and is what stops a local model looping. What the
+    # endpoint will accept of it is a separate question, answered by whatever it
+    # has already refused - and by `TRANSLATION_MAX_TOKENS` only until it does.
+    # One state for the whole call, so the escalation below sizes itself from
+    # what the requests above it just learned rather than from the cache.
+    capability = _EndpointCapability(_endpoint_identity())
+    effective_max_tokens = capability.budget(max_tokens, warn=True)
 
     def _dispatch(budget: int) -> str:
         backend_name = selected_backend_name()
@@ -785,8 +1045,149 @@ def _chat(
             max_tokens=budget,
         )
 
+    # Retry state for the whole call, not for one trip down the ladder. The
+    # truncation escalation runs the ladder a second time, and while these lived
+    # inside it that second run started fresh: a full adjustment quota again,
+    # another known-good fallback, and - because the ladder only ever walks
+    # *down* - a licence to spend them arriving back at the budget that had just
+    # been truncated. That last request generates, and generates the same
+    # cut-off reply, so the escalation paid twice to learn nothing.
+    #
+    # Counted as sends, not as retries: the decrement happens before the check
+    # and the request that opened the ladder is already inside it, so 3 buys two
+    # further adjustments and the third refusal goes to the fallback. One call
+    # therefore sends at most five times at this layer - the first request, two
+    # adjustments, one known-good, one escalation.
+    probes_left = 3
+    fell_back = False
+    truncated_at = 0
+
+    def _dispatch_learning_ceiling(budget: int) -> str:
+        """Send `budget`; if the endpoint refuses the *number*, find one it takes.
+
+        Nothing was generated when a refusal fires - the request was rejected
+        before it ran - so those retries cost round trips and no output tokens.
+        (Whether a provider bills for a rejected request is the provider's
+        business; not receiving tokens locally is not proof that nobody
+        charged.) Two halvings is the floor of that: 65536 -> 32768 -> 16384
+        covers the whole range of ceilings actually published for these models,
+        and a third would be sending a budget too small to translate with anyway.
+
+        The one request past that ladder is not a probe and is not free: it is a
+        full generation at a budget this endpoint has already answered at. It
+        exists because a capability question must never be the reason a request
+        that could have been completed fails instead - but it is spent once per
+        call, and never at a size a truncated reply has already outgrown.
+        """
+        nonlocal probes_left, fell_back, truncated_at
+        # This request is already a bisection step if the endpoint has a bracket
+        # and has never named its ceiling. Whatever it does is then news, win or
+        # lose, and the bracket has to move either way or the same midpoint gets
+        # probed on every request forever.
+        probing = bool(capability.limits.rejected_at) and not capability.limits.exact_ceiling
+        sent = budget
+        refused = False
+
+        def _learn_accepted(value: int) -> None:
+            """A lower bound, recorded as one. Together with the rejections it
+            brackets the real ceiling, so the next request that wants more
+            probes a *new* midpoint. Recording only after a refusal was the bug:
+            a midpoint that succeeded first try left the bracket untouched and
+            every later request re-probed the same number.
+
+            The two halves are gated differently, which is the thing that was
+            wrong here twice. Memory always: an unknown endpoint that truncates
+            at 40000 and then refuses 80000 has told this call that 40000 works,
+            and without it the bisection starts from zero, computes 40000 again
+            and is - correctly - blocked for being a budget already outgrown, so
+            a request that 60000 would have finished fails instead. Disk only
+            once something has been refused, because writing "at least this much
+            works" on every first-try success is a disk write per batch to store
+            what no refusal has bounded."""
+            capability.record_success(value, persist=refused or probing)
+
+        while True:
+            try:
+                answer = _dispatch(sent)
+            except MaxTokensRejectedError as rejected:
+                refused = True
+                named = rejected.limit
+                # A refusal that is about this prompt's size rather than the
+                # endpoint's still steers this call; it just is not written down.
+                learnable = getattr(rejected, "learnable", True)
+                if named is not None and named < sent:
+                    capability.record_exact_ceiling(named, persist=learnable)
+                else:
+                    capability.record_rejection(sent, persist=learnable)
+                probes_left -= 1
+                next_budget: int | None = None
+                source = ""
+                if probes_left > 0:
+                    if named is not None and named < sent:
+                        next_budget = named
+                        source = "parsed"
+                    else:
+                        # Recomputed from the bracket this refusal just
+                        # narrowed, not halved off the refused value: halving
+                        # from a midpoint probe would drop below a budget
+                        # already known to work.
+                        next_budget = capability.next_probe_after(sent)
+                        source = "probed"
+                    if not _usable_retry_budget(
+                        next_budget, below=sent, above=truncated_at
+                    ):
+                        next_budget = None
+                if next_budget is None and not fell_back:
+                    # Out of probes, or the next probe is not a usable budget.
+                    # A value already known good is neither, and failing while
+                    # holding one fails a translation the endpoint would have
+                    # done: with a real ceiling of 33000 the ladder spends
+                    # 49152, 40960 and 36864 on the bracket and never tries the
+                    # 32768 sitting in `known_good`.
+                    known_good = capability.limits.known_good or 0
+                    if _usable_retry_budget(
+                        known_good, below=sent, above=truncated_at
+                    ):
+                        next_budget = known_good
+                        source = "known-good"
+                        fell_back = True
+                if next_budget is None:
+                    raise
+                _emit_progress(
+                    on_progress,
+                    {
+                        "phase": "max_tokens_rejected",
+                        "diagnostic": True,
+                        "sent": sent,
+                        "retry_max_tokens": next_budget,
+                        "source": source,
+                        "learned": learnable,
+                    },
+                )
+                print(
+                    f"[WARN] endpoint rejected max_tokens={sent}, retrying at "
+                    f"{next_budget} ({source}{'' if learnable else ', not learned'})"
+                    f": {_refusal_note(rejected)}",
+                    flush=True,
+                )
+                sent = next_budget
+                continue
+            except ResponseTruncatedError:
+                # Generating until the budget ran out is the endpoint accepting
+                # the number - the reply died on its own bound, not on the
+                # parameter. The escalation below is the caller that has to know
+                # that: without it the bracket never moves, the retry recomputes
+                # the identical midpoint, and the `retry_budget <= limit` guard
+                # then fails a batch that had room left above it. It is also the
+                # floor every later budget in this call has to clear.
+                truncated_at = max(truncated_at, sent)
+                _learn_accepted(sent)
+                raise
+            _learn_accepted(sent)
+            return answer
+
     try:
-        return _dispatch(effective_max_tokens)
+        return _dispatch_learning_ceiling(effective_max_tokens)
     except ResponseTruncatedError as truncated:
         # The budget is an arithmetic bound on a legitimate translation, so
         # hitting it means either the bound was too tight for this batch or the
@@ -794,11 +1195,14 @@ def _chat(
         # settles the first case; the second costs one extra request and fails
         # anyway, which is what a terminal failure did immediately while also
         # discarding every other batch of the film.
-        retry_budget = min(
-            TRANSLATION_MAX_TOKENS,
+        # Through the same capability state as the first attempt: the escalation
+        # is exactly the case that wants more room, so it must be free to ask
+        # for it wherever the endpoint has not actually said no.
+        retry_budget = capability.budget(
             int(truncated.limit * llm_settings.TRANSLATION_TRUNCATION_RETRY_FACTOR),
+            warn=True,
         )
-        if retry_budget <= truncated.limit:
+        if retry_budget <= truncated_at:
             raise
         _emit_progress(
             on_progress,
@@ -811,15 +1215,19 @@ def _chat(
             },
         )
         try:
-            return _dispatch(retry_budget)
+            return _dispatch_learning_ceiling(retry_budget)
         except ResponseTruncatedError as again:
+            # `again.limit` is what the retry actually went out with, which is
+            # `retry_budget` only when the ladder did not have to step down from
+            # it. Reporting the budget that was *aimed* for names a number no
+            # request ever carried.
             raise ResponseTruncatedError(
-                f"{again}. Retried once at {retry_budget} tokens and it was cut "
+                f"{again}. Retried once at {again.limit} tokens and it was cut "
                 f"off again, so this looks like a runaway reply rather than a "
                 f"tight budget. The budget comes from "
                 f"TRANSLATION_OUTPUT_CHAR_RATIO (per request), not "
                 f"TRANSLATION_MAX_TOKENS.",
-                limit=retry_budget,
+                limit=again.limit,
             ) from again
 
 

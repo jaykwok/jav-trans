@@ -1,5 +1,7 @@
 import json
+import os
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -162,6 +164,13 @@ def test_translation_crash_resume_and_success_cleanup(monkeypatch, tmp_path, cap
         if expected_count == 0:
             return json.dumps({"translations": []}, ensure_ascii=False)
         chat_calls.append(start)
+        if start == 4 and os.getenv("_TEST_CRASH_TRANSLATION_BATCH"):
+            # The last batch must still be in flight when the crash lands.
+            # Workers now write their own cache entry as soon as they finish, so
+            # a batch that completes survives the crash by design - with an
+            # instant mock this one would finish first and there would be
+            # nothing left for the resume to do.
+            time.sleep(0.5)
         return _mock_translation_json(start, expected_count)
 
     monkeypatch.setattr(main.translator_module, "_chat", fake_chat)

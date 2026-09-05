@@ -16,7 +16,7 @@ class BaseTranslationBackend(ABC):
         *,
         temperature: float = 0.6,
         top_p: float = 0.9,
-        max_tokens: int = 384000,
+        max_tokens: int = 65536,
         response_format: dict | None = None,
         stream: bool = True,
         reasoning_effort: str | None = None,
