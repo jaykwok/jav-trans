@@ -26,7 +26,7 @@ def test_job_tempdir_groups_temp_outputs_and_keeps_srt_at_output_root(monkeypatc
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         seen_audio_path["path"] = out_path
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"")
@@ -39,6 +39,7 @@ def test_job_tempdir_groups_temp_outputs_and_keeps_srt_at_output_root(monkeypatc
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         assert device == "auto"
         assert env_overrides is not None
@@ -119,7 +120,11 @@ def test_resume_materializes_cache_into_current_job_directory(monkeypatch, tmp_p
     old_aligned = old_dir / "sample.aligned_segments.json"
     old_aligned.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(main.audio_module, "probe_video_duration_s", lambda _path: 1.0)
+    monkeypatch.setattr(
+        main.audio_module,
+        "probe_video_duration_s",
+        lambda _path, **_kwargs: 1.0,
+    )
     monkeypatch.setattr(
         main.aligned_cache_module,
         "try_load_aligned_segments",
@@ -180,7 +185,7 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"")
 
@@ -192,6 +197,7 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         assert device == "auto"
         assert env_overrides is not None
@@ -305,7 +311,7 @@ def test_successful_run_cleans_job_temp_by_default(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"")
 
@@ -317,6 +323,7 @@ def test_successful_run_cleans_job_temp_by_default(monkeypatch, tmp_path):
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         assert device == "auto"
         assert env_overrides is not None
@@ -361,7 +368,7 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"")
 
@@ -373,6 +380,7 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         assert device == "auto"
         assert env_overrides["ASR_CHUNK_MIN_PAUSE_S"] == "0.9"

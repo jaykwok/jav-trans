@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -13,8 +16,10 @@ _SRC_WEB = Path(__file__).resolve().parents[2] / "src" / "web"
 if str(_SRC_WEB) not in _web_package.__path__:
     _web_package.__path__.append(str(_SRC_WEB))
 
+from llm import backends as llm_backends
 from web.app import create_app
 from web import pipeline_manager as pm
+from web.models import JobSpec
 from web.routes import config as config_routes
 from web.routes import files as files_routes
 
@@ -34,10 +39,28 @@ async def _reset_pm_state() -> None:
         pm._cancel_events.clear()
     await _drain_queue(pm.gpu_queue)
     await _drain_queue(pm.trans_queue)
+    # A module-level asyncio.Queue binds to the first loop that waits on it, and
+    # every test here runs its own asyncio.run(): reuse would kill the next
+    # test's workers with "bound to a different event loop" as soon as they
+    # await an empty get(). Hand each test fresh queues instead.
+    pm.gpu_queue = asyncio.Queue()
+    pm.trans_queue = asyncio.Queue()
 
 
 def test_jobs_api_crud(tmp_path, monkeypatch):
     asyncio.run(_test_jobs_api_crud(tmp_path, monkeypatch))
+
+
+def test_gpu_state_api_reports_and_retries_cleanup(tmp_path, monkeypatch):
+    asyncio.run(_test_gpu_state_api_reports_and_retries_cleanup(tmp_path, monkeypatch))
+
+
+def test_gpu_state_and_cancel_stay_responsive_during_a_model_load(tmp_path, monkeypatch):
+    asyncio.run(
+        _test_gpu_state_and_cancel_stay_responsive_during_a_model_load(
+            tmp_path, monkeypatch
+        )
+    )
 
 
 def test_app_exposes_icon_assets(tmp_path, monkeypatch):
@@ -890,6 +913,133 @@ async def _test_jobs_api_crud(tmp_path, monkeypatch):
             assert response.status_code == 200
             assert response.json() == {"ok": True}
     finally:
+        await _reset_pm_state()
+
+
+async def _test_gpu_state_api_reports_and_retries_cleanup(tmp_path, monkeypatch):
+    # "清理失败" is a state the user has to be able to see and act on, not just a
+    # sentence buried in one job's error text. One status shape covers every
+    # owner of the card, so the page cannot call the GPU free on the strength of
+    # the ASR worker alone.
+    from core import resources
+
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    await _reset_pm_state()
+    attempts: list[int] = []
+
+    class _Immortal:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def stubborn_stopper(_process, job_handle):
+        attempts.append(1)
+        return resources.StopOutcome(
+            process_state="alive",
+            job_handle=job_handle,
+            detail="child process is alive after terminate and kill",
+        )
+
+    monkeypatch.setattr(resources, "_start_watchdog", lambda: None)
+    resources.register(
+        resource_id="asr-gpu-worker:test",
+        generation=1,
+        kind="asr_worker",
+        description="asr-gpu-worker",
+        process=_Immortal(),
+        job_handle=7,
+        stopper=stubborn_stopper,
+        holds_gpu=True,
+        state="stopping",
+        process_state="alive",
+        detail="child process is alive after terminate and kill",
+    )
+    monkeypatch.setattr(
+        pm.subprocess_tools,
+        "unreleased_children",
+        lambda: [{"name": "ffmpeg.exe", "pid": 99, "state": "unknown"}],
+    )
+
+    try:
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/gpu-state")
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["state"] == "cleanup_failed"
+            assert payload["gpu_blocked"] is True
+            assert payload["asr"]["pid"] == 4321
+            assert payload["pending_resources"][0]["kind"] == "asr_worker"
+            assert payload["handle_open"] is True
+            assert payload["orphan_media_children"][0]["name"] == "ffmpeg.exe"
+
+            response = await client.post("/api/gpu-state/retry-cleanup")
+            assert response.status_code == 200
+            assert attempts == [1]  # the one entry point retried the record
+            assert response.json()["state"] == "cleanup_failed"
+    finally:
+        resources.forget_all()
+        await _reset_pm_state()
+
+
+async def _test_gpu_state_and_cancel_stay_responsive_during_a_model_load(
+    tmp_path,
+    monkeypatch,
+):
+    """The status poll must never wait on a resource operation.
+
+    The local backend's lifecycle lock is held across model load and health
+    checks - up to the 300s startup timeout. The page polls /api/gpu-state every
+    5 seconds *on the event loop*, so one blocking read there stalled every
+    other request, 取消 included.
+    """
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    await _reset_pm_state()
+    from llm.backends.llamacpp_server import LlamaCppServerBackend
+
+    holding = threading.Event()
+    release = threading.Event()
+    backend = LlamaCppServerBackend()
+    backend._proc = SimpleNamespace(poll=lambda: None, kill=lambda: None)
+    monkeypatch.setitem(llm_backends._BACKEND_INSTANCES, "llamacpp", backend)
+
+    def hold_the_lock():
+        # Stands in for a model load: `_ensure_server` holds this across the
+        # spawn and the health-check poll, up to the 300s startup timeout.
+        with backend._lock:
+            holding.set()
+            release.wait(5.0)
+
+    holder = threading.Thread(target=hold_the_lock, daemon=True)
+    holder.start()
+    try:
+        assert holding.wait(2.0)
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            job = (await pm.create_job(JobSpec(video_paths=["sample.mp4"])))[0]
+            started = time.perf_counter()
+            state, cancelled = await asyncio.wait_for(
+                asyncio.gather(
+                    client.get("/api/gpu-state"),
+                    client.delete(f"/api/jobs/{job.id}"),
+                ),
+                timeout=3.0,
+            )
+            elapsed = time.perf_counter() - started
+
+        assert state.status_code == 200
+        assert cancelled.status_code == 200
+        assert elapsed < 1.0
+    finally:
+        release.set()
+        holder.join(5.0)
         await _reset_pm_state()
 
 

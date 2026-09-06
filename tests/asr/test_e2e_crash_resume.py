@@ -81,7 +81,7 @@ def _patch_pipeline(
     monkeypatch.setattr(main.translator_module, "_request_backoff_sleep", lambda *_args: None)
     monkeypatch.setattr(main.translator_module, "_auto_translation_batch_size", lambda *_args: 2)
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"fake-wav")
 
@@ -93,6 +93,7 @@ def _patch_pipeline(
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         assert device == "auto"
         assert env_overrides is not None

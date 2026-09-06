@@ -5,6 +5,7 @@ import sys
 import hashlib
 import json
 import shutil
+import uuid
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
@@ -14,6 +15,9 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 from core import events
 from core import stage_errors
+from core.cancellation import PipelineCancelledError as _PipelineCancelledError
+from core.cancellation import cancel_requested as _cancel_requested_impl
+from core.cancellation import raise_if_cancelled as _raise_if_cancelled_impl
 from core.config import load_config
 from core.job_context import JobContext
 from asr import alignment_shadow as alignment_shadow_module
@@ -439,20 +443,12 @@ def _temporary_env(overrides: dict[str, str]):
                 os.environ[key] = value
 
 
-class PipelineCancelledError(RuntimeError):
-    pass
-
-
-def _cancel_requested(cancel_event) -> bool:
-    try:
-        return bool(cancel_event is not None and cancel_event.is_set())
-    except Exception:
-        return False
-
-
-def _raise_if_cancelled(cancel_event) -> None:
-    if _cancel_requested(cancel_event):
-        raise PipelineCancelledError("任务已取消")
+# Re-exported from core so stage modules below main (pipeline.audio, and the
+# media subprocess runner underneath it) can raise the same cancellation the
+# Web layer already reports as 取消 rather than as a failure.
+PipelineCancelledError = _PipelineCancelledError
+_cancel_requested = _cancel_requested_impl
+_raise_if_cancelled = _raise_if_cancelled_impl
 
 
 def _run_log_dir(ctx: JobContext) -> Path:
@@ -720,6 +716,12 @@ def _resolve_job_temp_dir(job_id: str) -> str:
 
 
 def _materialize_cached_file(source: str | Path, destination: str | Path) -> bool:
+    """Bring a resumed job's cached file into this job's directory.
+
+    Published the same way an extraction is: hard link (already atomic) or copy
+    to a partial and replace, so an interrupted copy cannot leave a short file
+    under the name the cache reader trusts.
+    """
     source_path = Path(source).resolve()
     destination_path = Path(destination).resolve()
     if source_path == destination_path:
@@ -731,9 +733,33 @@ def _materialize_cached_file(source: str | Path, destination: str | Path) -> boo
         return destination_path.is_file()
     try:
         os.link(source_path, destination_path)
+        return True
     except OSError:
-        shutil.copy2(source_path, destination_path)
+        pass
+    staged = destination_path.with_name(
+        f"{destination_path.name}.{uuid.uuid4().hex[:8]}.partial"
+    )
+    try:
+        shutil.copy2(source_path, staged)
+        os.replace(staged, destination_path)
+    finally:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
     return True
+
+
+def _materialize_usable_audio(source: str | Path, destination: str | Path) -> bool:
+    """Materialize a resumed job's audio, and only claim it if it is complete.
+
+    `_materialize_cached_file` answers "is there a file there now", which was
+    enough until a wav an older build left half-written could be the file it
+    finds - including the case where source and destination are the same path.
+    """
+    if not _materialize_cached_file(source, destination):
+        return False
+    return audio_module.audio_cache_is_usable(str(destination))
 
 
 def _resolve_project_runtime_path(raw_path: str | Path) -> Path:
@@ -1018,6 +1044,7 @@ def run_asr_alignment(
     *,
     ctx: JobContext,
     job_id: str = "",
+    run_id: str = "",
     cache_job_id: str = "",
     cancel_event=None,
 ) -> AsrArtifacts:
@@ -1032,6 +1059,7 @@ def run_asr_alignment(
             video_path,
             ctx=ctx,
             job_id=job_id,
+            run_id=run_id,
             cache_job_id=cache_job_id,
             cancel_event=cancel_event,
         )
@@ -1054,6 +1082,7 @@ def _run_asr_alignment_impl(
     *,
     ctx: JobContext,
     job_id: str = "",
+    run_id: str = "",
     cache_job_id: str = "",
     cancel_event=None,
 ) -> AsrArtifacts:
@@ -1069,13 +1098,16 @@ def _run_asr_alignment_impl(
     cache_job_id = sanitize_job_id(cache_job_id or job_id)
     effective_ctx = ctx
     events._thread_local.video = os.path.basename(video_path)
-    events.set_current_job_id(job_id)
+    events.set_current_run(job_id, run_id)
     _raise_if_cancelled(cancel_event)
     # Ahead of ffprobe/ffmpeg, which would report a moved file as a non-zero
     # exit code and get described as a damaged or silent video.
     if not os.path.isfile(video_path):
         raise RuntimeError(f"{stage_errors.VIDEO_FILE_MISSING}\n{video_path}")
-    video_duration_s = audio_module.probe_video_duration_s(video_path)
+    video_duration_s = audio_module.probe_video_duration_s(
+        video_path,
+        cancel_event=cancel_event,
+    )
     with _temporary_env(_asr_stage_env_for_ctx(effective_ctx)):
         backend_label = asr_module.get_backend_label()
         if effective_ctx.run_log_enabled:
@@ -1157,7 +1189,10 @@ def _run_asr_alignment_impl(
 
         # 1. Extract audio (skipped if cached)
         audio_prepare_started = time.perf_counter()
-        audio_cached = os.path.exists(audio_path)
+        # Not os.path.exists: a wav that ffmpeg started and never finished is
+        # not a cache hit. Since 2026-09-05 extraction publishes atomically, so
+        # this only has to answer for files an older build left behind.
+        audio_cached = audio_module.audio_cache_is_usable(audio_path)
         _log_stage(logger, "stage_start audio_prepare")
         _raise_if_cancelled(cancel_event)
         if aligned_cache is not None:
@@ -1165,12 +1200,16 @@ def _run_asr_alignment_impl(
             asr_log = [str(item) for item in aligned_cache.get("asr_log", [])]
             asr_details = dict(aligned_cache.get("asr_details", {}))
             if cache_job_id != job_id:
-                audio_cached = audio_cached or _materialize_cached_file(
+                audio_cached = audio_cached or _materialize_usable_audio(
                     cache_audio_path,
                     audio_path,
                 )
                 if not audio_cached:
-                    audio_module.extract_audio(video_path, audio_path)
+                    audio_module.extract_audio(
+                        video_path,
+                        audio_path,
+                        cancel_event=cancel_event,
+                    )
                     audio_cached = False
             else:
                 audio_cached = True
@@ -1198,7 +1237,7 @@ def _run_asr_alignment_impl(
             console.print(
                 f"[green]命中 aligned_segments cache，跳过音频提取与 ASR：{_project_relative(aligned_segments_path)}[/green]"
             )
-        elif os.path.exists(audio_path) or _materialize_cached_file(
+        elif audio_module.audio_cache_is_usable(audio_path) or _materialize_usable_audio(
             cache_audio_path,
             audio_path,
         ):
@@ -1212,7 +1251,11 @@ def _run_asr_alignment_impl(
             )
             with console.status("[cyan]提取音频中...[/cyan]"):
                 _raise_if_cancelled(cancel_event)
-                audio_module.extract_audio(video_path, audio_path)
+                audio_module.extract_audio(
+                    video_path,
+                    audio_path,
+                    cancel_event=cancel_event,
+                )
                 _raise_if_cancelled(cancel_event)
             _log_stage(logger, f"extract_audio_done output={_project_relative(audio_path)}")
         pipeline_timings["audio_prepare_s"] = time.perf_counter() - audio_prepare_started
@@ -1336,6 +1379,7 @@ def _run_asr_alignment_impl(
                                 effective_ctx
                             ),
                             job_id=job_id,
+                            run_id=run_id,
                             on_stage=_on_stage,
                             cancel_requested=lambda: _cancel_requested(cancel_event),
                         )
@@ -1499,28 +1543,34 @@ def run_translation_and_write(
     *,
     ctx: JobContext,
     job_id: str = "",
+    run_id: str = "",
     cancel_event=None,
 ) -> list[str]:
     _reopen_snapshot_run_logger(artifacts)
     try:
-        return _run_translation_and_write_impl(
-            video_path,
-            artifacts,
-            ctx=ctx,
-            job_id=job_id,
-            cancel_event=cancel_event,
-        )
+        # A local model is task-scoped, not Web-session-scoped, but the instance
+        # is process-wide: closing it outright at the end of *this* task would
+        # pull the server out from under a parallel video still translating
+        # through it. The lease closes it when the last task lets go, which for
+        # a single job is the same moment as before, and it covers cancellation,
+        # translation failure, output-write failure, empty-ASR and retry alike.
+        #
+        # Resolved once, here: the settings panel may change while a job runs,
+        # and the lease has to name the instance this task will actually use.
+        # Leasing "llamacpp" unconditionally meant an API job could sit out a
+        # local server's retirement for a resource it was never going to touch.
+        backend_name = llm_backends.selected_backend_name()
+        with llm_backends.backend_lease(backend_name, cancel_event):
+            return _run_translation_and_write_impl(
+                video_path,
+                artifacts,
+                ctx=ctx,
+                job_id=job_id,
+                run_id=run_id,
+                cancel_event=cancel_event,
+            )
     finally:
-        try:
-            # A local model is task-scoped, not Web-session-scoped. Reset by
-            # explicit name rather than by the currently selected backend: the
-            # settings panel may change while a job is draining, and cleanup
-            # must still close a llama.cpp instance that this task started.
-            # This also covers cancellation, translation failure, output-write
-            # failure, empty-ASR and retry paths.
-            llm_backends.reset_backend("llamacpp")
-        finally:
-            _close_artifacts_logger(artifacts)
+        _close_artifacts_logger(artifacts)
 
 
 def _run_translation_and_write_impl(
@@ -1529,6 +1579,7 @@ def _run_translation_and_write_impl(
     *,
     ctx: JobContext,
     job_id: str = "",
+    run_id: str = "",
     cancel_event=None,
 ) -> list[str]:
     output_paths: list[str] = []
@@ -1545,7 +1596,7 @@ def _run_translation_and_write_impl(
     device = artifacts.device
     job_id = sanitize_job_id(job_id or ctx.job_id or artifacts.job_id)
     if job_id:
-        events.set_current_job_id(job_id)
+        events.set_current_run(job_id, run_id)
     job_temp_dir = artifacts.job_temp_dir
     os.makedirs(job_temp_dir, exist_ok=True)
     pipeline_started = artifacts.pipeline_started

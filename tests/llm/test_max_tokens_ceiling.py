@@ -38,7 +38,7 @@ def _isolated_limits(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", _BASE_URL)
     monkeypatch.setenv("LLM_MODEL_NAME", _MODEL)
-    monkeypatch.setattr(translator, "selected_backend_name", lambda *_a, **_k: "openai")
+    monkeypatch.setattr(translator, "task_backend_name", lambda *_a, **_k: "openai")
     translator._clamp_warned.clear()
 
 
@@ -282,7 +282,7 @@ def test_local_backend_keeps_the_configured_ceiling(monkeypatch):
     # Nothing to learn from and nothing to fall back to: a local model cannot
     # refuse a `max_tokens`, so the setting is the runaway backstop it has
     # always been and a caller-supplied budget may only lower it.
-    monkeypatch.setattr(translator, "selected_backend_name", lambda *_a, **_k: "llamacpp")
+    monkeypatch.setattr(translator, "task_backend_name", lambda *_a, **_k: "llamacpp")
     monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
     max_tokens_limits.record_exact_ceiling(_BASE_URL, _MODEL, 131072)
 

@@ -243,6 +243,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # frees more than the extra slots cost.
     "LLAMACPP_PARALLEL": "8",
     "LLAMACPP_STARTUP_TIMEOUT_S": "300",
+    # Admission may fail without abandoning the retiring resource owner.
+    "LOCAL_BACKEND_WAIT_TIMEOUT_S": "600",
+    # Bound only the caller's wait; cleanup continues on one thread per backend.
+    "LOCAL_BACKEND_CLOSE_WAIT_S": "15",
     # Prompt contract: auto | json | hymt2 (off/none alias json). Auto selects
     # the one contract registered for the configured model family.
     "TRANSLATION_PROMPT_PROFILE": "auto",

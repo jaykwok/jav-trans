@@ -106,6 +106,7 @@ def _emit_stage_event(
         {
             "ts": _event_ts(),
             "job_id": events._current_job_id(),
+            "run_id": events._current_run_id(),
             "video": video,
             "stage": stage,
             "phase": phase,

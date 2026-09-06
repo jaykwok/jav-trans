@@ -31,7 +31,7 @@ def test_asr_stage_env_restored_when_transcribe_raises(monkeypatch, tmp_path):
         lambda: f"backend:{main.os.environ['ASR_BACKEND']}",
     )
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
@@ -43,6 +43,7 @@ def test_asr_stage_env_restored_when_transcribe_raises(monkeypatch, tmp_path):
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         assert device == "auto"
         assert env_overrides["ASR_BACKEND"] == ASR_17B_BACKEND

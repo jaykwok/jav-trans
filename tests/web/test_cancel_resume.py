@@ -34,6 +34,12 @@ async def _reset_pm_state() -> None:
         pm._cancel_events.clear()
     await _drain_queue(pm.gpu_queue)
     await _drain_queue(pm.trans_queue)
+    # A module-level asyncio.Queue binds to the first loop that waits on it, and
+    # every test here runs its own asyncio.run(): reuse would kill the next
+    # test's workers with "bound to a different event loop" as soon as they
+    # await an empty get(). Hand each test fresh queues instead.
+    pm.gpu_queue = asyncio.Queue()
+    pm.trans_queue = asyncio.Queue()
 
 
 def test_cancel_event_reaches_asr_thread(tmp_path, monkeypatch):
@@ -75,6 +81,14 @@ async def _test_cancel_event_reaches_asr_thread(tmp_path, monkeypatch):
             await asyncio.sleep(0.01)
 
         assert observed_cancel.is_set()
+        # The final status is the worker's to write: 取消 only asks. Wait for the
+        # run to actually stop rather than for the request to return.
+        deadline = time.perf_counter() + 2.0
+        while time.perf_counter() < deadline:
+            current = await pm.get_job(job.id)
+            if current is not None and current.status == "cancelled":
+                break
+            await asyncio.sleep(0.01)
         current = await pm.get_job(job.id)
         assert current is not None
         assert current.status == "cancelled"
@@ -168,6 +182,329 @@ async def _test_gpu_worker_passes_captured_cancel_event_to_executor(tmp_path, mo
         assert pm._cancel_events[job.id] is not old_event
         assert current is not None
         assert current.status == "asr"
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await _reset_pm_state()
+
+
+def test_translation_worker_passes_captured_cancel_event_to_executor(tmp_path, monkeypatch):
+    asyncio.run(
+        _test_translation_worker_passes_captured_cancel_event_to_executor(
+            tmp_path, monkeypatch
+        )
+    )
+
+
+async def _test_translation_worker_passes_captured_cancel_event_to_executor(
+    tmp_path,
+    monkeypatch,
+):
+    # Mirror of the ASR guard above. The translation thread used to re-read
+    # `_cancel_events[job.id]` after it had already been handed to the executor,
+    # so a cancel-then-retry in that window gave the *old* translation the new
+    # run's fresh event: its own cancel flag became unreachable and the batch
+    # kept translating (and billing) under a job the UI had already retried.
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    await _reset_pm_state()
+
+    observed: list[threading.Event] = []
+    entered = asyncio.Event()
+
+    class InlineLoop:
+        async def run_in_executor(self, _executor, func, *args):
+            del func
+            observed.append(args[2])
+            entered.set()
+            pm._cancel_events[args[0].id] = threading.Event()
+            raise pm.pipeline_main.PipelineCancelledError("cancelled")
+
+    monkeypatch.setattr(asyncio, "get_running_loop", lambda: InlineLoop())
+
+    worker = asyncio.create_task(pm.translation_worker())
+    job = JobState(
+        id="translation-event",
+        spec=JobSpec(video_paths=["sample.mp4"]),
+        created_at="2026-05-04T00:00:00.000+00:00",
+        status="translating",
+    )
+    old_event = threading.Event()
+    try:
+        async with pm._state_lock:
+            pm._jobs[job.id] = job
+            pm._cancel_events[job.id] = old_event
+            pm._write_jobs_unlocked()
+        await pm.trans_queue.put((job, object()))
+
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+        assert observed == [old_event]
+        assert pm._cancel_events[job.id] is not old_event
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await _reset_pm_state()
+
+
+def test_running_translation_keeps_its_own_cancel_event_after_a_retry(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(pm, "_job_temp_dir", lambda job_id: str(tmp_path / job_id))
+    seen: dict[str, object] = {}
+
+    def fake_run_translation_and_write(_video_path, _artifacts, **kwargs):
+        seen["cancel_event"] = kwargs.get("cancel_event")
+        return []
+
+    monkeypatch.setattr(pm, "run_translation_and_write", fake_run_translation_and_write)
+
+    job = JobState(
+        id="retry-race-translation",
+        spec=JobSpec(video_paths=["sample.mp4"]),
+        created_at="2026-05-04T00:00:00.000+00:00",
+        status="translating",
+    )
+    running_event = threading.Event()
+    running_event.set()
+    retry_event = threading.Event()
+    monkeypatch.setitem(pm._cancel_events, job.id, retry_event)
+
+    pm._run_translation_and_write(job, object(), running_event, job.run_id)
+
+    # Its own event, not whatever the id currently maps to.
+    assert seen["cancel_event"] is running_event
+    assert seen["cancel_event"].is_set()
+
+
+def test_retry_mints_a_new_run_id(tmp_path, monkeypatch):
+    asyncio.run(_test_retry_mints_a_new_run_id(tmp_path, monkeypatch))
+
+
+async def _test_retry_mints_a_new_run_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    await _reset_pm_state()
+    try:
+        job = (await pm.create_job(JobSpec(video_paths=["sample.mp4"])))[0]
+        assert job.run_id
+        await pm.cancel_job(job.id)
+        first_run = job.run_id
+
+        retried = await pm.retry_job(job.id)
+
+        assert retried is not None
+        assert retried.id == job.id  # the job the user sees is the same one
+        assert retried.run_id and retried.run_id != first_run
+    finally:
+        await _reset_pm_state()
+
+
+def test_stale_run_cannot_finish_the_retried_job(tmp_path, monkeypatch):
+    asyncio.run(_test_stale_run_cannot_finish_the_retried_job(tmp_path, monkeypatch))
+
+
+async def _test_stale_run_cannot_finish_the_retried_job(tmp_path, monkeypatch):
+    # The late arrival here is the *final* state, not progress: a previous run
+    # reporting done/failed after the retry started would otherwise publish its
+    # own outcome (and artifact list) over the run that is still working.
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    await _reset_pm_state()
+    stale_job = JobState(
+        id="run-guard",
+        spec=JobSpec(video_paths=["sample.mp4"]),
+        created_at="2026-05-04T00:00:00.000+00:00",
+        run_id="run-1",
+        status="translating",
+    )
+    async with pm._state_lock:
+        pm._jobs[stale_job.id] = stale_job.model_copy(
+            update={"run_id": "run-2", "status": "translating"},
+        )
+        pm._write_jobs_unlocked()
+
+    await pm._set_job(
+        stale_job,
+        status="done",
+        current_stage="done",
+        artifacts=["stale.srt"],
+        expected_run_id="run-1",
+    )
+
+    current = await pm.get_job(stale_job.id)
+    assert current is not None
+    assert current.status == "translating"
+    assert current.artifacts == []
+
+    await pm._set_job(
+        stale_job,
+        status="done",
+        current_stage="done",
+        artifacts=["fresh.srt"],
+        expected_run_id="run-2",
+    )
+    current = await pm.get_job(stale_job.id)
+    assert current is not None
+    assert current.status == "done"
+    assert current.artifacts == ["fresh.srt"]
+    await _reset_pm_state()
+
+
+def test_running_translation_emits_under_the_run_it_was_given(tmp_path, monkeypatch):
+    # Producers stamp the run they captured. Reading the current run at send
+    # time would let a stale thread impersonate the retry that replaced it.
+    monkeypatch.setattr(pm, "_job_temp_dir", lambda job_id: str(tmp_path / job_id))
+    seen: dict[str, str] = {}
+
+    def fake_run_translation_and_write(_video_path, _artifacts, **kwargs):
+        seen["emitted_run_id"] = pm.events._current_run_id()
+        seen["passed_run_id"] = str(kwargs.get("run_id") or "")
+        return []
+
+    monkeypatch.setattr(pm, "run_translation_and_write", fake_run_translation_and_write)
+    job = JobState(
+        id="emitting-run",
+        spec=JobSpec(video_paths=["sample.mp4"]),
+        created_at="2026-05-04T00:00:00.000+00:00",
+        run_id="run-new",
+        status="translating",
+    )
+    # The store already holds the retry, exactly as it would while the previous
+    # run's thread is still winding down.
+    monkeypatch.setitem(pm._jobs, job.id, job)
+
+    pm._run_translation_and_write(job, object(), threading.Event(), "run-old")
+
+    assert seen["emitted_run_id"] == "run-old"
+    assert seen["passed_run_id"] == "run-old"
+
+
+def test_cancelling_a_running_job_is_not_yet_cancelled(tmp_path, monkeypatch):
+    asyncio.run(_test_cancelling_a_running_job_is_not_yet_cancelled(tmp_path, monkeypatch))
+
+
+async def _test_cancelling_a_running_job_is_not_yet_cancelled(tmp_path, monkeypatch):
+    # 已请求取消 and 已取消 are different facts. Reporting the second one while a
+    # worker thread is still between checkpoints is what let the page offer 重试
+    # next to a run that was still spending tokens.
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    await _reset_pm_state()
+    running = JobState(
+        id="running-job",
+        spec=JobSpec(video_paths=["sample.mp4"]),
+        created_at="2026-05-04T00:00:00.000+00:00",
+        run_id="run-1",
+        status="translating",
+    )
+    queued = JobState(
+        id="queued-job",
+        spec=JobSpec(video_paths=["sample.mp4"]),
+        created_at="2026-05-04T00:00:00.000+00:00",
+        run_id="run-2",
+        status="queued",
+    )
+    async with pm._state_lock:
+        pm._jobs[running.id] = running
+        pm._jobs[queued.id] = queued
+        pm._write_jobs_unlocked()
+
+    assert await pm.cancel_job(running.id)
+    assert await pm.cancel_job(queued.id)
+
+    assert (await pm.get_job(running.id)).status == "cancelling"
+    assert await pm.retry_job(running.id) is None
+    # Nothing was executing the queued one, so there is nothing to wind down.
+    assert (await pm.get_job(queued.id)).status == "cancelled"
+    assert await pm.retry_job(queued.id) is not None
+    await _reset_pm_state()
+
+
+def test_gpu_dispatch_pauses_while_a_child_still_owns_the_card(tmp_path, monkeypatch):
+    asyncio.run(_test_gpu_dispatch_pauses_while_a_child_still_owns_the_card(tmp_path, monkeypatch))
+
+
+async def _test_gpu_dispatch_pauses_while_a_child_still_owns_the_card(tmp_path, monkeypatch):
+    # Refusing to start a second worker only produces a failed job per attempt.
+    # Dispatch pauses instead, and resumes by itself once cleanup confirms.
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    monkeypatch.setattr(pm, "_GPU_BLOCKED_POLL_S", 0.02)
+    await _reset_pm_state()
+    blocked = {"value": True}
+    monkeypatch.setattr(pm.resources, "gpu_blocked", lambda: blocked["value"])
+    started = threading.Event()
+
+    def fake_asr(job, _cancel_event, _run_id):
+        started.set()
+        return {"job_id": job.id}
+
+    monkeypatch.setattr(pm, "_run_asr_alignment", fake_asr)
+    monkeypatch.setattr(
+        pm,
+        "_run_translation_and_write",
+        lambda *_args, **_kwargs: [],
+    )
+
+    worker = asyncio.create_task(pm.gpu_worker())
+    try:
+        job = (await pm.create_job(JobSpec(video_paths=["sample.mp4"])))[0]
+        deadline = time.perf_counter() + 1.0
+        while time.perf_counter() < deadline:
+            current = await pm.get_job(job.id)
+            if current is not None and current.current_stage == "gpu_blocked":
+                break
+            await asyncio.sleep(0.01)
+
+        current = await pm.get_job(job.id)
+        assert current is not None
+        assert current.status == "queued"
+        assert current.current_stage == "gpu_blocked"
+        assert not started.is_set()  # nothing was handed to the GPU
+
+        blocked["value"] = False
+        deadline = time.perf_counter() + 2.0
+        while not started.is_set() and time.perf_counter() < deadline:
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await _reset_pm_state()
+
+
+def test_cancelling_while_the_gpu_is_blocked_does_not_wait_for_it(tmp_path, monkeypatch):
+    asyncio.run(_test_cancelling_while_the_gpu_is_blocked_does_not_wait_for_it(tmp_path, monkeypatch))
+
+
+async def _test_cancelling_while_the_gpu_is_blocked_does_not_wait_for_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    monkeypatch.setattr(pm, "_GPU_BLOCKED_POLL_S", 0.02)
+    await _reset_pm_state()
+    monkeypatch.setattr(pm.resources, "gpu_blocked", lambda: True)
+    monkeypatch.setattr(
+        pm,
+        "_run_asr_alignment",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+
+    worker = asyncio.create_task(pm.gpu_worker())
+    try:
+        job = (await pm.create_job(JobSpec(video_paths=["sample.mp4"])))[0]
+        deadline = time.perf_counter() + 1.0
+        while time.perf_counter() < deadline:
+            current = await pm.get_job(job.id)
+            if current is not None and current.current_stage == "gpu_blocked":
+                break
+            await asyncio.sleep(0.01)
+
+        assert await pm.cancel_job(job.id)
+        deadline = time.perf_counter() + 1.0
+        while time.perf_counter() < deadline:
+            current = await pm.get_job(job.id)
+            if current is not None and current.status == "cancelled":
+                break
+            await asyncio.sleep(0.01)
+        current = await pm.get_job(job.id)
+        assert current is not None
+        assert current.status == "cancelled"
     finally:
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
@@ -605,7 +942,9 @@ async def _test_cancel_active_job_keeps_job_temp_dir_for_retry(tmp_path, monkeyp
     assert temp_dir.exists()
     current = await pm.get_job(job.id)
     assert current is not None
-    assert current.status == "cancelled"
+    # 已请求取消, not 已取消: the translation thread still owns this run, and the
+    # card must not offer 重试 until it reports that it stopped.
+    assert current.status == "cancelling"
     await _reset_pm_state()
 
 

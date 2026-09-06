@@ -8,6 +8,7 @@ import { installFiles } from './files.js';
 import { installJobAreaHandlers } from './jobsRender.js';
 import { installQcReport } from './qcReport.js';
 import { fetchAllJobs, startJobPolling } from './jobsApi.js';
+import { installGpuState, fetchGpuState } from './gpuState.js';
 import { connectSSE } from './sse.js';
 import {
   loadConfig,
@@ -27,6 +28,7 @@ installFiles();
 installJobAreaHandlers(fetchAllJobs, syncSettingsFromFormForSubmit);
 installQcReport();
 installSettingsPanel();
+installGpuState();
 startJobPolling();
 
 // Load config and settings, then restore form state
@@ -40,6 +42,7 @@ updateSkipTransState();
 saveFormMemory();
 
 await fetchAllJobs();
+await fetchGpuState();
 connectSSE();
 
 document.addEventListener('keydown', e => {

@@ -10,6 +10,10 @@ from typing import Any, Literal, Protocol, TypedDict
 class StageEvent(TypedDict):
     ts: str
     job_id: str
+    # Which execution of that job produced this. Empty from producers that do
+    # not run under the Web manager (the CLI), and from anything older; the
+    # receiver treats empty as "cannot tell" and does not filter it.
+    run_id: str
     video: str
     stage: str
     phase: Literal["start", "done", "skip", "blocked", "degraded", "progress"]
@@ -57,6 +61,7 @@ class _MemorySink:
             {
                 "ts": str(event.get("ts", "")),
                 "job_id": str(event.get("job_id", "")),
+                "run_id": str(event.get("run_id", "")),
                 "video": str(event.get("video", "")),
                 "stage": str(event.get("stage", "")),
                 "phase": event.get("phase", "progress"),
@@ -78,8 +83,23 @@ def _current_job_id() -> str:
     return str(getattr(_thread_local, "job_id", "") or "")
 
 
+def _current_run_id() -> str:
+    return str(getattr(_thread_local, "run_id", "") or "")
+
+
 def set_current_job_id(job_id: str) -> None:
     _thread_local.job_id = job_id
+
+
+def set_current_run(job_id: str, run_id: str = "") -> None:
+    """Bind this thread to one execution of one job.
+
+    Producers capture the run when they start and emit under it. They must not
+    look the current run up at send time: a thread left over from a cancelled
+    run would then stamp its late events with the retry's id and impersonate it.
+    """
+    _thread_local.job_id = job_id
+    _thread_local.run_id = run_id
 
 
 def configure_sink(sink_spec: str) -> None:
@@ -134,6 +154,7 @@ def get_memory_events() -> list[StageEvent]:
             {
                 "ts": event["ts"],
                 "job_id": event["job_id"],
+                "run_id": event.get("run_id", ""),
                 "video": event["video"],
                 "stage": event["stage"],
                 "phase": event["phase"],

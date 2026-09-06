@@ -17,6 +17,8 @@ from typing import Any, Callable
 from pipeline import batch_profile
 from pipeline.stage_log import ASR_STAGE_HEARTBEAT_PREFIX
 from utils.ffmpeg_runtime import configure_ffmpeg_shared_runtime
+from core import resources
+from utils.subprocess_tools import close_kill_on_close_job
 
 
 class GpuWorkerError(RuntimeError):
@@ -1065,12 +1067,15 @@ def worker_main(parent_conn: Connection) -> None:
             raise SystemExit(0)
 
         job_id = str(msg.get("job_id") or "")
+        run_id = str(msg.get("run_id") or "")
         try:
             from core import events as _events
             from utils import hf_progress as _hf_progress
 
-            _events.set_current_job_id(job_id)
-            _hf_progress.set_current_job_id(job_id)
+            # Stamped from the request, not looked up: this process outlives a
+            # single run, so events must carry the run that asked for them.
+            _events.set_current_run(job_id, run_id)
+            _hf_progress.set_current_job_id(job_id, run_id)
         except Exception:
             pass
         if op != "transcribe_and_align":
@@ -1233,12 +1238,83 @@ def worker_main(parent_conn: Connection) -> None:
 _CUDA_INIT_ENV_KEYS = ("PYTORCH_CUDA_ALLOC_CONF", "CUDA_VISIBLE_DEVICES")
 
 
+_CLIENT_ID_SEQ = 0
+_CLIENT_ID_LOCK = threading.RLock()
+_ASR_KIND = "asr_worker"
+
+
+def _next_client_id() -> int:
+    global _CLIENT_ID_SEQ
+    with _CLIENT_ID_LOCK:
+        _CLIENT_ID_SEQ += 1
+        return _CLIENT_ID_SEQ
+
+
+def unclosed_job_handles() -> list[dict[str, Any]]:
+    """Job Object handles from ASR children that would not close."""
+    return [
+        record
+        for record in resources.open_handles()
+        if record["kind"] == _ASR_KIND
+    ]
+
+
+def asr_gpu_cleanup_status() -> dict[str, Any]:
+    """What still holds the GPU, if anything.
+
+    Read by the web layer on every poll, so it must not take the worker lock -
+    that one is held for the whole length of an ASR run.
+    """
+    records = resources.pending(_ASR_KIND)
+    blocked = any(record["blocked"] for record in records)
+    handles = unclosed_job_handles()
+    worst = max(records, key=lambda record: record["attempts"], default=None)
+    next_retry = [r["next_retry_in_s"] for r in records if r["next_retry_in_s"]]
+    return {
+        "state": (
+            "cleanup_failed" if blocked else "cleaning" if records else "released"
+        ),
+        "blocked": blocked,
+        "pid": worst["pid"] if worst else None,
+        "attempts": worst["attempts"] if worst else 0,
+        "last_error": worst["last_error"] if worst else "",
+        "since": worst["since"] if worst else 0.0,
+        "generation": worst["generation"] if worst else 0,
+        "next_retry_in_s": min(next_retry) if next_retry else 0.0,
+        "handle_open": bool(handles),
+        "open_job_handles": len(handles),
+    }
+
+
+def asr_gpu_blocked() -> bool:
+    """True while an ASR child we could not stop still owns the GPU."""
+    return any(record["blocked"] for record in resources.pending(_ASR_KIND))
+
+
+def retry_asr_gpu_cleanup() -> dict[str, Any]:
+    """Manual 重新检查 / 重试清理 for ASR resources, then the current status."""
+    resources.retry_pending(_ASR_KIND)
+    return asr_gpu_cleanup_status()
+
+
 class _GpuWorkerClient:
     def __init__(self) -> None:
         self._ctx = mp.get_context("spawn")
         self._process = None
         self._conn = None
         self._job_handle = None
+        # _kill_child runs from the request path, from the watchdog and from the
+        # manual button; they must not tear down the same child concurrently.
+        self._child_lock = threading.RLock()
+        self._cleanup_error = ""
+        # Identity of this client, and of the child it is currently responsible
+        # for. Both travel with every cleanup-state update so a *different*
+        # client can never release a child it does not own.
+        self._client_id = _next_client_id()
+        # The id comes from the registry, so no two clients can ever name the
+        # same resource - not even after this one is garbage collected.
+        self._resource_token = resources.new_resource_id("asr-gpu-worker")
+        self._child_generation = 0
         self.kill_grace_s = _env_float("ASR_STAGE_WORKER_KILL_GRACE_S", 5.0)
         # Snapshot of the CUDA-init-time env the live worker was started under,
         # so we can restart it when a later job needs different alloc/device.
@@ -1259,25 +1335,139 @@ class _GpuWorkerClient:
                 pass
         self._conn = None
 
-    def _kill_child(self) -> None:
-        process = self._process
-        self._process = None
-        self._job_handle = None
-        if process is not None:
+    def _resource_id(self) -> str:
+        return self._resource_token
+
+    def _ensure_registered_locked(self, process, generation: int) -> None:
+        if resources.is_registered(self._resource_id(), generation):
+            return
+        resources.register(
+            resource_id=self._resource_id(),
+            generation=generation,
+            kind=_ASR_KIND,
+            description="asr-gpu-worker",
+            process=process,
+            job_handle=self._job_handle,
+            stopper=self._stop_child,
+            holds_gpu=True,
+        )
+
+    def _stop_child(self, process, job_handle) -> resources.StopOutcome:
+        """The blocking part of stopping this client's child.
+
+        Called by the resource registry, which owns the identity, the claim and
+        the retry schedule. Everything here is about *this* process object: it
+        never looks up "the current child", so a retry can only ever act on the
+        one it was registered for.
+        """
+        detail = ""
+        for step, grace_s in (("terminate", self.kill_grace_s), ("kill", 5.0)):
+            if self._child_liveness(process) == "gone":
+                break
             try:
-                if process.is_alive():
-                    process.terminate()
-                    process.join(self.kill_grace_s)
-                if process.is_alive():
-                    process.kill()
-                    process.join(5)
-                if process.is_alive():
-                    process.join(1)
+                getattr(process, step)()
+            except Exception as exc:
+                # Keep escalating: the next step is stronger, and giving up here
+                # is what left the child running.
+                detail = f"{step}() failed: {exc!r}"
+                print(f"[WARN] ASR stage worker {step}() failed: {exc!r}")
+            try:
+                process.join(grace_s)
             except Exception:
                 pass
-        self._close_conn()
 
-    def close(self) -> None:
+        # A Job Object handle is a raw integer: assigning None to it leaks the
+        # handle instead of closing it. Closing it is also the last escalation
+        # available - the job is kill-on-close, so the whole tree goes with it,
+        # including children terminate()/kill() never reach.
+        if job_handle and close_kill_on_close_job(job_handle):
+            job_handle = None
+        elif job_handle:
+            detail = detail or "job object handle could not be closed"
+            print("[WARN] ASR stage worker job object handle could not be closed")
+
+        if self._child_liveness(process) != "gone":
+            try:
+                process.join(1)
+            except Exception:
+                pass
+        liveness = self._child_liveness(process)
+        if liveness != "gone":
+            # The pid is diagnostics only - the process object is the identity,
+            # and reusing a bare pid after it exits is how you kill an unrelated
+            # process.
+            pid = getattr(process, "pid", None)
+            print(f"[WARN] ASR stage worker did not exit; pid={pid} {liveness}")
+            detail = detail or f"child process is {liveness} after terminate and kill"
+        with self._child_lock:
+            # Only touch this client's own state when the record being stopped
+            # *is* its current child. A retry for an older generation must not
+            # reach in and clear the handle or the connection of the worker that
+            # replaced it - the record owns what it was registered with.
+            if self._process is process:
+                self._close_conn()
+                self._job_handle = job_handle
+                if liveness == "gone":
+                    self._process = None
+        return resources.StopOutcome(
+            process_state=liveness, job_handle=job_handle, detail=detail
+        )
+
+    def _child_liveness(self, process) -> str:
+        """"gone", "alive" or "unknown" - an error is never "gone".
+
+        `is_alive()` raising (a process from another parent, a torn-down
+        multiprocessing state) used to read as "already exited", which is the
+        one answer that lets a caller start a second worker on the same GPU.
+        """
+        if process is None:
+            return "gone"
+        try:
+            return "alive" if process.is_alive() else "gone"
+        except Exception as exc:
+            self._cleanup_error = f"liveness check failed: {exc!r}"
+            return "unknown"
+
+    def _process_is_alive(self, process) -> bool:
+        # "Not confirmed gone" is what every caller of this actually means:
+        # unknown must keep the child tracked, not release it.
+        return self._child_liveness(process) != "gone"
+
+    def _kill_child(self) -> bool:
+        """Stop this client's current child. True when no child remains.
+
+        A thin request to the registry: it owns the identity, so a cleanup that
+        was scheduled for an earlier child cannot reach this one, and two
+        cleanups cannot run against the same child at once. What is left here is
+        only "which child is mine right now".
+        """
+        with self._child_lock:
+            generation = self._child_generation
+            process = self._process
+            if process is None:
+                self._close_conn()
+                return True
+            # Invariant: a live child is always a registered resource. Restoring
+            # it here rather than assuming it keeps "stop" reachable even if a
+            # child was adopted outside `_start_worker`.
+            self._ensure_registered_locked(process, generation)
+        result = resources.request_stop(self._resource_id(), generation)
+        if not result.stopped:
+            # Keep `_process` so the next attempt retries this same child
+            # instead of a caller treating the GPU as free and starting a
+            # second worker.
+            return False
+        # Two separate facts, deliberately not conflated: the child is confirmed
+        # gone, so the GPU is free; the job handle may still be open, which is a
+        # tracked resource, not a reason to hold the queue.
+        return True
+
+    def has_unreleased_child(self) -> bool:
+        """A child we failed to kill is still ours - do not replace the client."""
+        return self._process_is_alive(self._process)
+
+    def close(self) -> bool:
+        """Stop the child. Returns whether it is confirmed gone."""
         conn = self._conn
         process = self._process
         try:
@@ -1287,12 +1477,11 @@ class _GpuWorkerClient:
         except Exception:
             pass
         finally:
-            if process is not None and process.is_alive():
-                self._kill_child()
-            else:
-                self._process = None
-                self._job_handle = None
-                self._close_conn()
+            # Always through _kill_child: on the clean-exit path it only clears
+            # the references and closes the Job Object handle, and it is the one
+            # place that reports a child it could not stop.
+            stopped = self._kill_child()
+        return stopped
 
     def _effective_cuda_init_env(
         self,
@@ -1307,38 +1496,83 @@ class _GpuWorkerClient:
                 result[key] = os.environ.get(key, "")
         return result
 
-    def _start_worker(self) -> None:
-        self._kill_child()
-        parent_conn, child_conn = self._ctx.Pipe(duplex=True)
-        # daemon=True off-Windows so a SIGKILL'd/orphaned parent still reaps the
-        # GPU child (no Job Object there). Windows keeps daemon=False and relies
-        # on the kill-on-close Job Object assigned below.
-        process = self._ctx.Process(
-            target=worker_main,
-            args=(child_conn,),
-            daemon=(os.name != "nt"),
-        )
-        process.start()
-        self._job_handle = None
-        if os.name == "nt":
-            try:
-                from asr.local_backend import (
-                    _assign_process_to_job_object,
-                    _create_kill_on_close_job_object,
+    def _start_worker(self, cancel_requested: Callable[[], bool] | None = None) -> None:
+        # Everything that replaces this client's child runs under the same lock
+        # a cleanup takes, so "is the generation still the one I was scheduled
+        # for" cannot go stale between the check and the kill. The lock is
+        # released before the ready wait: cancelling a slow startup has to stay
+        # reachable.
+        with self._child_lock:
+            if not self._kill_child():
+                status = asr_gpu_cleanup_status()
+                raise GpuWorkerError(
+                    "cleanup_failed",
+                    "上一个 ASR GPU 子进程仍未退出，无法启动新的 GPU 进程；"
+                    "已暂停派发新的 GPU 任务，并在后台按退避间隔继续重试清理"
+                    f"（pid={status.get('pid')}，已重试 {status.get('attempts')} 次，"
+                    f"原因：{status.get('last_error') or '未知'}）。"
+                    "可在任务页点击「重试清理」/「重新检查」，或查看诊断信息。",
                 )
+            parent_conn, child_conn = self._ctx.Pipe(duplex=True)
+            # daemon=True off-Windows so a SIGKILL'd/orphaned parent still reaps
+            # the GPU child (no Job Object there). Windows keeps daemon=False and
+            # relies on the kill-on-close Job Object assigned below.
+            process = self._ctx.Process(
+                target=worker_main,
+                args=(child_conn,),
+                daemon=(os.name != "nt"),
+            )
+            process.start()
+            self._child_generation += 1
+            # The previous child's handle, if it would not close, stayed with
+            # its own registry record - a record this client can no longer
+            # reach. Binding a new one here therefore cannot overwrite it.
+            self._job_handle = None
+            # Registered before the handle is bound: from this moment the child
+            # has an identity, and every later stop request names it.
+            resources.register(
+                resource_id=self._resource_id(),
+                generation=self._child_generation,
+                kind=_ASR_KIND,
+                description="asr-gpu-worker",
+                process=process,
+                job_handle=None,
+                stopper=self._stop_child,
+                holds_gpu=True,
+            )
+            if os.name == "nt":
+                job = None
+                try:
+                    from asr.local_backend import (
+                        _assign_process_to_job_object,
+                        _create_kill_on_close_job_object,
+                    )
 
-                job = _create_kill_on_close_job_object()
-                _assign_process_to_job_object(job, process)
-                self._job_handle = job
-            except Exception:
-                self._job_handle = None
-        child_conn.close()
-        self._process = process
-        self._conn = parent_conn
+                    job = _create_kill_on_close_job_object()
+                    _assign_process_to_job_object(job, process)
+                    self._job_handle = job
+                    resources.attach_handle(
+                        self._resource_id(), self._child_generation, job
+                    )
+                except Exception:
+                    # A job that was created but not assigned still holds a
+                    # handle; dropping the reference leaks it for the life of
+                    # the process.
+                    close_kill_on_close_job(job)
+                    self._job_handle = None
+            child_conn.close()
+            self._process = process
+            self._conn = parent_conn
 
         ready_timeout_s = _env_float("ASR_STAGE_WORKER_READY_TIMEOUT_S", 60.0)
         deadline = time.monotonic() + ready_timeout_s
         while True:
+            # Startup is part of the request's cancellable lifetime: model load
+            # can take tens of seconds, and without this the user's 取消 was only
+            # noticed after the worker came up and the job had been sent.
+            if cancel_requested is not None and cancel_requested():
+                self._kill_child()
+                raise GpuWorkerError("cancelled", "ASR stage worker cancelled")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self._kill_child()
@@ -1374,12 +1608,17 @@ class _GpuWorkerClient:
             self._kill_child()
             raise GpuWorkerError(kind, detail)
 
-    def _ensure_worker(self) -> None:
+    def _ensure_worker(self, cancel_requested: Callable[[], bool] | None = None) -> None:
         if self.is_alive():
             return
-        self._start_worker()
+        self._start_worker(cancel_requested)
 
-    def _send_request(self, payload: dict[str, Any], env_overrides: dict[str, str] | None) -> None:
+    def _send_request(
+        self,
+        payload: dict[str, Any],
+        env_overrides: dict[str, str] | None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> None:
         """Send a request, transparently restarting once if the pipe is dead.
 
         A persistent worker can self-exit between jobs (idle timeout / max-jobs
@@ -1388,7 +1627,7 @@ class _GpuWorkerClient:
         CUDA-init-time env the (re)started worker is running under.
         """
         for attempt in range(2):
-            self._ensure_worker()
+            self._ensure_worker(cancel_requested)
             conn = self._conn
             if conn is None:
                 continue
@@ -1413,6 +1652,7 @@ class _GpuWorkerClient:
         device: str = "auto",
         env_overrides: dict[str, str] | None = None,
         job_id: str = "",
+        run_id: str = "",
         on_stage: Callable[[str], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> tuple[list[dict], list[str], dict]:
@@ -1427,11 +1667,12 @@ class _GpuWorkerClient:
         payload = {
             "op": "transcribe_and_align",
             "job_id": request_id,
+            "run_id": str(run_id or ""),
             "audio_path": str(Path(audio_path).resolve()),
             "device": str(device or "auto"),
             "env": dict(env_overrides or {}),
         }
-        self._send_request(payload, env_overrides)
+        self._send_request(payload, env_overrides, cancel_requested)
         assert self._conn is not None
 
         timeout_s = _env_float("ASR_STAGE_WORKER_TIMEOUT_S", 0.0)
@@ -1442,103 +1683,102 @@ class _GpuWorkerClient:
         last_heartbeat_at = request_started
         last_stage_message = "GPU worker request accepted"
 
-        while True:
-            if cancel_requested is not None and cancel_requested():
-                self._kill_child()
-                raise GpuWorkerError("cancelled", "ASR stage worker cancelled")
-            if deadline is not None and time.monotonic() >= deadline:
-                self._kill_child()
-                raise GpuWorkerTimeoutError(
-                    f"ASR stage worker timeout after {timeout_s:.1f}s"
-                )
+        # One cleanup site for the whole wait. Every branch below used to have
+        # to remember to kill the child before raising, and the heartbeat
+        # callback did not: a cancel that landed between the top-of-loop check
+        # and the heartbeat raised out of `on_stage` and left the GPU worker
+        # transcribing with nobody listening.
+        try:
+            while True:
+                if cancel_requested is not None and cancel_requested():
+                    raise GpuWorkerError("cancelled", "ASR stage worker cancelled")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise GpuWorkerTimeoutError(
+                        f"ASR stage worker timeout after {timeout_s:.1f}s"
+                    )
 
-            wait_s = 0.25
-            if deadline is not None:
-                wait_s = max(0.05, min(wait_s, deadline - time.monotonic()))
-            if not self._conn.poll(wait_s):
-                exitcode = self._process.exitcode if self._process is not None else None
-                if exitcode is not None:
-                    self._kill_child()
+                wait_s = 0.25
+                if deadline is not None:
+                    wait_s = max(0.05, min(wait_s, deadline - time.monotonic()))
+                if not self._conn.poll(wait_s):
+                    exitcode = (
+                        self._process.exitcode if self._process is not None else None
+                    )
+                    if exitcode is not None:
+                        raise GpuWorkerError(
+                            "crash",
+                            f"ASR stage worker exited before result exitcode={exitcode}",
+                        )
+                    now = time.monotonic()
+                    if (
+                        heartbeat_s > 0.0
+                        and on_stage is not None
+                        and now - last_heartbeat_at >= heartbeat_s
+                    ):
+                        on_stage(
+                            f"{ASR_STAGE_HEARTBEAT_PREFIX} "
+                            f"current={last_stage_message} "
+                            f"elapsed={now - request_started:.1f}s "
+                            f"idle={now - last_stage_at:.1f}s"
+                        )
+                        last_heartbeat_at = now
+                    continue
+
+                try:
+                    message = self._conn.recv()
+                except EOFError as exc:
+                    exitcode = (
+                        self._process.exitcode if self._process is not None else None
+                    )
                     raise GpuWorkerError(
                         "crash",
-                        f"ASR stage worker exited before result exitcode={exitcode}",
-                    )
-                now = time.monotonic()
-                if (
-                    heartbeat_s > 0.0
-                    and on_stage is not None
-                    and now - last_heartbeat_at >= heartbeat_s
-                ):
-                    on_stage(
-                        f"{ASR_STAGE_HEARTBEAT_PREFIX} "
-                        f"current={last_stage_message} "
-                        f"elapsed={now - request_started:.1f}s "
-                        f"idle={now - last_stage_at:.1f}s"
-                    )
-                    last_heartbeat_at = now
-                continue
+                        f"ASR stage worker pipe closed exitcode={exitcode}",
+                    ) from exc
 
-            try:
-                message = self._conn.recv()
-            except EOFError as exc:
-                exitcode = self._process.exitcode if self._process is not None else None
-                self._kill_child()
-                raise GpuWorkerError(
-                    "crash",
-                    f"ASR stage worker pipe closed exitcode={exitcode}",
-                ) from exc
+                if not isinstance(message, dict):
+                    raise GpuWorkerError("protocol_error", "worker message is not a dict")
+                if str(message.get("job_id") or "") != request_id:
+                    continue
 
-            if not isinstance(message, dict):
-                self._kill_child()
-                raise GpuWorkerError("protocol_error", "worker message is not a dict")
-            if str(message.get("job_id") or "") != request_id:
-                continue
-
-            op = message.get("op")
-            if op == "stage":
-                last_stage_message = str(message.get("message") or "")
-                last_stage_at = time.monotonic()
-                last_heartbeat_at = last_stage_at
-                if on_stage is not None:
-                    try:
+                op = message.get("op")
+                if op == "stage":
+                    last_stage_message = str(message.get("message") or "")
+                    last_stage_at = time.monotonic()
+                    last_heartbeat_at = last_stage_at
+                    if on_stage is not None:
                         on_stage(last_stage_message)
-                    except BaseException:
-                        self._kill_child()
-                        raise
-                continue
+                    continue
 
-            if op == "result":
-                segments = message.get("segments")
-                asr_log = message.get("asr_log")
-                asr_details = message.get("asr_details")
-                if not isinstance(segments, list):
-                    self._kill_child()
-                    raise GpuWorkerError("protocol_error", "segments must be a list")
-                if not isinstance(asr_log, list):
-                    self._kill_child()
-                    raise GpuWorkerError("protocol_error", "asr_log must be a list")
-                if not isinstance(asr_details, dict):
-                    self._kill_child()
-                    raise GpuWorkerError("protocol_error", "asr_details must be a dict")
-                return segments, [str(item) for item in asr_log], dict(asr_details)
+                if op == "result":
+                    segments = message.get("segments")
+                    asr_log = message.get("asr_log")
+                    asr_details = message.get("asr_details")
+                    if not isinstance(segments, list):
+                        raise GpuWorkerError("protocol_error", "segments must be a list")
+                    if not isinstance(asr_log, list):
+                        raise GpuWorkerError("protocol_error", "asr_log must be a list")
+                    if not isinstance(asr_details, dict):
+                        raise GpuWorkerError("protocol_error", "asr_details must be a dict")
+                    return segments, [str(item) for item in asr_log], dict(asr_details)
 
-            if op == "error":
-                kind = str(message.get("kind") or "crash")
-                detail = str(message.get("detail") or "ASR stage worker error")
-                stage = str(message.get("stage") or "")
-                runtime_tuning = message.get("runtime_tuning")
-                self._kill_child()
-                raise GpuWorkerError(
-                    kind,
-                    detail,
-                    stage=stage,
-                    runtime_tuning=(
-                        runtime_tuning if isinstance(runtime_tuning, dict) else {}
-                    ),
-                )
+                if op == "error":
+                    kind = str(message.get("kind") or "crash")
+                    detail = str(message.get("detail") or "ASR stage worker error")
+                    stage = str(message.get("stage") or "")
+                    runtime_tuning = message.get("runtime_tuning")
+                    raise GpuWorkerError(
+                        kind,
+                        detail,
+                        stage=stage,
+                        runtime_tuning=(
+                            runtime_tuning if isinstance(runtime_tuning, dict) else {}
+                        ),
+                    )
 
+                raise GpuWorkerError("protocol_error", f"unexpected worker op: {op}")
+        except BaseException:
             self._kill_child()
-            raise GpuWorkerError("protocol_error", f"unexpected worker op: {op}")
+            raise
 
     def transcribe_and_align(
         self,
@@ -1547,6 +1787,7 @@ class _GpuWorkerClient:
         device: str = "auto",
         env_overrides: dict[str, str] | None = None,
         job_id: str = "",
+        run_id: str = "",
         on_stage: Callable[[str], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> tuple[list[dict], list[str], dict]:
@@ -1561,6 +1802,7 @@ class _GpuWorkerClient:
                     device=device,
                     env_overrides=current_env,
                     job_id=job_id,
+                    run_id=run_id,
                     on_stage=on_stage,
                     cancel_requested=cancel_requested,
                 )
@@ -1649,7 +1891,16 @@ _GLOBAL_WORKER_LOCK = threading.RLock()
 
 def _get_global_worker() -> _GpuWorkerClient:
     global _GLOBAL_WORKER
-    if _GLOBAL_WORKER is None or not _GLOBAL_WORKER.is_alive():
+    # Only the child decides this now. A handle that would not close has already
+    # been handed to the pending table, which outlives any client - keeping the
+    # client for its sake would just give a retry a second, moving target.
+    if _GLOBAL_WORKER is None or not (
+        _GLOBAL_WORKER.is_alive() or _GLOBAL_WORKER.has_unreleased_child()
+    ):
+        # A client whose child survived the kill keeps the client: dropping it
+        # would forget the only reference to a live GPU process and start a
+        # second one next to it. The next _start_worker retries the kill and
+        # refuses to spawn while it fails.
         _GLOBAL_WORKER = _GpuWorkerClient()
     return _GLOBAL_WORKER
 
@@ -1660,6 +1911,7 @@ def transcribe_and_align(
     device: str = "auto",
     env_overrides: dict[str, str] | None = None,
     job_id: str = "",
+    run_id: str = "",
     on_stage: Callable[[str], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> tuple[list[dict], list[str], dict]:
@@ -1672,21 +1924,34 @@ def transcribe_and_align(
                 device=device,
                 env_overrides=env_overrides,
                 job_id=job_id,
+                run_id=run_id,
                 on_stage=on_stage,
                 cancel_requested=cancel_requested,
             )
         except Exception:
-            if not worker.is_alive():
+            if not (worker.is_alive() or worker.has_unreleased_child()):
                 _GLOBAL_WORKER = None
             raise
 
 
-def shutdown_global_worker() -> None:
+def shutdown_global_worker() -> bool:
+    """Stop the shared worker. Returns whether it is confirmed stopped.
+
+    Dropping the reference regardless of the outcome was the whole bug: the
+    undead child stayed on the card, the next client had no child of its own,
+    and its empty cleanup then cleared the blocked state - so the queue resumed
+    and a second GPU process started beside the first. A failed close keeps the
+    client, keeps the blocked state, and says so.
+    """
     global _GLOBAL_WORKER
     with _GLOBAL_WORKER_LOCK:
-        if _GLOBAL_WORKER is not None:
-            _GLOBAL_WORKER.close()
-        _GLOBAL_WORKER = None
+        worker = _GLOBAL_WORKER
+        if worker is None:
+            return True
+        stopped = bool(worker.close())
+        if stopped:
+            _GLOBAL_WORKER = None
+        return stopped
 
 
 atexit.register(shutdown_global_worker)

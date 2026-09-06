@@ -28,7 +28,7 @@ def _configure_headless(monkeypatch) -> None:
 
 
 def _mock_audio_and_asr(monkeypatch, segments: list[dict], *, checkpoint: bool = False) -> None:
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         path = Path(out_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fake wav")
@@ -41,6 +41,7 @@ def _mock_audio_and_asr(monkeypatch, segments: list[dict], *, checkpoint: bool =
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         assert device == "auto"
         assert env_overrides is not None

@@ -13,6 +13,24 @@ class TranslationCancelledError(TranslationError):
     """Raised when the caller requests cancellation."""
 
 
+class BackendUnavailableError(TranslationError):
+    """Admission timed out; cleanup continues and resource ownership is retained."""
+
+
+class BackendLeaseInvalidatedError(TranslationError):
+    """The backend instance a task was using has been taken out of service.
+
+    Deliberately not retryable: the instance is gone for good (the settings were
+    reset, or its last holder closed it), and the only correct answer is to stop
+    this task rather than continue on a replacement it never claimed - the two
+    halves of one video would come from two different models.
+
+    Lives here rather than in `llm.backends` so the backends themselves can
+    raise it: an instance has to refuse *at the moment of use*, since a reset can
+    land between a caller's check and its call.
+    """
+
+
 class RetryableTranslationError(TranslationError):
     """A transient transport or response-shape failure that may be retried."""
 

@@ -119,7 +119,7 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
         keep_temp_files=True,
     )
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
@@ -131,6 +131,7 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         calls["asr"] += 1
         assert device == "auto"
@@ -238,7 +239,7 @@ def test_asr_alignment_stage_writes_resume_signature_e2e(monkeypatch, tmp_path):
             )
         return real_write_json(path, payload)
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
@@ -250,6 +251,7 @@ def test_asr_alignment_stage_writes_resume_signature_e2e(monkeypatch, tmp_path):
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
@@ -388,7 +390,7 @@ def test_aligned_segments_cache_miss_when_signature_missing(monkeypatch, tmp_pat
         keep_temp_files=True,
     )
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
@@ -400,6 +402,7 @@ def test_aligned_segments_cache_miss_when_signature_missing(monkeypatch, tmp_pat
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         calls["asr"] += 1
         return (
@@ -453,7 +456,7 @@ def test_aligned_segments_cache_miss_when_audio_key_changes(monkeypatch, tmp_pat
         keep_temp_files=True,
     )
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
@@ -465,6 +468,7 @@ def test_aligned_segments_cache_miss_when_audio_key_changes(monkeypatch, tmp_pat
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         calls["asr"] += 1
         return (

@@ -16,18 +16,22 @@ OpenRouter), and it reports no `reasoning_tokens` at all - the number that is
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import os
 import re
 import threading
 import time
+from contextvars import ContextVar
 from typing import Callable
 from urllib.parse import urlsplit
 
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 from core.stage_errors import MISSING_MODEL
 from llm import settings as llm_settings
 from llm import transport_util
+from llm.async_transport import close_quietly, run_cancellable_request
 from llm.backends.base import BaseTranslationBackend
 from llm.errors import (
     ContentPolicyRefusalError,
@@ -72,6 +76,12 @@ _DEFAULT_OUTPUT_SCHEMA = {
 _CLIENT: OpenAI | None = None
 _CLIENT_KEY: tuple[str, str] = ("", "")
 _CLIENT_LOCK = threading.Lock()
+
+# The async client the current request owns. A ContextVar rather than an
+# argument so `_create_response` keeps its `(request, cancel_event)` shape, and
+# task-local rather than global so two concurrent requests never see each
+# other's client.
+_ACTIVE_ASYNC_CLIENT: ContextVar = ContextVar("openai_async_client", default=None)
 
 # The two endpoints this module knows anything about beyond "OpenAI-compatible".
 # Both are host comparisons, and both exist for a documented divergence rather
@@ -211,45 +221,98 @@ def _merge_extra_body(request: dict, extra: dict) -> None:
     request["extra_body"] = merged
 
 
-def _backoff_sleep(attempt: int, exc: Exception, cancel_event=None) -> None:
-    transport_util._request_backoff_sleep(attempt, exc, cancel_event=cancel_event)
+def _make_async_client() -> AsyncOpenAI:
+    """A client for exactly one request, on the loop that request owns.
+
+    An httpx pool binds to the loop that opened its connections, and every
+    request here runs on its own private loop, so a cached async client would be
+    handed a closed loop on its second use. One TLS handshake per request costs
+    nothing next to a request that generates for minutes - and it is what makes
+    "cancel the operation, not the shared client" true by construction: there is
+    no shared client for a cancelled job to close out from under another one.
+    """
+    require_translation_config("openai")
+    api_key = os.getenv("API_KEY", "").strip() or None
+    base_url = _normalize_openai_compat_base_url(
+        os.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip()
+    )
+    return AsyncOpenAI(api_key=api_key, base_url=base_url)
 
 
-def _create_response(
+async def _create_response(
     request: dict,
     cancel_event: threading.Event | None = None,
 ):
     last_error: Exception | None = None
+    # The client belongs to the operation, not to this call: it has to be
+    # created and closed on the loop the request runs on, while this stays the
+    # seam tests replace with a plain function of `request`.
+    client = _ACTIVE_ASYNC_CLIENT.get()
 
     for attempt in range(llm_settings.TRANSLATION_API_RETRIES):
         _raise_if_cancelled(cancel_event)
         try:
-            return _get_client().responses.create(**request)
+            return await client.responses.create(**request)
+        except asyncio.CancelledError:
+            # A cancelled request is never retried: the caller asked for it to
+            # stop, and re-issuing it would spend another round of reasoning
+            # tokens on work nobody is waiting for.
+            raise
         except Exception as exc:
             last_error = exc
             if not _is_retryable_api_error(exc):
                 raise
 
             if attempt < llm_settings.TRANSLATION_API_RETRIES - 1:
-                _backoff_sleep(attempt, exc, cancel_event=cancel_event)
+                await _abackoff_sleep(attempt, exc, cancel_event=cancel_event)
 
     if last_error is not None:
         raise last_error
     raise RuntimeError("response creation failed without an exception")
 
 
-def _call_create_response(
+async def _abackoff_sleep(
+    attempt: int,
+    exc: Exception,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    # asyncio.sleep, not the interruptible thread sleep: cancelling the task has
+    # to reach the wait between retries as well as the request itself.
+    delay = transport_util._request_backoff_delay(attempt)
+    transport_util._record_api_retry_event(exc, attempt, delay)
+    await asyncio.sleep(delay)
+    _raise_if_cancelled(cancel_event)
+
+
+async def _call_create_response(
     request: dict,
     cancel_event: threading.Event | None = None,
 ):
-    if cancel_event is None:
-        return _create_response(request)
+    """Call the seam, tolerating a double that is neither async nor cancellable.
+
+    Tests replace `_create_response` with a plain function returning a plain
+    iterator of events; the transport itself is async. Both shapes are accepted
+    here so those tests keep testing what they are about instead of transport
+    plumbing.
+    """
     try:
-        return _create_response(request, cancel_event=cancel_event)
+        result = _create_response(request, cancel_event=cancel_event)
     except TypeError as exc:
         if "cancel_event" not in str(exc):
             raise
-        return _create_response(request)
+        result = _create_response(request)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def _aiter_events(stream):
+    if hasattr(stream, "__aiter__"):
+        async for event in stream:
+            yield event
+        return
+    for event in stream:
+        yield event
 
 
 def _build_responses_input(
@@ -594,23 +657,6 @@ def _chat_responses(
     if effective_max_tokens > 0:
         request["max_output_tokens"] = effective_max_tokens
 
-    try:
-        response_stream = _call_create_response(request, cancel_event=cancel_event)
-    except Exception as exc:
-        # An endpoint that validates before opening the stream answers 400 here
-        # instead of with a `response.failed` frame, and the same refusal has to
-        # mean the same thing on both paths.
-        reason = _provider_error_reason(
-            *_exception_error_fields(exc), effective_max_tokens
-        )
-        if reason is not None:
-            raise reason from exc
-        raise
-
-    completed_response = None
-    incomplete_response = None
-    failed_error = None
-    reasoning_chars = 0
     last_emit = 0.0
     debounce_s = 0.25
     stream_state = {
@@ -619,6 +665,12 @@ def _chat_responses(
         "translated_count": 0,
         "id_scan_tail": "",
         "id_marker": '"id":',
+    }
+    outcome: dict = {
+        "completed_response": None,
+        "incomplete_response": None,
+        "failed_error": None,
+        "reasoning_chars": 0,
     }
 
     def maybe_emit(payload: dict, *, force: bool = False) -> None:
@@ -629,49 +681,93 @@ def _chat_responses(
         last_emit = now
         _emit_progress(on_progress, payload)
 
-    try:
-        for event in response_stream:
-            _raise_if_cancelled(cancel_event)
-            event_type = _response_event_type(event)
-            if event_type == "response.output_text.delta":
-                piece = _response_event_delta(event)
-                if piece:
-                    _emit_stream_content_progress(
-                        piece=piece,
-                        state=stream_state,
-                        expected_count=expected_count,
-                        maybe_emit=maybe_emit,
-                    )
-                continue
+    async def stream_response() -> None:
+        """The whole request as one cancellable operation.
 
-            if event_type in {
-                "response.reasoning_summary_text.delta",
-                "response.reasoning_text.delta",
-            }:
-                reasoning_piece = _response_event_delta(event)
-                if reasoning_piece:
-                    reasoning_chars += len(reasoning_piece)
-                    maybe_emit(
-                        {"phase": "thinking", "reasoning_chars": reasoning_chars}
-                    )
-                continue
+        Connect, response headers, every event, and the close all happen inside
+        this coroutine, so a cancel reaches the socket read the request is
+        actually parked in - including the minutes of silence before a reasoning
+        model emits its first token, where a between-events check never ran.
+        """
+        client = _make_async_client()
+        token = _ACTIVE_ASYNC_CLIENT.set(client)
+        response_stream = None
+        try:
+            try:
+                response_stream = await _call_create_response(
+                    request, cancel_event=cancel_event
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # An endpoint that validates before opening the stream answers
+                # 400 here instead of with a `response.failed` frame, and the
+                # same refusal has to mean the same thing on both paths.
+                reason = _provider_error_reason(
+                    *_exception_error_fields(exc), effective_max_tokens
+                )
+                if reason is not None:
+                    raise reason from exc
+                raise
 
-            if event_type == "response.completed":
-                completed_response = _response_event_response(event)
-                _emit_usage(on_usage, _get_nested_value(completed_response, "usage"))
-                continue
+            try:
+                async for event in _aiter_events(response_stream):
+                    event_type = _response_event_type(event)
+                    if event_type == "response.output_text.delta":
+                        piece = _response_event_delta(event)
+                        if piece:
+                            _emit_stream_content_progress(
+                                piece=piece,
+                                state=stream_state,
+                                expected_count=expected_count,
+                                maybe_emit=maybe_emit,
+                            )
+                        continue
 
-            if event_type == "response.incomplete":
-                incomplete_response = _response_event_response(event)
-                continue
+                    if event_type in {
+                        "response.reasoning_summary_text.delta",
+                        "response.reasoning_text.delta",
+                    }:
+                        reasoning_piece = _response_event_delta(event)
+                        if reasoning_piece:
+                            outcome["reasoning_chars"] += len(reasoning_piece)
+                            maybe_emit(
+                                {
+                                    "phase": "thinking",
+                                    "reasoning_chars": outcome["reasoning_chars"],
+                                }
+                            )
+                        continue
 
-            if event_type in {"response.failed", "response.error"}:
-                failed_error = event
-            _raise_if_cancelled(cancel_event)
-    except Exception as exc:
-        if _is_retryable_api_error(exc):
-            raise _stream_interrupted_format_error(exc) from exc
-        raise
+                    if event_type == "response.completed":
+                        completed = _response_event_response(event)
+                        outcome["completed_response"] = completed
+                        _emit_usage(on_usage, _get_nested_value(completed, "usage"))
+                        continue
+
+                    if event_type == "response.incomplete":
+                        outcome["incomplete_response"] = _response_event_response(event)
+                        continue
+
+                    if event_type in {"response.failed", "response.error"}:
+                        outcome["failed_error"] = event
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if _is_retryable_api_error(exc):
+                    raise _stream_interrupted_format_error(exc) from exc
+                raise
+        finally:
+            # Idempotent, and its failures never become the request's outcome:
+            # a cleanup error must not turn a cancelled request into a retry.
+            _ACTIVE_ASYNC_CLIENT.reset(token)
+            await close_quietly(response_stream)
+            await close_quietly(client)
+
+    run_cancellable_request(stream_response, cancel_event=cancel_event)
+    completed_response = outcome["completed_response"]
+    incomplete_response = outcome["incomplete_response"]
+    failed_error = outcome["failed_error"]
 
     _raise_if_cancelled(cancel_event)
     if failed_error is not None:

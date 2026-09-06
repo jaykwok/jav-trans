@@ -9,15 +9,17 @@ from huggingface_hub.utils.tqdm import tqdm as _base_tqdm
 
 # 模块级 fallback，跨线程可见（download 是串行的，无并发风险）
 _override_job_id: str = ""
+_override_run_id: str = ""
 
 
-def set_current_job_id(job_id: str) -> None:
-    global _override_job_id
+def set_current_job_id(job_id: str, run_id: str = "") -> None:
+    global _override_job_id, _override_run_id
     _override_job_id = job_id
+    _override_run_id = run_id
 
 
-def propagate_job_id_to_current_thread(job_id: str) -> None:
-    """Re-establish job_id on a worker thread a pool just spun up.
+def propagate_job_id_to_current_thread(job_id: str, run_id: str = "") -> None:
+    """Re-establish job_id (and its run) on a worker thread a pool just spun up.
 
     `core.events`'s job_id is thread-local by design, which a fresh
     ``ThreadPoolExecutor`` worker (e.g. the batch-translation pool in
@@ -32,7 +34,7 @@ def propagate_job_id_to_current_thread(job_id: str) -> None:
     try:
         from core import events
 
-        events.set_current_job_id(job_id)
+        events.set_current_run(job_id, run_id)
     except Exception:
         pass
 
@@ -51,6 +53,11 @@ def current_job_id() -> str:
     return _current_job_id()
 
 
+def current_run_id() -> str:
+    """The run this module would emit under; captured with `current_job_id`."""
+    return _current_run_id()
+
+
 def _current_job_id() -> str:
     # 先试线程本地（主线程调用路径有效）
     try:
@@ -65,6 +72,20 @@ def _current_job_id() -> str:
         pass
     # fallback：模块级变量（download worker 线程走这里）
     return _override_job_id
+
+
+def _current_run_id() -> str:
+    try:
+        from core import events
+
+        private_getter = getattr(events, "_current_run_id", None)
+        if callable(private_getter):
+            run_id = str(private_getter() or "")
+            if run_id:
+                return run_id
+    except Exception:
+        pass
+    return _override_run_id
 
 
 def _current_video() -> str:
@@ -85,6 +106,7 @@ def _emit(phase: str, extra: dict[str, Any]) -> None:
             {
                 "ts": _event_ts(),
                 "job_id": _current_job_id(),
+                "run_id": _current_run_id(),
                 "video": _current_video(),
                 "stage": "model_download",
                 "phase": phase,

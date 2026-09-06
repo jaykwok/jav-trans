@@ -83,3 +83,27 @@ class BaseTranslationBackend(ABC):
             cancelled = False
         if cancelled:
             raise TranslationCancelledError("任务已取消")
+
+
+class ManagedTranslationBackend(BaseTranslationBackend):
+    """Required lifecycle for backends owning a process or other shared resource.
+
+    Hooks inspected under the registry lock must be short, non-blocking reads
+    or state changes. Only close() may block; False never means ownership ended.
+    Invalidation is irreversible and must also be checked at the point of use.
+    """
+
+    @abstractmethod
+    def invalidate(self) -> None: ...
+
+    @abstractmethod
+    def is_invalidated(self) -> bool: ...
+
+    @abstractmethod
+    def cleanup_status(self) -> dict: ...
+
+    @abstractmethod
+    def generation_retiring(self) -> bool: ...
+
+    @abstractmethod
+    def close(self) -> bool: ...

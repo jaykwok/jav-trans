@@ -7,6 +7,7 @@ import { openQcReport } from './qcReport.js';
 const STATUS_LABEL = {
   pending: '待开始', queued: '排队中', asr: 'ASR转写', translating: '翻译中',
   writing: '写入中', done: '完成', failed: '失败', cancelled: '已取消',
+  cancelling: '停止中',
 };
 
 const STAGE_LABEL = {
@@ -17,6 +18,8 @@ const STAGE_LABEL = {
   done:                '已完成',
   failed:              '失败',
   cancelled:           '已取消',
+  cancelling:          '正在停止（已请求取消）',
+  gpu_blocked:         'GPU 占用中，等待清理',
   audio_prepare:       '音频提取',
   asr_alignment:       'ASR 转写 & 字幕时间轴',
   audio_chunking:      '音频切分',
@@ -29,7 +32,7 @@ const STAGE_LABEL = {
   model_download:      '模型下载',
 };
 
-const PROGRESS_PCT = { queued: 0, asr: 20, translating: 60, writing: 90, done: 100, failed: 100, cancelled: 0 };
+const PROGRESS_PCT = { queued: 0, asr: 20, translating: 60, writing: 90, done: 100, failed: 100, cancelled: 0, cancelling: 0 };
 // Rebalanced on 2026-07-31: the five boundary stages that used to fill 3->38%
 // no longer run, and chunking now costs one encoder pass instead of five models.
 const STAGE_PCT = {

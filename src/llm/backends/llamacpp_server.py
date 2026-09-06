@@ -16,6 +16,7 @@ the pipeline stops this server again once a job's translation stage finishes.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import os
 import shutil
 import socket
@@ -27,11 +28,30 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
-from llm.backends.base import BaseTranslationBackend
+from core import resources
+from llm.async_transport import close_quietly, run_cancellable_request
+from llm.backends.base import ManagedTranslationBackend
+from llm.errors import BackendLeaseInvalidatedError
 from utils.model_paths import PROJECT_ROOT
-from utils.subprocess_tools import no_window_subprocess_kwargs
+from utils.subprocess_tools import (
+    child_state,
+    close_kill_on_close_job,
+    no_window_subprocess_kwargs,
+)
 
 _SERVER_EXE_NAMES = ("llama-server.exe", "llama-server")
+_LOCAL_KIND = "local_server"
+_NO_CLEANUP = {
+    "stuck": False,
+    "pid": None,
+    "attempts": 0,
+    "last_error": "",
+    "since": 0.0,
+    "generation": 0,
+    "process_state": "gone",
+    "handle_open": False,
+    "blocks_gpu": False,
+}
 
 
 def _env(name: str, default: str = "") -> str:
@@ -209,17 +229,47 @@ def _wrap_response_format(schema: dict | None) -> dict | None:
 
 
 def _release_asr_worker_vram() -> None:
-    """Best-effort: free the resident ASR GPU worker before loading the GGUF.
+    """Free the resident ASR GPU worker before loading the GGUF.
 
     The worker respawns lazily on the next ASR stage; skipping this on an 8GB
-    card turns the server spawn into an instant CUDA OOM.
+    card turns the server spawn into an instant CUDA OOM. Which is exactly why
+    this is not best-effort: if the ASR child could not be stopped, its VRAM is
+    still held, and starting a multi-GB server next to it is the failure this
+    is meant to prevent. Refuse instead, with the same message and the same
+    manual recovery entry points as any other blocked cleanup.
     """
-    try:
-        from pipeline import gpu_worker
+    from pipeline import gpu_worker
 
-        gpu_worker.shutdown_global_worker()
-    except Exception:
-        pass
+    try:
+        stopped = gpu_worker.shutdown_global_worker()
+    except Exception as exc:
+        raise RuntimeError(
+            f"无法确认 ASR GPU 子进程已退出，拒绝加载本地翻译模型：{exc!r}"
+        ) from exc
+    if not stopped or gpu_worker.asr_gpu_blocked():
+        status = gpu_worker.asr_gpu_cleanup_status()
+        raise RuntimeError(
+            "ASR GPU 子进程仍未退出，显存未释放，拒绝启动本地翻译服务器"
+            f"（pid={status.get('pid')}，已重试 {status.get('attempts')} 次，"
+            f"原因：{status.get('last_error') or '未知'}）。"
+            "可在任务页点击「重试清理」/「重新检查」，或查看诊断信息。"
+        )
+    # The ASR worker is not the only thing that can be holding the card - an
+    # abandoned server from an earlier backend instance is another - so the
+    # question is asked of every owner, not just of this subsystem's own.
+    if resources.gpu_blocked():
+        blockers = [
+            record for record in resources.pending() if record["blocked"]
+        ]
+        detail = "；".join(
+            f"{record['kind']} pid={record['pid']} 进程={record['process_state']}"
+            for record in blockers
+        )
+        raise RuntimeError(
+            "仍有未确认退出的 GPU 子进程，显存未释放，拒绝启动本地翻译服务器"
+            f"（{detail or '未知'}）。"
+            "可在任务页点击「重试清理」/「重新检查」，或查看诊断信息。"
+        )
 
 
 if os.name == "nt":
@@ -292,7 +342,7 @@ else:  # pragma: no cover - project targets Windows
         return None
 
 
-class LlamaCppServerBackend(BaseTranslationBackend):
+class LlamaCppServerBackend(ManagedTranslationBackend):
     """OpenAI-compatible chat against a managed local llama-server process."""
 
     def __init__(self) -> None:
@@ -303,6 +353,34 @@ class LlamaCppServerBackend(BaseTranslationBackend):
         self._client = None
         self._model_path = ""
         self._log_path: Path | None = None
+        # Set when a request was abandoned while the server was still working on
+        # it. HTTP abort != generation stopped, and the difference is VRAM.
+        # Guarded by its own short lock, never by `_lock`: status is read from
+        # the web event loop, and `_lock` is held across model loads.
+        self._status_lock = threading.Lock()
+        self._draining_since: float | None = None
+        # A teardown that did not confirm. Same contract as the ASR worker:
+        # the process is still ours, a replacement must not start, and the state
+        # is visible and retryable rather than being swallowed by a bare
+        # `except TimeoutExpired: pass`.
+        # Identity of the servers this instance owns. The id comes from the
+        # registry so that two instances created one after the other cannot
+        # claim the same one: with a fixed id and a generation restarting at 0,
+        # instance B's first server had exactly the identity instance A's first
+        # server had, and A's queued cleanup terminated B's process.
+        self._resource_token = resources.new_resource_id("llamacpp-server")
+        # Bumped for every server this instance starts. A cleanup request names
+        # the generation it was raised for, so a late one cannot act on the
+        # server that replaced it.
+        self._server_generation = 0
+        # Set when a request was abandoned mid-generation: this generation stops
+        # taking new tasks and is closed once the ones holding it finish.
+        self._retiring = False
+        # One-way: set when the registry takes this instance out of service.
+        # Being removed from the registry only stops the *next* lookup - a caller
+        # already holding this object would still reach `_ensure_server()` and
+        # start a server to replace the one being closed.
+        self._invalidated = False
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -349,10 +427,26 @@ class LlamaCppServerBackend(BaseTranslationBackend):
         return text[-max_chars:]
 
     def _ensure_server(self, cancel_event=None) -> None:
+        # Before the fast path: an instance taken out of service must not start a
+        # server, and must not hand out the one it still has.
+        self._raise_if_invalidated()
         with self._lock:
+            self._raise_if_invalidated()  # the reset may have landed while we waited
             if self._proc is not None and self._proc.poll() is None and self._port:
                 return
-            self._teardown_locked()
+            # Doubles as the re-check: a process that has since exited on its
+            # own confirms here and clears the state. Only a server that is
+            # still unaccounted for blocks the start - loading a second
+            # multi-GB model next to one that still holds its VRAM is the
+            # failure this exists to prevent.
+            if not self._teardown_locked():
+                status = self.cleanup_status()
+                raise RuntimeError(
+                    "上一个 llama-server 未确认退出，拒绝启动新的本地翻译服务器"
+                    f"（pid={status.get('pid')}，已重试 {status.get('attempts')} 次，"
+                    f"原因：{status.get('last_error') or '未知'}）。"
+                    "可在任务页点击「重试清理」/「重新检查」，或查看诊断信息。"
+                )
 
             exe = resolve_server_executable()
             model_path = resolve_gguf_model_path()
@@ -390,7 +484,25 @@ class LlamaCppServerBackend(BaseTranslationBackend):
                     env=env,
                     **no_window_subprocess_kwargs(),
                 )
+            self._server_generation += 1
+            self._retiring = False
             self._job_handle = _bind_kill_on_close_job(self._proc)
+            resources.register(
+                resource_id=self._resource_id(),
+                generation=self._server_generation,
+                kind=_LOCAL_KIND,
+                description="llama-server",
+                process=self._proc,
+                job_handle=self._job_handle,
+                stopper=self._stop_server,
+                holds_gpu=True,
+            )
+            # Invalidation may have landed after the startup entrance check
+            # but before registration. Whichever side wins must publish stop
+            # intent, so a timed-out close never makes this live owner invisible
+            # to GPU admission or to the cleanup watchdog.
+            if self.is_invalidated():
+                resources.schedule_stop(self._resource_id(), self._server_generation)
             self._port = port
 
             timeout_s = _env_int("LLAMACPP_STARTUP_TIMEOUT_S", 300, 10, 3600)
@@ -425,28 +537,257 @@ class LlamaCppServerBackend(BaseTranslationBackend):
             max_retries=0,
         )
 
-    def _teardown_locked(self) -> None:
-        proc, self._proc = self._proc, None
-        self._client = None
-        self._port = None
-        if proc is not None and proc.poll() is None:
-            proc.kill()
+    def _make_async_client(self, port: int):
+        # Built per request, on that request's loop - see the note in
+        # openai_compat._make_async_client. Here it matters for a second reason:
+        # the process is shared between concurrent jobs, so cancelling one must
+        # not close a client the others are using.
+        from openai import AsyncOpenAI
+
+        return AsyncOpenAI(
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="local-llamacpp",
+            timeout=600.0,
+            max_retries=0,
+        )
+
+    def _resource_id(self) -> str:
+        return self._resource_token
+
+    def _stop_server(self, proc, job_handle) -> resources.StopOutcome:
+        """The blocking part of stopping one server. Called by the registry.
+
+        Everything here is about the process object it was handed. The old
+        version cleared `_proc` first and swallowed the wait timeout, so a
+        server that ignored kill() looked exactly like one that exited: the
+        instance was dropped from the registry, `draining` was cleared, and the
+        next translation loaded a second multi-GB model beside the first.
+        """
+        detail = ""
+        if proc is not None and child_state(proc) != "gone":
+            try:
+                proc.kill()
+            except Exception as exc:
+                detail = f"kill() failed: {exc!r}"
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                pass
-        if self._job_handle is not None and os.name == "nt":
-            import ctypes
-
+                detail = detail or "process still alive 10s after kill()"
+            except Exception as exc:
+                detail = detail or f"wait() failed: {exc!r}"
+        # Closing the job object is the last escalation available: it is
+        # kill-on-close, so the whole tree goes with it - including any child
+        # llama-server spawned that kill() never reached.
+        if job_handle and os.name == "nt":
+            if close_kill_on_close_job(job_handle):
+                job_handle = None
+            else:
+                # A failed close released nothing; dropping the integer would
+                # leak it, so it stays on this record.
+                detail = detail or "job object handle could not be closed"
+        elif job_handle:  # pragma: no cover - project targets Windows
+            job_handle = None
+        if proc is not None and child_state(proc) != "gone":
             try:
-                ctypes.windll.kernel32.CloseHandle(self._job_handle)
+                proc.wait(timeout=2)
             except Exception:
                 pass
-            self._job_handle = None
+        state = child_state(proc) if proc is not None else "gone"
+        if state != "gone":
+            detail = detail or f"llama-server is {state} after kill()"
+            print(f"[WARN] llama-server 未确认退出：{detail}", flush=True)
+        with self._status_lock:
+            self._job_handle = job_handle
+            if state == "gone" and self._proc is proc:
+                self._proc = None
+        return resources.StopOutcome(
+            process_state=state, job_handle=job_handle, detail=detail
+        )
 
-    def close(self) -> None:
+    def _teardown_locked(self) -> bool:
+        """Stop the current server. True *only* when it is confirmed gone.
+
+        The process reference is what makes a retry possible, so it is kept
+        until the process is confirmed gone.
+        """
+        proc = self._proc
+        generation = self._server_generation
+        # The client and port are dropped either way: whatever this process is
+        # doing, nothing may be sent to it again.
+        self._client = None
+        self._port = None
+        if proc is None:
+            self._retiring = False
+            return True
+        if not resources.is_registered(self._resource_id(), generation):
+            # A process adopted outside `_ensure_server` (tests, and any future
+            # path) still has to be stoppable through the one entry point.
+            resources.register(
+                resource_id=self._resource_id(),
+                generation=generation,
+                kind=_LOCAL_KIND,
+                description="llama-server",
+                process=proc,
+                job_handle=self._job_handle,
+                stopper=self._stop_server,
+                holds_gpu=True,
+            )
+        result = resources.request_stop(self._resource_id(), generation)
+        if result.stopped:
+            self._retiring = False
+        return result.stopped
+
+    def cleanup_status(self) -> dict:
+        """Is a server we tried to stop still unaccounted for?
+
+        Read from the web event loop, so `_lock` is off limits here - it is held
+        across model loads. The registry read takes only its own short lock.
+        """
+        records = [
+            record
+            for record in resources.pending(_LOCAL_KIND)
+            if record["resource_id"] == self._resource_id()
+        ]
+        if not records:
+            return dict(_NO_CLEANUP)
+        record = records[0]
+        return {
+            "stuck": True,
+            "pid": record["pid"],
+            "attempts": record["attempts"],
+            "last_error": record["last_error"],
+            "since": record["since"],
+            "generation": record["generation"],
+            "process_state": record["process_state"],
+            "handle_open": record["handle_open"],
+            # Two different claims. A process that may still be resident holds
+            # the card; a handle nobody could close does not, and blocking every
+            # GPU stage on it would be a made-up cost.
+            "blocks_gpu": record["process_state"] != "gone",
+        }
+
+    def close(self) -> bool:
+        """Stop the server for good. Returns whether it is confirmed stopped.
+
+        This is the "the last user left / the user changed the setting" path -
+        it always targets whatever this instance currently owns. 重试清理 is a
+        different operation and goes through the registry.
+        """
         with self._lock:
-            self._teardown_locked()
+            stopped = self._teardown_locked()
+        if stopped:
+            # Only now is the unknown resolved: the process that might still
+            # have been generating is gone, so nothing of that request outlives
+            # it. A teardown that did not confirm leaves the flag standing.
+            with self._status_lock:
+                self._draining_since = None
+        return stopped
+
+    def invalidate(self) -> None:
+        """Take this instance out of service permanently.
+
+        Called by the registry when the instance stops being the one in use -
+        settings reset, or its last holder let go. There is no way back: a task
+        that was already holding the object must fail rather than start new work
+        on it, and "new work" includes starting a server.
+        """
+        with self._status_lock:
+            self._invalidated = True
+        resources.schedule_stop(self._resource_id(), self._server_generation)
+
+    def is_invalidated(self) -> bool:
+        with self._status_lock:
+            return self._invalidated
+
+    def _raise_if_invalidated(self) -> None:
+        if self.is_invalidated():
+            raise BackendLeaseInvalidatedError(
+                "本地翻译服务实例已被停用（翻译设置已变更，或该实例已被关闭），"
+                "不会为它启动新的服务器；请重新运行该任务。"
+            )
+
+    def generation_retiring(self) -> bool:
+        """Is the running server's generation on its way out?
+
+        Set when a request was abandoned mid-generation. The server keeps
+        serving the tasks that already hold it, and takes no new ones: that is
+        what stops an endless stream of arriving tasks from extending an unknown
+        forever, without killing a task that is still translating.
+        """
+        with self._status_lock:
+            return bool(self._retiring and self._proc is not None)
+
+    # -- request -------------------------------------------------------------
+
+    def _request_completion(self, request: dict, cancel_event):
+        """One local completion, abortable while the model is still thinking.
+
+        A local request is silent from the first byte to the last: no streaming,
+        one blocking read, up to the 600s client timeout. Without this, 取消 on a
+        local job was unreachable for as long as the model kept generating.
+
+        Aborting the HTTP request is *not* proof that llama-server stopped
+        generating - it only proves this process stopped waiting. The server is
+        shared with whatever other job holds a lease on it, so killing it to
+        cancel one job is not on the table; instead the backend is marked as
+        draining, and the page says so rather than implying the card is free.
+        """
+        port = self._port
+
+        async def operation():
+            client = self._make_async_client(port)
+            try:
+                result = client.chat.completions.create(**request)
+                # Tests replace the client with a plain synchronous double; the
+                # transport itself is async.
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+            finally:
+                await close_quietly(client)
+
+        try:
+            response = run_cancellable_request(operation, cancel_event=cancel_event)
+        except BaseException:
+            with self._status_lock:
+                if self._proc is not None:
+                    self._draining_since = time.time()
+                    # This generation is no longer trustworthy: it may still be
+                    # generating for a request nobody is reading. Existing users
+                    # keep it, new tasks get a fresh one once they let go.
+                    self._retiring = True
+            raise
+        # Deliberately *not* cleared here. The server runs several slots in
+        # parallel, so another request finishing says nothing about the one that
+        # was abandoned - there is no id to correlate them by. The unknown only
+        # ends when the process itself is confirmed gone.
+        return response
+
+    def drain_status(self) -> dict:
+        """A snapshot, taken without ever waiting on the lifecycle lock.
+
+        `self._lock` is held across model load and health checks - up to the
+        300s startup timeout. The page polls this every 5 seconds on the event
+        loop, so taking that lock here would stall the whole web app, cancel
+        endpoint included, for as long as a load takes.
+        """
+        with self._status_lock:
+            since = self._draining_since
+            proc = self._proc
+        try:
+            running = proc is not None and proc.poll() is None
+        except Exception:
+            running = proc is not None
+        if since is not None and not running:
+            # The process is gone, so nothing of that request survives it.
+            with self._status_lock:
+                if self._draining_since == since:
+                    self._draining_since = None
+            since = None
+        return {
+            "draining": bool(since is not None and running),
+            "since": float(since or 0.0),
+        }
 
     # -- TranslationBackend --------------------------------------------------
 
@@ -486,6 +827,9 @@ class LlamaCppServerBackend(BaseTranslationBackend):
     ) -> str:
         del stream, reasoning_effort
         self._raise_if_cancelled(cancel_event)
+        # Checked at the moment of use, not only by whoever resolved this object:
+        # a reset can land between a caller's lease check and this call.
+        self._raise_if_invalidated()
         self._ensure_server(cancel_event)
         self._raise_if_cancelled(cancel_event)
         self._emit_progress(on_progress, {"phase": "translating", "expected": expected_count})
@@ -499,7 +843,7 @@ class LlamaCppServerBackend(BaseTranslationBackend):
         wrapped = _wrap_response_format(response_format)
         if wrapped is not None:
             request["response_format"] = wrapped
-        response = self._client.chat.completions.create(**request)
+        response = self._request_completion(request, cancel_event)
         self._raise_if_cancelled(cancel_event)
         usage = getattr(response, "usage", None)
         if usage is not None:

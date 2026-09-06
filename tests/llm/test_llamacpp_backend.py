@@ -176,7 +176,10 @@ def test_the_schema_reaches_the_request(monkeypatch):
 
     backend = LlamaCppServerBackend()
     monkeypatch.setattr(backend, "_ensure_server", lambda cancel_event=None: None)
-    backend._client = _FakeClient()
+    # The request now runs as one cancellable async operation that owns its own
+    # client, so the double is injected where that client is built.
+    backend._port = 8080
+    monkeypatch.setattr(backend, "_make_async_client", lambda _port: _FakeClient())
 
     schema = {"type": "object", "properties": {"translations": {"type": "array"}}}
     backend.chat_completion([{"role": "user", "content": "x"}], response_format=schema)
@@ -274,6 +277,9 @@ def test_without_a_schema_the_request_stays_plain(monkeypatch):
 
     backend = LlamaCppServerBackend()
     monkeypatch.setattr(backend, "_ensure_server", lambda cancel_event=None: None)
-    backend._client = _FakeClient()
+    # The request now runs as one cancellable async operation that owns its own
+    # client, so the double is injected where that client is built.
+    backend._port = 8080
+    monkeypatch.setattr(backend, "_make_async_client", lambda _port: _FakeClient())
     backend.chat_completion([{"role": "user", "content": "x"}])
     assert "response_format" not in sent

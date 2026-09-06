@@ -46,7 +46,7 @@ def test_skip_translation_writes_japanese_srt(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"")
 
@@ -58,6 +58,7 @@ def test_skip_translation_writes_japanese_srt(monkeypatch, tmp_path):
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         assert device == "auto"
         assert env_overrides is not None

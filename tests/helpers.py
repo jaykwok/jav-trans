@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import wave
 from pathlib import Path
 
 import main
@@ -10,6 +11,23 @@ ASR_17B_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
 # Dropped on 2026-07-31. Kept only so tests can assert it is now rejected:
 # a repo id that used to be valid is exactly the one a stale `.env` will carry.
 RETIRED_06B_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
+
+
+def write_pcm_wav(path: Path | str, *, seconds: float = 0.1) -> Path:
+    """A wav that `pipeline.audio.audio_file_is_complete` accepts.
+
+    Extraction validates its output before publishing it, so a test double for
+    ffmpeg has to produce a real file in the pipeline's format rather than a
+    few placeholder bytes.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(target), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(16000)
+        writer.writeframes(b"\x00\x00" * int(16000 * seconds))
+    return target
 
 
 def make_job_context(
@@ -55,11 +73,13 @@ def run_pipeline(
     ctx: JobContext,
     *,
     cache_job_id: str = "",
+    run_id: str = "",
 ):
     artifacts = main.run_asr_alignment(
         str(video_path),
         ctx=ctx,
         job_id=ctx.job_id,
+        run_id=run_id,
         cache_job_id=cache_job_id,
     )
     return main.run_translation_and_write(
@@ -67,4 +87,5 @@ def run_pipeline(
         artifacts,
         ctx=ctx,
         job_id=ctx.job_id,
+        run_id=run_id,
     )

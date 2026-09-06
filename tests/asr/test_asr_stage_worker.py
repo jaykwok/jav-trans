@@ -121,6 +121,177 @@ def test_stage_worker_emits_heartbeat_while_provider_is_silent(monkeypatch, tmp_
     assert any(message.startswith("阶段心跳 ") for message in messages)
 
 
+class _FakeChild:
+    """A child that answers is_alive()/terminate()/kill() like mp.Process."""
+
+    def __init__(self, *, refuse_terminate=False, immortal=False):
+        self.alive = True
+        self.pid = 4321
+        self.exitcode = None
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.joins: list[float | None] = []
+        self._refuse_terminate = refuse_terminate
+        self._immortal = immortal
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.terminate_calls += 1
+        if self._refuse_terminate:
+            raise PermissionError("Access is denied")
+        if not self._immortal:
+            self.alive = False
+
+    def kill(self):
+        self.kill_calls += 1
+        if not self._immortal:
+            self.alive = False
+
+    def join(self, timeout=None):
+        self.joins.append(timeout)
+
+
+def test_cancel_raised_by_the_heartbeat_callback_still_kills_the_child(
+    monkeypatch,
+    tmp_path,
+):
+    # Cancellation is checked at the top of the wait loop, but the heartbeat
+    # callback re-checks it too (main._on_stage raises). A cancel landing
+    # between the two used to leave the loop through the heartbeat, where -
+    # unlike every other branch - nothing killed the GPU child: the job was
+    # reported cancelled while the worker kept transcribing on the card.
+    import time as _time
+
+    class FakeConnection:
+        def poll(self, _wait_s):
+            _time.sleep(0.02)
+            return False
+
+        def recv(self):  # pragma: no cover - never reached
+            raise AssertionError("no message should be read")
+
+    client = gpu_worker._GpuWorkerClient()
+    client._conn = FakeConnection()
+    client._process = SimpleNamespace(is_alive=lambda: True, exitcode=None)
+    monkeypatch.setattr(client, "_send_request", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("ASR_STAGE_WORKER_HEARTBEAT_S", "0.01")
+    killed = {"count": 0}
+
+    def fake_kill(self):
+        del self
+        killed["count"] += 1
+        return True
+
+    monkeypatch.setattr(gpu_worker._GpuWorkerClient, "_kill_child", fake_kill)
+
+    def cancelling_on_stage(_message):
+        raise main.PipelineCancelledError("任务已取消")
+
+    with pytest.raises(main.PipelineCancelledError):
+        client._transcribe_and_align_once(
+            str(tmp_path / "audio.wav"),
+            job_id="heartbeat-cancel",
+            on_stage=cancelling_on_stage,
+        )
+
+    assert killed["count"] == 1
+
+
+def test_kill_child_escalates_when_terminate_is_refused():
+    # terminate() raising used to skip kill() entirely (one try block, one
+    # swallowed exception) *after* the handles had already been cleared, so the
+    # caller believed the GPU was free while the child was still running.
+    client = gpu_worker._GpuWorkerClient()
+    child = _FakeChild(refuse_terminate=True)
+    client._process = child
+
+    assert client._kill_child() is True
+    assert child.terminate_calls == 1
+    assert child.kill_calls == 1
+    assert client._process is None
+
+
+def test_kill_child_closes_the_job_object_handle(monkeypatch):
+    # The Job Object handle is a raw integer; setting the attribute to None
+    # leaked it, and on Windows the kill-on-close job is the only thing that
+    # reaches a child's own grandchildren.
+    closed: list[int] = []
+    monkeypatch.setattr(
+        gpu_worker,
+        "close_kill_on_close_job",
+        lambda handle: bool(closed.append(handle)) or True,
+    )
+    client = gpu_worker._GpuWorkerClient()
+    client._process = _FakeChild()
+    client._job_handle = 987654
+
+    assert client._kill_child() is True
+    assert closed == [987654]
+    assert client._job_handle is None
+
+
+def test_child_that_survives_the_kill_blocks_a_replacement_worker(monkeypatch):
+    monkeypatch.setattr(gpu_worker, "close_kill_on_close_job", lambda _handle: True)
+    client = gpu_worker._GpuWorkerClient()
+    child = _FakeChild(immortal=True)
+    client._process = child
+
+    assert client._kill_child() is False
+    # The client keeps the only reference to a live GPU process...
+    assert client._process is child
+    assert client.has_unreleased_child()
+    # ...so nothing may start a second worker beside it.
+    with pytest.raises(gpu_worker.GpuWorkerError) as exc_info:
+        client._start_worker()
+    assert exc_info.value.kind == "cleanup_failed"
+
+
+def test_global_worker_is_not_replaced_while_a_child_survives(monkeypatch):
+    client = gpu_worker._GpuWorkerClient()
+    client._process = _FakeChild(immortal=True)
+    monkeypatch.setattr(gpu_worker, "_GLOBAL_WORKER", client)
+
+    assert gpu_worker._get_global_worker() is client
+
+
+def test_worker_startup_wait_is_cancellable(monkeypatch):
+    # Model load takes tens of seconds; without a cancel check here the user's
+    # 取消 was only noticed after the worker came up and the job was sent.
+    client = gpu_worker._GpuWorkerClient()
+    monkeypatch.setattr(client, "_kill_child", lambda: True)
+
+    class FakeConnection:
+        def poll(self, _wait_s):
+            return False
+
+        def close(self):
+            return None
+
+    def fake_process_factory(*_args, **_kwargs):
+        return SimpleNamespace(
+            start=lambda: None,
+            is_alive=lambda: True,
+            exitcode=None,
+            pid=1234,
+        )
+
+    monkeypatch.setattr(
+        client,
+        "_ctx",
+        SimpleNamespace(
+            Pipe=lambda duplex=True: (FakeConnection(), FakeConnection()),
+            Process=fake_process_factory,
+        ),
+    )
+
+    with pytest.raises(gpu_worker.GpuWorkerError) as exc_info:
+        client._start_worker(lambda: True)
+
+    assert exc_info.value.kind == "cancelled"
+
+
 def test_physical_ram_ratio_is_hard_oom(monkeypatch):
     monkeypatch.setenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "5600")
     with pytest.raises(RuntimeError, match="Physical RAM budget exceeded"):
@@ -484,7 +655,7 @@ def test_unified_asr_stage_worker_does_not_touch_cuda_in_main(monkeypatch, tmp_p
         lambda last_boundary_signature=None: {"asr": "sig"},
     )
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
@@ -496,6 +667,7 @@ def test_unified_asr_stage_worker_does_not_touch_cuda_in_main(monkeypatch, tmp_p
         job_id,
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         assert device == "auto"
         assert "ASR_STAGE_WORKER_MODE" not in env_overrides
@@ -559,6 +731,7 @@ def test_stage_worker_retries_with_lower_batch_on_hard_oom(monkeypatch, tmp_path
         job_id,
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         del audio_path, device, job_id, on_stage, cancel_requested
         calls.append(dict(env_overrides))
@@ -623,6 +796,7 @@ def test_stage_worker_keeps_successful_result_when_reserved_exceeds_budget(
         job_id,
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         del self, audio_path, device, job_id, cancel_requested
         return (
@@ -682,6 +856,7 @@ def test_stage_worker_stops_with_low_vram_guidance_when_batch_one_oom(
         job_id,
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         del audio_path, device, job_id, on_stage, cancel_requested
         calls.append(dict(env_overrides))

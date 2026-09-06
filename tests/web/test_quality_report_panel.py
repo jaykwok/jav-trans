@@ -52,6 +52,9 @@ async def _reset_pm_state() -> None:
     while not pm.gpu_queue.empty():
         pm.gpu_queue.get_nowait()
         pm.gpu_queue.task_done()
+    # See the note in test_cancel_resume: per-test loops need per-test queues.
+    pm.gpu_queue = asyncio.Queue()
+    pm.trans_queue = asyncio.Queue()
 
 
 async def _job_with_artifacts(tmp_path, artifacts: list[str], output_dir: Path):

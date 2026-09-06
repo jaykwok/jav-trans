@@ -16,7 +16,13 @@ from llm.profiles import json_v3
 from llm.profiles.base import ProfileContext
 from llm import settings as llm_settings
 from llm import transport_util
-from llm.backends import get_backend, selected_backend_name
+from llm import backends as backends_module
+from llm.backends import (
+    get_backend,
+    selected_backend_name,
+    task_backend,
+    task_backend_name,
+)
 from llm.backends import openai_compat as openai_transport
 from llm.glossary import normalize_glossary_text
 from llm import prompt as prompt_module
@@ -125,8 +131,10 @@ _save_memory_entries = translation_cache._save_memory_entries
 
 
 def _translation_model_identity() -> str:
-    backend_name = selected_backend_name()
-    return get_backend(backend_name).cache_identity()
+    # The instance this task leased, not "whatever answers to the selected name
+    # right now": a cache identity computed from a different instance than the
+    # one that will answer the request is a key that does not describe its value.
+    return task_backend().cache_identity()
 
 
 def _effective_reasoning_effort(override: str | None = None) -> str:
@@ -142,7 +150,7 @@ def _effective_reasoning_effort(override: str | None = None) -> str:
     a backend is assumed to think: including the tier in its keys can only cost
     reuse, while omitting it would reinstate the bug this function exists for.
     """
-    supports = getattr(get_backend(selected_backend_name()), "supports_reasoning", None)
+    supports = getattr(task_backend(), "supports_reasoning", None)
     if callable(supports) and not supports():
         return ""
     return _normalize_reasoning_effort(
@@ -301,7 +309,7 @@ def translate_segments(
         return [], [], []
 
     effective_max_workers = max(1, int(max_workers))
-    backend_name = selected_backend_name()
+    backend_name = task_backend_name()
     if backend_name == "llamacpp":
         # More client workers than server slots just queue inside llama-server
         # and inflate per-request latency past the watchdog timeouts.
@@ -350,6 +358,8 @@ def translate_segments(
         )
 
         job_id_for_worker_threads = hf_progress.current_job_id()
+        run_id_for_worker_threads = hf_progress.current_run_id()
+        lease_for_worker_threads = backends_module.current_lease()
 
         def _engine_chat(messages: list[dict], **chat_kwargs) -> str:
             # run_batched dispatches this from a ThreadPoolExecutor pool, and a
@@ -358,7 +368,14 @@ def translate_segments(
             # call starts the server) would otherwise emit model_download
             # events with an empty job_id, which the frontend silently drops
             # instead of showing a progress bar.
-            hf_progress.propagate_job_id_to_current_thread(job_id_for_worker_threads)
+            hf_progress.propagate_job_id_to_current_thread(
+                job_id_for_worker_threads,
+                run_id_for_worker_threads,
+            )
+            # Same reason, for the backend: a pool thread holds no lease of its
+            # own, and resolving the backend by name here is exactly the lookup
+            # the lease replaces.
+            backends_module.bind_lease(lease_for_worker_threads)
 
             # Late global lookup keeps the _chat/_chat_with_reasoning test
             # seams on this module working for engine-driven requests.
@@ -768,7 +785,7 @@ def _endpoint_identity() -> tuple[str, str] | None:
     Local backends never refuse a `max_tokens`, and keying a learned limit on
     their empty base URL would let one endpoint's ceiling answer for another.
     """
-    if selected_backend_name() != "openai":
+    if task_backend_name() != "openai":
         return None
     model = os.getenv("LLM_MODEL_NAME", llm_settings.LLM_MODEL_NAME).strip()
     if not model:
@@ -1011,9 +1028,11 @@ def _chat(
     effective_max_tokens = capability.budget(max_tokens, warn=True)
 
     def _dispatch(budget: int) -> str:
-        backend_name = selected_backend_name()
-        if backend_name != "openai":
-            backend = get_backend(backend_name)
+        # Resolved through the lease: re-reading the selected name here meant a
+        # task could hold a claim on one instance and send its requests to
+        # another, which the holder of *that* one was then free to close.
+        if task_backend_name() != "openai":
+            backend = task_backend()
             return backend.chat_completion(
                 messages,
                 temperature=TRANSLATION_TEMPERATURE,

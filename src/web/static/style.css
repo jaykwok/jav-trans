@@ -591,7 +591,7 @@ main {
   width: 5px; height: 5px; border-radius: 50%;
   background: currentColor;
 }
-.badge-asr::before, .badge-translating::before, .badge-writing::before, .badge-queued::before {
+.badge-asr::before, .badge-translating::before, .badge-writing::before, .badge-queued::before, .badge-cancelling::before {
   animation: badge-breathe 1.6s ease-in-out infinite;
 }
 @keyframes badge-breathe {
@@ -606,6 +606,30 @@ main {
 .badge-done        { background: var(--success-soft);       color: var(--success); border-color: rgba(52, 211, 153, 0.30); }
 .badge-failed      { background: var(--error-soft);         color: var(--error);   border-color: rgba(251, 113, 133, 0.30); }
 .badge-cancelled   { background: rgba(255, 255, 255, 0.04); color: var(--muted);   border-color: rgba(255, 255, 255, 0.08); }
+/* 停止中:已请求取消但还没停下来,用警告色和呼吸点表示"仍在运行" */
+.badge-cancelling  { background: var(--warn-soft);          color: var(--warn);    border-color: rgba(251, 191, 36, 0.26); }
+
+/* ── GPU 资源提示条:清理中 / 清理失败 ── */
+.gpu-alert {
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--warn-soft);
+  border: 1px solid rgba(251, 191, 36, 0.26);
+}
+.gpu-alert-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.gpu-alert-label { flex: 1; font-size: 12px; font-weight: 600; color: var(--warn); }
+.gpu-alert-label.danger { color: var(--error); }
+.gpu-alert-diagnostics {
+  margin: 8px 0 0;
+  padding: 8px;
+  max-height: 180px; overflow: auto;
+  font-size: 11px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-all;
+  color: var(--muted);
+  background: rgba(0, 0, 0, 0.22);
+  border-radius: var(--radius-sm);
+}
 
 /* ── 进度条:流动渐变 + 扫光 ── */
 .progress-bar {

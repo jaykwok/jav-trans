@@ -31,6 +31,12 @@ async def _reset_pm_state() -> None:
         pm._cancel_events.clear()
     await _drain_queue(pm.gpu_queue)
     await _drain_queue(pm.trans_queue)
+    # A module-level asyncio.Queue binds to the first loop that waits on it, and
+    # every test here runs its own asyncio.run(): reuse would kill the next
+    # test's workers with "bound to a different event loop" as soon as they
+    # await an empty get(). Hand each test fresh queues instead.
+    pm.gpu_queue = asyncio.Queue()
+    pm.trans_queue = asyncio.Queue()
 
 
 def test_pipeline_workers_overlap(tmp_path, monkeypatch):
@@ -43,12 +49,12 @@ async def _test_pipeline_workers_overlap(tmp_path, monkeypatch):
     asr_done_at: dict[str, float] = {}
     translation_started_at: dict[str, float] = {}
 
-    def fake_asr(job, cancel_event=None):
+    def fake_asr(job, _cancel_event, _run_id):
         time.sleep(0.3)
         asr_done_at[job.id] = time.perf_counter()
         return {"job_id": job.id}
 
-    def fake_translation(job, _asr_artifacts):
+    def fake_translation(job, _asr_artifacts, _cancel_event, _run_id):
         translation_started_at[job.id] = time.perf_counter()
         time.sleep(1.0)
         return []

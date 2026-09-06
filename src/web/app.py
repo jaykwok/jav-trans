@@ -78,6 +78,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await asyncio.sleep(0.05)
         events.configure_sink(f"tcp:127.0.0.1:{port}")
         await pipeline_manager.load_jobs()
+        await pipeline_manager.reclaim_stale_audio_partials()
         worker_tasks = await pipeline_manager.start_workers()
         yield
     finally:

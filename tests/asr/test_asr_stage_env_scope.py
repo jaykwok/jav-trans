@@ -53,7 +53,7 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         }
         return None
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
@@ -65,6 +65,7 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         seen["transcribe_env"] = {
             "ASR_BACKEND": env_overrides.get("ASR_BACKEND"),
@@ -152,7 +153,7 @@ def test_asr_stage_env_scope_passes_chunking_and_alignment_flags(monkeypatch, tm
     monkeypatch.setattr(main.asr_module, "get_backend_label", lambda: "mock_asr")
     monkeypatch.setattr(main.aligned_cache_module, "try_load_aligned_segments", lambda *a, **k: None)
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
@@ -164,6 +165,7 @@ def test_asr_stage_env_scope_passes_chunking_and_alignment_flags(monkeypatch, tm
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         seen["head_path"] = env_overrides.get("ASR_ALIGNMENT_HEAD_PATH")
         seen["min_pause"] = env_overrides.get("ASR_CHUNK_MIN_PAUSE_S")
@@ -230,7 +232,7 @@ def test_chunk_root_reaches_transcribe_but_not_aligned_signature(
         seen["cache_signature"] = expected_signature
         return None
 
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
@@ -242,6 +244,7 @@ def test_chunk_root_reaches_transcribe_but_not_aligned_signature(
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         seen["transcribe_chunk_root"] = env_overrides.get("ASR_CHUNK_ROOT")
         assert device == "auto"

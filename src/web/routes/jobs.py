@@ -53,6 +53,18 @@ async def retry_job(job_id: str) -> JobState:
     return retried
 
 
+@router.get("/gpu-state")
+async def get_gpu_state() -> dict:
+    """Whether an unstoppable child still owns the GPU, and the diagnostics."""
+    return pm.gpu_cleanup_status()
+
+
+@router.post("/gpu-state/retry-cleanup")
+async def post_gpu_cleanup_retry() -> dict:
+    """重试清理 / 重新检查: one attempt, then the state it left behind."""
+    return await pm.retry_gpu_cleanup()
+
+
 @router.delete("/jobs")
 async def delete_finished_jobs() -> dict[str, int]:
     removed = await pm.remove_finished_jobs()

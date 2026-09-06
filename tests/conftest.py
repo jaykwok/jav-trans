@@ -41,6 +41,20 @@ def _close_test_local_translation_backend():
         pass
 
 
+@pytest.fixture(autouse=True)
+def _reset_gpu_cleanup_state():
+    yield
+    # A test that leaves the GPU marked "cleanup_failed" would pause dispatch
+    # for every later test (and keep the retry watchdog awake). Releasing it
+    # here also ends the watchdog loop at its next wake-up.
+    try:
+        from core import resources
+
+        resources.forget_all()
+    except Exception:
+        pass
+
+
 def _default_tmp_root() -> Path:
     try:
         user = getpass.getuser() or "user"

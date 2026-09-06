@@ -23,6 +23,27 @@ def unsubscribe(q: asyncio.Queue[str]) -> None:
         _subscribers.remove(q)
 
 
+def _is_stale_run(event: dict) -> bool:
+    """Did a previous execution of this job send this?
+
+    Both defences are needed: dropping it here keeps the browser from showing a
+    cancelled run's progress under the retry, and `update_job_progress` makes
+    the same check inside the state lock so the stored job cannot be rewritten
+    by it either. An event without a run id cannot be judged and is kept.
+    """
+    job_id = str(event.get("job_id", "") or "")
+    run_id = str(event.get("run_id", "") or "")
+    if not job_id or not run_id:
+        return False
+    try:
+        from web import pipeline_manager
+
+        active = pipeline_manager.active_run_id(job_id)
+    except Exception:
+        return False
+    return bool(active) and active != run_id
+
+
 def publish(event_line: str) -> None:
     line = str(event_line).strip()
     if not line:
@@ -32,6 +53,8 @@ def publish(event_line: str) -> None:
     except json.JSONDecodeError:
         event = None
     if isinstance(event, dict):
+        if _is_stale_run(event):
+            return
         job_id = str(event.get("job_id", "") or "")
         if job_id and event.get("stage") != "timing_summary":
             progress = {
@@ -60,7 +83,11 @@ def publish(event_line: str) -> None:
 
                 loop = asyncio.get_running_loop()
                 task = loop.create_task(
-                    pipeline_manager.update_job_progress(job_id, progress)
+                    pipeline_manager.update_job_progress(
+                        job_id,
+                        progress,
+                        run_id=str(event.get("run_id", "") or ""),
+                    )
                 )
                 _pending_progress_tasks.add(task)
                 task.add_done_callback(_pending_progress_tasks.discard)

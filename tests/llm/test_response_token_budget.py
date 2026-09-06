@@ -109,8 +109,8 @@ def test_the_budget_reaches_the_backend(monkeypatch):
             sent.update(kwargs)
             return '{"translations": []}'
 
-    monkeypatch.setattr(translator, "selected_backend_name", lambda: "llamacpp")
-    monkeypatch.setattr(translator, "get_backend", lambda name: _Backend())
+    monkeypatch.setattr(translator, "task_backend_name", lambda: "llamacpp")
+    monkeypatch.setattr(translator, "task_backend", _Backend)
     translator._chat([{"role": "user", "content": "x"}], max_tokens=777)
     assert sent["max_tokens"] == 777
 
@@ -125,8 +125,8 @@ def test_no_budget_falls_back_to_the_configured_ceiling(monkeypatch):
             sent.update(kwargs)
             return '{"translations": []}'
 
-    monkeypatch.setattr(translator, "selected_backend_name", lambda: "llamacpp")
-    monkeypatch.setattr(translator, "get_backend", lambda name: _Backend())
+    monkeypatch.setattr(translator, "task_backend_name", lambda: "llamacpp")
+    monkeypatch.setattr(translator, "task_backend", _Backend)
     translator._chat([{"role": "user", "content": "x"}])
     assert sent["max_tokens"] == translator.TRANSLATION_MAX_TOKENS
 
@@ -143,8 +143,8 @@ def test_a_budget_can_only_lower_the_ceiling(monkeypatch):
             sent.update(kwargs)
             return '{"translations": []}'
 
-    monkeypatch.setattr(translator, "selected_backend_name", lambda: "llamacpp")
-    monkeypatch.setattr(translator, "get_backend", lambda name: _Backend())
+    monkeypatch.setattr(translator, "task_backend_name", lambda: "llamacpp")
+    monkeypatch.setattr(translator, "task_backend", _Backend)
     translator._chat(
         [{"role": "user", "content": "x"}],
         max_tokens=translator.TRANSLATION_MAX_TOKENS * 10,
@@ -286,8 +286,8 @@ class TestBoundedSchema:
                 sent.update(kwargs)
                 return '{"translations": []}'
 
-        monkeypatch.setattr(translator, "selected_backend_name", lambda: "llamacpp")
-        monkeypatch.setattr(translator, "get_backend", lambda name: _Backend())
+        monkeypatch.setattr(translator, "task_backend_name", lambda: "llamacpp")
+        monkeypatch.setattr(translator, "task_backend", _Backend)
         bounded = get_profile("json").bounded_schema(_segments("こんばんは"))
         translator._chat(
             [{"role": "user", "content": "x"}], bounded_response_schema=bounded
@@ -307,7 +307,7 @@ class TestBoundedSchema:
             seen.update(kwargs)
             return '{"translations": []}'
 
-        monkeypatch.setattr(translator, "selected_backend_name", lambda: "openai")
+        monkeypatch.setattr(translator, "task_backend_name", lambda: "openai")
         monkeypatch.setattr(translator, "_chat_responses", _fake_completions)
         bounded = get_profile("json").bounded_schema(_segments("こんばんは"))
         translator._chat(

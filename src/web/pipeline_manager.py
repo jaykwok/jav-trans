@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from core import events
+from core import resources
 from core.config import DEFAULT_SETTINGS
 from core.job_context import JobContext
 from core.stage_errors import describe_stage_failure
@@ -23,8 +24,11 @@ from pipeline.artifacts import (
     write_translation_artifacts_snapshot,
 )
 from pipeline.aligned_cache import try_load_aligned_segments
-from pipeline.audio import get_audio_cache_key
+from pipeline.audio import get_audio_cache_key, reclaim_stale_partials
+from pipeline import gpu_worker as asr_gpu
 from pipeline.ids import sanitize_job_id
+from llm import backends as llm_backends
+from utils import subprocess_tools
 import main as pipeline_main
 from main import run_asr_alignment, run_translation_and_write
 from utils.model_paths import PROJECT_ROOT
@@ -61,6 +65,13 @@ _state_lock = asyncio.Lock()
 _jobs_path = PROJECT_ROOT / "tmp" / "web" / "jobs.json"
 _FINISHED_STATUSES = {"done", "failed", "cancelled"}
 _RETRYABLE_STATUSES = {"failed", "cancelled"}
+# "cancelling" is 已请求取消: the stop signal is out but the run has not reached
+# a checkpoint yet. It is deliberately not retryable - a retry while the old run
+# is still working is the situation run ids exist to survive, not to invite.
+_CANCELLING_STATUSES = {"cancelled", "cancelling"}
+# How often a job held back by a blocked GPU re-checks. Short enough that the
+# queue resumes on its own once cleanup confirms.
+_GPU_BLOCKED_POLL_S = 2.0
 _last_progress_write_ts: dict[str, float] = {}
 _jobs_write_lock = threading.Lock()
 
@@ -103,7 +114,7 @@ def _write_jobs_unlocked() -> None:
     _write_jobs_snapshot(list(_jobs.values()))
 
 
-_ACTIVE_STATUSES = {"queued", "asr", "translating", "writing"}
+_ACTIVE_STATUSES = {"queued", "asr", "translating", "writing", "cancelling"}
 
 
 async def load_jobs() -> None:
@@ -174,16 +185,24 @@ async def _set_job(
     artifacts: list[str] | None = None,
     error: str | None = None,
     expected_cancel_event: threading.Event | None = None,
+    expected_run_id: str | None = None,
 ) -> JobState:
     persist_snapshot: list[JobState] | None = None
     async with _state_lock:
         current = _jobs.get(job.id)
         if current is None:
             return job
+        # Both checks are the same question - "is the run reporting this still
+        # the current one?" - asked of the two things a run is identified by.
+        # The run id is the durable one (it survives a restart and travels with
+        # every event); the event object also covers records written before run
+        # ids existed.
         if (
             expected_cancel_event is not None
             and _cancel_events.get(job.id) is not expected_cancel_event
         ):
+            return current
+        if expected_run_id is not None and current.run_id != expected_run_id:
             return current
         if status is not None:
             current.status = status  # type: ignore[assignment]
@@ -203,6 +222,22 @@ async def _set_job(
 
 def _new_cancel_event() -> threading.Event:
     return threading.Event()
+
+
+def _new_run_id() -> str:
+    return uuid.uuid4().hex
+
+
+def active_run_id(job_id: str) -> str:
+    """The run a job is executing right now, for filtering events by hand.
+
+    Deliberately lock-free: the SSE fan-out runs on the event loop for every
+    line and only needs the latest published value. A read that races a retry
+    can only drop or admit one event at the moment of the swap, which the
+    state-lock check on the write path then settles.
+    """
+    job = _jobs.get(job_id)
+    return str(getattr(job, "run_id", "") or "") if job is not None else ""
 
 
 def _discard_cancel_event(job_id: str) -> None:
@@ -263,8 +298,27 @@ def _resume_cache_job_id(job: JobState) -> str:
     return job.id
 
 
+def _jobs_temp_root() -> Path:
+    return PROJECT_ROOT / "tmp" / "web" / "jobs"
+
+
 def _job_temp_dir(job_id: str) -> str:
-    return str((PROJECT_ROOT / "tmp" / "web" / "jobs" / sanitize_job_id(job_id)).resolve())
+    return str((_jobs_temp_root() / sanitize_job_id(job_id)).resolve())
+
+
+async def reclaim_stale_audio_partials() -> int:
+    """Drop extraction partials that no live run can still own.
+
+    Publishing audio atomically means an interrupted extraction leaves a
+    `.partial` instead of a poisoned cache entry; nothing reads those, so this
+    is only about disk. Age-based on purpose - a CLI run beside the app may be
+    writing one right now.
+    """
+    try:
+        return await asyncio.to_thread(reclaim_stale_partials, _jobs_temp_root())
+    except Exception:
+        log.exception("Failed to reclaim stale audio partials")
+        return 0
 
 
 def _remove_job_temp_dir(job_id: str) -> None:
@@ -333,19 +387,22 @@ def _job_context(job: JobState) -> JobContext:
     )
 
 
-def _run_asr_alignment(job: JobState, cancel_event=None):
-    events.set_current_job_id(job.id)
+def _run_asr_alignment(job: JobState, cancel_event: threading.Event, run_id: str):
+    # Identity and stop signal both arrive as arguments and are never looked up
+    # here. `_cancel_events[job.id]` and `_jobs[job.id].run_id` are the *current*
+    # run's; a retry replaces both, so a thread resolving them after it was
+    # handed to the executor would pick up the new run's (unset) event and stamp
+    # its own late events with the new run's id.
+    events.set_current_run(job.id, run_id)
     from utils import hf_progress as _hf_progress
 
-    _hf_progress.set_current_job_id(job.id)
+    _hf_progress.set_current_job_id(job.id, run_id)
     try:
-        cancel_event = cancel_event or _cancel_events.setdefault(
-            job.id,
-            _new_cancel_event(),
-        )
         artifacts = run_asr_alignment(
             job.spec.video_paths[0],
             ctx=_job_context(job),
+            job_id=job.id,
+            run_id=run_id,
             cache_job_id=_resume_cache_job_id(job),
             cancel_event=cancel_event,
         )
@@ -370,14 +427,23 @@ def _run_asr_alignment(job: JobState, cancel_event=None):
         _hf_progress.set_current_job_id("")
 
 
-def _run_translation_and_write(job: JobState, asr_artifacts) -> list[str]:
-    events.set_current_job_id(job.id)
-    cancel_event = _cancel_events.setdefault(job.id, _new_cancel_event())
+def _run_translation_and_write(
+    job: JobState,
+    asr_artifacts,
+    cancel_event: threading.Event,
+    run_id: str,
+) -> list[str]:
+    # Same rule as the ASR path: use the event and run the worker captured for
+    # *this* run. Re-reading `_cancel_events[job.id]` here handed a cancelled-
+    # then-retried job's old translation the new run's event, and the old batch
+    # kept spending tokens because its own cancel flag was no longer reachable.
+    events.set_current_run(job.id, run_id)
     return run_translation_and_write(
         job.spec.video_paths[0],
         asr_artifacts,
         ctx=_job_context(job),
         job_id=job.id,
+        run_id=run_id,
         cancel_event=cancel_event,
     )
 
@@ -427,27 +493,121 @@ def _relative_artifacts(paths: list[str], output_dir: str | None) -> list[str]:
     return result
 
 
+def gpu_cleanup_status() -> dict[str, Any]:
+    """GPU ownership as the page needs to show it: 正在清理 / 清理失败 / 已释放.
+
+    Also carries the media children `run_cancellable` could not confirm it
+    released, so "查看诊断信息" has one place to look instead of two.
+    """
+    status = dict(resources.snapshot())
+    # The ASR worker's own view stays available for the parts of the page that
+    # only speak about it, but it is no longer what "is the GPU free?" reads.
+    status["asr"] = asr_gpu.asr_gpu_cleanup_status()
+    status["orphan_media_children"] = subprocess_tools.unreleased_children()
+    # A cancelled local request releases this process, not necessarily the
+    # server's slot. Shown, never acted on: the server is shared.
+    local = dict(llm_backends.local_backend_drain_status())
+    # A local server we could not confirm we stopped, on the other hand, does
+    # block: it still holds its VRAM and refuses to load a replacement.
+    local["cleanup"] = llm_backends.local_backend_cleanup_status()
+    status["local_translation"] = local
+    # One answer for "may a GPU stage start?", covering every owner of the card.
+    # A page (or a queue) reading only the ASR worker's state would call the GPU
+    # free while a llama-server nobody could stop still had the model resident.
+    status["gpu_blocked"] = status["blocked"]
+    # Diagnostics: every pending record, whoever owns it.
+    status["pending_resources"] = status.pop("pending")
+    return status
+
+
+def gpu_admission_blocked() -> bool:
+    """Does anything still hold the GPU? Asked of every owner, not just ASR.
+
+    A leaked Job Object handle deliberately does not count: the process inside
+    it is confirmed gone, so it holds no VRAM. It is tracked and retried on its
+    own, which is a different problem from "the card is occupied".
+    """
+    return resources.gpu_blocked()
+
+
+async def retry_gpu_cleanup() -> dict[str, Any]:
+    """Manual 重试清理 / 重新检查. Runs off the loop: a kill attempt blocks.
+
+    One request against the resource registry, which retries only records that
+    are already waiting for cleanup. It cannot escalate into "stop what is
+    running now" - that used to be possible through the local backend, where the
+    button shut down a healthy server another job was translating through.
+    """
+    await asyncio.to_thread(resources.retry_pending)
+    # The local backend keeps one extra bookkeeping step of its own: a confirmed
+    # stop lets the instance leave the backend registry.
+    await asyncio.to_thread(llm_backends.retry_local_backend_cleanup)
+    return gpu_cleanup_status()
+
+
+async def _wait_for_gpu_release(
+    job: JobState,
+    cancel_event: threading.Event,
+    run_id: str,
+) -> bool:
+    """Hold a job back while a child we could not stop still owns the GPU.
+
+    Refusing to start a second worker is only half an answer: without this the
+    job would fail one by one against a busy GPU, and the user would be left
+    retrying by hand. Dispatch pauses instead, and resumes by itself as soon as
+    the cleanup confirms. Returns False when the job was cancelled while waiting.
+    """
+    announced = False
+    while gpu_admission_blocked():
+        if cancel_event.is_set() or job.status in _CANCELLING_STATUSES:
+            await _set_job(
+                job,
+                status="cancelled",
+                current_stage="cancelled",
+                expected_cancel_event=cancel_event,
+                expected_run_id=run_id,
+            )
+            return False
+        if not announced:
+            await _set_job(
+                job,
+                status="queued",
+                current_stage="gpu_blocked",
+                expected_cancel_event=cancel_event,
+                expected_run_id=run_id,
+            )
+            announced = True
+        await asyncio.sleep(_GPU_BLOCKED_POLL_S)
+    return True
+
+
 async def gpu_worker() -> None:
     while True:
         job = await gpu_queue.get()
         cancel_event: threading.Event | None = None
+        run_id = ""
         try:
             async with _state_lock:
                 if _jobs.get(job.id) is not job:
                     continue
                 cancel_event = _cancel_events.setdefault(job.id, _new_cancel_event())
-            if cancel_event.is_set() or job.status == "cancelled":
+                run_id = job.run_id
+            if cancel_event.is_set() or job.status in _CANCELLING_STATUSES:
                 await _set_job(
                     job,
                     status="cancelled",
                     expected_cancel_event=cancel_event,
+                    expected_run_id=run_id,
                 )
+                continue
+            if not await _wait_for_gpu_release(job, cancel_event, run_id):
                 continue
             await _set_job(
                 job,
                 status="asr",
                 current_stage="asr",
                 expected_cancel_event=cancel_event,
+                expected_run_id=run_id,
             )
             loop = asyncio.get_running_loop()
             asr_artifacts = await loop.run_in_executor(
@@ -455,6 +615,7 @@ async def gpu_worker() -> None:
                 _run_asr_alignment,
                 job,
                 cancel_event,
+                run_id,
             )
             # Check cancel again after executor returns: if cancel happened inside the
             # executor (between its last checkpoint and return), the artifacts are
@@ -465,6 +626,7 @@ async def gpu_worker() -> None:
                     status="cancelled",
                     current_stage="cancelled",
                     expected_cancel_event=cancel_event,
+                    expected_run_id=run_id,
                 )
                 continue
             await _set_job(
@@ -472,12 +634,13 @@ async def gpu_worker() -> None:
                 status="translating",
                 current_stage="translation",
                 expected_cancel_event=cancel_event,
+                expected_run_id=run_id,
             )
             await trans_queue.put((job, asr_artifacts))
         except Exception as exc:
             if (
                 _is_pipeline_cancelled(exc)
-                or job.status == "cancelled"
+                or job.status in _CANCELLING_STATUSES
                 or (cancel_event is not None and cancel_event.is_set())
             ):
                 await _set_job(
@@ -485,6 +648,7 @@ async def gpu_worker() -> None:
                     status="cancelled",
                     current_stage="cancelled",
                     expected_cancel_event=cancel_event,
+                    expected_run_id=run_id,
                 )
             else:
                 log.exception("ASR job failed: job_id=%s", job.id)
@@ -493,6 +657,7 @@ async def gpu_worker() -> None:
                     status="failed",
                     error=_public_error_message(exc),
                     expected_cancel_event=cancel_event,
+                    expected_run_id=run_id,
                 )
         finally:
             gpu_queue.task_done()
@@ -502,16 +667,19 @@ async def translation_worker() -> None:
     while True:
         job, asr_artifacts = await trans_queue.get()
         cancel_event: threading.Event | None = None
+        run_id = ""
         try:
             async with _state_lock:
                 if _jobs.get(job.id) is not job:
                     continue
                 cancel_event = _cancel_events.setdefault(job.id, _new_cancel_event())
-            if cancel_event.is_set() or job.status == "cancelled":
+                run_id = job.run_id
+            if cancel_event.is_set() or job.status in _CANCELLING_STATUSES:
                 await _set_job(
                     job,
                     status="cancelled",
                     expected_cancel_event=cancel_event,
+                    expected_run_id=run_id,
                 )
                 continue
             await _set_job(
@@ -519,6 +687,7 @@ async def translation_worker() -> None:
                 status="translating",
                 current_stage="translation_context",
                 expected_cancel_event=cancel_event,
+                expected_run_id=run_id,
             )
             loop = asyncio.get_running_loop()
             output_paths = await loop.run_in_executor(
@@ -526,6 +695,8 @@ async def translation_worker() -> None:
                 _run_translation_and_write,
                 job,
                 asr_artifacts,
+                cancel_event,
+                run_id,
             )
             if cancel_event.is_set():
                 await _set_job(
@@ -533,6 +704,7 @@ async def translation_worker() -> None:
                     status="cancelled",
                     current_stage="cancelled",
                     expected_cancel_event=cancel_event,
+                    expected_run_id=run_id,
                 )
                 continue
             artifacts = _relative_artifacts(output_paths, job.spec.output_dir)
@@ -542,11 +714,12 @@ async def translation_worker() -> None:
                 current_stage="done",
                 artifacts=artifacts,
                 expected_cancel_event=cancel_event,
+                expected_run_id=run_id,
             )
         except Exception as exc:
             if (
                 _is_pipeline_cancelled(exc)
-                or job.status == "cancelled"
+                or job.status in _CANCELLING_STATUSES
                 or (cancel_event is not None and cancel_event.is_set())
             ):
                 await _set_job(
@@ -554,6 +727,7 @@ async def translation_worker() -> None:
                     status="cancelled",
                     current_stage="cancelled",
                     expected_cancel_event=cancel_event,
+                    expected_run_id=run_id,
                 )
             else:
                 log.exception("translation job failed: job_id=%s", job.id)
@@ -562,6 +736,7 @@ async def translation_worker() -> None:
                     status="failed",
                     error=_public_error_message(exc),
                     expected_cancel_event=cancel_event,
+                    expected_run_id=run_id,
                 )
         finally:
             trans_queue.task_done()
@@ -577,6 +752,7 @@ async def create_job(spec: JobSpec) -> list[JobState]:
             id=job_id,
             spec=child_spec,
             created_at=_utc_now(),
+            run_id=_new_run_id(),
             status="queued",
         )
         async with _state_lock:
@@ -608,9 +784,17 @@ async def cancel_job(job_id: str) -> bool:
             return False
         event = _cancel_events.setdefault(job_id, _new_cancel_event())
         event.set()
-        if job.status not in ("done", "failed", "cancelled"):
+        if job.status == "queued":
+            # Nothing is executing it yet, so there is nothing to wind down.
             job.status = "cancelled"
             job.current_stage = "cancelled"
+        elif job.status not in _FINISHED_STATUSES:
+            # 已请求取消, not 已取消: a worker thread owns this run and is still
+            # between checkpoints. Calling it "cancelled" here is what let the
+            # page offer 重试 while the previous run was still spending tokens.
+            # Whichever worker owns it flips it to "cancelled" once it stops.
+            job.status = "cancelling"
+            job.current_stage = "cancelling"
         _write_jobs_unlocked()
         return True
 
@@ -625,6 +809,10 @@ async def retry_job(job_id: str) -> JobState | None:
         retried = job.model_copy(
             update={
                 "spec": _refresh_translation_settings(job.spec),
+                # A retry is a new execution of the same job: new run id, so
+                # anything the previous run still emits can be told apart from
+                # this one's instead of overwriting its progress.
+                "run_id": _new_run_id(),
                 "status": "queued",
                 "current_stage": None,
                 "progress": {},
@@ -714,15 +902,33 @@ async def _eviction_loop() -> None:
         await evict_old_jobs()
 
 
-async def update_job_progress(job_id: str, progress: dict[str, Any]) -> None:
+async def update_job_progress(
+    job_id: str,
+    progress: dict[str, Any],
+    *,
+    run_id: str = "",
+) -> None:
     persist_snapshot: list[JobState] | None = None
     async with _state_lock:
         job = _jobs.get(job_id)
         if job is None:
             return
+        # Inside the state lock, so the run cannot be swapped between the check
+        # and the write. An event with no run id (the CLI, or anything written
+        # before run ids) is not filtered - there is nothing to compare.
+        if run_id and job.run_id and run_id != job.run_id:
+            return
         job.progress = dict(progress)
         stage = progress.get("stage")
-        if isinstance(stage, str) and stage:
+        # A cancelled run keeps emitting until it reaches a checkpoint, and
+        # those events are its *own* - the run id matches, so no filter catches
+        # them. Counters may still move (they are what the run was doing), but
+        # the cancel stage is not theirs to undo: letting a translation event
+        # write "translating" back over 停止中 put the card straight back to
+        # looking like a job that had restarted itself. Only the worker that
+        # owns the run moves it out of cancelling, and only into a final state.
+        cancel_pending = job.status == "cancelling"
+        if isinstance(stage, str) and stage and not cancel_pending:
             job.current_stage = stage
             status = _EVENT_STAGE_STATUS.get(stage)
             if status and job.status not in _FINISHED_STATUSES:

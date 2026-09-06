@@ -30,7 +30,7 @@ def _configure_headless(monkeypatch) -> None:
 
 
 def _mock_minimal_pipeline(monkeypatch, segments: list[dict]) -> None:
-    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
         path = Path(out_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(
@@ -47,6 +47,7 @@ def _mock_minimal_pipeline(monkeypatch, segments: list[dict]) -> None:
         job_id="",
         on_stage=None,
         cancel_requested=None,
+        **_run_kwargs,
     ):
         assert device == "auto"
         assert env_overrides is not None
@@ -133,6 +134,35 @@ def test_stage_events_memory_sink_records_pipeline_events(monkeypatch, tmp_path)
         assert event["video"] == "sample.mp4"
         assert os.sep not in event["video"]
         assert "/" not in event["video"]
+
+
+def test_every_stage_event_carries_the_run_that_produced_it(monkeypatch, tmp_path):
+    """Without this the web layer cannot tell a retry's events from its
+    predecessor's: both arrive under the same job id, and the older run keeps
+    emitting until its threads reach a checkpoint."""
+    events.configure_sink("memory")
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"fake-video")
+    _configure_headless(monkeypatch)
+    ctx = make_job_context(
+        video_path,
+        tmp_path / "out",
+        tmp_path / "jobs",
+        subtitle_mode="bilingual",
+        skip_translation=True,
+        keep_temp_files=True,
+    )
+    _mock_minimal_pipeline(
+        monkeypatch,
+        [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+    )
+
+    run_pipeline(video_path, ctx, run_id="run-abc")
+
+    emitted = events.get_memory_events()
+    assert emitted
+    assert {event.get("run_id") for event in emitted} == {"run-abc"}
+    assert {event.get("job_id") for event in emitted} == {ctx.job_id}
 
 
 def test_empty_stage_event_sink_is_silent(monkeypatch, tmp_path, capsys):
