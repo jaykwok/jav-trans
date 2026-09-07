@@ -1,29 +1,9 @@
-"""Post-translation settled-rendering index (the "extra glossary").
+"""Observe recurring first-pass renderings for inspection, without model calls.
 
-Used to guess this with a dedicated LLM call before translation started: give
-it the whole film and ask it to name 10-20 recurring terms with a suggested
-Chinese rendering. Retired 2026-09-01 after two measured failures traced to
-the same root cause - the guess was fiction until the base pass actually ran:
-
-* Unmetered: the extraction request's usage was never threaded through
-  ``on_usage``, so its tokens never appeared in a film's cost total.
-* Wrong: asked to invent a rendering for the character name "オナ美" before any
-  line of the film had been translated, the model returned "小穴" (the female
-  anatomy term) - and that guess then rode into the base pass as a "settled"
-  translation every batch was told to keep.
-
-Nothing here calls the model anymore. ``derive_settled_glossary`` runs after
-the base pass instead of before it, over lines that already have a real
-translation: when the same Japanese line was sent more than once (this
-genre's dialogue repeats constantly - moans, stock phrases, scene-transition
-lines) and the base pass rendered it the same way most of the time, that
-majority rendering is a fact about what the film actually says, not a guess
-about what it might. Profiles opt in via ``wants_repair_pass`` (there being
-no earlier point at which this index could exist, it never reaches the base
-pass - only the repair pass, as extra context and as a new self-consistency
-detector). The on-disk artifact keeps the pre-2026-09-01 filename and
-``{"terms":[{"ja":...,"zh":...}]}`` shape so ``pipeline/quality.py``'s reader
-needs no change; only who writes it, and when, moved.
+A majority rendering describes model output, not the meaning of every occurrence.
+The pipeline saves this index as a diagnostic artifact; it does not promote
+repeated dialogue to mandatory terminology or feed it into automatic repair.
+Only the user's glossary governs terminology compliance.
 """
 
 from __future__ import annotations
@@ -44,11 +24,8 @@ _HAN_RE = re.compile(r"[㐀-䶿一-鿿豈-﫿]")
 def _is_usable_target(zh: str) -> bool:
     """A target that is not Chinese teaches the wrong lesson, so it is dropped.
 
-    These pairs are injected back into the repair prompt as settled
-    translations, so a target carrying kana, or written in Latin letters, is an
-    instruction to leave Japanese in the subtitle. Structural rather than
-    prompt-dependent on purpose: a model told to answer in Chinese has still
-    returned bare romanised names for a whole line before now.
+    This diagnostic index is for recurring Chinese renderings. Exclude source
+    remnants and bare romanised names instead of presenting them as vocabulary.
     """
     if _KANA_RE.search(zh):
         return False
@@ -220,7 +197,7 @@ def resolve_settled_glossary(
     cache_path: str,
     glossary: str,
 ) -> str:
-    """The formatted repair-context block, derived from what the film actually says.
+    """Save the observation artifact and return its optional display summary.
 
     Writes the same on-disk artifact the pre-extraction used to (path keyed by
     a digest of the source text, same ``{"terms":[...]}`` shape) so

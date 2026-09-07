@@ -30,14 +30,32 @@ _emit_progress = transport_util._emit_progress
 
 
 def _split_into_batches(segments: list[dict], batch_size: int) -> list[list[dict]]:
-    if not segments:
-        return []
-    if batch_size <= 0:
-        return [segments]
-    return [
-        segments[index : index + batch_size]
-        for index in range(0, len(segments), batch_size)
-    ]
+    from llm.context import split_batches
+    from llm import settings
+
+    return split_batches(
+        segments, batch_size, max_source_chars=settings.TRANSLATION_BATCH_MAX_SOURCE_CHARS
+    )
+
+
+def cache_scope(
+    source_context, profile: TranslationProfile, model_identity: str, *, backend_name: str = "openai"
+) -> str:
+    """Include every source occurrence and actual sampling recipe in reuse."""
+    import hashlib
+    import json
+    from llm import settings
+
+    sampling = {
+        "temperature": settings.TRANSLATION_TEMPERATURE,
+        "top_p": settings.TRANSLATION_TOP_P,
+        **(profile.sampling_parameters() if backend_name == "llamacpp" else {}),
+    }
+    payload = json.dumps(
+        [source_context.signature, model_identity, sampling],
+        ensure_ascii=False, sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
 class _SiblingBatchAborted(Exception):
@@ -246,6 +264,7 @@ def run_batched(
     on_batch_done=None,
     on_progress: Callable[[dict], None] | None = None,
     cancel_event: threading.Event | None = None,
+    source_context=None,
 ) -> tuple[list[str], list[dict], list[dict]]:
     """Free-parallel batch loop for id-addressed profiles (the JSON contract).
 
@@ -258,7 +277,16 @@ def run_batched(
     """
     _raise_if_cancelled(cancel_event)
     started = time.perf_counter()
+    from llm.context import SourceContext
+
+    source_context = source_context or SourceContext.build(segments, external_context=full_context)
     batches = _split_into_batches(segments, batch_size)
+    context_signature = cache_scope(source_context, profile, model_identity, backend_name=backend_name)
+    batch_starts: list[int] = []
+    offset = 0
+    for batch in batches:
+        batch_starts.append(offset)
+        offset += len(batch)
     expected_total = len(segments)
     prefix_mode = prefix_mode_label(use_full_json_prefix)
     progress_callbacks, _ = _make_aggregated_progress_callback(
@@ -286,6 +314,7 @@ def run_batched(
             compact_system_prompt=compact_system_prompt,
             batch_index=batch_index,
             warmup=warmup,
+            source_context=source_context,
         )
 
     zh_texts: list[str | None] = [None] * expected_total
@@ -325,9 +354,10 @@ def run_batched(
             compact_system_prompt=compact_system_prompt,
             reasoning_effort=reasoning_effort,
             prefix_mode=prefix_mode,
+            context_signature=context_signature,
         )
 
-    def _memory_key_for(source_text: str) -> str:
+    def _memory_key_for(source_text: str, occurrence_id: int) -> str:
         return translation_cache._translation_memory_key(
             source_text,
             extra_glossary,
@@ -337,14 +367,29 @@ def run_batched(
             prompt_version=prompt_version,
             model_name=model_identity,
             reasoning_effort=reasoning_effort,
+            context_signature=context_signature,
+            occurrence_id=occurrence_id,
         )
+
+    def valid_cached(source: str, text) -> bool:
+        if not isinstance(text, str) or not text.strip():
+            return False
+        try:
+            profile.validate_translation(source, text, target_lang)
+            return True
+        except RetryableTranslationFormatError:
+            return False
 
     for batch_index, batch_segments in enumerate(batches):
         _raise_if_cancelled(cancel_event)
         batch_key = _batch_key_for(batch_index, batch_segments)
         cached_texts = cache_map.get(batch_key)
-        start_index = batch_index * batch_size
-        if isinstance(cached_texts, list) and len(cached_texts) == len(batch_segments):
+        start_index = batch_starts[batch_index]
+        if (
+            isinstance(cached_texts, list)
+            and len(cached_texts) == len(batch_segments)
+            and all(valid_cached(str(seg.get("text", "")), text) for seg, text in zip(batch_segments, cached_texts))
+        ):
             exact_cache_hit_count += 1
             print(f"[translation-cache] restored batch {batch_index} cache_key={batch_key}")
             for offset, text in enumerate(cached_texts):
@@ -389,8 +434,8 @@ def run_batched(
                 source_text
             ):
                 continue
-            memory_text = memory_map.get(_memory_key_for(source_text))
-            if isinstance(memory_text, str) and memory_text.strip():
+            memory_text = memory_map.get(_memory_key_for(source_text, start_index + offset))
+            if valid_cached(source_text, memory_text):
                 global_index = start_index + offset
                 zh_texts[global_index] = _final_text(memory_text)
                 memory_hit_ids.append(global_index)
@@ -461,7 +506,7 @@ def run_batched(
     _raise_if_cancelled(cancel_event)
     # Warmup exists to prime the provider prefix cache before PARALLEL batches
     # land; with a single pending batch it is a pure extra request.
-    if pending_batches and len(pending_batches) > 1 and prefix_warmup and backend_name == "openai":
+    if pending_batches and len(pending_batches) > 1 and prefix_warmup and backend_name == "openai" and profile.schema is not None:
         warmup_started = time.perf_counter()
         warmup_usages: list[dict] = []
         warmup_messages = profile.build_messages([], ids=[], ctx=_ctx(warmup=True))
@@ -542,7 +587,7 @@ def run_batched(
         narrowing it.
         """
         segments = pending_by_index[batch_index]
-        start_index = batch_index * batch_size
+        start_index = batch_starts[batch_index]
         local_texts: list[str] = []
         memory_entries: list[tuple[str, str]] = []
         for offset in range(len(segments)):
@@ -560,7 +605,7 @@ def run_batched(
                     source_text
                 )
             ):
-                memory_entries.append((_memory_key_for(source_text), text))
+                memory_entries.append((_memory_key_for(source_text, global_index), text))
         if not cache_path:
             return
         batch_key = _batch_key_for(batch_index, segments)
@@ -590,7 +635,7 @@ def run_batched(
         worker_thread = threading.current_thread()
         worker_thread_id = threading.get_ident()
         worker_thread_name = worker_thread.name
-        start_index = batch_index * batch_size
+        start_index = batch_starts[batch_index]
         expected_count = len(batch_segments)
         all_batch_ids = list(range(start_index, start_index + expected_count))
         requested_segments: list[dict] = []
@@ -756,6 +801,10 @@ def run_batched(
                 parsed = profile.parse_response(raw_output, ids=requested_ids)
                 for idx in requested_ids:
                     if parsed.get(idx):
+                        profile.validate_translation(
+                            str(batch_segments[idx - start_index].get("text", "")),
+                            parsed[idx], target_lang,
+                        )
                         # Convert only. The profiles already normalized this, and
                         # re-running the normalizer here could turn a truthy but
                         # degenerate reply into "" - which this loop's own

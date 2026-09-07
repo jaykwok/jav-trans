@@ -655,6 +655,30 @@ def block_acoustics(block: dict) -> CueAcoustics | None:
         return None
 
 
+def vocalisation_run_boundaries(text: str, min_run: int) -> set[int]:
+    """Isolate known non-speech runs without fragmenting ordinary sentences.
+
+    The cue planner used to expose these runs accidentally by cutting at every
+    short word gap. Sentence-first layout must still expose the same text rule
+    to the filter. Protected responses and isolated reactions break a run, and
+    the caller still has to find an exact measured word edge at each offset.
+    """
+    parts = _indexed_parts(text)
+    boundaries: set[int] = set()
+    begin: int | None = None
+    for index in range(len(parts) + 1):
+        vocal = index < len(parts) and is_non_semantic_vocalisation(parts[index][2])
+        if vocal and begin is None:
+            begin = index
+        elif not vocal and begin is not None:
+            if index - begin >= max(2, min_run):
+                boundaries.update(parts[part][0] for part in range(begin, index))
+                if index < len(parts):
+                    boundaries.add(parts[index][0])
+            begin = None
+    return {offset for offset in boundaries if 0 < offset < len(text)}
+
+
 def drop_vocalisation_runs(
     blocks: list[dict],
     *,

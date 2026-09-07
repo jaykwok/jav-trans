@@ -761,7 +761,7 @@ def test_translation_repair_does_not_select_suspicious_asr_homophones():
     assert reasons == {}
 
 
-def test_translation_repair_selects_length_mismatch_candidates():
+def test_length_ratios_remain_diagnostics_without_forcing_a_rewrite():
     segments = [
         {"start": 0.0, "end": 1.0, "text": "これは普通の文です。"},
         {"start": 1.0, "end": 2.0, "text": "短い"},
@@ -775,15 +775,12 @@ def test_translation_repair_selects_length_mismatch_candidates():
 
     repair_ids, reasons = translator._select_translation_repair_ids(segments, zh_texts)
 
-    assert repair_ids == [1, 2]
-    assert reasons[1] == ["length_mismatch"]
-    assert reasons[2] == ["length_mismatch"]
+    assert repair_ids == [] and reasons == {}
+    assert translator._has_translation_length_mismatch(segments[1]["text"], zh_texts[1])
+    assert translator._has_translation_length_mismatch(segments[2]["text"], zh_texts[2])
 
 
-def test_the_repair_gate_selects_echo_kana_and_length_anomalies():
-    """One detector set, not two. There used to be a second selector for the
-    cascade's escalation path with these same three checks plus a copy of the
-    length one, which is the arrangement where they drift apart."""
+def test_the_repair_gate_selects_echo_and_kana_without_length_speculation():
     segments = [
         {"text": "これは翻訳されるべきです。"},
         {"text": "こんにちは。"},
@@ -799,10 +796,10 @@ def test_the_repair_gate_selects_echo_kana_and_length_anomalies():
 
     repair_ids, reasons = translator._select_translation_repair_ids(segments, zh_texts)
 
-    assert repair_ids == [0, 1, 2]
+    assert repair_ids == [0, 1]
     assert reasons[0] == ["source_echo", "japanese_remaining"]
     assert reasons[1] == ["japanese_remaining"]
-    assert reasons[2] == ["length_mismatch"]
+    assert 2 not in reasons
 
 
 def test_the_repair_gate_catches_a_glossary_term_the_translation_dropped():
@@ -840,36 +837,27 @@ def test_the_repair_gate_ignores_the_glossary_when_none_is_configured():
     assert translator._select_translation_repair_ids(segments, zh_texts, "") == ([], {})
 
 
-def test_the_repair_gate_catches_a_rendering_that_drifted_from_the_settled_index():
-    """`settled_pairs` comes from `global_glossary.derive_settled_glossary` -
-    this same film's own dominant rendering for a line it translated more than
-    once. A cue whose exact source line has a settled entry but whose current
-    text does not match it is exactly the drift the index exists to catch."""
+def test_the_repair_gate_allows_context_dependent_renderings():
+    """Whole-line wording is not a user glossary contract."""
     segments = [
         {"text": "気持ちいい…"},
         {"text": "気持ちいい…"},
         {"text": "今日はいい天気ですね。"},
     ]
     zh_texts = ["好舒服…", "爽死了…", "今天天气真好呢。"]
-    settled_pairs = {"気持ちいい…": "好舒服…"}
-
     repair_ids, reasons = translator._select_translation_repair_ids(
-        segments, zh_texts, "", settled_pairs
+        segments, zh_texts, ""
     )
 
-    assert repair_ids == [1]
-    assert reasons[1] == ["inconsistent_rendering"]
+    assert repair_ids == []
+    assert reasons == {}
 
 
 def test_the_repair_gate_ignores_settled_pairs_when_none_are_derived():
     segments = [{"text": "気持ちいい…"}]
     zh_texts = ["爽死了…"]
 
-    assert translator._select_translation_repair_ids(segments, zh_texts, "", {}) == (
-        [],
-        {},
-    )
-    assert translator._select_translation_repair_ids(segments, zh_texts, "", None) == (
+    assert translator._select_translation_repair_ids(segments, zh_texts, "") == (
         [],
         {},
     )
@@ -950,23 +938,23 @@ def test_a_cheap_first_pass_escalates_only_the_flagged_ids(monkeypatch):
     )
 
     assert retry_events == []
-    assert zh_texts == [repaired[0], repaired[1], repaired[2], initial[3]]
+    assert zh_texts == [repaired[0], repaired[1], initial[2], initial[3]]
     first_pass = [call for call in calls if not call["repair"]]
     repair = [call for call in calls if call["repair"]]
     assert {idx for call in first_pass for idx in call["ids"]} == {0, 1, 2, 3}
     assert all(call["reasoning_effort"] == "none" for call in first_pass)
     # Every flagged id gets a cheap none-tier repair attempt first...
     none_tier_repair = [call for call in repair if call["reasoning_effort"] == "none"]
-    assert {idx for call in none_tier_repair for idx in call["ids"]} == {0, 1, 2}
-    # ...and only the three flagged ids ever reach the escalated tier.
+    assert {idx for call in none_tier_repair for idx in call["ids"]} == {0, 1}
+    # Only proved output defects reach the escalated tier; length needs review.
     escalated = [call for call in repair if call["reasoning_effort"] == "low"]
-    assert {idx for call in escalated for idx in call["ids"]} == {0, 1, 2}
+    assert {idx for call in escalated for idx in call["ids"]} == {0, 1}
     timing = next(
         item for item in timings if item.get("mode") == "translation_repair_pass"
     )
     assert timing["reasoning_effort"] == "low"
     assert timing["none_tier_reasoning_effort"] == "none"
-    assert timing["escalated_count"] == 3
+    assert timing["escalated_count"] == 2
 
 
 def test_a_request_level_failure_in_the_cheap_repair_pass_still_lets_escalation_run(
@@ -1027,12 +1015,8 @@ def test_a_request_level_failure_in_the_cheap_repair_pass_still_lets_escalation_
     assert timing["escalated_count"] == 2
 
 
-def test_the_settled_index_from_the_base_pass_repairs_a_drifted_repeat(monkeypatch):
-    """End to end: the base pass renders the same line two ways, the settled
-    index built from its own output (see `global_glossary`) picks the majority
-    rendering, and the repair pass both sees that rendering in its prompt and
-    fixes the cue that drifted from it - with no model call involved in
-    building the index itself."""
+def test_recurrence_observations_do_not_rewrite_valid_base_translations(monkeypatch):
+    """A majority must not turn valid variation into a paid repair request."""
     segments = [
         {"start": 0.0, "end": 1.0, "text": "気持ちいい…"},
         {"start": 1.0, "end": 2.0, "text": "気持ちいい…"},
@@ -1070,9 +1054,8 @@ def test_the_settled_index_from_the_base_pass_repairs_a_drifted_repeat(monkeypat
         reasoning_effort="none",
     )
 
-    assert zh_texts == ["好舒服…", "好舒服…", "好舒服…", "你好。", "你好。"]
-    assert repair_prompts, "the drifted cue should have triggered a repair request"
-    assert "気持ちいい…-好舒服…" in repair_prompts[0]
+    assert zh_texts == [base[index] for index in range(len(segments))]
+    assert repair_prompts == []
 
 
 def test_the_repair_pass_splits_an_invalid_large_reply_instead_of_repeating_it(
@@ -1128,13 +1111,13 @@ def test_the_repair_pass_splits_an_invalid_large_reply_instead_of_repeating_it(
     assert timing["format_split_count"] == 3
 
 
-def test_translation_repair_length_mismatch_uses_source_translation_fields():
+def test_translation_repair_uses_source_translation_fields():
     segments = [
         {
             "start": 0.0,
             "end": 1.0,
             "source": "短い",
-            "translation": "这是一个明显被过度展开的中文翻译，长度远远超过原文。",
+            "translation": "短い",
         }
     ]
 
@@ -1147,28 +1130,27 @@ def test_translation_repair_length_mismatch_uses_source_translation_fields():
     )
 
     assert repair_ids == [0]
-    assert reasons[0] == ["length_mismatch"]
-    assert context_items[0]["reason"] == ["length_mismatch"]
+    assert reasons[0] == ["source_echo", "japanese_remaining"]
+    assert context_items[0]["reason"] == ["source_echo", "japanese_remaining"]
     assert context_items[0]["ja"] == "短い"
-    assert context_items[0]["current_zh"] == "这是一个明显被过度展开的中文翻译，长度远远超过原文。"
+    assert context_items[0]["current_zh"] == "短い"
 
 
-def test_translation_repair_selects_only_length_mismatch_candidates():
+def test_translation_repair_does_not_expand_a_correct_short_thank_you():
     segments = [
         {"start": 0.0, "end": 1.0, "text": "これは普通の文です。"},
         {"start": 1.0, "end": 2.0, "text": "これも普通の文です。"},
-        {"start": 2.0, "end": 3.0, "text": "短い"},
+        {"start": 2.0, "end": 3.0, "text": "ありがとうございます。"},
     ]
     zh_texts = [
         "这是普通句子。",
         "这也是普通句子。",
-        "这是一个明显被过度展开的中文翻译，长度远远超过原文。",
+        "谢谢",
     ]
 
     repair_ids, reasons = translator._select_translation_repair_ids(segments, zh_texts)
 
-    assert repair_ids == [2]
-    assert reasons[2] == ["length_mismatch"]
+    assert repair_ids == [] and reasons == {}
 
 
 def test_translation_repair_does_not_flag_literal_country_outside_sex_context():

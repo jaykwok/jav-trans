@@ -22,11 +22,10 @@ TIMELINE_MODES = ("alignment", "aligned", "raw", "reading")
 # invisible, and setting the old name produced v3 output labelled v2 - output
 # that lies about its own provenance is worse than no knob at all. So an
 # unknown value is refused rather than accepted and ignored.
-# v3_1: the same DP and the same candidate boundaries, with the measured gap
-# graded inside `word_gap` instead of every word gap scoring alike. It moves
-# ~1.4% of cuts, so an artifact from before it must not claim to be one from
-# after it.
-LAYOUT_ENGINE = "measured_safe_boundary_dp_v3_1"
+# v4 plans Japanese sentences before translation. Only overlong sentences may
+# split at a completed source clause with a measured pause; word gaps alone are
+# no longer eligible. The new stamp invalidates the former fragmented cue plan.
+LAYOUT_ENGINE = "source_sentence_first_v4"
 # v3: the display end may linger into silence that is already empty, bounded by
 # `linger_s` and `max_display_shift_from_acoustic_end_s` and stopping two frames
 # before the next cue. Acoustic edges and every word timing are unchanged, and
@@ -43,7 +42,7 @@ class SubtitleOptions:
     # duration target are deliberately soft: measured character/word timings
     # are authoritative, so an unsplittable cue remains over the target rather
     # than receiving an invented boundary.
-    max_source_chars: int = 20
+    max_source_chars: int = 32
     max_display_duration_s: float = 7.0
     min_duration: float = 0.6
     reading_cps: float = 7.0
@@ -140,7 +139,7 @@ class SubtitleOptions:
         return cls(
             layout_engine=env_text("SUBTITLE_LAYOUT_ENGINE", LAYOUT_ENGINE),
             timing_model=env_text("SUBTITLE_TIMING_MODEL", TIMING_MODEL),
-            max_source_chars=env_int("SUBTITLE_MAX_SOURCE_CHARS", 20, minimum=1),
+            max_source_chars=env_int("SUBTITLE_MAX_SOURCE_CHARS", 32, minimum=1),
             max_display_duration_s=env_float(
                 "SUBTITLE_MAX_DISPLAY_DURATION_S", 7.0, minimum=0.0
             ),

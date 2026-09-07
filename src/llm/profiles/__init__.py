@@ -15,11 +15,11 @@ Two contracts ship, split by where the model runs rather than by vendor:
 * ``json`` - the batch contract, for API models. It carries the layers that
   make a whole film cohere: worker-aware batching, the full-transcript prefix,
   the character table and the glossary.
-* ``hymt2`` - one cue per request, bare template, for the local llama.cpp
-  default. Not a downgrade by taste: Hy-MT2 measured 6/300 untranslated on the
-  bare template against 152/300 on the batch contract, and every context layer
-  added made it worse. The full-transcript prefix is also unavailable locally
-  regardless, since it does not fit an 8GB card's context budget.
+* ``hymt2`` - one preplanned source cue per request, using the current 7B
+  model's native background and terminology templates. Only bounded nearby
+  source and matching user terms are carried. The old 1.8B tests of the generic
+  batch prompt do not measure this contract. No whole-transcript prefix or
+  JSON output is requested from the local translation model.
 
 The removed Sakura/GalTransl profile is not coming back, and ``hymt2`` does not
 reinstate its defect: that profile wrote ``""`` for a line it could not match

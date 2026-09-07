@@ -361,6 +361,7 @@ class JsonProfile(TranslationProfile):
             source_payload_override=self.serialize_source(segments, ids=ids),
             full_source_payload=ctx.full_source_payload,
             requested_ids=list(ids),
+            source_context=ctx.source_context,
             warmup=ctx.warmup,
             compact_system_prompt_enabled=ctx.compact_system_prompt,
         )

@@ -145,10 +145,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_CHUNK_MIN_PAUSE_S": "0.6",
 
     # --- Subtitle Timings ---
-    # Best-effort Japanese source-character target per cue. Only punctuation or
-    # measured >=120ms word gaps are eligible boundaries; when none exists the
-    # cue remains longer instead of inventing a proportional timestamp.
-    "SUBTITLE_MAX_SOURCE_CHARS": "20",
+    # Plan complete source sentences before translation. Overlong sentences
+    # may split only at a completed clause with >=600ms measured silence.
+    # A word gap or a translated-text ratio cannot create a subtitle boundary.
+    "SUBTITLE_MAX_SOURCE_CHARS": "32",
     # Best-effort lexical-duration target paired with the source-character
     # target above. A measured safe boundary always outranks this value.
     "SUBTITLE_MAX_DISPLAY_DURATION_S": "7.0",

@@ -258,11 +258,11 @@ def test_local_ctc_words_stay_completely_mapped_through_cue_planning(monkeypatch
         subtitle_options=SubtitleOptions(),
     )
 
-    assert [cue["ja_text"] for cue in cues] == ["先", "後"]
-    assert summary["layout_diagnostics"]["subtitle_layout_split_skipped"] == {}
-    assert summary["layout_diagnostics"]["subtitle_layout_split_source"] == {
-        "measured_safe_boundary_dp": 2
-    }
+    # A silence alone cannot establish a Japanese sentence boundary.
+    assert [cue["ja_text"] for cue in cues] == ["先後"]
+    assert "".join(word["word"] for word in cues[0]["words"]) == "先後"
+    assert summary["layout_diagnostics"]["duration_soft_cap_violation"] == 1
+    assert summary["layout_diagnostics"]["subtitle_layout_split_source"] == {}
 
 
 def test_postgate_flags_survive_from_segment_to_cue_plan():

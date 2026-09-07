@@ -1,7 +1,6 @@
-"""Line-oriented contract for Hy-MT2, the local translation default.
+"""Line-oriented Hy-MT2 with the model card's native context/term templates.
 
-Hy-MT2 is a single-sentence translation model, and this profile exists because
-that is not a style preference. The contract was measured on the former 1.8B
+The old generic batch contract was measured on the former 1.8B
 default using 300 real ASR cues, scored by kana in the output (a Chinese subtitle
 line cannot contain kana, so kana there is untranslated source handed back):
 
@@ -11,21 +10,11 @@ line cannot contain kana, so kana there is untranslated source handed back):
     + neighbouring-line context    60 / 300
     JSON batch contract           152 / 300, plus 88 lines echoed verbatim
 
-Every addition to the prompt costs another notch, and the batch contract costs
-an order of magnitude: 63% of the lines it *did* return were wrong while
-`missing=0` and the JSON parsed, so neither the engine nor the post-gate had any
-reason to complain. Anything that deviates from the model card's template is out
-of distribution for this model.
-
-So this profile deliberately sends the bare template and nothing else. What that
-gives up is real and is not silently swallowed - `warn_about_inert_context`
-reports the glossary and character reference as inapplicable rather than
-accepting settings it will not use.
-
-Pairing it with the local backend rather than the JSON contract also costs less
-than it looks: the JSON contract's full-transcript prefix cannot fit an 8GB
-card's context budget anyway, so on local hardware that layer was never
-available to begin with.
+Those results do not measure the current 7B's native background and terminology
+templates. We still ask for one free-text target, never JSON or a whole-film
+prompt. Only nearby source evidence and terms actually present in the target
+are carried. Official reference:
+https://huggingface.co/tencent/Hy-MT2-7B-GGUF/blob/main/README.md
 """
 
 from __future__ import annotations
@@ -36,13 +25,19 @@ import re
 from llm.errors import RetryableTranslationFormatError
 from llm.profiles.base import ProfileContext, TranslationProfile
 from llm.profiles.json_v3 import _normalize_translation_text
+from llm.glossary import parse_glossary_pairs
+from llm.output_checks import invalid_line_output
+from llm.context import source_text
 
 logger = logging.getLogger(__name__)
 
-# The model card's own Default Translation template. Kept verbatim on purpose:
-# every measured deviation made it worse.
+# Model-card templates. Context is source-only and bounded per request.
 LINE_PROMPT = (
     "将以下文本翻译为{target_lang}，注意只需要输出翻译后的结果，不要额外解释：\n\n{text}"
+)
+CONTEXT_PROMPT = (
+    "【背景信息】\n{background}\n\n"
+    "请结合背景信息将以下文本翻译为{target_lang}。\n\n【待翻译文本】\n{text}"
 )
 
 _THINK_BLOCK_RE = re.compile(r"(?s)^.*</think>")
@@ -57,10 +52,10 @@ _MAX_TOKEN_BUDGET = 512
 
 
 class HyMt2Profile(TranslationProfile):
-    """One cue per request, bare template, no schema."""
+    """One preplanned source cue per request with native context and terms."""
 
     id = "hymt2"
-    version = "hymt2-line-v1"
+    version = "hymt2-context-v4"
 
     # No repair pass and no partial reissue: both are batch concepts. A request
     # here is one cue, so a bad reply is retried as a whole by the engine's
@@ -70,6 +65,16 @@ class HyMt2Profile(TranslationProfile):
     # Free-form text. Constraining this model with a grammar is what produced
     # the 152/300 failure above.
     schema = None
+
+    def sampling_parameters(self) -> dict[str, float | int]:
+        # The model card calls this repetition_penalty; llama.cpp's request
+        # field is repeat_penalty. Do not silently inherit an API recipe.
+        return {"temperature": 0.7, "top_p": 0.6, "top_k": 20, "repeat_penalty": 1.05}
+
+    def validate_translation(self, source: str, target: str, target_lang: str) -> None:
+        reason = invalid_line_output(source, target, target_lang)
+        if reason:
+            raise RetryableTranslationFormatError(f"Hy-MT2 returned unusable content: {reason}")
 
     def max_batch_size(self) -> int | None:
         return 1
@@ -106,19 +111,35 @@ class HyMt2Profile(TranslationProfile):
         ids: list[int],
         ctx: ProfileContext,
     ) -> list[dict]:
-        if len(segments) != 1:
-            # Reachable only if `max_batch_size` stopped being honoured. Failing
-            # here is the point: a bare reply carries no ids, so a two-cue
-            # request would be silently mis-assigned rather than detected.
-            raise ValueError(
-                f"{self.id} translates one cue per request, got {len(segments)}"
-            )
-        text = str(segments[0].get("text", ""))
+        if len(segments) != 1 or len(ids) != 1:
+            raise ValueError(f"{self.id} requires exactly one source cue per request")
+        text = source_text(segments[0])
         target_lang = (ctx.target_lang or "简体中文").strip() or "简体中文"
+        background: list[str] = []
+        if ctx.source_context is not None:
+            focus = ctx.source_context.focus(ids, radius=3, context_chars=240)
+            previous = [row["ja"] for row in focus["items"] if row["id"] < ids[0]]
+            following = [row["ja"] for row in focus["items"] if row["id"] > ids[-1]]
+            if previous:
+                background.append("前文：" + "\n".join(previous))
+            if following:
+                background.append("后文：" + "\n".join(following))
+        terms = [(ja, zh) for ja, zh in parse_glossary_pairs(ctx.glossary) if ja in text]
+        terminology = ""
+        if terms:
+            terminology = "参考下面的翻译：\n" + "\n".join(
+                f"{ja} 翻译成 {zh}" for ja, zh in sorted(terms, key=lambda pair: -len(pair[0]))[:8]
+            ) + "\n"
+        if background:
+            prompt = CONTEXT_PROMPT.format(
+                background="\n".join(background), target_lang=target_lang, text=text
+            )
+        else:
+            prompt = LINE_PROMPT.format(target_lang=target_lang, text=text)
         return [
             {
                 "role": "user",
-                "content": LINE_PROMPT.format(target_lang=target_lang, text=text),
+                "content": terminology + prompt,
             }
         ]
 
@@ -130,6 +151,8 @@ class HyMt2Profile(TranslationProfile):
     ) -> dict[int, str | None]:
         if not ids:
             return {}
+        if len(ids) != 1:
+            raise RetryableTranslationFormatError("Hy-MT2 accepts one source cue per response")
         cleaned = _THINK_BLOCK_RE.sub("", text or "").strip()
         normalized = _normalize_translation_text(cleaned)
         if normalized is None:
@@ -150,10 +173,10 @@ class HyMt2Profile(TranslationProfile):
         the UI and is entitled to know it does not reach the model.
         """
         inert: list[str] = []
-        if (ctx.glossary or "").strip() or (ctx.extra_glossary or "").strip():
-            inert.append("术语表")
+        if (ctx.extra_glossary or "").strip():
+            inert.append("自动重复句译法")
         if (ctx.character_reference or "").strip():
             inert.append("角色参考")
-        if (ctx.global_context or "").strip() or ctx.full_source_payload:
+        if ctx.source_context is None and ((ctx.global_context or "").strip() or ctx.full_source_payload):
             inert.append("全片上下文")
         return inert

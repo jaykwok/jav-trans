@@ -16,7 +16,7 @@ from core.config import (
     normalize_reasoning_effort,
     recognized_reasoning_effort,
 )
-from core.typed_config import env_float, env_int, env_text
+from core.typed_config import env_bool, env_float, env_int, env_text
 
 load_config()
 
@@ -150,6 +150,9 @@ TRANSLATION_TOP_P = 0.9
 # that a smaller batch used to protect is now covered by `bounded_schema`, which
 # caps each translation independently of the batch, and by the repair pass.
 TRANSLATION_BATCH_SIZE = env_int("TRANSLATION_BATCH_SIZE", 200, minimum=8, maximum=400)
+TRANSLATION_BATCH_MAX_SOURCE_CHARS = env_int(
+    "TRANSLATION_BATCH_MAX_SOURCE_CHARS", 6000, minimum=128, maximum=100000
+)
 COMPACT_SYSTEM_PROMPT = False
 TRANSLATION_API_RETRIES = 4
 TRANSLATION_BATCH_REPAIR_RETRIES = 2
@@ -185,6 +188,10 @@ TRANSLATION_REPAIR_MAX_IDS = env_int(
 # repair request has to lean on local context instead of reasoning, so it
 # gets a couple more lines of already-translated dialogue on each side.
 TRANSLATION_REPAIR_CONTEXT_RADIUS = 2
+TRANSLATION_SEMANTIC_REVIEW_ENABLED = env_bool("TRANSLATION_SEMANTIC_REVIEW_ENABLED", False)
+TRANSLATION_SEMANTIC_REVIEW_MAX_IDS = env_int(
+    "TRANSLATION_SEMANTIC_REVIEW_MAX_IDS", 80, minimum=0, maximum=400
+)
 TRANSLATION_REPAIR_LENGTH_RATIO_MIN = 0.25
 TRANSLATION_REPAIR_LENGTH_RATIO_MAX = 4.0
 # Which tier the repair pass reissues at. Empty follows the rule in

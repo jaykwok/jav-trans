@@ -779,7 +779,7 @@ def _aligned_words(text: str, start: float, char_s: float) -> list[dict]:
     return words
 
 
-def test_source_char_target_uses_the_only_later_measured_safe_point():
+def test_source_char_target_cannot_turn_a_word_gap_into_a_sentence_boundary():
     text = "あ" * 26
     words = _aligned_words(text, 0.0, 0.20)
     for word in words[23:]:
@@ -795,20 +795,17 @@ def test_source_char_target_uses_the_only_later_measured_safe_point():
 
     pieces = subtitle.prepare_srt_blocks(
         [block],
-        options=SubtitleOptions(drop_vocalisation_only_cues=False),
+        options=SubtitleOptions(drop_vocalisation_only_cues=False, max_source_chars=20),
     )
 
-    assert [len(piece["ja_text"]) for piece in pieces] == [23, 3]
+    assert [len(piece["ja_text"]) for piece in pieces] == [26]
     assert pieces[0]["source_char_violation"] is True
-    assert pieces[1]["start"] == pytest.approx(words[23]["start"])
-    # The boundary is the measured word edge; the display end may then linger in
-    # the silence after it, which is why the acoustic field is the one to assert.
-    assert pieces[0]["acoustic_end"] == pytest.approx(words[22]["end"])
-    assert pieces[0]["end"] < pieces[1]["start"]
+    assert pieces[0]["acoustic_end"] == pytest.approx(words[-1]["end"])
+    assert pieces[0]["text_break_type"] == "end"
 
 
 def test_source_char_target_does_not_invent_a_boundary_when_none_is_safe():
-    text = "あ" * 25
+    text = "あ" * 35
     words = _aligned_words(text, 0.0, 0.20)
     block = {
         "start": 0.0,
@@ -831,7 +828,7 @@ def test_source_char_target_does_not_invent_a_boundary_when_none_is_safe():
     assert pieces[0]["proportional_fallback_used"] is False
 
 
-def test_duration_target_uses_the_same_measured_safe_boundary_dp():
+def test_duration_target_cannot_split_continuous_source_at_a_short_gap():
     text = "あ" * 12
     words = _aligned_words(text, 0.0, 0.70)
     for word in words[6:]:
@@ -850,18 +847,12 @@ def test_duration_target_uses_the_same_measured_safe_boundary_dp():
         options=SubtitleOptions(drop_vocalisation_only_cues=False),
     )
 
-    assert [piece["ja_text"] for piece in pieces] == ["あ" * 6, "あ" * 6]
-    assert all(piece["duration_soft_cap_violation"] is False for piece in pieces)
-    assert pieces[0]["acoustic_end"] == pytest.approx(words[5]["end"])
-    assert pieces[1]["start"] == pytest.approx(words[6]["start"])
-    assert pieces[0]["end"] < pieces[1]["start"]
+    assert [piece["ja_text"] for piece in pieces] == [text]
+    assert pieces[0]["duration_soft_cap_violation"] is True
+    assert pieces[0]["acoustic_end"] == pytest.approx(words[-1]["end"])
 
 
-def test_long_cue_splits_at_measured_word_gap_not_mid_word():
-    # The failure this fixes: with no punctuation and two different speaking
-    # rates, a character-ratio split lands inside a word. The 0.8s silence
-    # between them is the only correct break, and only the measured word
-    # timings know where it is.
+def test_a_polite_preface_is_not_detached_from_the_request_at_a_bare_pause():
     first = "あのちょっとだけ"
     second = "まってくださいよおねがい"
     words = _aligned_words(first, 0.0, 0.20)
@@ -877,16 +868,10 @@ def test_long_cue_splits_at_measured_word_gap_not_mid_word():
 
     prepared = subtitle.prepare_srt_blocks([block], options=SubtitleOptions())
 
-    assert len(prepared) == 2
-    assert prepared[0]["ja_text"] == first
-    assert prepared[1]["ja_text"] == second
-    # Blank says the text boundary is safe; the next cue enters exactly with
-    # its first measured word, not halfway through the preceding silence.
-    assert prepared[1]["start"] == pytest.approx(gap_start + 0.8)
-    assert prepared[0]["subtitle_layout_split_source"] == (
-        "measured_safe_boundary_dp"
-    )
-    assert prepared[0]["text_break_type"] == "strong_gap"
+    assert len(prepared) == 1
+    assert prepared[0]["ja_text"] == first + second
+    assert prepared[0]["duration_soft_cap_violation"] is True
+    assert prepared[0]["text_break_type"] == "end"
 
 
 def test_a_cue_just_over_seven_seconds_splits_instead_of_overflowing():
@@ -923,40 +908,24 @@ def test_the_duration_cap_tolerance_is_under_one_frame():
     assert 0.0 < (1.0 / subtitle._CHAR_OVERFLOW_WEIGHT) ** 0.5 < 1.0
 
 
-def test_a_comma_the_speaker_paused_at_is_not_labelled_a_bare_pause():
-    """The kind order used to test the pause first, which threw the comma away.
-
-    A written clause end the speaker also paused at is the one boundary where
-    the transcript and the acoustics corroborate each other, and it was priced
-    identically to a pause with no punctuation at all.
-    """
-    words = _aligned_words("まって、", 0.0, 0.20)
+def test_a_completed_clause_needs_a_measured_pause():
+    first = "ここで待ちますが、"
+    words = _aligned_words(first, 0.0, 0.20)
     gap_start = words[-1]["end"]
     words += _aligned_words("いこう", gap_start + 0.8, 0.20)
 
-    assert subtitle._exact_boundary_kind(words, 4) == ("clause_with_pause", pytest.approx(0.8))
-    # Ranked between a sentence end and a bare pause, in that order.
-    assert (
-        subtitle._boundary_penalty("sentence_punctuation", 0.8)
-        < subtitle._boundary_penalty("clause_with_pause", 0.8)
-        < subtitle._boundary_penalty("strong_gap", 0.8)
-    )
+    assert subtitle._source_word_boundaries(words)[len(first)] == ("clause_with_pause", pytest.approx(0.8))
 
 
-def test_the_pause_penalty_is_continuous_across_the_strong_gap_threshold():
-    """0.599s and 0.601s used to cost 0.2003 and 0.05 - a fourfold step across
-    2ms of silence, at a threshold that is a labelling convenience."""
-    just_under = subtitle._boundary_penalty("word_gap", 0.599)
-    just_over = subtitle._boundary_penalty("strong_gap", 0.601)
-
-    assert just_under == pytest.approx(just_over, abs=0.005)
-    # And it still reaches the flat base once the pause is unambiguous.
-    assert subtitle._boundary_penalty("strong_gap", 2.0) == pytest.approx(0.05)
-    assert subtitle._boundary_penalty("strong_gap", 0.6) == pytest.approx(0.20)
+@pytest.mark.parametrize("gap", [0.599, 0.601, 2.0])
+def test_no_pause_threshold_can_create_a_source_sentence_boundary(gap):
+    words = _aligned_words("まだ終わっていない", 0.0, 0.2)
+    words += _aligned_words("わけじゃない", words[-1]["end"] + gap, 0.2)
+    assert subtitle._source_word_boundaries(words) == {}
 
 
-def test_long_grok_cue_splits_at_measured_word_gap_not_mid_word():
-    first = "あのちょっとだけ"
+def test_long_grok_cue_splits_at_a_completed_clause_with_a_measured_pause():
+    first = "明日は朝から仕事をしますが、"
     second = "まってくださいよおねがい"
     words = _aligned_words(first, 0.0, 0.20)
     gap_start = words[-1]["end"]
@@ -978,14 +947,14 @@ def test_long_grok_cue_splits_at_measured_word_gap_not_mid_word():
     assert prepared[1]["ja_text"] == second
     assert prepared[1]["start"] == pytest.approx(gap_start + 0.8)
     assert prepared[0]["subtitle_layout_split_source"] == (
-        "measured_safe_boundary_dp"
+        "source_sentence_boundaries"
     )
 
 
-def test_a_long_silence_puts_the_next_cue_at_its_measured_word_start():
-    text = "この村の儀式を受けてもらうために必ず儀式をしなければいけない男子は一週間耐えなければいけない"
+def test_a_long_clause_pause_puts_the_next_cue_at_its_measured_word_start():
+    text = "手続きには本人の確認が必要ですが、必ず身分証を持って来てください。"
     words = _aligned_words(text, 0.0, 0.25)
-    target_position = text.index("必")
+    target_position = text.index("必ず")
     # Model a long non-speech interval before this phrase. Character ratio would
     # put the boundary far too early; the measured word start is authoritative.
     for index, word in enumerate(words):
@@ -1073,9 +1042,9 @@ def test_single_measured_token_never_gets_split_at_an_invented_time():
 
 
 def test_ctc_punctuation_frames_do_not_become_subtitle_onsets():
-    first = "前の台詞"
-    ellipsis = "..."
-    second = "こんな出来損ない"
+    first = "「前の台詞"
+    ellipsis = "。」"
+    second = "次の台詞です。"
     words = _aligned_words(first, 0.0, 0.35)
     words += _aligned_words(ellipsis, 2.0, 0.60)
     second_start = 6.5
@@ -1101,13 +1070,13 @@ def test_ctc_punctuation_frames_do_not_become_subtitle_onsets():
 def test_long_blank_is_a_real_gap_between_independent_cue_edges():
     words = [
         {
-            "word": "先",
+            "word": "先。",
             "start": 0.0,
             "end": 0.5,
             "timestamp_kind": "ctc_forced_alignment",
         },
         {
-            "word": "後",
+            "word": "後。",
             "start": 15.0,
             "end": 15.5,
             "timestamp_kind": "ctc_forced_alignment",
@@ -1116,14 +1085,14 @@ def test_long_blank_is_a_real_gap_between_independent_cue_edges():
     block = {
         "start": 0.0,
         "end": 15.5,
-        "ja_text": "先後",
-        "zh_text": "先後",
+        "ja_text": "先。後。",
+        "zh_text": "先。後。",
         "words": words,
     }
 
     pieces = subtitle.prepare_srt_blocks([block], options=SubtitleOptions())
 
-    assert [piece["ja_text"] for piece in pieces] == ["先", "後"]
+    assert [piece["ja_text"] for piece in pieces] == ["先。", "後。"]
     # Both acoustic edges remain exactly on their measured lexical words, and
     # the 14.5s blank stays a blank: the first cue may hold for the 0.5s linger,
     # the remaining 14s carries no subtitle and the second cue still enters on
@@ -1179,10 +1148,7 @@ def test_within_word_spacing_is_not_a_safe_boundary():
     }
 
     timed = subtitle._timed_words(block)
-    assert not any(
-        subtitle._is_exact_safe_boundary(timed, index)
-        for index in range(1, len(timed))
-    )
+    assert subtitle._source_word_boundaries(timed) == {}
     # And end to end: no measured gap, no split, no invented boundary.
     pieces = subtitle.prepare_srt_blocks(
         [block],
@@ -1194,16 +1160,7 @@ def test_within_word_spacing_is_not_a_safe_boundary():
     )
 
 
-def test_a_wider_measured_gap_beats_a_marginal_one_that_fills_the_line():
-    """Where the cut lands when two word gaps are both legal.
-
-    Both boundaries fit under the 20-character cap, so with every word gap
-    scoring alike the choice fell to the fill terms and the later, narrower gap
-    won - a 0.15s silence is barely distinguishable from the space between
-    syllables. The measured gap is the only evidence a word gap has, so it is
-    read as a strength: 0.45s outranks 0.15s even though it leaves a shorter
-    first line.
-    """
+def test_neither_wide_nor_narrow_word_gaps_can_fragment_the_source():
     text = "あ" * 22
     words = _aligned_words(text, 0.0, 0.20)
     for word in words[6:]:
@@ -1223,18 +1180,11 @@ def test_a_wider_measured_gap_beats_a_marginal_one_that_fills_the_line():
         }
     ], options=SubtitleOptions(drop_vocalisation_only_cues=False))
 
-    assert [len(piece["ja_text"]) for piece in prepared] == [6, 16]
-    assert prepared[0]["text_break_type"] == "word_gap"
-    assert prepared[0]["text_break_gap_s"] == pytest.approx(0.45)
+    assert [len(piece["ja_text"]) for piece in prepared] == [22]
+    assert prepared[0]["text_break_type"] == "end"
 
 
-def test_the_widest_gap_does_not_override_a_written_comma():
-    """The grading stays inside `word_gap`.
-
-    A comma is syntax and a pause is not, so a wide silence must not outrank a
-    clause boundary - that trade was measured on eight films and moved 134 cuts
-    off written commas onto acoustic gaps.
-    """
+def test_a_comma_and_an_unrelated_gap_do_not_establish_a_completed_clause():
     text = "あ" * 8 + "、" + "あ" * 13
     words = _aligned_words(text, 0.0, 0.20)
     for word in words[14:]:
@@ -1251,5 +1201,6 @@ def test_the_widest_gap_does_not_override_a_written_comma():
         }
     ], options=SubtitleOptions(drop_vocalisation_only_cues=False))
 
-    assert prepared[0]["text_break_type"] == "clause_punctuation"
-    assert prepared[0]["ja_text"] == "あ" * 8 + "、"
+    assert len(prepared) == 1
+    assert prepared[0]["text_break_type"] == "end"
+    assert prepared[0]["ja_text"] == text

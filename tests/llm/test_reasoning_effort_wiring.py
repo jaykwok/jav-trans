@@ -169,16 +169,17 @@ class TestRepairTier:
     def test_the_repair_pass_reads_the_tier(self, monkeypatch) -> None:
         """Wired, not merely defined - the tier has to reach the request.
 
-        The fake reply ("你好") never stops looking short next to the source,
-        so the length-mismatch detector keeps flagging it after the cheap
-        `none` attempt and the pass escalates - which is what this test
-        checks for: the base pass's tier reaching the escalated request.
+        The cheap fake reply still echoes Japanese, so the pass must escalate
+        to the tier derived from the first pass. A valid short reply is not
+        grounds for further spending.
         """
         self._pin(monkeypatch, "")
         efforts: list[str] = []
 
         def fake_chat(_messages, **kwargs):
             efforts.append(kwargs["reasoning_effort"])
+            if kwargs["reasoning_effort"] == "none":
+                return '{"translations":[{"id":0,"text":"これは翻訳されるべきです。"}]}'
             return '{"translations":[{"id":0,"text":"你好"}]}'
 
         from llm import profiles as profiles_module
@@ -203,8 +204,7 @@ class TestRepairTier:
             ),
         )
 
-        # Cheap none-tier attempt first, then escalated because the reply is
-        # still flagged (length mismatch persists regardless of the tier).
+        # Cheap attempt first, then repair the remaining source echo.
         assert efforts == ["none", "low"]
 
 

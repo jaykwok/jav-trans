@@ -5,8 +5,9 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from subtitles.options import SubtitleOptions
+from subtitles.source_boundaries import source_boundary_hints
 from subtitles.ja_style import normalize_ja_subtitle_text, wrap_ja_subtitle_text
-from subtitles.vocalisation import drop_vocalisation_runs, is_decoration_only
+from subtitles.vocalisation import drop_vocalisation_runs, is_decoration_only, vocalisation_run_boundaries
 from subtitles.zh_style import normalize_zh_subtitle_text, wrap_zh_subtitle_text
 
 logger = logging.getLogger(__name__)
@@ -175,13 +176,6 @@ def _text_for_timing(block: dict) -> str:
     )
 
 
-def _fallback_text_position(text: str, ratio: float) -> int:
-    stripped = str(text or "")
-    if len(stripped) <= 1:
-        return len(stripped)
-    return max(1, min(len(stripped) - 1, int(round(len(stripped) * ratio))))
-
-
 def _split_text_by_positions(text: str, positions: list[int]) -> list[str]:
     raw = str(text or "")
     if not positions:
@@ -195,26 +189,8 @@ def _split_text_by_positions(text: str, positions: list[int]) -> list[str]:
     return pieces
 
 
-def _split_text_by_ratios(text: str, ratios: list[float]) -> list[str]:
-    raw = str(text or "")
-    if not ratios:
-        return [raw]
-    positions = []
-    for ratio in ratios:
-        position = _fallback_text_position(raw, ratio)
-        if 0 < position < len(raw):
-            positions.append(position)
-    return _split_text_by_positions(raw, sorted(set(positions)))
-
-
-# A silence between two measured words has to be at least this long before it is
-# offered as a cue boundary. Below it the "gap" is the ordinary space between
-# syllables of continuous speech, and cutting there splits a word.
-WORD_GAP_MIN_S = 0.12
-
-# A gap this long is treated as a full pause and scored like a strong cut. Sized
-# to the chunker's own pause floor (ASR_CHUNK_MIN_PAUSE_S default 0.6s) so the
-# two readings of silence agree on what counts as a pause.
+# A clause break needs both source syntax and this much measured silence.
+# Neither an ordinary word gap nor a long silence alone can divide a sentence.
 WORD_GAP_STRONG_S = 0.60
 
 
@@ -228,12 +204,6 @@ MEASURED_WORD_TIMESTAMP_KINDS = frozenset(
 
 def _has_measured_word_timestamp(word: dict) -> bool:
     return str(word.get("timestamp_kind") or "") in MEASURED_WORD_TIMESTAMP_KINDS
-
-
-_SENTENCE_END_CHARS = frozenset("。！？!?…")
-_CLAUSE_END_CHARS = frozenset("、，,；;")
-_EXACT_CLOSING_CHARS = frozenset("。！？!?…、，,；;）」』】〉》〕］｝”’")
-_EXACT_OPENING_CHARS = frozenset("（「『【〈《〔［｛“‘")
 
 
 def _compact_source_length(text: str) -> int:
@@ -258,42 +228,6 @@ def _exact_layout_words(block: dict, text: str) -> tuple[list[dict], str]:
     if "".join(str(word["word"]) for word in words) != text:
         return [], "measured_word_text_map_incomplete"
     return words, "complete"
-
-
-def _exact_boundary_kind(words: list[dict], index: int) -> tuple[str, float]:
-    left = words[index - 1]
-    right = words[index]
-    left_text = str(left.get("word") or "")
-    gap = max(0.0, float(right["start"]) - float(left["end"]))
-    if left_text[-1] in _SENTENCE_END_CHARS:
-        return "sentence_punctuation", gap
-    # Tested before the bare pause, because the order used to be the other way
-    # round and a comma the speaker also paused at came back as `strong_gap`
-    # with the comma discarded. Measured on eight films, 2,621 of 38,708
-    # candidate boundaries are in that state - the strongest evidence short of
-    # a sentence end, and the one place where the written syntax and the
-    # measured silence corroborate each other rather than standing alone.
-    if left_text[-1] in _CLAUSE_END_CHARS and gap >= WORD_GAP_STRONG_S:
-        return "clause_with_pause", gap
-    if gap >= WORD_GAP_STRONG_S:
-        return "strong_gap", gap
-    if left_text[-1] in _CLAUSE_END_CHARS:
-        return "clause_punctuation", gap
-    if gap >= WORD_GAP_MIN_S:
-        return "word_gap", gap
-    return "measured_character", gap
-
-
-def _is_exact_safe_boundary(words: list[dict], index: int) -> bool:
-    if not 0 < index < len(words):
-        return False
-    left_text = str(words[index - 1].get("word") or "")
-    right_text = str(words[index].get("word") or "")
-    if not left_text or not right_text:
-        return False
-    if right_text[0] in _EXACT_CLOSING_CHARS or left_text[-1] in _EXACT_OPENING_CHARS:
-        return False
-    return _exact_boundary_kind(words, index)[0] != "measured_character"
 
 
 def _is_lexical(word: dict) -> bool:
@@ -358,86 +292,36 @@ class _LexicalExtents:
         return float(self._words[first]["start"]), float(self._words[last]["end"])
 
 
-_BOUNDARY_BASE_PENALTY = {
-    "sentence_punctuation": 0.0,
-    "clause_with_pause": 0.04,
-    "strong_gap": 0.05,
-    "clause_punctuation": 0.10,
-    "word_gap": 0.20,
-    "end": 0.0,
-}
-
-# Beyond this a pause is simply a pause and scores the `strong_gap` base. Between
-# WORD_GAP_STRONG_S and here it is graded down to it, so that the label boundary
-# at 0.60s is continuous rather than a cliff.
-STRONG_GAP_PLATEAU_S = 1.20
-
-# Overflow past a cap is quadratic, and the weight decides how soft the cap is:
-# an overflow is taken whenever `weight * overflow^2` is cheaper than the 1.0 a
-# extra cue costs, i.e. whenever the overflow is under `sqrt(1/weight)`.
-#
-# The character cap is a project target, so 25.0 leaves it soft by ~0.2 of a
-# character - which, being sub-integer, makes it hard in practice.
-#
-# The duration cap is not a project target: 7s is the TTSG limit, and
-# `spec_duration_over_7s_count` gates it at zero. At 25.0 the same arithmetic
-# left it soft by 0.2s, and measured on eight films that is exactly what it
-# produced - 55 cues over 7s, 54 of them by at most 0.2s (median 0.077s). So the
-# gate and the layout disagreed by construction. 1000.0 puts the tolerance at
-# 0.032s, under one frame at 23.976fps, which takes those 54 to 0 for +41 cues
-# on 9,013 (+0.45%) with character-cap violations unchanged at 51 and
-# sentence-end cuts up 8. The 55th survives and should: it is a 20s span with no
-# safe boundary anywhere inside it, and v3 keeps the measured extent rather than
-# cutting at a time nothing was spoken at.
+# These costs choose among semantically eligible source boundaries only.
+# No overflow penalty can introduce a word-gap or translated-text split.
 _CHAR_OVERFLOW_WEIGHT = 25.0
 _DURATION_OVERFLOW_WEIGHT = 1000.0
 
 
-def _boundary_penalty(kind: str, gap_s: float) -> float:
-    """What a cut at this boundary costs the DP.
-
-    The kinds are ranked by what justifies the cut: a written sentence end, a
-    written clause end the speaker also paused at, a bare pause, a written
-    clause end alone, and last a gap merely wider than the space between
-    syllables. Note that a wide bare pause no longer outranks a written comma
-    across the whole range - see the grading below.
-
-    Two kinds are graded rather than flat, and for the same reason: the label is
-    a threshold, and a threshold crossed by a millisecond should not change the
-    price by a quarter of a cue.
-
-    `word_gap` is the kind whose entire evidence is the silence, and its 0.12s
-    floor admits boundaries barely distinguishable from continuous speech, so
-    the measured gap is read as a strength: 0.12s costs 0.36, 0.60s costs 0.20.
-    `strong_gap` continues that curve upward instead of dropping to its base the
-    instant the label changes: 0.60s costs 0.20, falling to the 0.05 base at
-    STRONG_GAP_PLATEAU_S. Before this the pair was discontinuous - 0.599s cost
-    0.2003 and 0.601s cost 0.05, a fourfold step across 2ms.
-
-    Measured on eight films (`agents/temp/20260812_180000_cut-tracking/` for the
-    `word_gap` grading, `agents/temp/20260904_100616_dp-weight-tuning/` for the
-    rest). The `word_gap` grading took marginal 0.12-0.20s cuts from 432 to 330
-    (-23.6%). Adding `clause_with_pause` at 0.04 plus the `strong_gap` grading
-    then moved 279 more cuts onto boundaries backed by written syntax (3,891 ->
-    4,170) and 149 more onto a corroborated comma (758 -> 907), while
-    sentence-end cuts held at 1,999 -> 2,000, continuation claims at 7,012, cues
-    at 9,012 -> 9,013, characters p50 at 16 and cap violations at 51.
-
-    0.04 is where the sweep stops being free: at 0.02 the tier is cheap enough
-    to pull cuts off sentence ends (-10) and raise continuation claims (+11).
-    Grading every kind was measured earlier and rejected - it moves 134 cuts off
-    written commas onto acoustic gaps, trading syntax for silence.
-    """
-    base = _BOUNDARY_BASE_PENALTY[kind]
-    if kind == "word_gap":
-        shortfall = max(0.0, WORD_GAP_STRONG_S - float(gap_s)) / WORD_GAP_STRONG_S
-        return base + 0.20 * shortfall
-    if kind == "strong_gap":
-        span = STRONG_GAP_PLATEAU_S - WORD_GAP_STRONG_S
-        excess = min(1.0, max(0.0, float(gap_s) - WORD_GAP_STRONG_S) / span)
-        # 0.20 where `word_gap` leaves off, decaying to the base.
-        return 0.20 - (0.20 - base) * excess
-    return base
+def _source_word_boundaries(
+    words: list[dict], *, vocalisation_min_run: int | None = None
+) -> dict[int, tuple[str, float]]:
+    text = "".join(str(word["word"]) for word in words)
+    hints = source_boundary_hints(text)
+    if vocalisation_min_run is not None:
+        for offset in vocalisation_run_boundaries(text, vocalisation_min_run):
+            if hints.get(offset) != "sentence_punctuation":
+                hints[offset] = "vocalisation_boundary"
+    extent = _LexicalExtents(words)
+    boundaries: dict[int, tuple[str, float]] = {}
+    offset = 0
+    for index, word in enumerate(words[:-1], start=1):
+        offset += len(str(word["word"]))
+        kind = hints.get(offset)
+        if kind is None:
+            continue
+        left, right = extent(0, index), extent(index, len(words))
+        if left is None or right is None or right[0] < left[1] - 1e-9:
+            continue
+        gap = max(0.0, right[0] - left[1])
+        if kind != "clause_with_pause" or gap >= WORD_GAP_STRONG_S - 1e-9:
+            boundaries[index] = (kind, gap)
+    return boundaries
 
 
 def _exact_safe_dp_plan(
@@ -445,12 +329,11 @@ def _exact_safe_dp_plan(
     *,
     options: SubtitleOptions,
 ) -> dict | None:
-    """Jointly optimize source length and lexical duration on exact boundaries.
+    """Plan source sentences, splitting an overlong sentence only at clauses.
 
-    Both caps are best-effort. The only hard constraints are a complete measured
-    text map and safe candidate boundaries: punctuation, or a measured gap of at
-    least 120ms. A direct start-to-end edge always exists, so an unsplittable
-    segment is retained intact and its overflow remains visible in diagnostics.
+    Sentence ends are mandatory. Within a sentence, both a completed clause and
+    a measured pause are required. Display targets only rank those legal cuts;
+    they cannot break a word or a dependent expression to make a cue fit.
     """
     text = _text_for_timing(block)
     if not text.strip():
@@ -460,13 +343,17 @@ def _exact_safe_dp_plan(
         return {"pieces": [], "reason": map_status, "score": 0.0}
 
     word_count = len(words)
-    candidates = [0, word_count]
-    candidates.extend(
-        index
-        for index in range(1, word_count)
-        if _is_exact_safe_boundary(words, index)
+    # Legacy callers may already have a translated secondary field. Keep their
+    # cue intact: source offsets never identify positions in another language.
+    has_translation = any(
+        str(block.get(key) or "") not in {"", text}
+        for key in ("ja_text", "zh_text", "text")
     )
-    candidates = sorted(set(candidates))
+    boundaries = {} if has_translation else _source_word_boundaries(
+        words,
+        vocalisation_min_run=options.vocalisation_min_run if options.drop_vocalisation_only_cues else None,
+    )
+    candidates = [0, *sorted(boundaries), word_count]
 
     char_prefix = [0]
     text_prefix = [0]
@@ -479,11 +366,12 @@ def _exact_safe_dp_plan(
     char_cap = max(1, int(options.max_source_chars))
     duration_cap_s = _subtitle_max_display_duration_s(options)
     best: dict[int, tuple[float, int | None]] = {0: (0.0, None)}
+    sentence_start = 0
     for end_index in candidates[1:]:
         best_cost = float("inf")
         best_start: int | None = None
         for start_index in candidates:
-            if start_index >= end_index or start_index not in best:
+            if start_index < sentence_start or start_index >= end_index or start_index not in best:
                 continue
             extent = lexical_extent(start_index, end_index)
             if extent is None:
@@ -503,11 +391,11 @@ def _exact_safe_dp_plan(
             if end_index == word_count:
                 kind, gap = "end", 0.0
             else:
-                kind, gap = _exact_boundary_kind(words, end_index)
+                kind, gap = boundaries[end_index]
             cost = (
                 best[start_index][0]
                 + 1.0
-                + _boundary_penalty(kind, gap)
+                + (0.10 if kind == "clause_with_pause" else 0.0)
                 + underfill * 0.25
                 + float(char_overflow * char_overflow) * _CHAR_OVERFLOW_WEIGHT
                 + float(duration_overflow * duration_overflow)
@@ -518,6 +406,8 @@ def _exact_safe_dp_plan(
                 best_start = start_index
         if best_start is not None:
             best[end_index] = (best_cost, best_start)
+        if end_index in boundaries and boundaries[end_index][0] != "clause_with_pause":
+            sentence_start = end_index
 
     if word_count not in best:
         return {"pieces": [], "reason": "no_complete_safe_path", "score": 0.0}
@@ -539,7 +429,7 @@ def _exact_safe_dp_plan(
         end_kind, end_gap = (
             ("end", 0.0)
             if end_index == word_count
-            else _exact_boundary_kind(words, end_index)
+            else boundaries[end_index]
         )
         pieces.append(
             {
@@ -550,10 +440,7 @@ def _exact_safe_dp_plan(
                 "start": extent[0],
                 "end": extent[1],
                 "end_boundary_kind": end_kind,
-                # The measured silence the cut sits in. The DP scores boundaries
-                # by kind alone, so this is the graded evidence behind a coarse
-                # label: 0.12s and 0.55s are both `word_gap` and are not equally
-                # likely to be the end of a thought.
+                # Retain the acoustic evidence behind a source clause break.
                 "end_boundary_gap_s": round(float(end_gap), 3),
                 "source_char_count": (
                     char_prefix[end_index] - char_prefix[start_index]
@@ -571,6 +458,7 @@ def _exact_safe_dp_plan(
         "internal_safe_boundary_count": max(0, len(candidates) - 2),
         "words": words,
         "text": text,
+        "has_translation": has_translation,
     }
 
 
@@ -598,7 +486,7 @@ def _split_long_display_block(
     *,
     options: SubtitleOptions,
 ) -> list[dict]:
-    """Split one source segment only at exact, measured, safe boundaries."""
+    """Split source text before translation, preserving its measured edges."""
     timing_text = _text_for_timing(block)
     if not timing_text.strip():
         return [dict(block)]
@@ -616,12 +504,7 @@ def _split_long_display_block(
         return [item]
 
     words = list(plan["words"])
-    timing_total_units = max(_count_text_units(timing_text), 1e-6)
     timing_positions = [int(piece["text_end"]) for piece in pieces[:-1]]
-    ratios = [
-        _count_text_units(timing_text[:position]) / timing_total_units
-        for position in timing_positions
-    ]
     text_fields: dict[str, list[str]] = {}
     for key in ("ja_text", "zh_text", "text"):
         value = block.get(key)
@@ -633,9 +516,9 @@ def _split_long_display_block(
                 timing_positions,
             )
         else:
-            # This only distributes an already translated secondary text field.
-            # Cue timestamps still come exclusively from measured source words.
-            text_fields[key] = _split_text_by_ratios(str(value), ratios)
+            # A translated field forbids resegmentation; an empty placeholder
+            # may accompany source pieces without manufacturing target text.
+            text_fields[key] = [str(value)] if len(pieces) == 1 else [""] * len(pieces)
 
     split_blocks: list[dict] = []
     for index, piece in enumerate(pieces):
@@ -676,17 +559,19 @@ def _split_long_display_block(
         item["continues_from_previous"] = (
             bool(block.get("continues_from_previous"))
             if index == 0
-            else previous_boundary_kind != "sentence_punctuation"
+            else previous_boundary_kind == "clause_with_pause"
         )
         item["continues_into_next"] = (
             bool(block.get("continues_into_next"))
             if index == len(pieces) - 1
-            else end_boundary_kind != "sentence_punctuation"
+            else end_boundary_kind == "clause_with_pause"
         )
         if len(pieces) > 1:
-            item["subtitle_layout_split"] = "source_char_or_duration_soft_cap"
-            item["subtitle_layout_split_source"] = "measured_safe_boundary_dp"
+            item["subtitle_layout_split"] = "source_sentence_or_long_clause"
+            item["subtitle_layout_split_source"] = "source_sentence_boundaries"
             item.pop("subtitle_layout_split_skipped", None)
+        elif plan.get("has_translation"):
+            item["subtitle_layout_split_skipped"] = "translation_already_attached"
         elif (
             int(plan.get("internal_safe_boundary_count") or 0) == 0
             and (
@@ -702,7 +587,7 @@ def _split_long_display_block(
                 "measured_safe_boundaries_unavailable"
             )
         item["layout_engine"] = options.layout_engine
-        item["layout_version"] = "subtitle_layout_v3"
+        item["layout_version"] = "subtitle_layout_v4"
         item["timing_model"] = options.timing_model
         item["exact_measured_timeline"] = True
         item["layout_timeline_locked"] = True
@@ -1029,7 +914,7 @@ def _finalize_layout_fields(
             display_end - acoustic_end,
         )
         item.setdefault("layout_engine", options.layout_engine)
-        item.setdefault("layout_version", "subtitle_layout_v3")
+        item.setdefault("layout_version", "subtitle_layout_v4")
         item.setdefault("timing_model", options.timing_model)
         item["duration_soft_cap_violation"] = bool(
             max_display_s > 0.0 and item["display_duration"] > max_display_s

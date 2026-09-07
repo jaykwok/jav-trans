@@ -1,12 +1,10 @@
 """Post-translation repair pass (JSON contract).
 
 Optional stage a profile opts into via ``wants_repair_pass``: scan the finished
-translation for lines a local detector can call suspicious - source echo,
-residual Japanese kana, a glossary term the translation did not use, a
-rendering that drifted from this same film's own settled index (see
-``global_glossary``), target/source length ratio out of band - then reissue
-only those ids, with a few lines of local context and one tier more thinking
-than the base pass used.
+translation for empty output, Japanese source echo, residual kana and missing
+user terminology. Reissue only those ids, with neighbouring cues and confirmed
+continuation units. Length ratios and variation between repeated lines do not
+prove a translation is wrong; optional semantic review handles that uncertainty.
 
 That escalation is the second half of the cost cascade. Reasoning is a
 per-request cost that barely scales with batch size, so buying it for a whole
@@ -45,6 +43,7 @@ from llm.errors import (
 from llm.profiles import json_v3
 from llm.profiles.base import TranslationProfile
 from llm.session import TranslationSession
+from llm.context import SourceContext, cue_item
 
 _raise_if_cancelled = transport_util._raise_if_cancelled
 _emit_progress = transport_util._emit_progress
@@ -72,8 +71,7 @@ def apply_repair_pass(
 
     Stage 1 reissues every flagged id at `none` - not a blind retry of the
     original batch request, but the repair prompt, which names the exact
-    defect (`reason`) and now carries the film's settled term glossary
-    (`extra_glossary`), neither of which the original batch request had. Most
+    defect (`reason`) with source-backed local context. Most
     flagged ids resolve here without paying for reasoning at all. Stage 2
     re-runs the same local detectors against the stage-1 output and only pays
     `escalated_effort` (derived from the base pass's tier via
@@ -101,13 +99,8 @@ def apply_repair_pass(
     target_lang = session.target_lang
     character_reference = session.character_reference
     glossary_pairs = parse_glossary_pairs(glossary) if glossary else []
-    # Full source line -> the rendering the base pass used most often for it,
-    # derived from this same film's own output (see `global_glossary`). Reused
-    # here as a second detector so a cue that drifted from the film's own norm
-    # gets caught the same cheap, text-only way a glossary violation does.
-    settled_pairs = dict(parse_glossary_pairs(extra_glossary)) if extra_glossary else {}
     repair_ids, reasons = _select_translation_repair_ids(
-        segments, zh_texts, glossary, settled_pairs
+        segments, zh_texts, glossary
     )
     if not repair_ids:
         return zh_texts, None
@@ -210,7 +203,7 @@ def apply_repair_pass(
     def lingering_echoes() -> list[int]:
         return [
             idx
-            for idx in repair_ids
+            for idx in range(len(segments))
             if _has_source_echo(
                 _repair_source_text(segments[idx]),
                 _repair_translation_text(segments[idx], repaired_texts, idx),
@@ -221,15 +214,15 @@ def apply_repair_pass(
         """Ids the detector suite still flags after a repair attempt.
 
         Updates `reasons` in place so the next request describes the CURRENT
-        defect - a cue fixed for length but freshly echoing after stage 1
-        must not carry a stale `length_mismatch` label into stage 2.
+        defect - a cue fixed for terminology but freshly echoing after stage 1
+        must not carry a stale defect label into stage 2.
         """
         flagged: list[int] = []
         for idx in candidates:
             source = _repair_source_text(segments[idx])
             target = _repair_translation_text(segments[idx], repaired_texts, idx)
             local_reasons = _detect_repair_reasons(
-                source, target, glossary_pairs, settled_pairs
+                source, target, glossary_pairs
             )
             if local_reasons:
                 reasons[idx] = list(dict.fromkeys(local_reasons))
@@ -317,7 +310,7 @@ def apply_repair_pass(
     # Outside the handler on purpose: a provider error must not be able to skip
     # this gate. Returning the Japanese source as the translation is the known
     # 10.1% untranslated-film regression, and the caller caches what it gets
-    # back, so it is worth failing the run over. Residual kana and length flags
+    # back, so it is worth failing the run over. Residual kana and glossary flags
     # stay diagnostics - they are just as often proper names or deliberate
     # subtitle compression.
     final_echoes = lingering_echoes()
@@ -408,7 +401,8 @@ def _fold_translation_check(text: str) -> str:
 
 def _has_source_echo(source: str, target: str) -> bool:
     folded_source = _fold_translation_check(source)
-    return bool(folded_source) and _fold_translation_check(target) == folded_source
+    # Shared Han words and Latin names can be valid unchanged translations.
+    return bool(_KANA_RE.search(source)) and bool(folded_source) and _fold_translation_check(target) == folded_source
 
 
 def _has_remaining_japanese_kana(target: str) -> bool:
@@ -428,41 +422,23 @@ def _glossary_violations(source: str, target: str, pairs: list[tuple[str, str]])
     return False
 
 
-def _inconsistent_rendering(
-    source: str, target: str, settled_pairs: dict[str, str]
-) -> bool:
-    """This exact line has a dominant rendering elsewhere in the film, and this
-    cue used something else.
-
-    Exact-line match, not substring containment like `_glossary_violations`: the
-    index is built from whole recurring lines (see `global_glossary`), so a
-    partial match would compare the wrong unit and false-positive on short
-    lines embedded in longer ones.
-    """
-    settled_zh = settled_pairs.get(source)
-    return bool(settled_zh) and target.strip() != settled_zh
-
-
 def _detect_repair_reasons(
     source: str,
     target: str,
     glossary_pairs: list[tuple[str, str]],
-    settled_pairs: dict[str, str] | None = None,
 ) -> list[str]:
     """The detector suite, factored out so the post-none-tier recheck in
     `apply_repair_pass` shares one implementation with the initial selection
     below instead of drifting into a second copy."""
     local_reasons: list[str] = []
+    if not target.strip():
+        local_reasons.append("empty_translation")
     if _has_source_echo(source, target):
         local_reasons.append("source_echo")
     if _has_remaining_japanese_kana(target):
         local_reasons.append("japanese_remaining")
     if glossary_pairs and _glossary_violations(source, target, glossary_pairs):
         local_reasons.append("glossary_violation")
-    if settled_pairs and _inconsistent_rendering(source, target, settled_pairs):
-        local_reasons.append("inconsistent_rendering")
-    if _has_translation_length_mismatch(source, target):
-        local_reasons.append("length_mismatch")
     return local_reasons
 
 
@@ -470,15 +446,14 @@ def _select_translation_repair_ids(
     segments: list[dict],
     zh_texts: list[str],
     glossary: str = "",
-    settled_pairs: dict[str, str] | None = None,
 ) -> tuple[list[int], dict[int, list[str]]]:
-    """Lines a local check can call wrong, with why.
+    """Lines with an actionable output defect, with why.
 
     Every detector is cheap and text-only by design - the pass has to decide
     what to escalate without spending a model call to find out, or the saving it
     exists for is gone. They differ in how much they prove: an exact source echo
     or a missed glossary term is definitely wrong, while kana and length are
-    correlates.
+    correlates. A length ratio alone is never a reason to rewrite a cue.
 
     The glossary check was added 2026-08-24 after measuring sample-v: at
     `reasoning_effort=low` the base pass rendered 5 of 37 ちんぽ cues as 鸡巴
@@ -495,7 +470,7 @@ def _select_translation_repair_ids(
     for idx, seg in enumerate(segments):
         source = _repair_source_text(seg)
         target = _repair_translation_text(seg, zh_texts, idx)
-        local_reasons = _detect_repair_reasons(source, target, pairs, settled_pairs)
+        local_reasons = _detect_repair_reasons(source, target, pairs)
         if not local_reasons:
             continue
         repair_ids.append(idx)
@@ -546,11 +521,10 @@ def _build_repair_messages(
     )
     system_prompt += (
         "\n\n这是翻译后局部修复任务。只修复 requested_ids 中的译文；"
-        "只处理 reason 字段指出的源文回显、日文假名残留、术语表未生效、"
-        "译名与全片同一句台词不一致或译文长度异常，"
+        "只处理 reason 字段指出的空译文、源文回显、日文假名残留或术语表未生效，"
         "保持原字幕文本含义，不要根据上下文推测或改写源文。"
         "reason 只是问题类别提示，不是固定译文；最终译文必须服从原文和既定术语。"
-        "性器官术语继续统一为肉棒/小穴，不要漂移成其他书面或错误译法。"
+        "保持否定、条件、施受关系和真实重复的作用，不为了通过长度检查添加或删除含义。"
     )
     context_items = _build_repair_context_items(
         segments,
@@ -564,18 +538,18 @@ def _build_repair_messages(
         "只返回 requested_ids 中列出的 id，恰好返回这些 id，不要返回 context_only 项。",
         "每个 text 只能是修复后的中文字幕；不要解释原因。",
     ]
-    # Same block the base pass got, threaded through so a `none`-tier repair
-    # request has the film's already-settled terms to fall back on instead of
-    # having to infer them from three lines of local context alone - this is
-    # most of what makes a cheap first attempt viable.
+    # Legacy caller-supplied examples remain nonbinding; the main pipeline
+    # never promotes repeated whole-line renderings into user terminology.
     extra_block = prompt_module._build_extra_glossary_block(extra_glossary)
     if extra_block:
         user_parts.append(extra_block)
-        user_parts.append("注意：必须严格使用上面 <glossary> 标签内的术语表翻译。")
     user_parts.extend(
         [
             "【局部上下文 JSON】",
             json.dumps(context_items, ensure_ascii=False, indent=2),
+            "【完整语义单元】\n" + json.dumps(
+                SourceContext.build(segments).focus(repair_ids)["semantic_units"], ensure_ascii=False
+            ),
             '输出 JSON：{"translations":[{"id":0,"text":"..."}]}',
         ]
     )
@@ -591,10 +565,10 @@ def _build_repair_context_items(
     repair_ids: list[int],
     reasons: dict[int, list[str]],
 ) -> list[dict]:
-    indexes: set[int] = set()
-    radius = llm_settings.TRANSLATION_REPAIR_CONTEXT_RADIUS
-    for idx in repair_ids:
-        indexes.update(range(max(0, idx - radius), min(len(segments), idx + radius + 1)))
+    focus = SourceContext.build(segments).focus(
+        repair_ids, radius=llm_settings.TRANSLATION_REPAIR_CONTEXT_RADIUS
+    )
+    indexes = {row["id"] for row in focus["items"]}
 
     items = []
     repair_id_set = set(repair_ids)
@@ -602,7 +576,7 @@ def _build_repair_context_items(
         seg = segments[idx]
         items.append(
             {
-                "id": idx,
+                **cue_item(seg, idx),
                 "role": "repair" if idx in repair_id_set else "context_only",
                 "reason": _public_repair_reasons(reasons.get(idx, [])),
                 "start": _safe_float(seg.get("start")),
@@ -617,8 +591,8 @@ def _build_repair_context_items(
 def _public_repair_reasons(local_reasons: list[str]) -> list[str]:
     public: list[str] = []
     for reason in local_reasons:
-        if reason == "length_mismatch":
-            public.append("length_mismatch")
+        if reason == "empty_translation":
+            public.append("empty_translation")
         elif reason == "source_echo":
             public.append("source_echo")
         elif reason == "japanese_remaining":

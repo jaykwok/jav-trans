@@ -16,6 +16,8 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass
 
+from llm.context import SourceContext
+
 
 @dataclass(frozen=True)
 class ProfileContext:
@@ -35,6 +37,7 @@ class ProfileContext:
     # whether the request only warms the provider prefix cache.
     batch_index: int = 0
     warmup: bool = False
+    source_context: SourceContext | None = None
 
 
 class TranslationProfile(abc.ABC):
@@ -66,6 +69,14 @@ class TranslationProfile(abc.ABC):
         scheduling mode.
         """
         return None
+
+    def sampling_parameters(self) -> dict[str, float | int]:
+        """Native llama.cpp overrides; API transports use deployment defaults."""
+        return {}
+
+    def validate_translation(self, source: str, target: str, target_lang: str) -> None:
+        """Raise on unusable content independently of the wire format."""
+        del source, target, target_lang
 
     def response_token_budget(
         self,

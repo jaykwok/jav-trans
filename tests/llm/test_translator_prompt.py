@@ -4,7 +4,7 @@ from llm import translator
 def test_prompt_version_is_current():
     """The cache key is `id@version`, so this constant is what decides whether a
     prompt change reaches anyone who already has a cache."""
-    assert translator.PROMPT_VERSION == "v3.4"
+    assert translator.PROMPT_VERSION == "v4.0"
 
 
 def test_system_prompt_no_male_prefix_example():
@@ -12,12 +12,11 @@ def test_system_prompt_no_male_prefix_example():
 
 
 def test_system_prompt_tone_is_scene_conditional():
-    # The unconditional whole-film flirtation directive was removed; tone must be
-    # scene-conditional (explicit for sexual scenes, plain for the rest).
+    # Tone follows the source, never a genre-based instruction to intensify it.
     full = translator._SYSTEM_PROMPT_FULL
     assert "本片译文要体现主动撩拨的语气" not in full
-    assert "情欲场景" in full
-    assert "非情欲对白" in full
+    assert "语域和情绪强度跟随原句" in full
+    assert "不因为视频题材或场景自行加强语气" in full
 
 
 def test_system_prompt_includes_style_examples():
@@ -67,6 +66,16 @@ def test_system_prompt_fixes_requested_genital_terms_without_kikuka():
     assert "菊花" not in prompt
     assert "淫穴" not in prompt
     assert "骚逼" not in prompt
+    assert "用户词汇表没有另行指定时" in prompt
+
+
+def test_fidelity_and_evidenced_names_precede_display_constraints():
+    prompt = translator._build_system_prompt("山田", target_lang="简体中文", glossary="")
+    assert "原文含义完整准确 > 用户词汇表" in prompt
+    assert "不是每条译文的语义上限" in prompt
+    assert "不一律只保留一次" in prompt
+    assert "缺少依据保留原名" in prompt
+    assert "智能拆解" not in prompt
 
 
 def test_leading_role_label_regex_strips_human_male_prefix():

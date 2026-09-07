@@ -1,15 +1,7 @@
-"""A cue split by display duration is half a sentence, and the translator has to
-be told so.
+"""Overlong source sentences may split at completed clauses with a pause.
 
-The layout DP cuts a long cue at a measured word gap, which keeps it off the
-middle of a word - but it still lands in the middle of a sentence. The
-translator then sees two independent lines and closes each one off as a complete
-utterance, which is where "…想要你插到" / "更里面" turns into two sentences that
-do not join.
-
-Two things have to hold for the fix to work at all: inherited continuation flags
-must survive a later exact split, and they have to reach the prompt. Both are
-pinned here.
+Their context markers reach translation, and filtering a non-speech passage
+must clear any claim of continuity across that removed passage.
 """
 
 from __future__ import annotations
@@ -31,12 +23,12 @@ from subtitles.options import SubtitleOptions  # noqa: E402
 
 
 def _long_cue(*, start: float = 0.0, end: float = 30.0, text: str = "") -> dict:
-    text = text or "こんにちは" * 20
+    text = text or "明日の仕事が予定よりも早く終わったら、駅前の店で必要な買い物を済ませますが、帰りにそちらの家まで寄って連絡します。"
     words = []
     cursor = start
     for index, char in enumerate(text):
-        if index and index % 10 == 0:
-            cursor += 0.20
+        if index and text[index - 1] == "、":
+            cursor += 0.80
         words.append(
             {
                 "word": char,
@@ -79,7 +71,7 @@ class TestFlagsOnASplitCue:
         assert pieces[-1]["continues_into_next"] is False
 
     def test_middle_pieces_continue_both_ways(self) -> None:
-        pieces = _split(_long_cue(end=60.0, text="こんにちは" * 40))
+        pieces = _split(_long_cue(end=60.0))
         assert len(pieces) >= 3
         for piece in pieces[1:-1]:
             assert piece["continues_from_previous"] is True

@@ -186,7 +186,7 @@ class TestTheFieldsThatUseIt:
 
         options = SubtitleOptions.from_env()
 
-        assert options.max_source_chars == 20
+        assert options.max_source_chars == 32
         assert options.linger_s == 0.0  # a duration, clamped at its floor
         assert options.reading_cps == 7.0
         assert len(typed_config.configuration_problems()) == 3

@@ -36,6 +36,8 @@ def test_compact_prompt_shorter_for_batch1_when_enabled(monkeypatch):
     )
 
     assert len(batch1_prompt) < len(batch0_prompt)
-    assert "EXAMPLE JSON OUTPUT" in batch0_prompt
-    assert "EXAMPLE JSON OUTPUT" not in batch1_prompt
-
+    assert "风格示例" in batch0_prompt
+    assert "风格示例" not in batch1_prompt
+    for prompt in (batch0_prompt, batch1_prompt):
+        assert "semantic_units" in prompt
+        assert '"translations"' in prompt

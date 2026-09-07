@@ -7,7 +7,7 @@ def test_translation_glossary_empty_omits_glossary_section():
         glossary="",
     )
 
-    assert "词汇表" not in prompt
+    assert "以下词汇表必须严格遵守，不得自行创造译名：" not in prompt
 
 
 def test_translation_glossary_appends_user_terms():
@@ -21,4 +21,3 @@ def test_translation_glossary_appends_user_terms():
 
     assert "以下词汇表必须严格遵守，不得自行创造译名：" in prompt
     assert "健太-男主\n小那海-女主" in prompt
-

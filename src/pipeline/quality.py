@@ -58,13 +58,8 @@ def collect_glossary_pairs(
 ) -> list[tuple[str, str]]:
     source_glossary = os.getenv("TRANSLATION_GLOSSARY", "") if glossary is None else glossary
     pairs = parse_glossary_pairs_from_text(source_glossary)
-    pairs.extend(
-        load_global_glossary_pairs(
-            job_temp_dir,
-            video_stem,
-            console=console,
-        )
-    )
+    # Repeated whole-line renderings are observations, not glossary contracts.
+    # Counting them as required terms rewards context-blind mistranslation.
 
     merged: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()

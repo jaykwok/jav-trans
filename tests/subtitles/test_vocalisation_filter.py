@@ -273,7 +273,8 @@ class TestFilterRunsOnFinishedCues:
             blocks, options=options, diagnostics=diagnostics
         )
 
-        assert len(cues) > 1, "the DP must actually split this for the test to bite"
+        assert [cue["ja_text"] for cue in cues] == ["本当にそうなんですか、", "それで大丈夫ですね"]
+        assert diagnostics["vocalisation_cues_dropped"] == 3
         assert "vocalisation_cues_flagged" in diagnostics
         assert all(
             not is_non_semantic_vocalisation(cue.get("text") or "")

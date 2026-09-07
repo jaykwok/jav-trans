@@ -17,6 +17,7 @@ from llm.run_context import RunContext
 from llm.session import TranslationSession
 from llm.profiles import json_v3
 from llm.profiles.base import ProfileContext
+from llm.context import SourceContext
 from llm import settings as llm_settings
 from llm import token_budget
 from llm import transport_util
@@ -211,6 +212,7 @@ def _translation_cache_key(
     character_reference: str = "",
     reasoning_effort: str | None = None,
     prefix_mode: str = "",
+    context_signature: str = "",
 ) -> str:
     return translation_cache._translation_cache_key(
         batch_index,
@@ -224,6 +226,7 @@ def _translation_cache_key(
         compact_system_prompt=COMPACT_SYSTEM_PROMPT,
         reasoning_effort=_effective_reasoning_effort(reasoning_effort),
         prefix_mode=prefix_mode,
+        context_signature=context_signature,
     )
 
 
@@ -235,6 +238,8 @@ def _translation_memory_key(
     target_lang: str = "简体中文",
     character_reference: str = "",
     reasoning_effort: str | None = None,
+    context_signature: str = "",
+    occurrence_id: int | None = None,
 ) -> str:
     return translation_cache._translation_memory_key(
         source_text,
@@ -245,6 +250,8 @@ def _translation_memory_key(
         prompt_version=_effective_prompt_version(),
         model_name=_translation_model_identity(),
         reasoning_effort=_effective_reasoning_effort(reasoning_effort),
+        context_signature=context_signature,
+        occurrence_id=occurrence_id,
     )
 
 
@@ -342,7 +349,7 @@ def translate_segments(
         effective_batch_size = min(effective_batch_size, max(1, int(profile_batch_cap)))
     if effective_batch_size > 0:
         effective_max_workers = _auto_translation_workers(
-            -(-len(segments) // effective_batch_size),  # ceil
+            len(_split_into_batches(segments, effective_batch_size)),
             effective_max_workers,
         )
     effective_cache_path = cache_path or ""
@@ -381,6 +388,14 @@ def translate_segments(
                 global_context
                 if global_context is not None
                 else generate_global_context(segments)
+            )
+            external_context = (
+                full_context if global_context is not None and full_context != generate_global_context(segments) else ""
+            )
+            source_context = SourceContext.build(segments, external_context=external_context)
+            model_identity = _translation_model_identity()
+            context_signature = engine_module.cache_scope(
+                source_context, profile, model_identity, backend_name=backend_name
             )
             context_char_limit = _translation_context_char_limit()
             if context_char_limit > 0 and len(full_context) > context_char_limit:
@@ -424,9 +439,8 @@ def translate_segments(
                 batch_repair_retries=TRANSLATION_BATCH_REPAIR_RETRIES,
                 batch_max_requests=TRANSLATION_BATCH_MAX_REQUESTS,
                 prefix_warmup=TRANSLATION_PREFIX_WARMUP,
-                # No settled rendering exists before the base pass has translated
-                # anything - see `global_glossary`. The repair pass gets one,
-                # derived from this pass's own output.
+                # Recurring translations are observed after the first pass,
+                # never promoted to mandatory terminology.
                 extra_glossary="",
                 full_context=full_context,
                 full_source_payload=full_source_payload,
@@ -439,12 +453,13 @@ def translate_segments(
                 # This profile's signature, not a fresh selection: the key has to
                 # name the contract that produced the text it keys.
                 prompt_version=profile.cache_signature(),
-                model_identity=_translation_model_identity(),
+                model_identity=model_identity,
                 compact_system_prompt=COMPACT_SYSTEM_PROMPT,
                 reasoning_effort=_effective_reasoning_effort(reasoning_effort),
                 on_batch_done=on_batch_done,
                 on_progress=on_progress,
                 cancel_event=cancel_event,
+                source_context=source_context,
             )
             retry_events.extend(worker_retry_events)
             _raise_if_cancelled(cancel_event)
@@ -467,11 +482,13 @@ def translate_segments(
                     # written under a key nothing ever reads again.
                     "reasoning_effort": reasoning_effort,
                     "prefix_mode": engine_module.prefix_mode_label(use_full_json_prefix),
+                    "context_signature": context_signature,
                 }
+                start = 0
+                memory_entries: list[tuple[str, str]] = []
                 for b_index, b_segments in enumerate(
                     _split_into_batches(segments, effective_batch_size)
                 ):
-                    start = b_index * effective_batch_size
                     local_texts = [
                         repaired_texts[start + off]
                         if start + off < len(repaired_texts)
@@ -482,11 +499,27 @@ def translate_segments(
                     _save_cache_entry(
                         effective_cache_path, batch_key, local_texts, _cache_lock
                     )
+                    for offset, (segment, text) in enumerate(zip(b_segments, local_texts)):
+                        source = str(segment.get("text", ""))
+                        if text and _translation_memory_source_is_cacheable(source):
+                            key = _translation_memory_key(
+                                source, glossary=effective_glossary,
+                                target_lang=effective_target_lang,
+                                character_reference=effective_character_reference,
+                                reasoning_effort=reasoning_effort,
+                                context_signature=context_signature,
+                                occurrence_id=start + offset,
+                            )
+                            memory_entries.append((key, text))
+                    start += len(b_segments)
+                if memory_entries:
+                    _save_memory_entries(effective_cache_path, memory_entries, _cache_lock)
 
             if profile.wants_repair_pass:
                 # Derived from this pass's own output, so it only exists once
                 # there is something to measure - see `global_glossary`.
-                settled_glossary_value = resolve_settled_glossary(
+                # Record recurrence for inspection, never as a translation rule.
+                resolve_settled_glossary(
                     segments, zh_texts, effective_cache_path, effective_glossary
                 )
                 zh_texts, repair_timing = repair_module.apply_repair_pass(
@@ -494,7 +527,7 @@ def translate_segments(
                     zh_texts,
                     chat=_engine_chat,
                     session=session,
-                    extra_glossary=settled_glossary_value,
+                    extra_glossary="",
                     on_progress=on_progress,
                     cancel_event=cancel_event,
                     cache_writer=_persist_repaired_translation_cache,
@@ -502,6 +535,16 @@ def translate_segments(
                 _raise_if_cancelled(cancel_event)
                 if repair_timing is not None:
                     timings.append(repair_timing)
+                from llm.semantic_review import apply_semantic_review
+
+                zh_texts, review_timing = apply_semantic_review(
+                    segments, zh_texts, chat=_engine_chat, session=session,
+                    source_context=source_context, model_identity=model_identity,
+                    on_progress=on_progress, cancel_event=cancel_event,
+                    cache_writer=_persist_repaired_translation_cache,
+                )
+                if review_timing is not None:
+                    timings.append(review_timing)
             return zh_texts, timings, list(retry_events)
     finally:
         if previous_retry_events is None:
@@ -750,10 +793,8 @@ _make_aggregated_progress_callback = engine_module._make_aggregated_progress_cal
 def _warn_about_inert_context(profile, *, glossary: str, character_reference: str) -> None:
     """Say so when the chosen contract cannot carry a setting the user filled in.
 
-    Accepting a glossary and silently ignoring it is the "配置项写了没人读"
-    failure this repo hunts elsewhere; the local per-line contract genuinely
-    cannot use one (every context layer measured worse on Hy-MT2), but the user
-    typed it into the UI and is entitled to know where it went.
+    The local contract supports matching user terms and nearby source context.
+    Character references still cannot be carried by its native template.
     """
     reporter = getattr(profile, "warn_about_inert_context", None)
     if reporter is None:
@@ -848,10 +889,15 @@ def _chat(
         # another, which the holder of *that* one was then free to close.
         if task_backend_name() != "openai":
             backend = task_backend()
+            profile = request_config.current_profile()
+            sampling = profile.sampling_parameters() if profile is not None and task_backend_name() == "llamacpp" else {}
+            model_options = {}
+            if task_backend_name() == "llamacpp" and sampling:
+                model_options["sampling_parameters"] = sampling
             return backend.chat_completion(
                 messages,
-                temperature=TRANSLATION_TEMPERATURE,
-                top_p=TRANSLATION_TOP_P,
+                temperature=float(sampling.get("temperature", TRANSLATION_TEMPERATURE)),
+                top_p=float(sampling.get("top_p", TRANSLATION_TOP_P)),
                 max_tokens=budget,
                 # Local-only, and deliberately not passed to the OpenAI
                 # transports below: their strict structured-output mode
@@ -866,6 +912,7 @@ def _chat(
                 cancel_event=cancel_event,
                 on_progress=on_progress,
                 on_usage=on_usage,
+                **model_options,
             )
         return _chat_responses(
             messages,

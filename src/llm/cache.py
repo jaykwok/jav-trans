@@ -164,6 +164,7 @@ def _compute_prompt_signature(
     compact_system_prompt: bool,
     reasoning_effort: str = "",
     prefix_mode: str = "",
+    context_signature: str = "",
 ) -> str:
     compact = "1" if compact_system_prompt else "0"
     normalized_glossary = normalize_glossary_text(glossary)
@@ -176,6 +177,8 @@ def _compute_prompt_signature(
     payload += _optional_signature_parts(
         reasoning_effort=reasoning_effort, prefix_mode=prefix_mode
     )
+    if context_signature:
+        payload += f"\ncontext={context_signature}"
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
 
@@ -188,6 +191,7 @@ def _compute_translation_memory_signature(
     prompt_version: str,
     model_name: str,
     reasoning_effort: str = "",
+    context_signature: str = "",
 ) -> str:
     payload = (
         f"{prompt_version}\n{target_lang.strip()}\n"
@@ -201,6 +205,8 @@ def _compute_translation_memory_signature(
     # is reusable across point releases and prompt-length modes. The thinking
     # tier is not that kind of detail - it changes what the line says.
     payload += _optional_signature_parts(reasoning_effort=reasoning_effort)
+    if context_signature:
+        payload += f"\ncontext={context_signature}"
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
 
@@ -214,8 +220,12 @@ def _translation_memory_key(
     prompt_version: str,
     model_name: str,
     reasoning_effort: str = "",
+    context_signature: str = "",
+    occurrence_id: int | None = None,
 ) -> str:
     normalized_source = _normalize_translation_memory_source(source_text)
+    if occurrence_id is not None:
+        normalized_source = f"{occurrence_id}\n{normalized_source}"
     source_sig = hashlib.sha1(normalized_source.encode("utf-8")).hexdigest()[:16]
     memory_sig = _compute_translation_memory_signature(
         extra_glossary,
@@ -225,6 +235,7 @@ def _translation_memory_key(
         prompt_version=prompt_version,
         model_name=model_name,
         reasoning_effort=reasoning_effort,
+        context_signature=context_signature,
     )
     return f"tm::{memory_sig}::{source_sig}"
 
@@ -266,6 +277,7 @@ def _translation_cache_key(
     compact_system_prompt: bool,
     reasoning_effort: str = "",
     prefix_mode: str = "",
+    context_signature: str = "",
 ) -> str:
     source_payload = []
     for seg in batch_segments:
@@ -283,6 +295,8 @@ def _translation_cache_key(
                 "end": round(end, 3),
                 "duration_sec": round(max(0.0, end - start), 3),
                 "ja": str(seg.get("ja_text") or seg.get("text") or seg.get("ja") or ""),
+                "cont_prev": bool(seg.get("continues_from_previous")),
+                "cont_next": bool(seg.get("continues_into_next")),
             }
         )
     source_sig = hashlib.sha1(
@@ -303,5 +317,6 @@ def _translation_cache_key(
         compact_system_prompt=compact_system_prompt,
         reasoning_effort=reasoning_effort,
         prefix_mode=prefix_mode,
+        context_signature=context_signature,
     )
     return f"{prompt_sig}::{batch_index}::{source_sig}"

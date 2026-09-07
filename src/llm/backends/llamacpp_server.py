@@ -32,7 +32,7 @@ from core import gpu_admission, resources
 from core.typed_config import env_int
 from llm.async_transport import close_quietly, run_cancellable_request
 from llm.backends.base import ManagedTranslationBackend
-from llm.errors import BackendLeaseInvalidatedError, TranslationCancelledError
+from llm.errors import BackendLeaseInvalidatedError, TranslationCancelledError, ResponseTruncatedError
 from utils.model_paths import PROJECT_ROOT
 from utils.subprocess_tools import (
     child_state,
@@ -1020,6 +1020,7 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         cancel_event=None,
         on_progress: Callable[[dict], None] | None = None,
         on_usage: Callable[[dict], None] | None = None,
+        sampling_parameters: dict | None = None,
     ) -> str:
         del reasoning_effort
         self._raise_if_cancelled(cancel_event)
@@ -1036,6 +1037,15 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             "top_p": top_p,
             "max_tokens": max_tokens,
         }
+        # These are llama.cpp extensions, not OpenAI SDK keyword arguments.
+        # The SDK merges extra_body into the JSON sent to the server.
+        extra_body = {
+            key: sampling_parameters[key]
+            for key in ("top_k", "repeat_penalty")
+            if sampling_parameters is not None and key in sampling_parameters
+        }
+        if extra_body:
+            request["extra_body"] = extra_body
         wrapped = _wrap_response_format(response_format)
         if wrapped is not None:
             request["response_format"] = wrapped
@@ -1054,4 +1064,6 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         choices = getattr(response, "choices", None) or []
         if not choices:
             raise RuntimeError("llama-server 返回了空的 choices")
+        if getattr(choices[0], "finish_reason", None) == "length":
+            raise ResponseTruncatedError("llama-server exhausted the output token budget", limit=max_tokens)
         return str(choices[0].message.content or "")

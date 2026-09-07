@@ -7,6 +7,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 from llm import engine as engine_module
 from llm import translator
+from llm.context import SourceContext
+from llm.profiles import select_profile
+
+
+def _scope(segments):
+    return engine_module.cache_scope(
+        SourceContext.build(segments), select_profile(), translator._translation_model_identity()
+    )
 
 
 def _read_cache_jsonl(path) -> dict:
@@ -75,6 +83,7 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
         target_lang="简体中文",
         character_reference="",
         prefix_mode=engine_module.prefix_mode_label(True),
+        context_signature=_scope(segments),
     )
     cache_path.write_text(
         json.dumps({"key": cache_key, "value": ["cached-0", "cached-1"]}, ensure_ascii=False) + "\n",
@@ -118,6 +127,7 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
             target_lang="简体中文",
             character_reference="",
             prefix_mode=engine_module.prefix_mode_label(True),
+            context_signature=_scope(segments),
         )
     ] == ["zh-2", "zh-3"]
     assert cache_path.exists()
@@ -254,21 +264,23 @@ def test_single_request_translation_uses_text_memory_when_timing_changes(monkeyp
 
 def test_translation_memory_partial_hit_requests_only_missing_ids(monkeypatch, tmp_path):
     cache_path = tmp_path / "translation_cache.jsonl"
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "もっと来て"},
+        {"start": 1.0, "end": 2.0, "text": "そこ触って"},
+        {"start": 2.0, "end": 3.0, "text": "気持ちいい"},
+    ]
     cached_key = translator._translation_memory_key(
         "もっと来て",
         glossary="",
         target_lang="简体中文",
+        context_signature=_scope(segments),
+        occurrence_id=0,
     )
     translator._save_memory_entries(
         cache_path,
         [(cached_key, "再靠近点")],
         threading.Lock(),
     )
-    segments = [
-        {"start": 0.0, "end": 1.0, "text": "もっと来て"},
-        {"start": 1.0, "end": 2.0, "text": "そこ触って"},
-        {"start": 2.0, "end": 3.0, "text": "気持ちいい"},
-    ]
     calls: list[tuple[list[int], int]] = []
 
     def fake_chat(messages, expected_count=0, on_progress=None, **_kwargs):
