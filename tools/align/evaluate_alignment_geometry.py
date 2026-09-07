@@ -63,6 +63,13 @@ from asr.alignment import (  # noqa: E402
 )
 from audio.loading import load_audio_16k_mono  # noqa: E402
 from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
+
+from tools.align.checkpoint_io import (  # noqa: E402
+    add_checkpoint_arguments,
+    add_device_arguments,
+    load_checkpoint,
+    resolve_device,
+)
 from asr.encoder_features import EncoderFeatureConfig, Qwen3AsrEncoder  # noqa: E402
 
 SAMPLE_RATE = 16000
@@ -106,17 +113,19 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--model-path", default="")
     parser.add_argument("--seed", type=int, default=20260731)
+    add_checkpoint_arguments(parser)
+    add_device_arguments(parser)
     args = parser.parse_args()
 
     import torch
 
     apply_vram_safety_cap(0.95)
-    payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    payload = load_checkpoint(args.checkpoint, trusted=args.trust_checkpoint)
     if str(payload.get("schema")) != ALIGNMENT_MODEL_SCHEMA:
         raise SystemExit(f"not an alignment checkpoint: {payload.get('schema')!r}")
     vocab = AlignmentVocab.from_payload(payload["vocab"])
     upsample = int(payload["upsample"])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device, allow_cpu=args.allow_cpu)
     head = build_head(
         vocab_size=vocab.size,
         input_dim=int(payload.get("input_dim", 2048)),
@@ -135,7 +144,7 @@ def main() -> None:
         rows = [rows[i] for i in sorted(picked)]
 
     extractor = Qwen3AsrEncoder(
-        EncoderFeatureConfig(model_path=args.model_path or "", device="cuda")
+        EncoderFeatureConfig(model_path=args.model_path or "", device=str(device))
     )
 
     def posteriors(audios: list[np.ndarray]):

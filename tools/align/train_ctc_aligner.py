@@ -47,6 +47,12 @@ from asr.alignment import (  # noqa: E402
     normalize_text,
 )
 from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
+from tools.align.checkpoint_io import (  # noqa: E402
+    add_checkpoint_arguments,
+    add_device_arguments,
+    load_checkpoint,
+    resolve_device,
+)
 from tools.align.frame_teacher_supervision import (  # noqa: E402
     IGNORE_LABEL,
     balanced_frame_class_loss,
@@ -586,6 +592,8 @@ def main() -> None:
     parser.add_argument("--frame-boundary-ignore-s", type=float, default=0.10)
     parser.add_argument("--frame-negative-min-s", type=float, default=0.50)
     parser.add_argument("--seed", type=int, default=20260731)
+    add_checkpoint_arguments(parser)
+    add_device_arguments(parser)
     args = parser.parse_args()
 
     # Scoped by cache rather than by domain. A domain is a mixture label used to
@@ -687,8 +695,8 @@ def main() -> None:
     for row in train_rows:
         counts.update(row["text"])
     if args.vocab_checkpoint:
-        vocab_payload = torch.load(
-            args.vocab_checkpoint, map_location="cpu", weights_only=False
+        vocab_payload = load_checkpoint(
+            args.vocab_checkpoint, trusted=args.trust_checkpoint
         )
         vocab = AlignmentVocab.from_payload(vocab_payload["vocab"])
         if bool(vocab.acoustic_only) != bool(args.acoustic_targets):
@@ -711,7 +719,9 @@ def main() -> None:
         count for char, count in counts.items() if is_acoustic_char(char)
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Explicit, because a training run that silently moves to CPU does not fail
+    # - it takes days and looks like a success at the end of them.
+    device = resolve_device(args.device, allow_cpu=args.allow_cpu)
     head = build_head(
         vocab_size=vocab.size,
         hidden_dim=args.hidden_dim,

@@ -32,8 +32,7 @@ for root in (PROJECT_ROOT, SRC_ROOT):
 from asr.alignment import AlignmentHead, blank_runs, normalize_text  # noqa: E402
 from asr.subtitle_timing import build_aligned_word_timestamps  # noqa: E402
 from audio.loading import load_audio_16k_mono  # noqa: E402
-from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
-from asr.encoder_features import qwen3_asr_audio_output_lengths  # noqa: E402
+from tools.align.qwen_asr_session import QwenAsrSession  # noqa: E402
 
 SAMPLE_RATE = 16000
 FEATURE_CHUNK_S = 30.0
@@ -82,13 +81,6 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260731)
     args = parser.parse_args()
 
-    import torch
-    from transformers import AutoModelForMultimodalLM, AutoProcessor
-
-    from asr.backends.qwen import active_qwen_asr_model_id, active_qwen_asr_model_path
-    from utils.model_paths import resolve_model_spec
-
-    apply_vram_safety_cap(0.95)
     rows = [
         json.loads(line)
         for line in Path(args.manifest).read_text(encoding="utf-8-sig").splitlines()
@@ -102,61 +94,12 @@ def main() -> None:
     rng.shuffle(videos)
     picked = [by_video[video][0] for video in videos[: args.windows]]
 
-    model_spec = resolve_model_spec(
-        active_qwen_asr_model_path() or None, active_qwen_asr_model_id(), download=True
-    )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    processor = AutoProcessor.from_pretrained(model_spec)
-    model = AutoModelForMultimodalLM.from_pretrained(
-        model_spec, dtype=dtype, device_map=str(device)
-    )
-    model.eval()
-    head = AlignmentHead.load(args.checkpoint, device=device)
-
-    def _move(clip: np.ndarray) -> dict:
-        inputs = processor.apply_transcription_request(audio=[clip], language=None)
-        return {
-            key: (
-                value.to(device=device, dtype=dtype)
-                if key == "input_features"
-                else value.to(device=device)
-            )
-            if torch.is_tensor(value)
-            else value
-            for key, value in inputs.items()
-        }
-
-    def encode(clip: np.ndarray) -> np.ndarray:
-        moved = _move(clip)
-        with torch.inference_mode():
-            features = model.get_audio_features(
-                input_features=moved["input_features"],
-                input_features_mask=moved["input_features_mask"],
-            ).pooler_output
-        frames = int(
-            qwen3_asr_audio_output_lengths(moved["input_features_mask"].sum(dim=1))[0]
-        )
-        return features[:frames].detach().float().cpu().numpy()
+    session = QwenAsrSession.load()
+    head = AlignmentHead.load(args.checkpoint, device=session.device)
+    encode = session.frame_features
 
     def transcribe(clip: np.ndarray) -> str:
-        moved = _move(clip)
-        with torch.inference_mode():
-            generated = model.generate(
-                **moved, max_new_tokens=args.max_new_tokens, do_sample=False
-            )
-        suffix = generated[:, moved["input_ids"].shape[1] :]
-        decoded = processor.batch_decode(
-            suffix, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        # Without `parse_output` the decode still carries the prompt template
-        # ("language Japanese<asr_text>"), ~25 characters that were never
-        # spoken; the aligner would place them in the audio and both the score
-        # and every timestamp after them would be wrong.
-        parsed = processor.parse_output(decoded)
-        if isinstance(parsed, dict):
-            parsed = [parsed]
-        return str(parsed[0].get("transcription") or "")
+        return session.transcribe(clip, max_new_tokens=args.max_new_tokens)
 
     lines: list[dict] = []
     stats = {"regions": 0, "runaway": 0, "empty": 0, "unalignable": 0}

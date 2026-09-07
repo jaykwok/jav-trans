@@ -59,6 +59,13 @@ from audio.loading import load_audio_16k_mono  # noqa: E402
 from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
 from asr.encoder_features import EncoderFeatureConfig, Qwen3AsrEncoder  # noqa: E402
 
+from tools.align.checkpoint_io import (  # noqa: E402
+    add_checkpoint_arguments,
+    add_device_arguments,
+    load_checkpoint,
+    resolve_device,
+)
+
 SAMPLE_RATE = 16000
 SCHEMA = "asr_alignment_blank_bias_sweep_v1"
 
@@ -109,6 +116,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--model-path", default="")
     parser.add_argument("--seed", type=int, default=20260731)
+    add_checkpoint_arguments(parser)
+    add_device_arguments(parser)
     args = parser.parse_args()
 
     biases = sorted(set(args.bias or [0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]))
@@ -118,12 +127,12 @@ def main() -> None:
     import torch
 
     apply_vram_safety_cap(0.95)
-    payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    payload = load_checkpoint(args.checkpoint, trusted=args.trust_checkpoint)
     if str(payload.get("schema")) != ALIGNMENT_MODEL_SCHEMA:
         raise SystemExit(f"not an alignment checkpoint: {payload.get('schema')!r}")
     vocab = AlignmentVocab.from_payload(payload["vocab"])
     upsample = int(payload["upsample"])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device, allow_cpu=args.allow_cpu)
     head = build_head(
         vocab_size=vocab.size,
         input_dim=int(payload.get("input_dim", 2048)),

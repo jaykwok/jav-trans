@@ -46,8 +46,7 @@ from asr.cue_features import build_candidate  # noqa: E402
 from asr.postgate import PostGateConfig, review  # noqa: E402
 from tools.align.pregate_reference import PreGateConfig, speech_regions  # noqa: E402
 from audio.loading import load_audio_16k_mono  # noqa: E402
-from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
-from asr.encoder_features import qwen3_asr_audio_output_lengths  # noqa: E402
+from tools.align.qwen_asr_session import QwenAsrSession  # noqa: E402
 
 RESULT_SCHEMA = "pregate_dropped_audio_probe_v1"
 SAMPLE_RATE = 16000
@@ -113,12 +112,6 @@ def main() -> None:
     args = parser.parse_args()
 
     import torch
-    from transformers import AutoModelForMultimodalLM, AutoProcessor
-
-    from asr.backends.qwen import active_qwen_asr_model_id, active_qwen_asr_model_path
-    from utils.model_paths import resolve_model_spec
-
-    apply_vram_safety_cap(0.95)
 
     rows = _read_jsonl(Path(args.dataset))
     if args.split:
@@ -135,59 +128,15 @@ def main() -> None:
     order = rng.permutation(len(rows))[: max(1, args.windows)]
     picked = [rows[int(index)] for index in order]
 
-    model_spec = resolve_model_spec(
-        active_qwen_asr_model_path() or None, active_qwen_asr_model_id(), download=True
-    )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    processor = AutoProcessor.from_pretrained(model_spec)
-    model = AutoModelForMultimodalLM.from_pretrained(
-        model_spec, dtype=dtype, device_map=str(device)
-    )
-    model.eval()
-    head = AlignmentHead.load(args.checkpoint, device=device)
+    session = QwenAsrSession.load()
+    head = AlignmentHead.load(args.checkpoint, device=session.device)
     config = PreGateConfig()
     post_config = PostGateConfig()
 
-    def _move(clip: np.ndarray) -> dict:
-        inputs = processor.apply_transcription_request(audio=[clip], language=None)
-        return {
-            key: (
-                value.to(device=device, dtype=dtype)
-                if key == "input_features"
-                else value.to(device=device)
-            )
-            if torch.is_tensor(value)
-            else value
-            for key, value in inputs.items()
-        }
-
-    def features_of(clip: np.ndarray):
-        moved = _move(clip)
-        with torch.inference_mode():
-            audio_features = model.get_audio_features(
-                input_features=moved["input_features"],
-                input_features_mask=moved["input_features_mask"],
-            ).pooler_output
-        frames = int(
-            qwen3_asr_audio_output_lengths(moved["input_features_mask"].sum(dim=1))[0]
-        )
-        return audio_features[:frames].detach().float().cpu().numpy()
+    features_of = session.frame_features
 
     def transcribe(clip: np.ndarray) -> str:
-        moved = _move(clip)
-        with torch.inference_mode():
-            generated = model.generate(
-                **moved, max_new_tokens=args.max_new_tokens, do_sample=False
-            )
-        suffix = generated[:, moved["input_ids"].shape[1] :]
-        decoded = processor.batch_decode(
-            suffix, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        parsed = processor.parse_output(decoded)
-        if isinstance(parsed, dict):
-            parsed = [parsed]
-        return str(parsed[0].get("transcription") or "")
+        return session.transcribe(clip, max_new_tokens=args.max_new_tokens)
 
     records: list[dict[str, Any]] = []
     dropped_s = 0.0

@@ -1120,7 +1120,21 @@ class AlignmentHead:
         import torch
 
         resolved_path = resolve_alignment_head_path(checkpoint_path)
-        payload = torch.load(resolved_path, map_location="cpu", weights_only=False)
+        # `weights_only=True` because this file is not always one the user made:
+        # `hf:<repo>@<sha>#<file>` downloads it, and the permissive loader
+        # unpickles whatever the archive says, which is arbitrary code before a
+        # single tensor has been read. Every checkpoint this project produces is
+        # tensors and plain values, so the strict loader reads all four shipped
+        # heads (v1, v2, v3, shadow) unchanged - verified on 2026-09-06.
+        try:
+            payload = torch.load(resolved_path, map_location="cpu", weights_only=True)
+        except Exception as exc:
+            raise ValueError(
+                f"对齐头 {resolved_path} 无法在安全模式下读取："
+                "它包含张量和基本类型以外的对象。这类文件只有在完全信任来源时"
+                "才能加载，请改用本项目训练/晋升流程产出的 checkpoint。"
+                f"（原始错误：{exc}）"
+            ) from exc
         schema = str(payload.get("schema") or "")
         if schema not in SUPPORTED_ALIGNMENT_MODEL_SCHEMAS:
             raise ValueError(

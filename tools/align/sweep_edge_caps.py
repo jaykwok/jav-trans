@@ -82,6 +82,13 @@ from asr.alignment import (  # noqa: E402
 from audio.loading import load_audio_16k_mono  # noqa: E402
 from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
 
+from tools.align.checkpoint_io import (  # noqa: E402
+    add_checkpoint_arguments,
+    add_device_arguments,
+    load_checkpoint,
+    resolve_device,
+)
+
 SAMPLE_RATE = 16000
 SCHEMA = "asr_edge_cap_sweep_v2"
 AUDIBLE_EARLY_S = 0.200
@@ -138,16 +145,16 @@ def summarize(errors: list[float]) -> dict:
     }
 
 
-def load_head(checkpoint: Path, model_path: str):
+def load_head(checkpoint: Path, model_path: str, *, trusted: bool, device_choice: str, allow_cpu: bool):
     import torch
 
     apply_vram_safety_cap(0.95)
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload = load_checkpoint(checkpoint, trusted=trusted)
     if str(payload.get("schema")) != ALIGNMENT_MODEL_SCHEMA:
         raise SystemExit(f"not an alignment checkpoint: {payload.get('schema')!r}")
     vocab = AlignmentVocab.from_payload(payload["vocab"])
     upsample = int(payload["upsample"])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(device_choice, allow_cpu=allow_cpu)
     head = build_head(
         vocab_size=vocab.size,
         input_dim=int(payload.get("input_dim", 2048)),
@@ -195,6 +202,8 @@ def main() -> None:
     parser.add_argument("--model-path", default="")
     parser.add_argument("--onset-caps", default="0.00,0.05,0.10,0.15,0.20,0.30")
     parser.add_argument("--coda-caps", default="0.00,0.10,0.15,0.20,0.25,0.30,0.40")
+    add_checkpoint_arguments(parser)
+    add_device_arguments(parser)
     args = parser.parse_args()
 
     onset_caps = [float(p) for p in str(args.onset_caps).split(",") if p.strip()]
@@ -219,7 +228,13 @@ def main() -> None:
             "re-run measure_core_leading_silence.py"
         )
 
-    posteriors, vocab, upsample = load_head(resolve(args.checkpoint), args.model_path)
+    posteriors, vocab, upsample = load_head(
+        resolve(args.checkpoint),
+        args.model_path,
+        trusted=args.trust_checkpoint,
+        device_choice=args.device,
+        allow_cpu=args.allow_cpu,
+    )
 
     rows = read_jsonl(resolve(args.composites))
     rng = np.random.default_rng(args.seed)

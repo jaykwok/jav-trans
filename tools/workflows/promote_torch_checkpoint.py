@@ -3,9 +3,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.align.checkpoint_io import (  # noqa: E402
+    add_checkpoint_arguments,
+    load_checkpoint,
+)
 
 
 def promote_checkpoint(
@@ -22,10 +32,11 @@ def promote_checkpoint(
     metadata_updates: dict[str, Any] | None = None,
     promotion_reason: str = "",
     promoted_at: str | None = None,
+    trusted: bool = False,
 ) -> dict[str, Any]:
     import torch
 
-    payload = torch.load(input_path, map_location="cpu", weights_only=False)
+    payload = load_checkpoint(input_path, trusted=trusted)
     metadata = dict(payload.get("metadata") or {})
     if metadata_updates is not None:
         metadata.update(metadata_updates)
@@ -92,6 +103,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selected-validation-file", type=Path)
     parser.add_argument("--metadata-json", default="")
     parser.add_argument("--promotion-reason", default="")
+    add_checkpoint_arguments(parser)
     return parser.parse_args()
 
 
@@ -109,6 +121,7 @@ def main() -> None:
         selected_validation=_read_selected_validation(args.selected_validation_file),
         metadata_updates=_read_metadata_json(args.metadata_json),
         promotion_reason=args.promotion_reason,
+        trusted=args.trust_checkpoint,
     )
     print(
         json.dumps(

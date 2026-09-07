@@ -51,6 +51,12 @@ from asr.alignment import (  # noqa: E402
     build_head,
 )
 from audio.loading import load_audio_16k_mono  # noqa: E402
+from tools.align.checkpoint_io import (  # noqa: E402
+    add_checkpoint_arguments,
+    add_device_arguments,
+    load_checkpoint,
+    resolve_device,
+)
 from tools.align.frame_teacher_supervision import (  # noqa: E402
     load_accepted_frame_teachers,
     merge_intervals,
@@ -244,18 +250,21 @@ def measure(
     positive_merge_gap_s: float,
     long_gap_min_s: float,
     limit: int,
+    trusted: bool = False,
+    device_choice: str = "auto",
+    allow_cpu: bool = False,
 ) -> dict[str, object]:
     import torch
 
     from tools.align.train_ctc_aligner import FeatureCache
 
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload = load_checkpoint(checkpoint, trusted=trusted)
     if str(payload.get("schema") or "") not in SUPPORTED_ALIGNMENT_MODEL_SCHEMAS:
         raise SystemExit(f"not an alignment checkpoint: {payload.get('schema')!r}")
     vocab = AlignmentVocab.from_payload(payload["vocab"])
     upsample = int(payload["upsample"])
     frame_s = ENCODER_FRAME_S / float(upsample)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(device_choice, allow_cpu=allow_cpu)
     # This measurement is entirely about the CTC blank column and does not read
     # the frame classes at all - but a v2 checkpoint carries the extra layer, and
     # `load_state_dict` is strict, so the head has to be built with it or the
@@ -455,10 +464,15 @@ def main() -> None:
     parser.add_argument("--long-gap-min-s", type=float, default=0.50)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--output", required=True)
+    add_checkpoint_arguments(parser)
+    add_device_arguments(parser)
     args = parser.parse_args()
 
     report = measure(
         checkpoint=resolve_repo_path(args.checkpoint),
+        trusted=args.trust_checkpoint,
+        device_choice=args.device,
+        allow_cpu=args.allow_cpu,
         cache_dir=resolve_repo_path(args.cache_dir),
         teacher_results=resolve_repo_path(args.teacher_results),
         teacher_manifest=resolve_repo_path(args.teacher_manifest),
