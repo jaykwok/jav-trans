@@ -21,12 +21,13 @@ payload under `dist/setup-payload/jav-trans` and passes its own `--workpath`
 (`build/jav-trans-setup`) - one PyInstaller cache shared by two different
 Analysis inputs is a stale-build trap.
 
-PyTorch, the ASR weights, and the CTC head are not in the archive. The first run
-downloads them on the user's machine, which is what takes a release from ~6 GB
-to ~150 MB and makes a patch release cheap to publish. The console stays open
-during `uv sync` so the user can see the download rate and decide whether they
-need a proxy; `bootstrap.py` measures against the real torch wheel named in
-`uv.lock` and reports the estimated time rather than applying a threshold.
+Python, PyTorch, the ASR weights, and the CTC head are not in the archive. The
+installer obtains Python as needed and installs the locked dependencies on the
+user's machine; the first ASR task downloads the model and alignment head.
+This keeps the release around 100 MB. The console stays open during `uv sync`
+so the user can see the download rate and decide whether they need a proxy;
+`bootstrap.py` measures against the real torch wheel named in `uv.lock` and
+reports the estimated time rather than applying a threshold.
 
 FFmpeg travels with the archive because TorchCodec loads its shared DLLs at
 import time and uv cannot install them. `launcher.py` finds them at `bin/`.
@@ -135,9 +136,9 @@ a single `.7z` file and no split volumes. ZIP setup archives use the same
 publication path: freeze the build manifest, verify the source, compress in a
 private directory, extract and verify the actual archived bytes, then rename
 the complete directory into place. A failed check publishes nothing. Existing
-release directories are never overwritten. Publish this large Windows bundle through external storage such
-as a netdisk; GitHub Releases are expected to publish source code and release
-notes only.
+release directories are never overwritten. Publish this large offline bundle
+through external storage such as a netdisk. GitHub Releases use the small setup
+ZIP described above, alongside the release notes and source archives.
 
 ## Reproducibility: pinned weights and a hash manifest
 

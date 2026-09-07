@@ -512,10 +512,13 @@ def forced_align(
     # A valid path ends on the last label or on the blank after it.
     tail = states - 1
     state = tail if scores[tail] >= scores[tail - 1] else tail - 1
+    # Copy the compact uint8 lattice once. Reading a CUDA scalar for every
+    # frame synchronizes the device on every step of this serial traceback.
+    trace = backpointers.cpu().numpy()
     path = [0] * frames
     for t in range(frames - 1, -1, -1):
         path[t] = state
-        state -= int(backpointers[t][state].item())
+        state -= int(trace[t, state])
 
     frame_scores = log_probs.detach().float().cpu()
     spans: list[CharSpan] = []
