@@ -9,6 +9,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $Root
+$env:PYTHONIOENCODING = "utf-8"
 
 $Uv = Get-Command uv -ErrorAction SilentlyContinue
 if (-not $Uv) {
@@ -65,6 +66,15 @@ if ($LASTEXITCODE -ne 0) {
 $Exe = Join-Path $Root "dist/jav-trans/jav-trans.exe"
 if (-not (Test-Path $Exe)) {
     throw "Build finished but executable was not found: $Exe"
+}
+
+# Record what this build actually contains. The version says which commit; only
+# this says which weights, which binaries, and which lock file.
+$ManifestArgs = @("--dist", "dist/jav-trans")
+if ($SkipModels) { $ManifestArgs += "--skip-models" }
+& uv run --no-sync python "packaging/record_release_manifest.py" @ManifestArgs
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
 }
 
 Write-Host "DONE: $Exe"

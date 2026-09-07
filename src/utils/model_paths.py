@@ -1,3 +1,5 @@
+import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -114,6 +116,111 @@ def model_dir_name(repo_id: str) -> str:
 
 def canonical_model_dir(repo_id: str) -> Path:
     return MODELS_ROOT / model_dir_name(repo_id)
+
+
+MODEL_RECEIPT = "model-revision.json"
+MODEL_RECEIPT_SCHEMA = "model_revision_v1"
+
+
+def require_commit_sha(revision: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+        raise ValueError("模型固定版本必须是完整的 40 位 commit SHA")
+    return revision.lower()
+
+
+def revision_model_dir(repo_id: str, revision: str) -> Path:
+    return MODELS_ROOT / ".pinned" / model_dir_name(repo_id) / require_commit_sha(revision)
+
+
+def inference_model_files(root: Path, *, include_receipt: bool = False):
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        if path.name == MODEL_RECEIPT and not include_receipt:
+            continue
+        if any(
+            fnmatch.fnmatch(relative.as_posix(), pattern) or fnmatch.fnmatch(path.name, pattern)
+            for pattern in DEFAULT_INFERENCE_IGNORE_PATTERNS
+        ):
+            continue
+        yield path
+
+
+def _model_file_records(root: Path) -> dict:
+    records = {}
+    for path in inference_model_files(root):
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        records[path.relative_to(root).as_posix()] = {
+            "bytes": path.stat().st_size, "sha256": digest.hexdigest(),
+        }
+    return records
+
+
+def record_model_revision(root: Path, repo_id: str, revision: str) -> dict:
+    if not _path_has_model_files(root):
+        raise ValueError("固定版本模型缺少配置或完整权重")
+    payload = {
+        "schema": MODEL_RECEIPT_SCHEMA, "repo_id": repo_id,
+        "revision": require_commit_sha(revision), "files": _model_file_records(root),
+    }
+    with (root / MODEL_RECEIPT).open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return payload
+
+
+def verify_model_revision(root: Path, repo_id: str, revision: str) -> dict:
+    revision = require_commit_sha(revision)
+    try:
+        payload = json.loads((root / MODEL_RECEIPT).read_text("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("模型目录没有可验证的固定版本记录") from exc
+    if not isinstance(payload, dict) or (
+        payload.get("schema") != MODEL_RECEIPT_SCHEMA
+        or payload.get("repo_id") != repo_id or payload.get("revision") != revision
+        or not _path_has_model_files(root)
+    ):
+        raise ValueError("模型目录与固定版本不符")
+    if payload.get("files") != _model_file_records(root):
+        raise ValueError("模型文件已改变，与固定版本的哈希记录不符")
+    return payload
+
+
+def _resolve_pinned_model(
+    explicit_path: str | None, repo_id: str, revision: str, *, download: bool,
+    allow_patterns=None, ignore_patterns=None,
+) -> str:
+    revision = require_commit_sha(revision)
+    target = _project_path(explicit_path).resolve() if explicit_path else revision_model_dir(repo_id, revision).resolve()
+    if target.exists():
+        verify_model_revision(target, repo_id, revision)
+        return str(target)
+    if not download:
+        raise FileNotFoundError("固定版本模型尚未准备好")
+    # A mutable canonical cache never proves which revision it contains.
+    # Keep each SHA separate; only a completed, verified directory is reusable.
+    from filelock import FileLock
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(target.with_name(target.name + ".lock")), timeout=60):
+        if target.exists():
+            verify_model_revision(target, repo_id, revision)
+            return str(target)
+        staging = target.with_name(target.name + ".partial")
+        _download_snapshot(
+            repo_id, staging, revision=revision,
+            allow_patterns=allow_patterns, ignore_patterns=ignore_patterns,
+        )
+        record_model_revision(staging, repo_id, revision)
+        staging.replace(target)
+    return str(target)
 
 
 def _iter_local_model_candidates(repo_id: str):
@@ -320,6 +427,11 @@ def resolve_model_spec(
     allow_patterns: str | list[str] | None = None,
     ignore_patterns: str | list[str] | None = None,
 ) -> str:
+    if revision is not None:
+        return _resolve_pinned_model(
+            explicit_path, repo_id, revision, download=download,
+            allow_patterns=allow_patterns, ignore_patterns=ignore_patterns,
+        )
     if explicit_path:
         candidate = _project_path(explicit_path).resolve()
         if _path_has_model_files(candidate):
@@ -350,4 +462,3 @@ def resolve_model_spec(
         )
 
     return repo_id
-

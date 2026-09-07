@@ -3,7 +3,6 @@
 import os
 import shutil
 import importlib.util
-import fnmatch
 import sys
 from pathlib import Path
 
@@ -43,33 +42,6 @@ def _env_bool(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-INFERENCE_IGNORE_PATTERNS = [
-    "optimizer.pt",
-    "**/optimizer.pt",
-    "optimizer.bin",
-    "**/optimizer.bin",
-    "scheduler.pt",
-    "**/scheduler.pt",
-    "scaler.pt",
-    "**/scaler.pt",
-    "rng_state*.pth",
-    "**/rng_state*.pth",
-    "trainer_state.json",
-    "**/trainer_state.json",
-    "training_args.bin",
-    "**/training_args.bin",
-]
-
-
-def _ignored_inference_file(relative_path: str) -> bool:
-    normalized = relative_path.replace("\\", "/")
-    name = Path(normalized).name
-    return any(
-        fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch(name, pattern)
-        for pattern in INFERENCE_IGNORE_PATTERNS
-    )
-
-
 def _alignment_head_source() -> str:
     """Fetch the CTC alignment head the app will run, at the pinned revision.
 
@@ -81,6 +53,7 @@ def _alignment_head_source() -> str:
     sys.path.insert(0, str(ROOT / "src"))
     from asr.alignment import _parse_hf_reference
     from core.config import DEFAULT_SETTINGS
+    from utils.model_paths import require_commit_sha
 
     reference = DEFAULT_SETTINGS["ASR_ALIGNMENT_HEAD_PATH"].strip()
     if not reference.lower().startswith("hf:"):
@@ -89,28 +62,7 @@ def _alignment_head_source() -> str:
     from huggingface_hub import hf_hub_download
 
     repo, revision, filename = _parse_hf_reference(reference)
-    return hf_hub_download(repo_id=repo, filename=filename, revision=revision or None)
-
-
-def _collect_inference_model_dir(path: str, dest: str, label: str) -> list[tuple[str, str]]:
-    source = _require_path(path, label)
-    if not source.is_dir():
-        raise SystemExit(f"{label} must be a directory: {source}")
-
-    collected = []
-    for file_path in source.rglob("*"):
-        if not file_path.is_file():
-            continue
-        relative = file_path.relative_to(source).as_posix()
-        if _ignored_inference_file(relative):
-            continue
-        relative_parent = Path(relative).parent.as_posix()
-        target_dir = dest if relative_parent == "." else (Path(dest) / relative_parent).as_posix()
-        collected.append((str(file_path), target_dir))
-
-    if not collected:
-        raise SystemExit(f"{label} has no inference files to bundle: {source}")
-    return collected
+    return hf_hub_download(repo_id=repo, filename=filename, revision=require_commit_sha(revision or ""))
 
 
 def _which_tool(name: str, env_name: str) -> Path:
@@ -190,12 +142,17 @@ datas += [
 ]
 
 if not _env_bool("JAV_TRANS_SKIP_MODELS"):
+    sys.path.insert(0, str(ROOT / "packaging"))
+    from prepare_default_model import verified_release_models
+    from utils.model_paths import inference_model_files, model_dir_name
+
+    release_models = verified_release_models()
     datas.append((_alignment_head_source(), "models"))
-    datas += _collect_inference_model_dir(
-        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
-        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
-        "bundled default 1.7B ASR / SpeechBoundary model",
-    )
+    for source, repo_id, _label in release_models:
+        destination = Path("models") / model_dir_name(repo_id)
+        for file_path in inference_model_files(source, include_receipt=True):
+            relative_parent = file_path.relative_to(source).parent
+            datas.append((str(file_path), (destination / relative_parent).as_posix()))
 
 binaries = _ffmpeg_binaries()
 binaries += _torchcodec_binaries()

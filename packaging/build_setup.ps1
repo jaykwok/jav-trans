@@ -19,6 +19,7 @@ param(
 # first run does, and it is the launcher every time after that.
 
 $ErrorActionPreference = "Stop"
+$env:PYTHONIOENCODING = "utf-8"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $Root
 
@@ -147,6 +148,15 @@ $SizeMb = [math]::Round(
     ((Get-ChildItem -Path $Payload -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB), 1)
 Write-Host "Payload: $Payload ($SizeMb MB)"
 
+# Freeze and hash every file, including this setup build's plain Python source.
+# Models downloaded on the user's machine are outside this archive's inventory.
+$ManifestPath = Join-Path $OutputDir "setup-manifest.json"
+& uv run --no-sync python "packaging/record_release_manifest.py" `
+    --dist $Payload --output $ManifestPath --skip-models
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
 if ($SkipArchive) {
     Write-Host "DONE (archive skipped)"
     exit 0
@@ -155,10 +165,9 @@ if ($SkipArchive) {
 # zip rather than the .7z the full bundle uses: this archive is small enough
 # that the compression ratio does not matter, and Windows opens zip without
 # installing anything.
-New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
-$Archive = Join-Path (Resolve-Path $OutputDir) $ArchiveName
-Remove-Item -LiteralPath $Archive -Force -ErrorAction SilentlyContinue
-Compress-Archive -Path $Payload -DestinationPath $Archive -CompressionLevel Optimal
-
-$ArchiveMb = [math]::Round(((Get-Item -LiteralPath $Archive).Length / 1MB), 1)
-Write-Host "DONE: $Archive ($ArchiveMb MB)"
+& uv run --no-sync python "packaging/archive_release.py" `
+    --source $Payload --output $OutputDir --manifest $ManifestPath --name $ArchiveName
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+Write-Host "DONE: verified release generation saved under $OutputDir"

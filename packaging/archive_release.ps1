@@ -2,16 +2,17 @@ param(
     [string]$SourceDir = "dist/jav-trans",
     [string]$OutputDir = "dist/release-assets",
     [string]$ArchiveName = "jav-trans-windows-x64.7z",
+    [string]$ManifestPath = "dist/release-assets/release-manifest.json",
     [int]$Threads = [Environment]::ProcessorCount
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $Root
+$env:PYTHONIOENCODING = "utf-8"
 
-$Source = Resolve-Path $SourceDir
-New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
-$Output = Join-Path (Resolve-Path $OutputDir) $ArchiveName
+$Source = (Resolve-Path -LiteralPath $SourceDir).Path
+$Manifest = (Resolve-Path -LiteralPath $ManifestPath).Path
 
 $SevenZipCandidates = @(
     "C:\Program Files\7-Zip\7z.exe",
@@ -33,15 +34,9 @@ if ($Threads -lt 1) {
     $Threads = [Environment]::ProcessorCount
 }
 
-Remove-Item -Path "$Output.*" -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $Output -Force -ErrorAction SilentlyContinue
-
 Write-Host "Using $Threads compression threads."
 Write-Host "Using 7-Zip: $SevenZipPath"
-& $SevenZipPath a -t7z -m0=LZMA2 -mx=5 "-mmt=$Threads" $Output $Source
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
-}
-
-Get-ChildItem -Path (Resolve-Path $OutputDir) -Filter $ArchiveName |
-    Select-Object Name,Length,LastWriteTime
+& uv run --no-sync python "packaging/archive_release.py" `
+    --source $Source --output $OutputDir --manifest $Manifest `
+    --name $ArchiveName --threads $Threads --seven-zip $SevenZipPath
+exit $LASTEXITCODE

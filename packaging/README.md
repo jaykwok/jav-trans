@@ -9,7 +9,8 @@ offline fallback.
 .\packaging\build_setup.ps1 -Clean
 ```
 
-Produces `dist/release-assets/jav-trans-windows-x64.zip` (~100 MB), whose payload
+Produces `dist/release-assets/release-<timestamp>-<id>/jav-trans-windows-x64.zip`
+(~100 MB), with `release-manifest.json` and a `.zip.sha256` file. Its payload
 is `jav-trans.exe`, `bin/` (FFmpeg Shared), `src/`, `launcher.py`,
 `pyproject.toml`, `uv.lock`, and `README.txt`. FFmpeg is most of the size.
 
@@ -115,7 +116,10 @@ At runtime, writable files are created next to `jav-trans.exe`:
 
 - `.env` for persisted settings
 - `models/` for user-downloaded or user-replaced models
-- `tmp/jobs/` for job state and resumable task files
+- `tmp/web/` for persisted job state
+- `tmp/jobs/` for resumable task files
+- `tmp/outputs/` for immutable generations of completed outputs; these are not
+  disposable caches and remain after deleting a job
 - `tmp/log/` for `.run.log` diagnostics that users can attach to bug reports
 
 To create one local 7-Zip archive:
@@ -124,16 +128,65 @@ To create one local 7-Zip archive:
 .\packaging\archive_release.ps1
 ```
 
-The default output is `dist/release-assets/jav-trans-windows-x64.7z`. The archive
-script creates a single `.7z` file and no split volumes. Publish this large
-Windows bundle through external storage such as a netdisk; GitHub Releases are
-expected to publish source code and release notes only.
+The default output is
+`dist/release-assets/release-<timestamp>-<id>/jav-trans-windows-x64.7z`, with
+`.7z.sha256` and `release-manifest.json` beside it. The archive script creates
+a single `.7z` file and no split volumes. ZIP setup archives use the same
+publication path: freeze the build manifest, verify the source, compress in a
+private directory, extract and verify the actual archived bytes, then rename
+the complete directory into place. A failed check publishes nothing. Existing
+release directories are never overwritten. Publish this large Windows bundle through external storage such
+as a netdisk; GitHub Releases are expected to publish source code and release
+notes only.
 
-Training-only Mamba artifacts are deliberately excluded from release
-packages: CUDA feature caches, synthetic WAVs, sequence JSONL files, and
-`datasets/train/...` outputs are all regenerable research data. New users only
-need the bundled repo-tagged Boundary Refiner and SpeechBoundary-JA scorer
-plus the bundled Hugging Face inference models above. Do not
-restore old `src/vad` checkpoint paths; if Mamba checkpoints grow too large for
-source distribution, publish them as GitHub Release or Hugging Face artifacts
-instead.
+## Reproducibility: pinned weights and a hash manifest
+
+The full bundle's ASR model is downloaded at a pinned commit, recorded in
+`packaging/model-pins.json`. `build_windows.ps1` refuses to build without a valid
+full commit SHA,
+because a release that says "the 1.7B ASR model" and takes whatever the branch
+points at that afternoon is not the same package twice. Refresh the pin
+deliberately, as its own step:
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+uv run python packaging/prepare_default_model.py --pin
+```
+
+Pinning queries public Hub metadata; it does not download model weights.
+Preparing a full bundle downloads into `models/.pinned/<repo>/<commit>/`,
+separately from the application's ordinary model cache. A `model-revision.json`
+receipt records the repository, SHA, sizes and SHA256 hashes of every inference
+file. Preparation, spec data collection and the final payload all verify this
+receipt. A modified or incomplete pinned directory is refused; an unrelated
+cached model cannot satisfy the pin. There is no unpinned full-build option.
+The CTC alignment head is pinned by SHA through
+`DEFAULT_SETTINGS["ASR_ALIGNMENT_HEAD_PATH"]`, and the packaged app loads it with
+`weights_only=True` - a head fetched from the Hub is not a file the user wrote.
+
+After PyInstaller succeeds, the build records
+`dist/release-assets/release-manifest.json`: SHA256 of every payload file,
+including code, bytecode, configuration, templates, model weights and tool
+binaries, plus `uv.lock`, `pyproject.toml`, model pins and the source commit's
+dirty status. The setup build writes `setup-manifest.json` before archiving,
+even with `-SkipArchive`. Each published generation contains its own frozen
+copy named `release-manifest.json`.
+
+The setup ZIP hashes the files it ships. Its first-run downloads are outside
+that inventory, so this does not promise an identical installed environment or
+fixed ASR weights for setup users. Use the full bundle when the model payload
+must be fixed. Neither path promises bit-for-bit identical PyInstaller archives.
+
+To check an extracted payload from the corresponding source checkout:
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+uv run python packaging/record_release_manifest.py --dist dist/jav-trans --verify dist/release-assets/release-<timestamp>-<id>/release-manifest.json
+```
+
+Paths in the manifest are relative to the payload and to the repository, so it
+carries nothing about the machine that built it.
+
+Training-only artifacts, CUDA feature caches, synthetic WAVs and sequence JSONL
+files are excluded. The full bundle ships the default ASR model and CTC head
+listed above; retired Mamba and VAD checkpoints are not release inputs.
