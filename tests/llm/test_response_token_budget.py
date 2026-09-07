@@ -14,6 +14,7 @@ import json
 
 import pytest
 
+from llm import token_budget
 from llm import settings as llm_settings
 from llm.profiles import get_profile
 from llm.profiles.json_v3 import _reasoning_token_allowance
@@ -128,7 +129,7 @@ def test_no_budget_falls_back_to_the_configured_ceiling(monkeypatch):
     monkeypatch.setattr(translator, "task_backend_name", lambda: "llamacpp")
     monkeypatch.setattr(translator, "task_backend", _Backend)
     translator._chat([{"role": "user", "content": "x"}])
-    assert sent["max_tokens"] == translator.TRANSLATION_MAX_TOKENS
+    assert sent["max_tokens"] == token_budget.CONFIGURED_MAX_TOKENS
 
 
 def test_a_budget_can_only_lower_the_ceiling(monkeypatch):
@@ -147,9 +148,9 @@ def test_a_budget_can_only_lower_the_ceiling(monkeypatch):
     monkeypatch.setattr(translator, "task_backend", _Backend)
     translator._chat(
         [{"role": "user", "content": "x"}],
-        max_tokens=translator.TRANSLATION_MAX_TOKENS * 10,
+        max_tokens=token_budget.CONFIGURED_MAX_TOKENS * 10,
     )
-    assert sent["max_tokens"] == translator.TRANSLATION_MAX_TOKENS
+    assert sent["max_tokens"] == token_budget.CONFIGURED_MAX_TOKENS
 
 
 def test_the_engine_sizes_each_request_by_its_own_segments(monkeypatch):

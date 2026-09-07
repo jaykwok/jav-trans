@@ -1,19 +1,21 @@
 import os
 import logging
 import time
+import uuid
 import sys
 import hashlib
 import json
 import shutil
 import uuid
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 from core import events
+from core.typed_config import env_bool
 from core import stage_errors
 from core.cancellation import PipelineCancelledError as _PipelineCancelledError
 from core.cancellation import cancel_requested as _cancel_requested_impl
@@ -27,7 +29,11 @@ from pipeline import audio as audio_module
 from pipeline import cleanup as cleanup_module
 from pipeline import gpu_worker as asr_stage_worker_module
 from pipeline import output as output_module
-from pipeline import output_writer as output_writer_module
+from pipeline.execution_plan import (
+    TRANSLATION_BACKEND,
+    ExecutionPlan,
+)
+from pipeline import artifact_store
 from pipeline import quality as quality_module
 from pipeline import stage_log as stage_log_module
 from pipeline.artifacts import AsrArtifacts
@@ -89,21 +95,7 @@ _ASR_PROGRESS_RE = stage_log_module._ASR_PROGRESS_RE
 
 
 def _env_flag(name: str) -> bool:
-    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(float(os.getenv(name, str(default))))
-    except (TypeError, ValueError):
-        return default
+    return env_bool(name, False)
 
 
 def _ctx_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
@@ -620,7 +612,7 @@ _log_stage = stage_log_module._log_stage
 
 
 def _project_relative(path: str | Path | None) -> str | None:
-    return output_writer_module.project_relative(path, project_root=PROJECT_ROOT)
+    return artifact_store.project_relative(path, project_root=PROJECT_ROOT)
 
 
 _log_timing_snapshot = stage_log_module._log_timing_snapshot
@@ -787,11 +779,77 @@ _format_asr_stage_label = stage_log_module._format_asr_stage_label
 
 
 def _write_json(path: str, payload: dict) -> None:
-    output_writer_module.write_json(path, payload, project_root=PROJECT_ROOT)
+    artifact_store.write_json(path, payload, project_root=PROJECT_ROOT)
 
 
 def _write_json_atomic(path: str | Path, payload: dict) -> None:
-    output_writer_module.write_json_atomic(path, payload, project_root=PROJECT_ROOT)
+    artifact_store.write_json_atomic(path, payload, project_root=PROJECT_ROOT)
+
+
+def output_target_for_ctx(video_path: str, ctx: JobContext) -> Path:
+    video = _resolve_project_runtime_path(video_path)
+    directory = _resolve_project_runtime_path(ctx.output_dir) if ctx.output_dir else video.parent
+    return directory / ExecutionPlan.for_asr(ctx).srt_filename(video.stem)
+
+
+def _output_lease(
+    video_path: str, ctx: JobContext, *, job_id: str, run_id: str,
+    target: str | Path | None = None,
+) -> artifact_store.OutputLease:
+    destination = Path(target).resolve() if target else output_target_for_ctx(video_path, ctx)
+    identity = run_id or ctx.output_run_id or uuid.uuid4().hex
+    if ctx.output_generation and ctx.output_run_id == identity:
+        if Path(ctx.output_target).resolve() != destination:
+            raise ValueError("运行的输出目标与已登记的目标不一致")
+        return artifact_store.OutputLease(
+            destination, PROJECT_ROOT, job_id, identity, ctx.output_generation,
+        )
+    lease = artifact_store.claim_output(
+        destination, project_root=PROJECT_ROOT, job_id=job_id, run_id=identity,
+    )
+    ctx.output_target = str(destination)
+    ctx.output_generation = lease.sequence
+    ctx.output_run_id = lease.run_id
+    return lease
+
+
+def _run_outputs(
+    *, ctx: JobContext, run_id: str, job_id: str, job_temp_dir: str, video_stem: str,
+) -> artifact_store.RunOutputs:
+    return artifact_store.RunOutputs(lease=artifact_store.OutputLease(
+        Path(ctx.output_target), PROJECT_ROOT, job_id,
+        run_id or ctx.output_run_id, ctx.output_generation,
+    ))
+
+
+def _publish_outputs(
+    outputs: artifact_store.RunOutputs, paths: list[str], artifacts: AsrArtifacts,
+    cancel_event,
+) -> list[str]:
+    staged = {path.resolve() for path in outputs.targets()}
+    extras = list(paths)
+    if artifacts.quality_report_path:
+        markdown = Path(artifacts.quality_report_path)
+        extras.append(str(markdown.with_suffix(".json")))
+    for index, raw in enumerate(extras):
+        path = Path(raw).resolve()
+        if path not in staged and path.is_file():
+            outputs.stage_file(path, name=f"diagnostic_{index}")
+            staged.add(path)
+    manifest = outputs.publish(
+        still_current=lambda: cancel_event is None or not cancel_event.is_set(),
+    )
+    resolved = {
+        str(Path(raw).resolve() if Path(raw).is_absolute() else (PROJECT_ROOT / raw).resolve()):
+            str(artifact_store.artifact_path(manifest["files"][name], PROJECT_ROOT))
+        for name, raw in manifest["targets"].items()
+    }
+    for name in ("transcript_path", "aligned_segments_path", "bilingual_json_path", "quality_report_path"):
+        value = getattr(artifacts, name, "")
+        if value and str(Path(value).resolve()) in resolved:
+            setattr(artifacts, name, resolved[str(Path(value).resolve())])
+    artifact_store.export_output(outputs.lease)
+    return artifact_store.manifest_paths(manifest, project_root=PROJECT_ROOT)
 
 
 def _write_quality_report_for_ctx(
@@ -805,6 +863,7 @@ def _write_quality_report_for_ctx(
     enabled: bool | None = None,
     glossary: str | None = None,
     ja_track: bool = False,
+    report_dir_override: str | Path | None = None,
 ) -> str | None:
     return quality_module.write_quality_report(
         video_stem=video_stem,
@@ -818,7 +877,7 @@ def _write_quality_report_for_ctx(
         video_duration_s=video_duration_s,
         enabled=enabled,
         glossary=glossary,
-        report_dir=_quality_report_dir_for_ctx(ctx),
+        report_dir=report_dir_override or _quality_report_dir_for_ctx(ctx),
         hard_fail=_quality_hard_fail_for_ctx(ctx),
         ja_track=ja_track,
     )
@@ -887,17 +946,14 @@ def _prepare_translation_cues(
     segments: list[dict],
     *,
     subtitle_options,
-    bilingual: bool,
     on_stage=None,
     asr_details: dict | None = None,
 ) -> tuple[list[dict], dict]:
     source_blocks = _build_japanese_srt_blocks(segments)
-    mode = "bilingual" if bilingual else "srt"
     prepare_diagnostics: dict = {}
     cues = subtitle_module.prepare_srt_blocks(
         source_blocks,
         options=subtitle_options,
-        mode=mode,
         on_stage=on_stage,
         diagnostics=prepare_diagnostics,
         acoustic_classes=_frame_class_reader(asr_details),
@@ -1104,6 +1160,9 @@ def _run_asr_alignment_impl(
     # exit code and get described as a damaged or silent video.
     if not os.path.isfile(video_path):
         raise RuntimeError(f"{stage_errors.VIDEO_FILE_MISSING}\n{video_path}")
+    lease = _output_lease(video_path, ctx, job_id=job_id, run_id=run_id or uuid.uuid4().hex)
+    run_id = lease.run_id
+    events.set_current_run(job_id, run_id)
     video_duration_s = audio_module.probe_video_duration_s(
         video_path,
         cancel_event=cancel_event,
@@ -1476,19 +1535,17 @@ def _run_asr_alignment_impl(
     console.print(f"[green]识别完成，共 {len(segments)} 个片段。[/green]")
     _log_stage(logger, f"segments_count={len(segments)}")
 
-    skip_translation = effective_ctx.skip_translation
-    if skip_translation:
-        bilingual = False
-    else:
-        bilingual = output_module.resolve_subtitle_bilingual_for_ctx(effective_ctx)
+    # One statement of what this run is: whether it translates, how its output
+    # is spelled, and what each of its stages will take from the machine.
+    plan = ExecutionPlan.for_asr(effective_ctx).after_asr(segment_count=len(segments))
+    bilingual = plan.bilingual
 
     output_dir = output_module.resolve_output_dir_for_ctx(
         video_path,
         effective_ctx,
         project_root=PROJECT_ROOT,
     )
-    srt_filename = f"{video_filename}.ja.srt" if skip_translation else f"{video_filename}.srt"
-    srt_path = os.path.join(output_dir, srt_filename)
+    srt_path = os.path.join(output_dir, plan.srt_filename(video_filename))
     transcript_path = os.path.join(job_temp_dir, f"{video_filename}.transcript.json")
     asr_manifest_path = os.path.join(job_temp_dir, f"{video_filename}.asr_manifest.json")
     bilingual_json_path = os.path.join(
@@ -1537,6 +1594,16 @@ def _run_asr_alignment_impl(
     )
 
 
+def _run_plan(artifacts: AsrArtifacts, ctx: JobContext) -> ExecutionPlan:
+    """What this run will do, decided before it starts doing it.
+
+    Built *before* the lease, because a lease is a wait: a Japanese-only run and
+    a run with nothing to translate would otherwise queue behind a local server
+    that is retiring, and fail on the timeout of a resource they never use.
+    """
+    return ExecutionPlan.for_run(ctx, has_segments=bool(artifacts.segments))
+
+
 def run_translation_and_write(
     video_path: str,
     artifacts: AsrArtifacts,
@@ -1548,25 +1615,39 @@ def run_translation_and_write(
 ) -> list[str]:
     _reopen_snapshot_run_logger(artifacts)
     try:
-        # A local model is task-scoped, not Web-session-scoped, but the instance
-        # is process-wide: closing it outright at the end of *this* task would
-        # pull the server out from under a parallel video still translating
-        # through it. The lease closes it when the last task lets go, which for
-        # a single job is the same moment as before, and it covers cancellation,
-        # translation failure, output-write failure, empty-ASR and retry alike.
-        #
-        # Resolved once, here: the settings panel may change while a job runs,
-        # and the lease has to name the instance this task will actually use.
-        # Leasing "llamacpp" unconditionally meant an API job could sit out a
-        # local server's retirement for a resource it was never going to touch.
-        backend_name = llm_backends.selected_backend_name()
-        with llm_backends.backend_lease(backend_name, cancel_event):
+        _raise_if_cancelled(cancel_event)
+        job_id = sanitize_job_id(job_id or ctx.job_id or artifacts.job_id)
+        lease = _output_lease(video_path, ctx, job_id=job_id, run_id=run_id, target=artifacts.srt_path)
+        existing = artifact_store.resume_output(lease)
+        if existing is not None:
+            return artifact_store.manifest_paths(existing, project_root=PROJECT_ROOT)
+        plan = _run_plan(artifacts, ctx)
+        with ExitStack() as stack:
+            if plan.needs(TRANSLATION_BACKEND):
+                # A local model is task-scoped, not Web-session-scoped, but the
+                # instance is process-wide: closing it outright at the end of
+                # *this* task would pull the server out from under a parallel
+                # video still translating through it. The lease closes it when
+                # the last task lets go, which for a single job is the same
+                # moment as before, and it covers cancellation, translation
+                # failure, output-write failure, empty-ASR and retry alike.
+                #
+                # Resolved once, here: the settings panel may change while a job
+                # runs, and the lease has to name the instance this task will
+                # actually use. Leasing "llamacpp" unconditionally meant an API
+                # job could sit out a local server's retirement for a resource
+                # it was never going to touch.
+                backend_name = llm_backends.selected_backend_name()
+                stack.enter_context(
+                    llm_backends.backend_lease(backend_name, cancel_event)
+                )
             return _run_translation_and_write_impl(
                 video_path,
                 artifacts,
                 ctx=ctx,
+                plan=plan,
                 job_id=job_id,
-                run_id=run_id,
+                run_id=lease.run_id,
                 cancel_event=cancel_event,
             )
     finally:
@@ -1578,6 +1659,7 @@ def _run_translation_and_write_impl(
     artifacts: AsrArtifacts,
     *,
     ctx: JobContext,
+    plan: ExecutionPlan | None = None,
     job_id: str = "",
     run_id: str = "",
     cancel_event=None,
@@ -1595,6 +1677,11 @@ def _run_translation_and_write_impl(
     backend_label = artifacts.backend_label or asr_module.get_backend_label()
     device = artifacts.device
     job_id = sanitize_job_id(job_id or ctx.job_id or artifacts.job_id)
+    lease = _output_lease(video_path, ctx, job_id=job_id, run_id=run_id, target=artifacts.srt_path)
+    run_id = lease.run_id
+    existing = artifact_store.resume_output(lease)
+    if existing is not None:
+        return artifact_store.manifest_paths(existing, project_root=PROJECT_ROOT)
     if job_id:
         events.set_current_run(job_id, run_id)
     job_temp_dir = artifacts.job_temp_dir
@@ -1613,7 +1700,9 @@ def _run_translation_and_write_impl(
     timings_path = artifacts.timings_path
     translation_cache_path = artifacts.translation_cache_path
     bilingual = artifacts.bilingual
-    skip_translation = ctx.skip_translation
+    if plan is None:
+        plan = _run_plan(artifacts, ctx)
+    skip_translation = plan.subtitle_language == "ja"
     subtitle_options = _subtitle_options_for_ctx(ctx)
     aligned_cache_signature = artifacts.aligned_cache_signature
     if aligned_cache_signature is None:
@@ -1658,28 +1747,44 @@ def _run_translation_and_write_impl(
         write_started = time.perf_counter()
         _log_stage(logger, "stage_start write_output")
         _raise_if_cancelled(cancel_event)
+        outputs = _run_outputs(
+            ctx=ctx,
+            run_id=run_id,
+            job_id=job_id,
+            job_temp_dir=job_temp_dir,
+            video_stem=video_filename,
+        )
         if bilingual:
-            srt_blocks = subtitle_module.write_bilingual_srt(
-                [],
+            srt_blocks = outputs.stage(
                 srt_path,
-                options=subtitle_options,
+                name="srt",
+                write=lambda staged: subtitle_module.write_bilingual_srt(
+                    [],
+                    str(staged),
+                    options=subtitle_options,
+                ),
             )
         else:
-            srt_blocks = subtitle_module.write_srt(
-                [],
+            srt_blocks = outputs.stage(
                 srt_path,
-                options=subtitle_options,
-                language="ja" if skip_translation else "zh",
+                name="srt",
+                write=lambda staged: subtitle_module.write_srt(
+                    [],
+                    str(staged),
+                    options=subtitle_options,
+                    language=plan.subtitle_language,
+                ),
             )
-        _write_json(
+        outputs.stage_json(
             transcript_path,
             {
                 "backend": backend_label,
                 "audio_path": audio_path,
                 "chunks": asr_details.get("transcript_chunks", []),
             },
+            name="transcript",
         )
-        _write_json(
+        outputs.stage_json(
             aligned_segments_path,
             _aligned_segments_payload(
                 backend_label=backend_label,
@@ -1691,14 +1796,17 @@ def _run_translation_and_write_impl(
                 cache_signature=aligned_cache_signature,
                 subtitle_options=subtitle_options,
             ),
+            name="aligned_segments",
         )
-        _write_json(
+        outputs.stage_json(
             bilingual_json_path,
             {
                 "blocks": srt_blocks,
                 "timeline_mode": subtitle_options.timeline_mode,
             },
+            name="bilingual_json",
         )
+        _raise_if_cancelled(cancel_event)
         output_paths.extend(
             [srt_path, transcript_path, aligned_segments_path, bilingual_json_path]
         )
@@ -1719,6 +1827,7 @@ def _run_translation_and_write_impl(
 
         _log_timing_snapshot(logger, pipeline_timings, asr_details)
         quality_report_path = _write_quality_report_for_ctx(
+            report_dir_override=outputs.staging_dir / "quality",
             ctx=ctx,
             video_stem=video_filename,
             job_temp_dir=job_temp_dir,
@@ -1767,6 +1876,7 @@ def _run_translation_and_write_impl(
             output_paths.append(quality_report_path)
         artifacts.quality_report_path = quality_report_path or ""
         _print_timing_summary(pipeline_timings, asr_details)
+        output_paths = _publish_outputs(outputs, output_paths, artifacts, cancel_event)
         console.print(
             f"\n[bold yellow]未识别到可翻译字幕。[/bold yellow] 已生成空文件：{_project_relative(srt_path)}"
         )
@@ -1788,7 +1898,6 @@ def _run_translation_and_write_impl(
         srt_blocks, cue_summary = _prepare_translation_cues(
             segments,
             subtitle_options=subtitle_options,
-            bilingual=False,
             on_stage=lambda stage, current, total: _log_stage(
                 logger,
                 f"subtitle_cue_plan stage={stage} {current}/{total}",
@@ -1814,23 +1923,35 @@ def _run_translation_and_write_impl(
         write_started = time.perf_counter()
         _log_stage(logger, "stage_start write_output")
         _raise_if_cancelled(cancel_event)
+        outputs = _run_outputs(
+            ctx=ctx,
+            run_id=run_id,
+            job_id=job_id,
+            job_temp_dir=job_temp_dir,
+            video_stem=video_filename,
+        )
         # Japanese-only output: the cues carry Japanese in `zh_text`, so the
         # writer has to be told which style guide applies.
-        srt_blocks = subtitle_module.write_srt(
-            srt_blocks,
+        srt_blocks = outputs.stage(
             srt_path,
-            options=subtitle_options,
-            language="ja",
+            name="srt",
+            write=lambda staged: subtitle_module.write_srt(
+                srt_blocks,
+                str(staged),
+                options=subtitle_options,
+                language="ja",
+            ),
         )
-        _write_json(
+        outputs.stage_json(
             transcript_path,
             {
                 "backend": backend_label,
                 "audio_path": audio_path,
                 "chunks": asr_details.get("transcript_chunks", []),
             },
+            name="transcript",
         )
-        _write_json(
+        outputs.stage_json(
             aligned_segments_path,
             _aligned_segments_payload(
                 backend_label=backend_label,
@@ -1842,8 +1963,9 @@ def _run_translation_and_write_impl(
                 cache_signature=aligned_cache_signature,
                 subtitle_options=subtitle_options,
             ),
+            name="aligned_segments",
         )
-        _write_json(
+        outputs.stage_json(
             bilingual_json_path,
             {
                 "backend": backend_label,
@@ -1853,7 +1975,9 @@ def _run_translation_and_write_impl(
                 "translation_request_timings": translation_request_timings,
                 "translation_api_retry_events": [],
             },
+            name="bilingual_json",
         )
+        _raise_if_cancelled(cancel_event)
         output_paths.extend(
             [srt_path, transcript_path, aligned_segments_path, bilingual_json_path]
         )
@@ -1873,6 +1997,7 @@ def _run_translation_and_write_impl(
         )
 
         quality_report_path = _write_quality_report_for_ctx(
+            report_dir_override=outputs.staging_dir / "quality",
             ctx=ctx,
             video_stem=video_filename,
             job_temp_dir=job_temp_dir,
@@ -1934,6 +2059,7 @@ def _run_translation_and_write_impl(
             f"run_done srt={_project_relative(srt_path)} timings={_project_relative(timings_path)}",
         )
         _print_timing_summary(pipeline_timings, asr_details)
+        output_paths = _publish_outputs(outputs, output_paths, artifacts, cancel_event)
         console.print(f"\n[bold green]完成！[/bold green] 已保存至：{_project_relative(srt_path)}")
         console.print(f"[dim]详细耗时：{_project_relative(timings_path)}[/dim]")
         if not ctx.keep_temp_files:
@@ -1949,7 +2075,6 @@ def _run_translation_and_write_impl(
     translation_segments, cue_summary = _prepare_translation_cues(
         segments,
         subtitle_options=subtitle_options,
-        bilingual=bilingual,
         on_stage=lambda stage, current, total: _log_stage(
             logger,
             f"subtitle_cue_plan stage={stage} {current}/{total}",
@@ -2136,28 +2261,44 @@ def _run_translation_and_write_impl(
     write_started = time.perf_counter()
     _log_stage(logger, "stage_start write_output")
     _raise_if_cancelled(cancel_event)
+    outputs = _run_outputs(
+        ctx=ctx,
+        run_id=run_id,
+        job_id=job_id,
+        job_temp_dir=job_temp_dir,
+        video_stem=video_filename,
+    )
     if bilingual:
-        srt_blocks = subtitle_module.write_bilingual_srt(
-            srt_blocks,
+        srt_blocks = outputs.stage(
             srt_path,
-            options=subtitle_options,
+            name="srt",
+            write=lambda staged: subtitle_module.write_bilingual_srt(
+                srt_blocks,
+                str(staged),
+                options=subtitle_options,
+            ),
         )
     else:
-        srt_blocks = subtitle_module.write_srt(
-            srt_blocks,
+        srt_blocks = outputs.stage(
             srt_path,
-            options=subtitle_options,
+            name="srt",
+            write=lambda staged: subtitle_module.write_srt(
+                srt_blocks,
+                str(staged),
+                options=subtitle_options,
+            ),
         )
 
-    _write_json(
+    outputs.stage_json(
         transcript_path,
         {
             "backend": backend_label,
             "audio_path": audio_path,
             "chunks": asr_details.get("transcript_chunks", []),
         },
+        name="transcript",
     )
-    _write_json(
+    outputs.stage_json(
         aligned_segments_path,
         _aligned_segments_payload(
             backend_label=backend_label,
@@ -2169,8 +2310,9 @@ def _run_translation_and_write_impl(
             cache_signature=aligned_cache_signature,
             subtitle_options=subtitle_options,
         ),
+        name="aligned_segments",
     )
-    _write_json(
+    outputs.stage_json(
         bilingual_json_path,
         {
             "backend": backend_label,
@@ -2179,7 +2321,9 @@ def _run_translation_and_write_impl(
             "translation_request_timings": translation_request_timings,
             "translation_api_retry_events": translation_api_retry_events,
         },
+        name="bilingual_json",
     )
+    _raise_if_cancelled(cancel_event)
     output_paths.extend(
         [srt_path, transcript_path, aligned_segments_path, bilingual_json_path]
     )
@@ -2197,6 +2341,7 @@ def _run_translation_and_write_impl(
         skip_reason=_asr_details_cuda_skip_reason(asr_details),
     )
     quality_report_path = _write_quality_report_for_ctx(
+        report_dir_override=outputs.staging_dir / "quality",
         ctx=ctx,
         video_stem=video_filename,
         job_temp_dir=job_temp_dir,
@@ -2257,6 +2402,7 @@ def _run_translation_and_write_impl(
         f"run_done srt={_project_relative(srt_path)} timings={_project_relative(timings_path)}",
     )
     _print_timing_summary(pipeline_timings, asr_details)
+    output_paths = _publish_outputs(outputs, output_paths, artifacts, cancel_event)
     console.print(f"\n[bold green]完成！[/bold green] 已保存至：{_project_relative(srt_path)}")
     console.print(f"[dim]详细耗时：{_project_relative(timings_path)}[/dim]")
     if not ctx.keep_temp_files:

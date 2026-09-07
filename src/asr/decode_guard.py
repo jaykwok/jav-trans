@@ -74,6 +74,8 @@ import math
 import os
 from typing import TYPE_CHECKING, Sequence
 
+from core.typed_config import FALL_BACK, env_bool, env_float, env_int, env_text
+
 if TYPE_CHECKING:  # pragma: no cover - import cost is the whole point
     import torch
 
@@ -103,39 +105,34 @@ MIN_REPEATS = 3
 # arbitrary constant.
 DEFAULT_BUDGET_SECONDS = 30.0
 
+# Rates below this are not slow settings, they are unusable ones: at 1e-6 tokens
+# per second a 30s chunk gets a budget of zero.
+_SMALLEST_USEFUL_RATE = 1e-3
+
 
 def loop_guard_enabled() -> bool:
-    return os.getenv("ASR_DECODE_LOOP_GUARD", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return max(1, int(os.getenv(name, str(default))))
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_float(name: str, default: float, *, upper: float | None = None) -> float:
-    try:
-        value = float(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-    if value <= 0.0 or (upper is not None and value > upper):
-        return default
-    return value
+    return env_bool("ASR_DECODE_LOOP_GUARD", True)
 
 
 def tokens_per_second_ceiling() -> float:
-    return _env_float("ASR_DECODE_TOKENS_PER_SECOND", TOKENS_PER_SECOND_CEILING)
+    # A rate, so a value at or below zero falls back rather than clamping: a
+    # ceiling of ~0 tokens per second truncates every line in the film.
+    return env_float(
+        "ASR_DECODE_TOKENS_PER_SECOND",
+        TOKENS_PER_SECOND_CEILING,
+        minimum=_SMALLEST_USEFUL_RATE,
+        out_of_range=FALL_BACK,
+    )
 
 
 def loop_budget_fraction() -> float:
-    return _env_float("ASR_DECODE_LOOP_BUDGET_FRACTION", LOOP_BUDGET_FRACTION, upper=1.0)
+    return env_float(
+        "ASR_DECODE_LOOP_BUDGET_FRACTION",
+        LOOP_BUDGET_FRACTION,
+        minimum=_SMALLEST_USEFUL_RATE,
+        maximum=1.0,
+        out_of_range=FALL_BACK,
+    )
 
 
 def explicit_token_cap() -> int | None:
@@ -146,13 +143,13 @@ def explicit_token_cap() -> int | None:
     is the thing that was silently truncating dialogue, so it must not be the
     default.
     """
-    raw = os.getenv("ASR_MAX_NEW_TOKENS", "").strip().lower()
-    if raw in {"", "auto", "0", "none", "off"}:
+    raw = env_text("ASR_MAX_NEW_TOKENS", "auto", lower=True)
+    if raw in {"auto", "0", "none", "off"}:
         return None
-    try:
-        return max(MIN_TOKEN_BUDGET, int(raw))
-    except (TypeError, ValueError):
-        return None
+    cap = env_int("ASR_MAX_NEW_TOKENS", 0, minimum=MIN_TOKEN_BUDGET)
+    # 0 only happens when the value did not parse, which is recorded as a config
+    # problem. "Follow the audio" is the safe reading of an unusable cap.
+    return cap or None
 
 
 def plausible_token_budget(duration_s: float) -> int:
@@ -181,11 +178,11 @@ def loop_guard_config(token_budget: int | None = None) -> tuple[int, int, int]:
     leaving a threshold calibrated against a different budget.
     """
     budget = int(token_budget or plausible_token_budget(DEFAULT_BUDGET_SECONDS))
-    min_repeats = _env_int("ASR_DECODE_LOOP_MIN_REPEATS", MIN_REPEATS)
+    min_repeats = env_int("ASR_DECODE_LOOP_MIN_REPEATS", MIN_REPEATS, minimum=1)
     derived_tokens = max(min_repeats, math.ceil(loop_budget_fraction() * budget))
-    min_tokens = _env_int("ASR_DECODE_LOOP_MIN_TOKENS", derived_tokens)
+    min_tokens = env_int("ASR_DECODE_LOOP_MIN_TOKENS", derived_tokens, minimum=1)
     derived_ngram = max(1, min_tokens // min_repeats)
-    max_ngram = _env_int("ASR_DECODE_LOOP_MAX_NGRAM", derived_ngram)
+    max_ngram = env_int("ASR_DECODE_LOOP_MAX_NGRAM", derived_ngram, minimum=1)
     return max_ngram, min_repeats, min_tokens
 
 

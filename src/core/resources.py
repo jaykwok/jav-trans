@@ -123,6 +123,12 @@ class _Record:
 
 
 _LOCK = threading.RLock()
+# Registering work has to be able to *wake* the watchdog, not merely hope it
+# looks again. It shares `_LOCK` on purpose: "the queue is empty" and "this
+# thread is no longer the watchdog" are then decided under the very lock a
+# registrant takes to publish its record, which is what closes the window
+# described in `_watchdog_loop`.
+_WAKE = threading.Condition(_LOCK)
 _RECORDS: dict[tuple[str, int], _Record] = {}
 _WATCHDOG: threading.Thread | None = None
 _ID_SEQ = itertools.count(1)
@@ -400,6 +406,21 @@ def gpu_blocked() -> bool:
         )
 
 
+def occupies_gpu(resource_id: str, generation: int) -> bool:
+    """Is this one identity still holding the card?
+
+    Same rule as `gpu_blocked`, asked of a named resource instead of of all of
+    them, so an owner of a *live* resource can be tracked by identity rather
+    than by rescanning. A record that confirmed its process gone holds no VRAM
+    even if its Job Object handle would not close - that is a handle to retry,
+    not a card to wait for. An identity that is no longer registered holds
+    nothing.
+    """
+    with _LOCK:
+        record = _RECORDS.get((resource_id, generation))
+        return bool(record and record.holds_gpu and record.process_state != "gone")
+
+
 def open_handles() -> list[dict[str, Any]]:
     """Handles we tried to close and could not.
 
@@ -439,8 +460,11 @@ def snapshot() -> dict[str, Any]:
 
 def forget_all() -> None:
     """Drop every record. Tests only - it releases nothing."""
-    with _LOCK:
+    with _WAKE:
         _RECORDS.clear()
+        # So a parked watchdog retires now rather than at the end of a backoff
+        # it computed for records that no longer exist.
+        _WAKE.notify_all()
 
 
 def _start_watchdog() -> None:
@@ -448,10 +472,16 @@ def _start_watchdog() -> None:
 
     One loop for every subsystem: a second watchdog per backend was how the
     backoff drifted apart from the state it was supposed to be retrying.
+
+    Called after every state change that can create work. When the loop is
+    already running this only wakes it, so a record registered while it sleeps
+    is retried at *its* next_retry_at instead of at the end of whatever backoff
+    the thread had computed before that record existed.
     """
     global _WATCHDOG
-    with _LOCK:
+    with _WAKE:
         if _WATCHDOG is not None and _WATCHDOG.is_alive():
+            _WAKE.notify_all()
             return
         _WATCHDOG = threading.Thread(
             target=_watchdog_loop, name="resource-cleanup-watchdog", daemon=True
@@ -460,22 +490,34 @@ def _start_watchdog() -> None:
 
 
 def _watchdog_loop() -> None:
+    """Own the retry schedule until there is nothing left to retry.
+
+    Deciding to exit and *giving up the job* happen in one lock section. They
+    used to be separate: the thread read an empty queue, released the lock and
+    only then returned, and a registration landing in that window found
+    `_WATCHDOG.is_alive()` still true, started no replacement, and left its
+    record waiting for a retry that no longer had a thread. With `holds_gpu` set
+    that is a permanent `gpu_blocked()`, recoverable only by an explicit manual
+    cleanup. Retiring under `_WAKE` means a registrant either publishes its
+    record before this thread's scan (so the scan sees it and stays) or acquires
+    the lock after `_WATCHDOG` is cleared (so `_start_watchdog` starts a fresh
+    thread). There is no third ordering.
+    """
+    global _WATCHDOG
     while True:
-        with _LOCK:
-            due = [
-                (record.resource_id, record.generation, record.next_retry_at)
+        with _WAKE:
+            if _WATCHDOG is not threading.current_thread():
+                # Superseded - whatever `_WATCHDOG` names now owns the retries.
+                return
+            schedule = [
+                record.next_retry_at
                 for record in _RECORDS.values()
                 if record.state == "stopping" and not record.claimed
             ]
-        if not due:
-            return
-        wait_s = max(0.05, min(at for _id, _gen, at in due) - time.time())
-        time.sleep(min(wait_s, RETRY_MAX_S))
-        now = time.time()
-        # Re-read after sleeping: the resource may have been released while this
-        # thread waited, and a request raised against the identity captured
-        # before the sleep is the one thing that cannot touch its replacement.
-        with _LOCK:
+            if not schedule:
+                _WATCHDOG = None
+                return
+            now = time.time()
             ready = [
                 (record.resource_id, record.generation)
                 for record in _RECORDS.values()
@@ -483,6 +525,13 @@ def _watchdog_loop() -> None:
                 and not record.claimed
                 and record.next_retry_at <= now
             ]
+            if not ready:
+                # Re-read on the way back round: the resource may have been
+                # released while this thread waited, and a request raised
+                # against the identity captured before the wait is the one
+                # thing that cannot touch its replacement.
+                _WAKE.wait(max(0.05, min(min(schedule) - now, RETRY_MAX_S)))
+                continue
         for resource_id, generation in ready:
             try:
                 request_stop(resource_id, generation)

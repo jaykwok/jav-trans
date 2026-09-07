@@ -89,7 +89,7 @@ def _env(name: str) -> str:
     return str(os.getenv(name, "") or "").strip()
 
 
-def _detection_haystack(backend: str) -> str:
+def _detection_haystack(backend: str, *, model_name: str | None = None) -> str:
     if backend == "llamacpp":
         return " ".join(
             (
@@ -101,13 +101,31 @@ def _detection_haystack(backend: str) -> str:
     if backend == "openai":
         # Self-hosted fine-tunes behind an OpenAI-compatible server (vLLM /
         # llama-server started by hand) are detected via the model name.
-        return _env("LLM_MODEL_NAME").lower()
+        return (_env("LLM_MODEL_NAME") if model_name is None else model_name).lower()
     # The transformers local backend cannot load GGUF releases, and custom
     # backends must opt in via TRANSLATION_PROMPT_PROFILE.
     return ""
 
 
-def select_profile() -> TranslationProfile:
+def select_profile(
+    *,
+    backend: str | None = None,
+    model_name: str | None = None,
+) -> TranslationProfile:
+    """Which prompt contract this run speaks.
+
+    ``backend`` and ``model_name`` let a caller that has already settled those -
+    a task holds a backend lease and a frozen endpoint snapshot - select from
+    what it settled rather than from whatever the settings panel says now.
+    Detection reads configuration strings only, so passing them in is enough to
+    make the answer as stable as the values behind it; omitting them keeps the
+    live-environment reading every other caller has always had.
+
+    Selecting twice is the failure this exists to prevent: the run used the
+    profile picked here while the cache key carried a *second* selection made
+    later, so a model switched mid-run produced `json@v3.4` output filed under
+    `hymt2@hymt2-line-v1`.
+    """
     pinned = _env("TRANSLATION_PROMPT_PROFILE").lower() or "auto"
     if pinned != "auto":
         profile_id = _PIN_ALIASES.get(pinned, pinned)
@@ -115,8 +133,8 @@ def select_profile() -> TranslationProfile:
             return _REGISTRY[profile_id]
         return _REGISTRY[_DEFAULT_PROFILE_ID]
 
-    backend = _env("TRANSLATION_BACKEND").lower() or "openai"
-    haystack = _detection_haystack(backend)
+    backend = (backend or _env("TRANSLATION_BACKEND")).lower() or "openai"
+    haystack = _detection_haystack(backend, model_name=model_name)
     if haystack:
         for profile_id, tokens in _MATCH_TOKENS.items():
             if any(token in haystack for token in tokens):

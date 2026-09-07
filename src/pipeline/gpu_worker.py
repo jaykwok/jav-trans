@@ -17,7 +17,8 @@ from typing import Any, Callable
 from pipeline import batch_profile
 from pipeline.stage_log import ASR_STAGE_HEARTBEAT_PREFIX
 from utils.ffmpeg_runtime import configure_ffmpeg_shared_runtime
-from core import resources
+from core import gpu_admission, resources
+from core.typed_config import env_float, env_int
 from utils.subprocess_tools import close_kill_on_close_job
 
 
@@ -45,24 +46,10 @@ class GpuWorkerTimeoutError(GpuWorkerError):
 _PROFILE_MARKER_SUFFIX = "__PROFILE_ACTIVE"
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name, str(default)).strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, str(default)).strip()
-    if not raw:
-        return default
-    try:
-        return int(float(raw))
-    except (TypeError, ValueError):
-        return default
+# Thin names kept because this module reads a dozen worker knobs and the call
+# sites read better without the module prefix; the rules are the shared ones.
+_env_float = env_float
+_env_int = env_int
 
 
 def _safe_send(conn: Connection, message: dict[str, Any]) -> bool:
@@ -1916,8 +1903,23 @@ def transcribe_and_align(
     cancel_requested: Callable[[], bool] | None = None,
 ) -> tuple[list[dict], list[str], dict]:
     global _GLOBAL_WORKER
-    with _GLOBAL_WORKER_LOCK:
-        worker = _get_global_worker()
+    # The permit, not `_GLOBAL_WORKER_LOCK`, is what makes one transcription at
+    # a time true. Holding this lock for the whole request made it the thing a
+    # local-model start blocked on inside `shutdown_global_worker()` - an
+    # uncancellable wait for another job's entire ASR stage, on a lock whose
+    # actual job is a two-line state change. The registry lock is short again;
+    # exclusion and the cancellable wait belong to admission.
+    try:
+        permit = gpu_admission.acquire(
+            gpu_admission.ASR,
+            cancel=cancel_requested,
+            description="asr-gpu-worker",
+        )
+    except gpu_admission.GpuAdmissionCancelled as exc:
+        raise GpuWorkerError("cancelled", "ASR stage worker cancelled") from exc
+    try:
+        with _GLOBAL_WORKER_LOCK:
+            worker = _get_global_worker()
         try:
             return worker.transcribe_and_align(
                 audio_path,
@@ -1929,9 +1931,17 @@ def transcribe_and_align(
                 cancel_requested=cancel_requested,
             )
         except Exception:
-            if not (worker.is_alive() or worker.has_unreleased_child()):
-                _GLOBAL_WORKER = None
+            with _GLOBAL_WORKER_LOCK:
+                # Only if it is still the shared one: the lock is no longer held
+                # across the request, so clearing "whatever is filed there now"
+                # could drop a replacement somebody else is already using.
+                if _GLOBAL_WORKER is worker and not (
+                    worker.is_alive() or worker.has_unreleased_child()
+                ):
+                    _GLOBAL_WORKER = None
             raise
+    finally:
+        gpu_admission.release(permit)
 
 
 def shutdown_global_worker() -> bool:

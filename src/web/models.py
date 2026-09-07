@@ -54,6 +54,10 @@ class JobState(BaseModel):
         "asr",
         "translating",
         "writing",
+        "saving",
+        "save_failed",
+        "publish_failed",
+        "export_failed",
         "done",
         # 已请求取消: the cancel signal is out, the run has not stopped yet.
         # Distinct from "cancelled", which means nothing is still running.
@@ -65,6 +69,17 @@ class JobState(BaseModel):
     progress: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[str] = Field(default_factory=list)
     error: str | None = None
+    pending_status: Literal["done", "failed", "cancelled", "publish_failed", "export_failed"] | None = None
+    storage_error: str | None = None
+    output_target: str = ""
+    output_generation: int = 0
+    # A process-wide clock tick, stamped on every published change. `run_id`
+    # tells two *executions* apart; this tells two states of the same execution
+    # apart, which is what the page needs: SSE progress and the 3s poll both
+    # issue GETs, responses can arrive out of order, and the older one used to
+    # win simply by landing last (a `failed` card reappearing over a running
+    # one). Monotonic across jobs, so it also dates a whole list response.
+    revision: int = 0
 
 
 class SettingsRead(BaseModel):

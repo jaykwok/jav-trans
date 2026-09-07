@@ -11,9 +11,10 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from starlette.responses import FileResponse
 
+from pipeline import artifact_store
 from utils.model_paths import PROJECT_ROOT
 from utils.subprocess_tools import no_window_subprocess_kwargs
-from web.pipeline_manager import get_job
+from web.pipeline_manager import get_job, output_lease_for_job
 from web.models import JobState
 
 
@@ -125,25 +126,29 @@ def _artifact_path_candidates(job: JobState, raw_path: str) -> list[Path]:
 
 
 def _resolve_authorized_artifact_path(job: JobState, raw_path: str) -> Path | None:
-    allowed_roots = _authorized_artifact_roots(job)
-
-    for candidate in _artifact_path_candidates(job, raw_path):
-        try:
-            resolved = candidate.expanduser().resolve()
-        except (OSError, RuntimeError):
-            continue
-        if not resolved.exists():
-            continue
-
-        # Guard against path traversal: even a tampered jobs.json artifact must
-        # remain inside an output root derived from this job's own specification.
-        for root in allowed_roots:
-            try:
-                resolved.relative_to(root)
-            except ValueError:
-                continue
-            return resolved
-    return None
+    lease = output_lease_for_job(job)
+    if job.output_generation:
+        # New jobs read only committed immutable files. There is no fallback to
+        # a mutable export if the manifest is missing or corrupt.
+        manifest = artifact_store.read_run_manifest(lease, verify=True) if lease else None
+        if manifest is None:
+            return None
+        requested = Path(raw_path).name
+        candidates = [
+            path for path in artifact_store.manifest_paths(manifest, project_root=PROJECT_ROOT)
+            if Path(path).name == requested
+        ]
+        return artifact_store.authorized_path(
+            candidates, [artifact_store.output_store_root(lease.target, project_root=PROJECT_ROOT)],
+        )
+    # Which paths this job could plausibly mean is a question about the job;
+    # whether the answer is allowed out of the process is a question about
+    # artifacts, and `pipeline.artifact_store` is the one place that answers it -
+    # so opening and downloading cannot drift into two different rules again.
+    return artifact_store.authorized_path(
+        _artifact_path_candidates(job, raw_path),
+        _authorized_artifact_roots(job),
+    )
 
 
 def _is_job_video_path(job: JobState, path: Path) -> bool:
@@ -374,7 +379,14 @@ async def open_folder(job_id: str, path: str) -> dict[str, bool]:
     job = await get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    target = _resolve_authorized_artifact_path(job, path)
+    target = None
+    if job.output_target:
+        exported = artifact_store.artifact_path(job.output_target, PROJECT_ROOT)
+        requested = artifact_store.artifact_path(path, PROJECT_ROOT)
+        if requested == exported and exported.parent.is_dir():
+            target = artifact_store.authorized_path([exported.parent], _authorized_artifact_roots(job))
+    if target is None:
+        target = await asyncio.to_thread(_resolve_authorized_artifact_path, job, path)
     if target is None:
         video_path = _resolve_existing_video_path(path)
         if video_path is not None and _is_job_video_path(job, video_path):
@@ -398,7 +410,7 @@ async def open_artifact(job_id: str, path: str) -> dict[str, bool]:
     job = await get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    target = _resolve_authorized_artifact_path(job, path)
+    target = await asyncio.to_thread(_resolve_authorized_artifact_path, job, path)
     if target is None:
         raise HTTPException(status_code=403, detail="Artifact is not part of this job")
     if not target.is_file():
@@ -413,14 +425,7 @@ async def open_artifact(job_id: str, path: str) -> dict[str, bool]:
 
 
 def _quality_report_paths(job: JobState) -> tuple[Path, Path | None] | None:
-    """Locate this job's quality report and the machine-readable twin beside it.
-
-    Only the Markdown copy is registered as an artifact - it is the one a human
-    opens - while `write_quality_report` writes the JSON next to it under the
-    same stem. Resolving the Markdown through the artifact guard and then
-    swapping the suffix keeps the traversal check intact: a sibling of an
-    authorised file is inside an authorised directory by construction.
-    """
+    """Resolve both representations from the same committed generation."""
     for artifact in job.artifacts:
         name = Path(str(artifact)).name
         if not name.endswith(_QUALITY_MARKDOWN_SUFFIX):
@@ -428,6 +433,9 @@ def _quality_report_paths(job: JobState) -> tuple[Path, Path | None] | None:
         markdown_path = _resolve_authorized_artifact_path(job, name)
         if markdown_path is None:
             continue
+        if job.output_generation:
+            json_path = _resolve_authorized_artifact_path(job, Path(name).with_suffix(".json").name)
+            return markdown_path, json_path
         json_path = markdown_path.with_suffix(".json")
         return markdown_path, json_path if json_path.is_file() else None
     return None
@@ -439,7 +447,7 @@ async def get_quality_report(job_id: str) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    found = _quality_report_paths(job)
+    found = await asyncio.to_thread(_quality_report_paths, job)
     if found is None:
         # Not an error: the report is opt-in (QUALITY_REPORT_ENABLED / the
         # 「生成质量报告」 toggle), so its absence is the normal case and the page
@@ -480,37 +488,14 @@ async def get_output_file(job_id: str, filename: str) -> FileResponse:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    # The same resolver the open routes use, deliberately. Downloading had its
+    # own pair of roots - the job's output_dir and the project - which omitted
+    # the one the pipeline actually writes to when no output_dir is set: the
+    # directory beside each source video. A film outside the project therefore
+    # produced subtitles the page would open and refuse to download. Two rules
+    # for one authorisation question is one rule too many.
     requested_name = _safe_name(filename)
-    output_base = _resolve_output_base(job.spec.output_dir)
-    candidates: list[Path] = []
-    for artifact in job.artifacts:
-        artifact_path = Path(str(artifact))
-        if artifact_path.name == requested_name:
-            if artifact_path.is_absolute():
-                candidates.append(artifact_path)
-            else:
-                candidates.append(output_base / artifact_path)
-                candidates.append(PROJECT_ROOT / artifact_path)
-
-    output_root = output_base.resolve()
-    project_root = PROJECT_ROOT.resolve()
-    for candidate in candidates:
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            continue
-        if not resolved.is_file():
-            continue
-        # Guard against path traversal: only serve files inside the job's output
-        # base or the project root, even if a persisted jobs.json artifact entry
-        # was tampered to point elsewhere.
-        try:
-            resolved.relative_to(output_root)
-        except ValueError:
-            try:
-                resolved.relative_to(project_root)
-            except ValueError:
-                continue
-        return FileResponse(resolved, filename=requested_name)
-
-    raise HTTPException(status_code=404, detail="Output file not found")
+    target = await asyncio.to_thread(_resolve_authorized_artifact_path, job, requested_name)
+    if target is None or not target.is_file():
+        raise HTTPException(status_code=404, detail="Output file not found")
+    return FileResponse(target, filename=requested_name)

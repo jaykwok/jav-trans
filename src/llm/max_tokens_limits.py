@@ -62,6 +62,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from core.typed_config import env_text
 from utils.runtime_paths import runtime_path
 
 # v4 has no expiry at all, and a stored refusal now carries a stronger claim
@@ -100,11 +101,12 @@ class EndpointLimits:
 
 
 def limits_path() -> Path:
-    raw = os.getenv(
-        "TRANSLATION_MAX_TOKENS_CACHE_PATH",
-        "tmp/cache/translation_max_tokens.json",
-    ).strip()
-    return runtime_path(raw or "tmp/cache/translation_max_tokens.json")
+    return runtime_path(
+        env_text(
+            "TRANSLATION_MAX_TOKENS_CACHE_PATH",
+            "tmp/cache/translation_max_tokens.json",
+        )
+    )
 
 
 def endpoint_key(base_url: str, model: str) -> str:

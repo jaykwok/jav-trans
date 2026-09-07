@@ -12,11 +12,12 @@ from pathlib import Path
 import xxhash
 
 from core.cancellation import PipelineCancelledError, cancel_requested
+from core.typed_config import env_bool, env_float, env_int, env_text
 from utils.subprocess_tools import SubprocessCancelledError, run_cancellable
 
-_AUDIO_SAMPLE_RATE = max(8000, int(os.getenv("AUDIO_SAMPLE_RATE", "16000")))
-_AUDIO_CHANNELS = max(1, int(os.getenv("AUDIO_CHANNELS", "1")))
-_AUDIO_BASE_FILTER = os.getenv("AUDIO_FILTER", "highpass=f=70,lowpass=f=7600").strip()
+_AUDIO_SAMPLE_RATE = env_int("AUDIO_SAMPLE_RATE", 16000, minimum=8000)
+_AUDIO_CHANNELS = env_int("AUDIO_CHANNELS", 1, minimum=1)
+_AUDIO_BASE_FILTER = env_text("AUDIO_FILTER", "highpass=f=70,lowpass=f=7600")
 # PCM WAV has no discontinuous timestamp axis. Without async resampling, ffmpeg
 # concatenates decoded packets across edit-list / PTS gaps and silently shortens
 # the ASR audio. Every CTC timestamp after such a gap then becomes early against
@@ -39,29 +40,13 @@ _PARTIAL_SUFFIX = ".partial"
 _PARTIAL_GLOB = f"*{_PARTIAL_SUFFIX}"
 _STALE_PARTIAL_AGE_S = 1800.0
 _WAV_SAMPLE_WIDTH = 2
-_AUDIO_USE_LOUDNORM = os.getenv("AUDIO_USE_LOUDNORM", "0").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_AUDIO_DYNAUDNORM = os.getenv("AUDIO_DYNAUDNORM", "1").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+_AUDIO_USE_LOUDNORM = env_bool("AUDIO_USE_LOUDNORM", False)
+_AUDIO_DYNAUDNORM = env_bool("AUDIO_DYNAUDNORM", True)
 
 
 def build_audio_filter_chain() -> str:
-    dynaudnorm_enabled = os.getenv(
-        "AUDIO_DYNAUDNORM",
-        "1" if _AUDIO_DYNAUDNORM else "0",
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    loudnorm_enabled = os.getenv(
-        "AUDIO_USE_LOUDNORM",
-        "1" if _AUDIO_USE_LOUDNORM else "0",
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    dynaudnorm_enabled = env_bool("AUDIO_DYNAUDNORM", _AUDIO_DYNAUDNORM)
+    loudnorm_enabled = env_bool("AUDIO_USE_LOUDNORM", _AUDIO_USE_LOUDNORM)
 
     filters = [_AUDIO_TIMELINE_FILTER]
     if _AUDIO_BASE_FILTER:
@@ -109,15 +94,13 @@ def _audio_extract_timeout_s(
     *,
     cancel_event: threading.Event | None = None,
 ) -> float:
-    override = os.getenv("AUDIO_EXTRACT_TIMEOUT_S", "").strip()
-    if override:
-        try:
-            parsed = float(override)
-        except ValueError as exc:
-            raise ValueError(f"AUDIO_EXTRACT_TIMEOUT_S must be a positive number, got {override!r}") from exc
-        if parsed <= 0:
-            raise ValueError(f"AUDIO_EXTRACT_TIMEOUT_S must be positive, got {override!r}")
-        return parsed
+    # 0 (or unset) means "derive it from the video's own duration", which is
+    # what the caller wants far more often than a fixed number. A value that
+    # cannot be a timeout is reported as a config problem and derived instead of
+    # aborting the extraction - the run is not wrong, the setting is.
+    override = env_float("AUDIO_EXTRACT_TIMEOUT_S", 0.0, minimum=0.0)
+    if override > 0:
+        return override
     duration = probe_video_duration_s(video_path, cancel_event=cancel_event)
     if duration:
         return max(300.0, duration * 4.0 + 120.0)
@@ -291,15 +274,8 @@ def extract_audio(
 
 
 def _probe_timeout_s() -> float:
-    override = os.getenv("FFPROBE_TIMEOUT_S", "").strip()
-    if override:
-        try:
-            parsed = float(override)
-        except ValueError:
-            return _DEFAULT_PROBE_TIMEOUT_S
-        if parsed > 0:
-            return parsed
-    return _DEFAULT_PROBE_TIMEOUT_S
+    override = env_float("FFPROBE_TIMEOUT_S", 0.0, minimum=0.0)
+    return override if override > 0 else _DEFAULT_PROBE_TIMEOUT_S
 
 
 def probe_video_duration_s(

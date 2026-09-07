@@ -37,6 +37,7 @@ async def _reset_pm_state() -> None:
     async with pm._state_lock:
         pm._jobs.clear()
         pm._cancel_events.clear()
+        pm._tombstones.clear()
     await _drain_queue(pm.gpu_queue)
     await _drain_queue(pm.trans_queue)
     # A module-level asyncio.Queue binds to the first loop that waits on it, and
@@ -85,6 +86,32 @@ def test_model_requirements_includes_cuda_driver_warning(tmp_path, monkeypatch):
 
 def test_model_requirements_can_skip_the_cuda_probe(tmp_path, monkeypatch):
     asyncio.run(_test_model_requirements_can_skip_the_cuda_probe(tmp_path, monkeypatch))
+
+
+def test_the_cuda_probe_never_stalls_the_event_loop(tmp_path, monkeypatch):
+    asyncio.run(_test_the_cuda_probe_never_stalls_the_event_loop(tmp_path, monkeypatch))
+
+
+def test_a_restart_is_a_new_clock_not_an_older_one(tmp_path, monkeypatch):
+    asyncio.run(_test_a_restart_is_a_new_clock_not_an_older_one(tmp_path, monkeypatch))
+
+
+def test_a_restart_inside_one_millisecond_is_still_a_new_epoch(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    monkeypatch.setattr(
+        pm, "_time", SimpleNamespace(time=lambda: 1_700_000_000.0, sleep=lambda _s: None)
+    )
+    monkeypatch.setattr(pm, "_epoch", 0)
+
+    first = pm.state_epoch()
+    pm._epoch = 0  # a fresh interpreter, before the clock has moved
+    second = pm.state_epoch()
+
+    assert second == first + 1
+
+
+def test_every_published_change_dates_itself(tmp_path, monkeypatch):
+    asyncio.run(_test_every_published_change_dates_itself(tmp_path, monkeypatch))
 
 
 def test_cuda_environment_status_reads_frozen_probe_file(tmp_path, monkeypatch):
@@ -310,6 +337,16 @@ def test_open_folder_allows_default_video_directory(tmp_path, monkeypatch):
     asyncio.run(_test_open_folder_allows_default_video_directory(tmp_path, monkeypatch))
 
 
+def test_downloading_an_artifact_follows_the_same_rule_as_opening_it(
+    tmp_path, monkeypatch
+):
+    asyncio.run(
+        _test_downloading_an_artifact_follows_the_same_rule_as_opening_it(
+            tmp_path, monkeypatch
+        )
+    )
+
+
 async def _test_app_exposes_icon_assets(tmp_path, monkeypatch):
     image_dir = tmp_path / "src" / "assets" / "images"
     image_dir.mkdir(parents=True)
@@ -466,6 +503,156 @@ async def _test_model_requirements_can_skip_the_cuda_probe(tmp_path, monkeypatch
     assert skipped.json()["missing_count"] == 1
     assert included.json()["cuda"]["ok"] is True
     assert probes == 1
+
+
+async def _test_every_published_change_dates_itself(tmp_path, monkeypatch):
+    """Ordering the page can act on has to come from the server.
+
+    `run_id` distinguishes two executions; it says nothing about two states of
+    the same one, which is what arrives out of order. So every published change
+    carries a monotonic revision, and a list response carries the reading it was
+    taken at - the only way an empty list can say "everything was deleted"
+    rather than "this is from before anything existed".
+    """
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    await _reset_pm_state()
+
+    try:
+        job = (await pm.create_job(JobSpec(video_paths=["sample.mp4"])))[0]
+        created = job.revision
+        await pm.update_job_progress(
+            job.id, {"stage": "asr", "pct": 10}, run_id=job.run_id
+        )
+        progressed = (await pm.get_job(job.id)).revision
+        await pm._set_job(job, status="done", expected_run_id=job.run_id)
+        finished = (await pm.get_job(job.id)).revision
+
+        assert 0 < created < progressed < finished
+
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            listed = await client.get("/api/jobs")
+            watermark = int(listed.headers["X-Jobs-Revision"])
+            assert [item["revision"] for item in listed.json()] == [finished]
+            assert watermark >= finished
+
+            cleared = await client.delete("/api/jobs")
+            emptied = await client.get("/api/jobs")
+
+        assert cleared.json()["removed"] == 1
+        assert emptied.json() == []
+        # The removal itself moved the clock: a list response taken before it
+        # is now datably older, which is what lets the page drop it.
+        assert int(emptied.headers["X-Jobs-Revision"]) > watermark
+    finally:
+        await _reset_pm_state()
+
+
+async def _test_a_restart_is_a_new_clock_not_an_older_one(tmp_path, monkeypatch):
+    """The revision counter is resumed from what survived, so it can rewind.
+
+    Delete every job and restart and there is nothing left to resume from: the
+    clock starts at 0, below the reading a page left open has already applied.
+    That page then reads everything the new server says as older news and drops
+    it - including the empty list that would have explained the deletion, and
+    every job created afterwards. The epoch is what makes the rewind legible as
+    a different clock rather than an older one.
+    """
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    monkeypatch.setattr(pm, "_epoch", 0)
+    await _reset_pm_state()
+
+    try:
+        job = (await pm.create_job(JobSpec(video_paths=["sample.mp4"])))[0]
+        await pm._set_job(job, status="done", expected_run_id=job.run_id)
+
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            listed = await client.get("/api/jobs")
+            first_epoch = int(listed.headers["X-Jobs-Epoch"])
+            single = await client.get(f"/api/jobs/{job.id}")
+            # A single-job response has a revision in its body and nowhere but a
+            # header to say which clock issued it.
+            assert int(single.headers["X-Jobs-Epoch"]) == first_epoch
+
+            await client.delete("/api/jobs")
+            emptied = await client.get("/api/jobs")
+            high_water = int(emptied.headers["X-Jobs-Revision"])
+            assert int(emptied.headers["X-Jobs-Epoch"]) == first_epoch
+
+        assert high_water > 0
+
+        # The restart: a fresh interpreter starts the counter at zero and
+        # load_jobs can only raise it to the highest revision that survived.
+        pm._epoch = 0
+        pm._revision_counter = 0
+        pm._tombstones.clear()
+        await pm.load_jobs()
+        _jobs, revision = await pm.jobs_snapshot()
+
+        assert revision < high_water  # the rewind is real, not designed away
+        assert pm.state_epoch() > first_epoch  # and it arrives labelled as one
+    finally:
+        await _reset_pm_state()
+
+
+async def _test_the_cuda_probe_never_stalls_the_event_loop(tmp_path, monkeypatch):
+    """A 20-second child process is not something to await on the event loop.
+
+    The probe spawns a torch-importing child and waits for it. Run inline in an
+    async route, everything else the server owes the page - progress, 取消,
+    another tab - waits behind it, because a coroutine only yields where it
+    awaits. It is cached, so this is the first load: exactly when the page is
+    trying to render.
+    """
+    _isolate_model_requirement_env(tmp_path, monkeypatch)
+    release = threading.Event()
+    ticks = 0
+
+    def slow_probe():
+        # Stands in for the torch-importing child: it ends only once the loop
+        # has proved it is still running, so a loop that stops ticking never
+        # gets its answer back.
+        release.wait(10.0)
+        return {"status": "ok", "ok": True, "code": "ok", "message": "CUDA 可用。"}
+
+    monkeypatch.setattr(config_routes, "_cuda_environment_status", slow_probe)
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+            if ticks >= 30:
+                release.set()
+
+    beating = asyncio.create_task(heartbeat())
+    try:
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            probed = await asyncio.wait_for(
+                client.get("/api/model-requirements"), timeout=5.0
+            )
+    finally:
+        release.set()
+        beating.cancel()
+        try:
+            await beating
+        except asyncio.CancelledError:
+            pass
+
+    assert probed.status_code == 200
+    assert probed.json()["cuda"]["ok"] is True
+    assert ticks >= 30
 
 
 async def _test_model_requirements_includes_cuda_driver_warning(tmp_path, monkeypatch):
@@ -1183,6 +1370,8 @@ async def _test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
         job = jobs[0]
         async with pm._state_lock:
             job.status = "done"
+            job.output_generation = 0  # legacy artifact authorization fixture
+            job.output_target = ""
             job.artifacts = ["sample.srt"]
             pm._jobs[job.id] = job
 
@@ -1270,6 +1459,8 @@ async def _test_open_folder_allows_default_video_directory(tmp_path, monkeypatch
         job = jobs[0]
         async with pm._state_lock:
             job.status = "done"
+            job.output_generation = 0  # legacy paths, including a tampered entry
+            job.output_target = ""
             job.artifacts = [str(artifact_path), str(outside_artifact)]
             pm._jobs[job.id] = job
 
@@ -1287,6 +1478,63 @@ async def _test_open_folder_allows_default_video_directory(tmp_path, monkeypatch
         assert allowed.status_code == 200
         assert blocked.status_code == 403
         assert opened == [str(video_dir.resolve())]
+    finally:
+        await _reset_pm_state()
+
+
+async def _test_downloading_an_artifact_follows_the_same_rule_as_opening_it(
+    tmp_path, monkeypatch
+):
+    """Opening and downloading ask the same question, so they share a resolver.
+
+    The download route kept its own pair of roots - the job's output_dir and
+    the project - and omitted the directory the pipeline actually writes to
+    when no output_dir is set: the one beside the source video. A film outside
+    the project produced subtitles the page would happily open and then refuse
+    to download, which reads as data loss to the person who ran the job.
+    """
+    from web.routes import files as files_routes
+
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    monkeypatch.setattr(files_routes, "PROJECT_ROOT", project_root)
+    await _reset_pm_state()
+    video_dir = tmp_path / "videos"
+    video_dir.mkdir()
+    video_path = video_dir / "sample.mp4"
+    video_path.write_bytes(b"video")
+    artifact_path = video_dir / "sample.srt"
+    artifact_path.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nこんにちは\n", encoding="utf-8"
+    )
+    outside_artifact = tmp_path / "outside.srt"
+    outside_artifact.write_text("secret\n", encoding="utf-8")
+
+    try:
+        jobs = await pm.create_job(
+            pm.JobSpec(video_paths=[str(video_path)], output_dir=None)
+        )
+        job = jobs[0]
+        async with pm._state_lock:
+            job.status = "done"
+            job.output_generation = 0  # legacy paths, including a tampered entry
+            job.output_target = ""
+            job.artifacts = [str(artifact_path), str(outside_artifact)]
+            pm._jobs[job.id] = job
+
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            downloaded = await client.get(f"/api/output/{job.id}/sample.srt")
+            unauthorized = await client.get(f"/api/output/{job.id}/outside.srt")
+            missing = await client.get(f"/api/output/{job.id}/never-written.srt")
+
+        assert downloaded.status_code == 200
+        assert "こんにちは" in downloaded.content.decode("utf-8")
+        # Recorded as an artifact, but outside every root this job may write to:
+        # the traversal guard still refuses it.
+        assert unauthorized.status_code == 404
+        assert missing.status_code == 404
     finally:
         await _reset_pm_state()
 

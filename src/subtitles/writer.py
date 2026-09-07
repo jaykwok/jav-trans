@@ -296,21 +296,66 @@ def _is_exact_safe_boundary(words: list[dict], index: int) -> bool:
     return _exact_boundary_kind(words, index)[0] != "measured_character"
 
 
+def _is_lexical(word: dict) -> bool:
+    # Acoustic-only vocabularies intentionally return zero-width punctuation.
+    # Such tokens remain in the text slice but cannot define a spoken edge.
+    return float(word["end"]) > float(word["start"])
+
+
 def _exact_lexical_extent(
     words: list[dict],
     start_index: int,
     end_index: int,
 ) -> tuple[float, float] | None:
-    # Acoustic-only vocabularies intentionally return zero-width punctuation.
-    # Such tokens remain in the text slice but cannot define a spoken edge.
-    lexical = [
-        word
-        for word in words[start_index:end_index]
-        if float(word["end"]) > float(word["start"])
-    ]
+    """The spoken edges of `words[start_index:end_index]`, by scanning it.
+
+    The reference definition. `_LexicalExtents` answers the same question in
+    constant time and is what the DP uses; the two are held equal by test.
+    """
+    lexical = [word for word in words[start_index:end_index] if _is_lexical(word)]
     if not lexical:
         return None
     return float(lexical[0]["start"]), float(lexical[-1]["end"])
+
+
+class _LexicalExtents:
+    """The same answer as `_exact_lexical_extent`, precomputed.
+
+    The DP asks this once per candidate edge, and a scan makes each answer O(n)
+    in the words spanned - with dense candidates the extent lookups alone
+    approach O(n^3) over a segment, which is more work than the O(k^2) scoring
+    they exist to feed. Which words are spoken does not change during the DP, so
+    both directions are computed once and every edge is then two lookups.
+
+    Nothing about the segmentation criteria changes: same words, same edges, same
+    costs.
+    """
+
+    __slots__ = ("_words", "_next", "_previous")
+
+    def __init__(self, words: list[dict]) -> None:
+        count = len(words)
+        spoken = [_is_lexical(word) for word in words]
+        # `_next[i]`: the first spoken index at or after `i`, else `count`.
+        following = [count] * (count + 1)
+        for index in range(count - 1, -1, -1):
+            following[index] = index if spoken[index] else following[index + 1]
+        # `_previous[i]`: the last spoken index strictly before `i`, else -1.
+        preceding = [-1] * (count + 1)
+        for index in range(count):
+            preceding[index + 1] = index if spoken[index] else preceding[index]
+        self._words = words
+        self._next = following
+        self._previous = preceding
+
+    def __call__(
+        self, start_index: int, end_index: int
+    ) -> tuple[float, float] | None:
+        first = self._next[start_index]
+        if first >= end_index:
+            return None  # the slice is empty, or punctuation only
+        last = self._previous[end_index]
+        return float(self._words[first]["start"]), float(self._words[last]["end"])
 
 
 _BOUNDARY_BASE_PENALTY = {
@@ -430,6 +475,7 @@ def _exact_safe_dp_plan(
         char_prefix.append(char_prefix[-1] + _compact_source_length(token))
         text_prefix.append(text_prefix[-1] + len(token))
 
+    lexical_extent = _LexicalExtents(words)
     char_cap = max(1, int(options.max_source_chars))
     duration_cap_s = _subtitle_max_display_duration_s(options)
     best: dict[int, tuple[float, int | None]] = {0: (0.0, None)}
@@ -439,7 +485,7 @@ def _exact_safe_dp_plan(
         for start_index in candidates:
             if start_index >= end_index or start_index not in best:
                 continue
-            extent = _exact_lexical_extent(words, start_index, end_index)
+            extent = lexical_extent(start_index, end_index)
             if extent is None:
                 continue
             length = char_prefix[end_index] - char_prefix[start_index]
@@ -487,7 +533,7 @@ def _exact_safe_dp_plan(
 
     pieces: list[dict] = []
     for start_index, end_index in zip(path, path[1:]):
-        extent = _exact_lexical_extent(words, start_index, end_index)
+        extent = lexical_extent(start_index, end_index)
         if extent is None:
             return {"pieces": [], "reason": "punctuation_only_piece", "score": 0.0}
         end_kind, end_gap = (
@@ -1110,7 +1156,6 @@ def prepare_srt_blocks(
     blocks: list[dict],
     *,
     options: SubtitleOptions | None = None,
-    mode: Literal["srt", "bilingual"] = "srt",
     on_stage: Callable[[str, int, int], None] | None = None,
     diagnostics: dict | None = None,
     acoustic_classes: Callable[[float, float], dict | None] | None = None,
@@ -1128,7 +1173,6 @@ def prepare_srt_blocks(
     from importing the ASR stage to do the arithmetic itself.
     """
     options = _coerce_options(options)
-    del mode
     return _prepare_subtitle_blocks(
         blocks,
         options=options,

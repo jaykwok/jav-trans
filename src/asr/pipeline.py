@@ -40,6 +40,7 @@ from asr.transcribe import (
     _with_alignment_window,
 )
 from asr.backends.registry import get_backend_label, _resolve_asr_backend
+from core.typed_config import env_float, env_int, env_text
 from pipeline import memory_safety
 
 _JSON_PAYLOAD_INLINE_ARRAY_LIMIT = 4096
@@ -95,27 +96,6 @@ def current_asr_chunk_root() -> Path:
     return chunking.current_asr_chunk_root()
 
 
-# An empty value means "use the default", the same reading every other module
-# in the tree gives it. It has to: the Web「参数调优」box forwards `KEY=` lines
-# verbatim - its own placeholder shows `ASR_ALIGNMENT_HEAD_PATH=` as the way to
-# clear a setting - so an empty string is a reachable value for every forwarded
-# `ASR_*` knob. These two used to call `float()` on it unguarded, which turned
-# `ASR_CHUNK_MAX_S=` into a bare `ValueError: could not convert string to float`
-# out of the middle of the ASR stage.
-def _env_float(name: str, default: str) -> float:
-    try:
-        return float(os.getenv(name, "").strip() or default)
-    except (TypeError, ValueError):
-        return float(default)
-
-
-def _env_int(name: str, default: str) -> int:
-    try:
-        return int(float(os.getenv(name, "").strip() or default))
-    except (TypeError, ValueError):
-        return int(float(default))
-
-
 def _asr_language_for_chunking() -> str:
     """Read at call time like every other setting in this stage.
 
@@ -123,7 +103,7 @@ def _asr_language_for_chunking() -> str:
     worker could not pick up between jobs - and the only remaining excuse for
     reloading this module to refresh the environment.
     """
-    return os.getenv("ASR_LANGUAGE", "Japanese").strip() or "Japanese"
+    return env_text("ASR_LANGUAGE", "Japanese")
 
 
 # Where the last chunking pass recorded how it cut the audio. Owned here because
@@ -157,10 +137,6 @@ _LAST_FRAME_CLASS_TRACK: dict | None = None
 def _set_last_frame_class_track(track: dict | None) -> None:
     global _LAST_FRAME_CLASS_TRACK
     _LAST_FRAME_CLASS_TRACK = track
-
-
-def last_frame_class_track() -> dict | None:
-    return _LAST_FRAME_CLASS_TRACK
 
 
 def _spans_digest(spans: list[tuple[float, float]]) -> str:
@@ -269,9 +245,9 @@ def _pause_reading() -> str:
 
 def _chunking_config() -> dict:
     return {
-        "max_chunk_s": _env_float("ASR_CHUNK_MAX_S", "30.0"),
-        "min_chunk_s": _env_float("ASR_CHUNK_MIN_S", "2.0"),
-        "min_blank_s": _env_float("ASR_CHUNK_MIN_PAUSE_S", "0.6"),
+        "max_chunk_s": env_float("ASR_CHUNK_MAX_S", 30.0, minimum=1.0),
+        "min_chunk_s": env_float("ASR_CHUNK_MIN_S", 2.0, minimum=0.0),
+        "min_blank_s": env_float("ASR_CHUNK_MIN_PAUSE_S", 0.6, minimum=0.0),
         # Which reading of the head supplies the cut points. `blank` is the
         # shipped one: stretches the CTC argmax covers entirely with blank.
         # `speech` is the v2 alternative - stretches the frame head says are not
@@ -280,7 +256,7 @@ def _chunking_config() -> dict:
         # because the pause reading decides chunk placement for every job and a
         # worse placement is paid on every second of audio.
         "pause_reading": _pause_reading(),
-        "speech_threshold": _env_float("ASR_CHUNK_SPEECH_THRESHOLD", "0.5"),
+        "speech_threshold": env_float("ASR_CHUNK_SPEECH_THRESHOLD", 0.5, minimum=0.0, maximum=1.0),
     }
 
 
@@ -413,7 +389,7 @@ def _blank_runs_for_audio(
         # access crosses PCIe. The default is 4 to keep that cliff two doublings
         # away rather than one, because free VRAM is not ours alone - a browser
         # on the same GPU moves it.
-        batch_size = max(1, _env_int("ASR_FEATURE_BATCH_SIZE", "4"))
+        batch_size = env_int("ASR_FEATURE_BATCH_SIZE", 4, minimum=1)
         pieces = []
         frame_pieces: list = []
         returned_frames: list[int] = []
@@ -706,13 +682,10 @@ def _record_cuda_memory(
 
 
 def _vram_budget_mb() -> float:
-    raw = os.getenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "0").strip().lower()
-    if raw in {"", "0", "false", "no", "off", "none"}:
+    raw = env_text("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "0", lower=True)
+    if raw in {"0", "false", "no", "off", "none"}:
         return 0.0
-    try:
-        return max(0.0, float(raw))
-    except (TypeError, ValueError):
-        return 0.0
+    return env_float("ASR_STAGE_WORKER_VRAM_BUDGET_MB", 0.0, minimum=0.0)
 
 
 def _shared_vram_spill_tolerance_mb() -> float:
@@ -722,11 +695,7 @@ def _shared_vram_spill_tolerance_mb() -> float:
     # WDDM spill moves hundreds of MB of tensor pages, so a small tolerance
     # separates counter noise from actual spill. A 4MB jitter once killed a
     # fully finished transcription pass three times in a row.
-    raw = os.getenv("ASR_SHARED_VRAM_SPILL_TOLERANCE_MB", "64").strip()
-    try:
-        return max(0.0, float(raw))
-    except (TypeError, ValueError):
-        return 64.0
+    return env_float("ASR_SHARED_VRAM_SPILL_TOLERANCE_MB", 64.0, minimum=0.0)
 
 
 def _enforce_vram_budget_from_snapshot(snapshot: dict) -> None:

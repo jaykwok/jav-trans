@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import threading
+
+import pytest
+
 from core import events
 from utils import hf_progress
 
@@ -137,6 +141,73 @@ def test_standalone_file_download_keeps_its_real_filename(monkeypatch):
 
     assert captured[0]["extra"]["file"] == "Hy-MT2-7B-Q4_K_M.gguf"
     assert captured[-1]["phase"] == "done"
+
+
+def test_a_cancelled_download_is_stopped_through_its_progress_bar(monkeypatch):
+    """huggingface_hub has no cancellation token, but it does call the bar.
+
+    A 4.6GB GGUF is minutes of transfer; without this, cancelling the task that
+    asked for it leaves the bytes coming. The partial file is resumable, so
+    stopping costs nothing but the time already spent.
+    """
+    _events_sink(monkeypatch)
+    cancel = threading.Event()
+    bar = hf_progress.tqdm_class(cancel)(
+        total=1000,
+        initial=0,
+        unit="B",
+        unit_scale=True,
+        desc="sample-model.gguf",
+        name="huggingface_hub.xet_get.transfer",
+        disable=True,
+    )
+
+    bar.update(10)  # not cancelled: an ordinary chunk
+    cancel.set()
+
+    with pytest.raises(hf_progress.DownloadCancelled):
+        bar.update(10)
+
+
+def test_a_bar_reports_under_the_run_that_built_it(monkeypatch):
+    """huggingface_hub drives `update` from its own transfer threads.
+
+    Reading the identity when a chunk lands means reading it on a thread that
+    has none, and falling through to a module-level value the next job to start
+    a download has since overwritten. A multi-GB transfer outlives whatever was
+    current when it began, so the bar carries its own run.
+    """
+    monkeypatch.setattr(events, "_thread_local", threading.local())
+    captured: list[dict] = []
+    monkeypatch.setattr(events, "emit", lambda event: captured.append(event))
+    events.set_current_run("sample-a", "run-a")
+    events._thread_local.video = "sample-a.mp4"
+
+    bar = hf_progress.HfDownloadProgressTqdm(
+        total=100,
+        initial=0,
+        unit="B",
+        unit_scale=True,
+        desc="sample-model.gguf",
+        name="huggingface_hub.http_get",
+        disable=True,
+    )
+    # The bytes are still arriving when the next job takes over the thread.
+    events.set_current_run("sample-b", "run-b")
+    events._thread_local.video = "sample-b.mp4"
+    bar.update(100)
+    bar.close()
+
+    assert [event["phase"] for event in captured] == ["start", "progress", "done"]
+    assert {
+        (event["job_id"], event["run_id"], event["video"]) for event in captured
+    } == {("sample-a", "run-a", "sample-a.mp4")}
+
+
+def test_without_an_event_the_bar_is_the_plain_one():
+    # The ASR download path passes no event, and must keep behaving exactly as
+    # it did - including being the same class the other tests here drive.
+    assert hf_progress.tqdm_class() is hf_progress.HfDownloadProgressTqdm
 
 
 def test_propagate_job_id_to_current_thread_sets_the_events_thread_local():

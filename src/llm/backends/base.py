@@ -18,14 +18,19 @@ class BaseTranslationBackend(ABC):
         top_p: float = 0.9,
         max_tokens: int = 65536,
         response_format: dict | None = None,
-        stream: bool = True,
         reasoning_effort: str | None = None,
         expected_count: int = 0,
         cancel_event = None,
         on_progress: Callable[[dict], None] | None = None,
         on_usage: Callable[[dict], None] | None = None,
     ) -> str:
-        """执行翻译请求，返回完整内容"""
+        """执行翻译请求，返回完整译文。
+
+        Whether a backend streams internally is its own business - the canonical
+        OpenAI transport does, to collect progress and to notice a truncated
+        answer early; the local one does not. Either way the return value is the
+        finished text, so there is no knob here to turn.
+        """
         pass
 
     def cache_identity(self) -> str:
@@ -39,10 +44,6 @@ class BaseTranslationBackend(ABC):
     def supports_reasoning(self) -> bool:
         """是否支持 reasoning/thinking"""
         return False
-
-    def supports_streaming(self) -> bool:
-        """是否支持流式输出"""
-        return True
 
     @abstractmethod
     def name(self) -> str:

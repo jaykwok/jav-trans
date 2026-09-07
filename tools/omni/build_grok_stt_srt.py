@@ -200,7 +200,6 @@ def run(
         planned = prepare_srt_blocks(
             _source_blocks(source_cues),
             options=options,
-            mode="bilingual",
         )
         planned, unrenderable_cue_count = _drop_unrenderable_tight_cues(planned)
         cues = _translation_cues(planned)

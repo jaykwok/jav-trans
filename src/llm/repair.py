@@ -37,12 +37,14 @@ from llm import settings as llm_settings
 from llm import transport_util
 from llm.glossary import parse_glossary_pairs
 from llm.errors import (
+    TERMINAL_TRANSLATION_ERRORS,
     ResponseTruncatedError,
     RetryableTranslationFormatError,
     TranslationCancelledError,
 )
 from llm.profiles import json_v3
 from llm.profiles.base import TranslationProfile
+from llm.session import TranslationSession
 
 _raise_if_cancelled = transport_util._raise_if_cancelled
 _emit_progress = transport_util._emit_progress
@@ -60,12 +62,7 @@ def apply_repair_pass(
     zh_texts: list[str],
     *,
     chat: Callable[..., str],
-    profile: TranslationProfile,
-    batch_size: int,
-    reasoning_effort: str,
-    target_lang: str,
-    glossary: str,
-    character_reference: str,
+    session: TranslationSession,
     extra_glossary: str = "",
     on_progress: Callable[[dict], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -97,6 +94,12 @@ def apply_repair_pass(
     which is a different request shape (a real reasoning budget).
     """
     _raise_if_cancelled(cancel_event)
+    # Read from the session, never from live settings: this pass reissues text
+    # the base pass produced, and the two have to be the same run.
+    profile = session.profile
+    glossary = session.glossary
+    target_lang = session.target_lang
+    character_reference = session.character_reference
     glossary_pairs = parse_glossary_pairs(glossary) if glossary else []
     # Full source line -> the rendering the base pass used most often for it,
     # derived from this same film's own output (see `global_glossary`). Reused
@@ -119,9 +122,9 @@ def apply_repair_pass(
     format_split_count = 0
     request_count = 0
     request_cap = max(1, int(llm_settings.TRANSLATION_BATCH_MAX_REQUESTS))
-    initial_span = max(1, int(batch_size))
+    initial_span = max(1, int(session.batch_size))
     none_effort = "none"
-    escalated_effort = llm_settings._repair_reasoning_effort(reasoning_effort)
+    escalated_effort = session.repair_reasoning_effort
 
     _emit_progress(
         on_progress,
@@ -233,6 +236,26 @@ def apply_repair_pass(
                 flagged.append(idx)
         return flagged
 
+    def persist_repairs(texts: list[str]) -> None:
+        """Write what was actually fixed back into the translation cache.
+
+        Runs on the degraded path as well as the clean one: a repair that
+        succeeded was paid for, and a later request failing says nothing about
+        it. Idempotent - `_save_cache_entry` appends and reads dedupe by
+        last-write-wins per batch_key.
+        """
+        if not repaired_ids or cache_writer is None:
+            return
+        try:
+            cache_writer(texts)
+        except TranslationCancelledError:
+            raise
+        except Exception as exc:
+            print(
+                f"[WARN] failed to persist repaired translation cache: {exc}",
+                flush=True,
+            )
+
     unresolved: list[int] = []
     escalate_candidates: list[int] = []
     request_error: Exception | None = None
@@ -250,7 +273,12 @@ def apply_repair_pass(
             none_tier_unresolved.extend(
                 request_group(repair_ids[offset : offset + initial_span], none_effort)
             )
-    except TranslationCancelledError:
+    except TERMINAL_TRANSLATION_ERRORS:
+        # Cancellation, a lease that is gone, a content refusal: each of these
+        # says the next request cannot succeed either, and stage 2's escalation
+        # is still a request. Persist what stage 1 did fix, then let the type
+        # the backend raised reach the caller unchanged.
+        persist_repairs(repaired_texts)
         raise
     except Exception as exc:
         # A request-level failure at this tier almost always repeats for
@@ -280,7 +308,8 @@ def apply_repair_pass(
         echoes = lingering_echoes()
         for offset in range(0, len(echoes), retry_span):
             unresolved.extend(request_group(echoes[offset : offset + retry_span], escalated_effort))
-    except TranslationCancelledError:
+    except TERMINAL_TRANSLATION_ERRORS:
+        persist_repairs(repaired_texts)
         raise
     except Exception as exc:
         request_error = exc
@@ -301,42 +330,41 @@ def apply_repair_pass(
         )
 
     if request_error is not None:
+        # `repaired_texts`, not `zh_texts`. The echo gate above was applied to
+        # the repaired array, so returning the original one would return
+        # something that was never checked - and specifically, would put back
+        # the Japanese source lines the earlier requests had already fixed and
+        # been billed for. Verification, return value and cache are the same
+        # array on every exit from this function; ids the detectors still flag
+        # are reported as unresolved rather than being hidden behind a rollback.
+        still_flagged = recheck(repair_ids)
+        persist_repairs(repaired_texts)
         print(f"[WARN] translation repair failed: {request_error}", flush=True)
         _emit_progress(
             on_progress,
             {
                 "phase": "repair_failed",
                 "repair_ids": repair_ids,
+                "repaired": len(repaired_ids),
+                "unresolved": len(still_flagged),
                 "error": str(request_error)[:200],
             },
         )
-        return zh_texts, {
+        return repaired_texts, {
             "mode": "translation_repair_failed",
             "start_index": min(repair_ids),
-            "segment_count": 0,
+            "segment_count": len(repaired_ids),
             "elapsed_s": time.perf_counter() - started,
             "request_count": request_count,
             "repair_ids": repair_ids,
             "candidate_count": len(repair_ids),
-            "missing_count": len(repair_ids),
-            "missing_indexes": repair_ids,
+            "missing_count": len(still_flagged),
+            "missing_indexes": still_flagged,
             "error": str(request_error)[:500],
             **transport_util._merge_usage_metrics(request_usages),
         }
 
-    if repaired_ids and cache_writer is not None:
-        # Persist repaired texts back into the translation cache so a re-run
-        # doesn't pay for the same repair again. Idempotent: _save_cache_entry
-        # appends and reads dedupe by last-write-wins per batch_key.
-        try:
-            cache_writer(repaired_texts)
-        except TranslationCancelledError:
-            raise
-        except Exception as exc:
-            print(
-                f"[WARN] failed to persist repaired translation cache: {exc}",
-                flush=True,
-            )
+    persist_repairs(repaired_texts)
     timing = {
         "mode": "translation_repair_pass",
         "start_index": min(repair_ids),

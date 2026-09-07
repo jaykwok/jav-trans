@@ -243,7 +243,7 @@ def test_prepare_srt_blocks_sorts_and_removes_overlap_with_frame_gap():
     ]
     options = SubtitleOptions()
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
 
     assert [block["ja_text"] for block in prepared] == ["私", "君"]
     assert prepared[0]["end"] == pytest.approx(1.0 - options.frame_gap_s)
@@ -264,7 +264,6 @@ def test_prepare_srt_blocks_reports_dp_stage_progress():
     subtitle.prepare_srt_blocks(
         blocks,
         options=SubtitleOptions(max_display_duration_s=6.0),
-        mode="bilingual",
         on_stage=lambda stage, current, total: events.append(
             (stage, current, total)
         ),
@@ -293,7 +292,6 @@ def test_prepare_srt_blocks_anchors_start_to_first_timed_word():
     prepared = subtitle.prepare_srt_blocks(
         blocks,
         options=SubtitleOptions(),
-        mode="bilingual",
     )
 
     assert prepared[0]["start"] == pytest.approx(10.0)
@@ -318,7 +316,6 @@ def test_prepare_srt_blocks_does_not_anchor_to_synthetic_proportional_words():
     prepared = subtitle.prepare_srt_blocks(
         blocks,
         options=SubtitleOptions(),
-        mode="bilingual",
     )
 
     assert prepared[0]["start"] == pytest.approx(10.35)
@@ -345,7 +342,6 @@ def test_prepare_srt_blocks_preserves_earliest_word_start_anchor_without_merge()
     prepared = subtitle.prepare_srt_blocks(
         blocks,
         options=SubtitleOptions(),
-        mode="bilingual",
     )
 
     assert len(prepared) == 2
@@ -367,7 +363,7 @@ def test_prepare_srt_blocks_final_normalize_guards_reading_window_overlap(monkey
 
     monkeypatch.setattr(subtitle, "_resolve_subtitle_window", expand_first_window)
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
 
     assert prepared[0]["end"] == pytest.approx(1.2 - options.frame_gap_s)
     assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
@@ -384,7 +380,7 @@ def test_timing_polish_collapses_short_gap_to_two_frames():
         linger_s=0.45,
     )
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
 
     assert prepared[0]["end"] == pytest.approx(1.2 - options.frame_gap_s)
     assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
@@ -401,7 +397,7 @@ def test_timing_polish_preserves_natural_pause():
         linger_s=0.45,
     )
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
 
     # Linger stops at next_start - short_gap_collapse_s, keeping a visible
     # half-second pause; the 0.5s acoustic-shift cap no longer binds first.
@@ -420,7 +416,7 @@ def test_timing_polish_disabled_keeps_existing_alignment_end():
         linger_s=0.45,
     )
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
 
     assert prepared[0]["end"] == pytest.approx(1.0)
 
@@ -450,7 +446,7 @@ def test_unmeasured_weak_cut_candidate_is_not_used_as_a_timeline():
         linger_s=0.45,
     )
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
 
     assert len(prepared) == 1
     assert prepared[0]["start"] == pytest.approx(0.0)
@@ -472,7 +468,7 @@ def test_long_display_cue_never_falls_back_to_proportional_text_split():
     ]
     options = SubtitleOptions(timing_polish_enabled=False)
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
 
     assert len(prepared) == 1
     assert prepared[0]["proportional_fallback_used"] is False
@@ -489,7 +485,7 @@ def test_short_cues_are_not_merged():
     ]
     options = SubtitleOptions()
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
 
     assert len(prepared) == 3
     assert [item["ja_text"] for item in prepared] == ["私", "僕", "いい"]
@@ -504,7 +500,6 @@ def test_close_short_cues_remain_separate():
     prepared = subtitle.prepare_srt_blocks(
         blocks,
         options=SubtitleOptions(),
-        mode="bilingual",
     )
 
     assert len(prepared) == 2
@@ -517,7 +512,7 @@ def test_short_cues_ignore_acoustic_metadata_without_merge():
     ]
     options = SubtitleOptions()
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
 
     assert len(prepared) == 2
 
@@ -531,12 +526,10 @@ def test_prepare_srt_blocks_has_same_no_merge_behavior_for_japanese_only():
     merged = subtitle.prepare_srt_blocks(
         blocks,
         options=SubtitleOptions(),
-        mode="srt",
     )
     unmerged = subtitle.prepare_srt_blocks(
         blocks,
         options=SubtitleOptions(),
-        mode="srt",
     )
 
     assert len(merged) == 2
@@ -553,7 +546,7 @@ def test_timing_polish_does_not_merge_after_collapsing_gap():
         short_gap_collapse_s=0.5,
     )
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="srt")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
 
     assert len(prepared) == 2
     assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
@@ -569,7 +562,7 @@ def test_timing_polish_keeps_short_cues_separate():
         short_gap_collapse_s=0.5,
     )
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="srt")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
 
     assert len(prepared) == 2
     assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
@@ -594,7 +587,6 @@ def test_prepare_srt_blocks_merges_overlap_when_too_tight():
     prepared = subtitle.prepare_srt_blocks(
         blocks,
         options=SubtitleOptions(),
-        mode="bilingual",
     )
 
     assert len(prepared) == 2
@@ -618,7 +610,7 @@ def test_normalize_subtitle_timeline_locks_next_start_when_too_tight():
     ]
     options = SubtitleOptions()
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
 
     assert len(prepared) == 2
     assert prepared[1]["start"] == pytest.approx(1.02)
@@ -642,7 +634,7 @@ def test_too_close_cues_keep_two_frame_gap_and_report_min_display_violation():
     ]
     options = SubtitleOptions()
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
 
     assert prepared[0]["end"] == pytest.approx(prepared[1]["start"] - options.frame_gap_s)
     assert prepared[0]["display_duration"] < options.frame_min_duration_s
@@ -659,7 +651,7 @@ def test_write_bilingual_srt_returns_normalized_blocks(tmp_path):
     ]
     options = SubtitleOptions()
 
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
     written = subtitle.write_bilingual_srt(prepared, str(path), options=options)
 
     assert written[0]["end"] == pytest.approx(1.0 - options.frame_gap_s)
@@ -673,7 +665,7 @@ def test_adjacent_short_blocks_are_not_merged(tmp_path):
         {"start": 1.1, "end": 2.0, "ja_text": "もっと", "zh_text": "更多"},
     ]
 
-    prepared = subtitle.prepare_srt_blocks(blocks, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks)
     subtitle.write_bilingual_srt(prepared, str(path))
 
     content = path.read_text(encoding="utf-8")
@@ -691,7 +683,7 @@ def test_adjacent_blocks_stay_separate_after_sentence_punctuation(tmp_path):
         {"start": 1.05, "end": 2.0, "ja_text": "次", "zh_text": "下一句"},
     ]
 
-    prepared = subtitle.prepare_srt_blocks(blocks, mode="bilingual")
+    prepared = subtitle.prepare_srt_blocks(blocks)
     subtitle.write_bilingual_srt(prepared, str(path))
 
     content = path.read_text(encoding="utf-8")

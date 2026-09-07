@@ -5,6 +5,8 @@ import os
 from ctypes import wintypes
 from typing import Any
 
+from core.typed_config import env_float
+
 
 class MemoryMonitorError(RuntimeError):
     pass
@@ -143,10 +145,7 @@ def shared_vram_snapshot(*, pid: int | None = None, required: bool = False) -> d
 
 
 def runtime_memory_snapshot(*, require_shared_vram: bool = False) -> dict[str, Any]:
-    try:
-        ratio = float(os.getenv("ASR_STAGE_WORKER_RAM_RATIO", "0.95"))
-    except ValueError:
-        ratio = 0.95
+    ratio = env_float("ASR_STAGE_WORKER_RAM_RATIO", 0.95, minimum=0.05, maximum=1.0)
     pid = os.getpid()
     shared = shared_vram_snapshot(pid=pid, required=require_shared_vram)
     raw_shared_mb = shared.get("shared_vram_mb")

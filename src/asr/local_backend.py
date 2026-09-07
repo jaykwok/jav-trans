@@ -29,27 +29,24 @@ from asr.subtitle_timing import (
     build_boundary_word_timestamps,
 )
 from asr.text_normalize import normalize_display_text, strip_text_punctuation
+from core.typed_config import env_bool, env_float, env_int, env_text
 
 logger = logging.getLogger(__name__)
 
-ASR_LANGUAGE = os.getenv("ASR_LANGUAGE", "Japanese").strip() or "Japanese"
-
-
-def _env_int(name: str, default: str) -> int:
-    try:
-        return int(float(os.getenv(name, default)))
-    except (TypeError, ValueError):
-        return int(float(default))
+ASR_LANGUAGE = env_text("ASR_LANGUAGE", "Japanese")
 
 
 def _resolve_asr_batch_size() -> int:
-    raw = os.getenv("ASR_BATCH_SIZE", "auto").strip().lower()
-    if raw in {"", "auto"}:
-        return max(1, qwen_asr_default_batch_size(current_qwen_asr_backend()))
-    return max(1, int(raw))
+    # A value that is not a batch size falls back to the repo's own default
+    # rather than to 1: the setting is wrong, the hardware is not, and quietly
+    # transcribing a whole film one chunk at a time is not a safe reading of it.
+    automatic = max(1, qwen_asr_default_batch_size(current_qwen_asr_backend()))
+    if env_text("ASR_BATCH_SIZE", "auto", lower=True) == "auto":
+        return automatic
+    return env_int("ASR_BATCH_SIZE", automatic, minimum=1)
 
 
-TRANSCRIPTION_TIMEOUT_S = float(os.getenv("TRANSCRIPTION_TIMEOUT_S", "180"))
+TRANSCRIPTION_TIMEOUT_S = env_float("TRANSCRIPTION_TIMEOUT_S", 180.0, minimum=1.0)
 # --- Windows Job Object: kill the GPU worker if the parent dies abnormally
 # (kill -9 / segfault / OOM-killer / task-manager end). daemon=True only covers
 # graceful interpreter exit; a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -240,8 +237,8 @@ def _normalize_deterministic_generation_config(model) -> None:
 
 def _apply_generation_safety(model) -> None:
     _normalize_deterministic_generation_config(model)
-    model.generation_config.repetition_penalty = float(
-        os.getenv("ASR_REPETITION_PENALTY", "1.05")
+    model.generation_config.repetition_penalty = env_float(
+        "ASR_REPETITION_PENALTY", 1.05, minimum=1.0
     )
 
 
@@ -303,23 +300,15 @@ def _rows_truncated_at_cap(suffix, model, caps: Sequence[int] | int) -> list[boo
 
 
 def _transcription_timeout_s() -> float:
-    try:
-        return float(os.getenv("TRANSCRIPTION_TIMEOUT_S", str(TRANSCRIPTION_TIMEOUT_S)))
-    except (TypeError, ValueError):
-        return TRANSCRIPTION_TIMEOUT_S
+    return env_float("TRANSCRIPTION_TIMEOUT_S", TRANSCRIPTION_TIMEOUT_S, minimum=1.0)
 
 
 def _asr_language() -> str:
-    return os.getenv("ASR_LANGUAGE", ASR_LANGUAGE).strip() or "Japanese"
+    return env_text("ASR_LANGUAGE", ASR_LANGUAGE)
 
 
 def _asr_force_language() -> bool:
-    return os.getenv("ASR_FORCE_LANGUAGE", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
+    return env_bool("ASR_FORCE_LANGUAGE", True)
 
 
 def _qwen_generation_metadata(
@@ -1071,7 +1060,7 @@ class LocalAsrBackend:
         # 7.26 GiB on an 8 GiB card. Here it matters more, not less: this runs
         # right after decoding, so the allocator is already holding fragmented
         # blocks. 4 is where the speed-up has saturated anyway.
-        batch_size = max(1, _env_int("ASR_ALIGN_BATCH_SIZE", "4"))
+        batch_size = env_int("ASR_ALIGN_BATCH_SIZE", 4, minimum=1)
         primary_head = self._resolve_alignment_head([])
         if (
             primary_head is None

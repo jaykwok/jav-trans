@@ -429,6 +429,33 @@ def _extract_model_ids(payload: Any) -> list[str]:
     return []
 
 
+_CUDA_PROBE_LOCK = threading.Lock()
+
+
+async def _cuda_environment_status_off_the_loop() -> dict[str, Any]:
+    """The probe, run where a 20-second child process cannot stop the server.
+
+    `_cuda_environment_status` spawns a torch-importing child and waits up to
+    20s for it. Called straight from an async route, that wait happens *on the
+    event loop*: every other request - the progress stream, 取消 - waits behind
+    it, because a coroutine only yields where it awaits. The result is cached,
+    so this was a first-load-only stall, which is exactly when the page is
+    trying to render.
+
+    The lock makes it single-flight: `lru_cache` does not deduplicate concurrent
+    callers, and two page loads racing would otherwise spawn two probes. The
+    second waits in a worker thread and gets the cached answer.
+    """
+    return await asyncio.get_running_loop().run_in_executor(
+        None, _cuda_environment_status_blocking
+    )
+
+
+def _cuda_environment_status_blocking() -> dict[str, Any]:
+    with _CUDA_PROBE_LOCK:
+        return _cuda_environment_status()
+
+
 @router.get("/config")
 async def get_config() -> dict[str, Any]:
     load_config()
@@ -465,7 +492,9 @@ async def get_model_requirements(
         ),
     ]
     missing = [item for item in requirements if not item["present"]]
-    cuda_status = _cuda_environment_status() if include_cuda else None
+    cuda_status = (
+        await _cuda_environment_status_off_the_loop() if include_cuda else None
+    )
     gpu_ready = bool(cuda_status.get("ok")) if cuda_status else None
     return {
         "required_models": requirements,

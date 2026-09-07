@@ -5,6 +5,8 @@ import struct
 import wave
 from pathlib import Path
 
+import pytest
+
 from helpers import ASR_17B_BACKEND
 
 from asr import result_cache
@@ -380,6 +382,48 @@ def test_align_results_second_pass_served_from_finalize_cache(monkeypatch, tmp_p
     # No model load, no finalize call: the whole pass came from the cache.
     assert "load" not in second_backend.events
     assert not [e for e in second_backend.events if not isinstance(e, str)]
+
+
+def _entry_path(cache_root: Path) -> Path:
+    entries = [
+        path for path in cache_root.rglob("*.json") if path.name != "signature.json"
+    ]
+    assert len(entries) == 1, entries
+    return entries[0]
+
+
+class TestACorruptEntryIsAMissNotAFailure:
+    """Valid JSON of the wrong shape used to reach `.get` outside the `except`.
+
+    A truncated or half-written file fails to parse and is already handled. A
+    file holding `[]` or `null` parses perfectly and then raises AttributeError
+    on the first field read - past the best-effort boundary, out of finalize,
+    and into a job that was only ever consulting an accelerator. Both stages
+    take the same two shapes, hence four cases.
+    """
+
+    @pytest.mark.parametrize("corruption", ["[]", "null"])
+    def test_the_text_stage_misses(self, monkeypatch, tmp_path, corruption) -> None:
+        cache_root = _setup_cache_env(monkeypatch, tmp_path)
+        wav = tmp_path / "chunk.wav"
+        _write_wav(wav, value=7)
+        result_cache.store(wav, _text_result())
+        _entry_path(cache_root).write_text(corruption, encoding="utf-8")
+
+        assert result_cache.lookup(wav) is None
+
+    @pytest.mark.parametrize("corruption", ["[]", "null"])
+    def test_the_finalize_stage_misses(self, monkeypatch, tmp_path, corruption) -> None:
+        cache_root = _setup_cache_env(monkeypatch, tmp_path)
+        _setup_head_env(monkeypatch, tmp_path)
+        wav = tmp_path / "chunk.wav"
+        _write_wav(wav, value=7)
+        result_cache.finalize_store(
+            wav, text="テスト", result=_aligned_result(), log=[]
+        )
+        _entry_path(cache_root).write_text(corruption, encoding="utf-8")
+
+        assert result_cache.finalize_lookup(wav, text="テスト") is None
 
 
 class TestSignatureCoversWhatChangesTheText:

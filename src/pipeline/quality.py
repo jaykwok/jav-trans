@@ -7,6 +7,7 @@ from typing import Callable
 
 from rich.console import Console
 
+from core.typed_config import env_bool, env_text
 from llm.glossary import parse_glossary_pairs
 from subtitles.qc import compute_quality_report
 
@@ -298,7 +299,7 @@ def write_quality_report(
             ja_track=ja_track,
         )
         explicit_report_dir = str(report_dir).strip() if report_dir is not None else ""
-        env_report_dir = os.getenv("QUALITY_REPORT_DIR", "").strip()
+        env_report_dir = env_text("QUALITY_REPORT_DIR", "")
         effective_report_dir = (
             Path(explicit_report_dir or env_report_dir).expanduser()
             if explicit_report_dir or env_report_dir
@@ -324,7 +325,7 @@ def write_quality_report(
         effective_hard_fail = (
             bool(hard_fail)
             if hard_fail is not None
-            else os.getenv("QC_HARD_FAIL", "0").strip() == "1"
+            else env_bool("QC_HARD_FAIL", False)
         )
         if effective_hard_fail and warnings_list:
             raise RuntimeError(

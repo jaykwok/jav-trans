@@ -154,9 +154,9 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
         fake_transcribe_and_align,
     )
 
-    run_pipeline(video_path, ctx)
+    published = {Path(path).name: Path(path) for path in run_pipeline(video_path, ctx)}
 
-    aligned_path = temp_root / "clip" / "clip.aligned_segments.json"
+    aligned_path = published["clip.aligned_segments.json"]
     payload = json.loads(aligned_path.read_text(encoding="utf-8"))
     assert calls["asr"] == 1
     assert payload["backend"] == "mock_asr"
@@ -169,7 +169,7 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
     assert payload["asr_log"] == ["mock asr"]
     assert "transcript_chunks" not in payload["asr_details"]
     assert payload["asr_details"]["transcript_chunk_count"] == 1
-    transcript = json.loads((temp_root / "clip" / "clip.transcript.json").read_text(encoding="utf-8"))
+    transcript = json.loads(published["clip.transcript.json"].read_text(encoding="utf-8"))
     assert transcript["chunks"] == [{"text": "こんにちは"}]
     timings = json.loads((temp_root / "clip" / "clip.timings.json").read_text(encoding="utf-8"))
     assert "transcript_chunks" not in timings["asr_details"]

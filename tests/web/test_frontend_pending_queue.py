@@ -34,7 +34,7 @@ def test_completed_job_opens_srt_and_forces_full_progress() -> None:
     assert "job.status === 'done'" in jobs_js
     assert "pct = 100;" in jobs_js
     assert "const terminalStage = CLEARABLE.has(job.status) ? job.status : null;" in jobs_js
-    assert "const activeStage = terminalStage || job.progress?.stage" in jobs_js
+    assert "const activeStage = savingStage || terminalStage || job.progress?.stage" in jobs_js
     assert "done:                '已完成'" in jobs_js
     assert "const progressInfo = terminalStage" in jobs_js
     assert "data-open-artifact" in jobs_js

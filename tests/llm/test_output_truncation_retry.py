@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import pytest
 
+from llm import token_budget
 from llm import settings as llm_settings
 from llm import translator
 from llm.errors import (
@@ -137,7 +138,7 @@ class TestEscalation:
         monkeypatch.setenv("LLM_MODEL_NAME", "test-model")
         transport = _Transport(truncate_first=1)
         _install(monkeypatch, transport)
-        monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 500)
+        monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 500)
         monkeypatch.setattr(llm_settings, "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0)
 
         _chat(max_tokens=500)

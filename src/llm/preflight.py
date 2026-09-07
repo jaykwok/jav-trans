@@ -19,6 +19,9 @@ from __future__ import annotations
 import os
 
 from core.stage_errors import MISSING_API_KEY, MISSING_BASE_URL, MISSING_MODEL
+from llm import request_config
+from llm import settings as llm_settings
+from llm import token_budget
 
 # v1.0 shipped a Sakura/GalTransl GGUF as the llamacpp default, and its
 # line-oriented prompt contract was removed on 2026-08-04. Such a model cannot
@@ -34,7 +37,12 @@ RETIRED_GGUF_MODEL = (
 
 
 def _missing(name: str) -> bool:
-    return not os.getenv(name, "").strip()
+    # The task's frozen configuration when a task is running, the live
+    # environment otherwise (queueing, retry, the CLI). Both checks below run
+    # inside the OpenAI client factory as well, and there the question is "does
+    # the request this task is about to build have what it needs" - clearing the
+    # key in the settings panel must not fail a job that captured a valid one.
+    return not request_config.getenv(name, "").strip()
 
 
 def _retired_gguf_model() -> bool:
@@ -47,9 +55,7 @@ def _retired_gguf_model() -> bool:
 
 def translation_config_problems(backend: str | None = None) -> list[str]:
     """Actionable messages for everything the translation stage still needs."""
-    from llm.backends import selected_backend_name
-
-    selected = selected_backend_name(backend)
+    selected = llm_settings.selected_backend_name(backend)
     if selected == "llamacpp":
         return [RETIRED_GGUF_MODEL] if _retired_gguf_model() else []
     if selected != "openai":
@@ -93,11 +99,11 @@ def translation_budget_warnings() -> list[str]:
     Compared against the budget the endpoint would actually get, not against the
     configured fallback: once an endpoint has named a ceiling, the fallback is
     not what binds, and warning about it would be describing a number nothing
-    uses.
+    uses. That comparison comes from `llm.token_budget`, which knows the learned
+    limits without knowing the engine - asking the engine is what put this check
+    inside an import cycle with the stage it is supposed to precede.
     """
     from llm import profiles as profiles_module
-    from llm import settings as llm_settings
-    from llm import translator as translator_module
 
     batch_size = max(1, int(llm_settings.TRANSLATION_BATCH_SIZE))
     floor = profiles_module.select_profile().response_token_budget(
@@ -107,10 +113,12 @@ def translation_budget_warnings() -> list[str]:
     if floor is None:
         return []
     floor = int(floor)
-    # The pure one: the warning-emitting variant would print here at startup and
-    # then mark the endpoint as already-warned, so the run-time clamp - the one
-    # that sees the real source text - would never say anything.
-    effective = translator_module._plain_max_tokens_budget(floor)
+    # The silent one: the warning-emitting variant would print here at startup
+    # and then mark the endpoint as already-warned, so the run-time clamp - the
+    # one that sees the real source text - would never say anything.
+    effective = token_budget.plain_budget(
+        floor, backend_name=llm_settings.selected_backend_name()
+    )
     if effective >= floor:
         return []
     return [
@@ -118,7 +126,7 @@ def translation_budget_warnings() -> list[str]:
         "每个批次都会被压到这个上限，且回复被切断后无法再向上重试。"
         f"（batch={batch_size}，推理档={llm_settings.LLM_REASONING_EFFORT}，"
         f"推理配额={llm_settings.TRANSLATION_REASONING_TOKEN_ALLOWANCE}，"
-        f"TRANSLATION_MAX_TOKENS={int(translator_module.TRANSLATION_MAX_TOKENS)}）"
+        f"TRANSLATION_MAX_TOKENS={int(token_budget.CONFIGURED_MAX_TOKENS)}）"
         "调高 TRANSLATION_MAX_TOKENS，或调小批次/推理配额。"
     ]
 

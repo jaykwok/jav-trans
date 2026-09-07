@@ -66,6 +66,9 @@ async def _job_with_artifacts(tmp_path, artifacts: list[str], output_dir: Path):
     job = jobs[0]
     async with pm._state_lock:
         job.status = "done"
+        # Legacy records have no manifest; new-generation QC has an integration test.
+        job.output_generation = 0
+        job.output_target = ""
         job.artifacts = artifacts
         pm._jobs[job.id] = job
     return job

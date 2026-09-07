@@ -11,6 +11,17 @@ import pytest
 import main
 from core import resources
 from llm import backends as llm_backends
+from llm.errors import TranslationCancelledError
+
+
+@pytest.fixture(autouse=True)
+def output_identity(monkeypatch, tmp_path):
+    # Backend lifetime tests stub computation; isolate output ownership too.
+    lease = main.artifact_store.claim_output(
+        tmp_path / "sample-a.srt", project_root=tmp_path,
+        job_id="sample-job", run_id="sample-run",
+    )
+    monkeypatch.setattr(main, "_output_lease", lambda *args, **kwargs: lease)
 
 
 @pytest.fixture
@@ -31,6 +42,24 @@ def clean_local_backend_slot(monkeypatch):
     llm_backends._BACKEND_INSTANCES.pop("llamacpp", None)
 
 
+def _translating_artifacts() -> SimpleNamespace:
+    """Stands in for a run that will actually send something to a backend.
+
+    The entry point now decides whether to lease at all, so "there is something
+    to translate" has to be stated rather than assumed: a bare object() would
+    describe a Japanese-only run, which takes no lease and would make every
+    lease assertion below vacuously true.
+    """
+    return SimpleNamespace(segments=[{"start": 0.0, "end": 1.0, "text": "日本語"}], job_id="sample-job", srt_path="sample-a.srt")
+
+
+def _translating_ctx() -> SimpleNamespace:
+    # `subtitle_mode` as well as `skip_translation`: the entry point builds an
+    # ExecutionPlan, which states how the output is spelled alongside whether
+    # anything is translated at all.
+    return SimpleNamespace(skip_translation=False, subtitle_mode="zh", job_id="sample-job")
+
+
 class _FakeBackend:
     def __init__(self, closed: list[str], label: str) -> None:
         self._closed = closed
@@ -45,7 +74,7 @@ class _FakeBackend:
 def test_translation_task_always_closes_local_backend(monkeypatch, fails):
     closed_backends: list[str] = []
     closed_loggers: list[object] = []
-    artifacts = object()
+    artifacts = _translating_artifacts()
 
     monkeypatch.setenv("TRANSLATION_BACKEND", "llamacpp")
     monkeypatch.setattr(main, "_reopen_snapshot_run_logger", lambda _artifacts: None)
@@ -69,10 +98,10 @@ def test_translation_task_always_closes_local_backend(monkeypatch, fails):
 
     if fails:
         with pytest.raises(RuntimeError, match="translation failed"):
-            main.run_translation_and_write("video.mp4", artifacts, ctx=object())
+            main.run_translation_and_write("video.mp4", artifacts, ctx=_translating_ctx())
     else:
         assert main.run_translation_and_write(
-            "video.mp4", artifacts, ctx=object()
+            "video.mp4", artifacts, ctx=_translating_ctx()
         ) == ["done.srt"]
 
     assert closed_backends == ["llamacpp"]
@@ -100,7 +129,9 @@ def test_finished_task_does_not_close_a_backend_another_task_is_using(monkeypatc
             "_run_translation_and_write_impl",
             lambda *_args, **_kwargs: ["done.srt"],
         )
-        main.run_translation_and_write("video.mp4", object(), ctx=object())
+        main.run_translation_and_write(
+            "video.mp4", _translating_artifacts(), ctx=_translating_ctx()
+        )
         assert closed_backends == []
         assert llm_backends.backend_lease_count("llamacpp") == 1
 
@@ -309,7 +340,7 @@ class _FakeOsBoundary:
             llamacpp_server, "resolve_server_executable", lambda: "llama-server.exe"
         )
         monkeypatch.setattr(
-            llamacpp_server, "resolve_gguf_model_path", lambda: "model.gguf"
+            llamacpp_server, "resolve_gguf_model_path", lambda **_kwargs: "model.gguf"
         )
         monkeypatch.setattr(llamacpp_server, "_pick_free_port", lambda: 8080)
         monkeypatch.setattr(llamacpp_server, "_release_asr_worker_vram", lambda: None)
@@ -322,9 +353,6 @@ class _FakeOsBoundary:
         )
         monkeypatch.setattr(
             llamacpp_server.LlamaCppServerBackend, "_health_ok", lambda _self, _port: True
-        )
-        monkeypatch.setattr(
-            llamacpp_server.LlamaCppServerBackend, "_make_client", lambda _self, _port: object()
         )
         monkeypatch.setattr(resources, "_start_watchdog", lambda: None)
 
@@ -365,6 +393,247 @@ def test_two_backend_instances_never_claim_the_same_server_identity(monkeypatch,
     assert running.kills == 0
     assert running.poll() is None
     assert resources.is_registered(*second_identity) is True
+
+
+class TestWaitingOutAModelLoad:
+    """A model load is minutes, and `_lock` used to be held across all of it.
+
+    Everything that touches the instance queued behind it: a sibling task on an
+    uncancellable lock wait - the same shape as the ASR-lock bug one layer up -
+    and 关闭, which is what the page calls when the user changes the setting.
+    The load now happens outside the lock, and "a start is in progress" is
+    state a waiter can watch rather than a lock it disappears into.
+    """
+
+    @staticmethod
+    def _loading_backend(monkeypatch, tmp_path):
+        from llm.backends import llamacpp_server
+
+        _FakeOsBoundary(monkeypatch, tmp_path)
+        ready = threading.Event()
+        monkeypatch.setattr(
+            llamacpp_server.LlamaCppServerBackend,
+            "_health_ok",
+            lambda _self, _port: ready.is_set(),
+        )
+        return llamacpp_server.LlamaCppServerBackend(), ready
+
+    def test_a_second_task_can_be_cancelled_while_it_waits(self, monkeypatch, tmp_path):
+        backend, ready = self._loading_backend(monkeypatch, tmp_path)
+        cancel = threading.Event()
+        loader_done = threading.Event()
+        waiter: list = []
+
+        def load():
+            try:
+                backend._ensure_server()
+            finally:
+                loader_done.set()
+
+        def arrive_during_the_load():
+            try:
+                backend._ensure_server(cancel_event=cancel)
+                waiter.append("started")
+            except BaseException as exc:
+                waiter.append(exc)
+
+        loader = threading.Thread(target=load, daemon=True)
+        loader.start()
+        try:
+            second = threading.Thread(target=arrive_during_the_load, daemon=True)
+            second.start()
+            time.sleep(0.2)  # it is waiting out the load by now
+            assert waiter == []
+
+            cancel.set()
+            second.join(3.0)
+
+            assert len(waiter) == 1
+            assert isinstance(waiter[0], TranslationCancelledError)
+        finally:
+            ready.set()
+            assert loader_done.wait(5.0)
+            loader.join(5.0)
+            backend.close()
+
+    def test_a_sibling_can_be_cancelled_while_the_model_is_resolved(
+        self, monkeypatch, tmp_path
+    ):
+        """Resolving the GGUF is a 4.6GB download on a first run.
+
+        Under `_lock` it was worse than the load itself: a sibling task did not
+        even reach the condition it was supposed to wait on - it blocked on the
+        lock, where its cancel event could not reach it, until the download
+        finished.
+        """
+        from llm.backends import llamacpp_server
+
+        _FakeOsBoundary(monkeypatch, tmp_path)
+        resolving = threading.Event()
+        release = threading.Event()
+
+        def resolve(**_kwargs):
+            resolving.set()
+            assert release.wait(5.0)
+            return "model.gguf"
+
+        monkeypatch.setattr(llamacpp_server, "resolve_gguf_model_path", resolve)
+        backend = llamacpp_server.LlamaCppServerBackend()
+        cancel = threading.Event()
+        waiter: list = []
+        starter_done = threading.Event()
+
+        def start():
+            try:
+                backend._ensure_server()
+            finally:
+                starter_done.set()
+
+        def arrive_during_the_download():
+            try:
+                backend._ensure_server(cancel_event=cancel)
+                waiter.append("started")
+            except BaseException as exc:
+                waiter.append(exc)
+
+        starter = threading.Thread(target=start, daemon=True)
+        starter.start()
+        try:
+            assert resolving.wait(3.0)
+            second = threading.Thread(target=arrive_during_the_download, daemon=True)
+            second.start()
+            time.sleep(0.2)
+            assert waiter == []
+
+            cancel.set()
+            second.join(3.0)
+
+            assert len(waiter) == 1
+            assert isinstance(waiter[0], TranslationCancelledError)
+        finally:
+            release.set()
+            assert starter_done.wait(5.0)
+            starter.join(5.0)
+            backend.close()
+
+    def test_the_starter_stops_waiting_on_a_download_that_will_not_stop(
+        self, monkeypatch, tmp_path
+    ):
+        # The progress hook asks huggingface_hub to abort, but what it does with
+        # that is not a contract we own. The wait is cancellable either way.
+        from llm.backends import llamacpp_server
+
+        _FakeOsBoundary(monkeypatch, tmp_path)
+        resolving = threading.Event()
+        release = threading.Event()
+
+        def never_returns(**_kwargs):
+            resolving.set()
+            assert release.wait(10.0)
+            return "model.gguf"
+
+        monkeypatch.setattr(llamacpp_server, "resolve_gguf_model_path", never_returns)
+        backend = llamacpp_server.LlamaCppServerBackend()
+        cancel = threading.Event()
+        outcome: list = []
+
+        def start():
+            try:
+                backend._ensure_server(cancel_event=cancel)
+                outcome.append("started")
+            except BaseException as exc:
+                outcome.append(exc)
+
+        thread = threading.Thread(target=start, daemon=True)
+        thread.start()
+        try:
+            assert resolving.wait(3.0)
+            cancel.set()
+            thread.join(3.0)
+
+            assert not thread.is_alive()
+            assert isinstance(outcome[0], TranslationCancelledError)
+        finally:
+            release.set()
+
+    def test_the_download_reports_under_the_run_that_asked_for_it(
+        self, monkeypatch, tmp_path
+    ):
+        """A new thread inherits no run.
+
+        `core.events`'s job_id is thread-local, so the resolver thread starts
+        with none, and hf_progress's module-level fallback is *shared* - it is
+        whatever job most recently started an ASR download. Unattributed
+        progress is merely lost; progress stamped with a concurrent job's id
+        passes every check the receiving end makes and shows a translation
+        model's download inside that other job.
+        """
+        from core import events
+        from llm.backends import llamacpp_server
+        from utils import hf_progress
+
+        _FakeOsBoundary(monkeypatch, tmp_path)
+        monkeypatch.setattr(events, "_thread_local", threading.local())
+        events.set_current_run("sample-a", "run-a")
+        events._thread_local.video = "sample-a.mp4"
+        # Another job is downloading an ASR model right now, and that is what
+        # the shared fallback says.
+        monkeypatch.setattr(hf_progress, "_override_job_id", "sample-b")
+        monkeypatch.setattr(hf_progress, "_override_run_id", "run-b")
+        captured: list[dict] = []
+        monkeypatch.setattr(events, "emit", lambda event: captured.append(event))
+
+        def resolve(*, cancel_event=None):
+            with hf_progress.tqdm_class(cancel_event)(
+                total=100, initial=0, unit="B", unit_scale=True,
+                desc="sample-model.gguf", name="huggingface_hub.http_get",
+                disable=True,
+            ) as bar:
+                bar.update(100)
+            return "model.gguf"
+
+        monkeypatch.setattr(llamacpp_server, "resolve_gguf_model_path", resolve)
+        backend = llamacpp_server.LlamaCppServerBackend()
+
+        assert backend._resolve_model_path(threading.Event()) == "model.gguf"
+
+        assert captured
+        assert {
+            (event["job_id"], event["run_id"], event["video"]) for event in captured
+        } == {("sample-a", "run-a", "sample-a.mp4")}
+
+    def test_closing_does_not_queue_behind_the_load(self, monkeypatch, tmp_path):
+        backend, ready = self._loading_backend(monkeypatch, tmp_path)
+        outcome: list = []
+        loader_done = threading.Event()
+
+        def load():
+            try:
+                backend._ensure_server()
+                outcome.append("started")
+            except BaseException as exc:
+                outcome.append(exc)
+            finally:
+                loader_done.set()
+
+        loader = threading.Thread(target=load, daemon=True)
+        loader.start()
+        try:
+            time.sleep(0.2)  # inside the load
+            started = time.perf_counter()
+            stopped = backend.close()
+            elapsed = time.perf_counter() - started
+
+            assert stopped is True
+            assert elapsed < 1.0
+            # And the load it interrupted says so, rather than reporting a
+            # startup failure of a process someone else stopped.
+            assert loader_done.wait(5.0)
+            assert isinstance(outcome[0], RuntimeError)
+            assert "被关闭或替换" in str(outcome[0])
+        finally:
+            ready.set()
+            loader.join(5.0)
 
 
 def test_a_local_server_that_will_not_die_is_not_reported_as_stopped():
@@ -548,6 +817,38 @@ def test_a_stuck_local_server_holds_the_gpu_against_asr_too(monkeypatch):
     assert status["state"] == "cleaning"
 
 
+def test_a_started_server_hands_the_card_over_rather_than_giving_it_back(
+    monkeypatch, tmp_path
+):
+    """A *healthy* server is what the cleanup ledger cannot see.
+
+    The test above is about one that could not be stopped. This one starts
+    normally, so nothing is pending anywhere - and the queue still must not
+    dispatch an ASR stage into it. Startup takes exclusive use of the card and
+    then hands it to the identity it registered, in one step: registering and
+    then releasing would leave an instant where the permit is free and the
+    resident server is not yet holding anyone off.
+    """
+    from llm.backends.llamacpp_server import LlamaCppServerBackend
+    from core import gpu_admission
+    from web import pipeline_manager as pm
+
+    _FakeOsBoundary(monkeypatch, tmp_path)
+    backend = LlamaCppServerBackend()
+    backend._ensure_server()
+    identity = (backend._resource_id(), backend._server_generation)
+
+    assert resources.gpu_blocked() is False  # nothing was asked to stop
+    assert gpu_admission.holder() is None  # the permit was not kept
+    assert [claim["resource_id"] for claim in gpu_admission.claims()] == [identity[0]]
+    assert pm.gpu_admission_blocked() is True
+
+    assert backend.close() is True
+
+    assert gpu_admission.claims() == []  # the claim ended with its record
+    assert pm.gpu_admission_blocked() is False
+
+
 def test_a_cancelled_request_retires_the_generation_instead_of_trusting_it():
     # Cancelling the HTTP request proves this process stopped reading, not that
     # the server stopped generating. So that generation stops taking new work -
@@ -655,7 +956,10 @@ def test_cancelling_a_task_ends_its_wait_for_a_retiring_generation(monkeypatch):
     def cancelled_task():
         try:
             main.run_translation_and_write(
-                "video.mp4", object(), ctx=object(), cancel_event=cancel
+                "video.mp4",
+                _translating_artifacts(),
+                ctx=_translating_ctx(),
+                cancel_event=cancel,
             )
             outcome.append("returned")
         except main.PipelineCancelledError:
@@ -694,7 +998,9 @@ def test_an_api_task_does_not_wait_for_a_local_servers_retirement(monkeypatch):
         backend._retiring = True
         thread = threading.Thread(
             target=lambda: (
-                main.run_translation_and_write("video.mp4", object(), ctx=object()),
+                main.run_translation_and_write(
+                    "video.mp4", _translating_artifacts(), ctx=_translating_ctx()
+                ),
                 done.set(),
             ),
             daemon=True,
@@ -702,6 +1008,62 @@ def test_an_api_task_does_not_wait_for_a_local_servers_retirement(monkeypatch):
         thread.start()
         assert done.wait(2.0) is True
         assert llm_backends.backend_lease_count("openai") == 0
+        assert llm_backends.backend_lease_count("llamacpp") == 1
+
+    thread.join(5.0)
+
+
+@pytest.mark.parametrize(
+    "artifacts, ctx",
+    [
+        (
+            _translating_artifacts(),
+            SimpleNamespace(skip_translation=True, subtitle_mode="zh", job_id="sample-job"),
+        ),
+        (
+            SimpleNamespace(segments=[], job_id="sample-job", srt_path="sample-a.srt"),
+            _translating_ctx(),
+        ),
+    ],
+    ids=["japanese-only", "nothing-recognised"],
+)
+def test_a_run_with_nothing_to_translate_waits_for_no_backend(
+    monkeypatch, artifacts, ctx
+):
+    """A lease is a wait, so taking one is a decision, not a formality.
+
+    Japanese-only output and an empty transcript never send a request, yet both
+    used to queue behind a retiring local server on the way in - and could fail
+    on its timeout, before the writer that was their entire job had a chance to
+    run.
+    """
+    monkeypatch.setenv("TRANSLATION_BACKEND", "llamacpp")
+    monkeypatch.setattr(llm_backends, "_RETIRE_WAIT_S", 30.0)
+    monkeypatch.setattr(main, "_reopen_snapshot_run_logger", lambda _artifacts: None)
+    monkeypatch.setattr(main, "_close_artifacts_logger", lambda _value: None)
+    monkeypatch.setattr(
+        main, "_run_translation_and_write_impl", lambda *_args, **_kwargs: ["sample.ja.srt"]
+    )
+    backend = _retiring_local_backend(monkeypatch)
+    written: list[list[str]] = []
+    done = threading.Event()
+
+    with llm_backends.backend_lease("llamacpp"):  # a local job, still translating
+        backend._retiring = True
+        thread = threading.Thread(
+            target=lambda: (
+                written.append(
+                    main.run_translation_and_write("video.mp4", artifacts, ctx=ctx)
+                ),
+                done.set(),
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+        assert done.wait(2.0) is True
+        assert written == [["sample.ja.srt"]]
+        # No second holder: it went straight to the writer.
         assert llm_backends.backend_lease_count("llamacpp") == 1
 
     thread.join(5.0)
@@ -787,7 +1149,9 @@ def test_a_task_never_sends_requests_to_an_instance_it_does_not_hold(monkeypatch
     )
 
     with pytest.raises(llm_backends.BackendLeaseInvalidatedError):
-        main.run_translation_and_write("video.mp4", object(), ctx=object())
+        main.run_translation_and_write(
+            "video.mp4", _translating_artifacts(), ctx=_translating_ctx()
+        )
 
     assert calls == []  # B never saw a request from a task holding A
     assert llm_backends.backend_lease_count("llamacpp") == 0

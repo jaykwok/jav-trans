@@ -6,15 +6,19 @@ import threading
 from typing import Callable
 
 from core.config import DEFAULT_REASONING_EFFORT, REASONING_EFFORTS, load_config
+from core.typed_config import env_int
 from llm import cache as translation_cache
 from llm import engine as engine_module
 from llm import global_glossary
-from llm import max_tokens_limits
 from llm import repair as repair_module
 from llm import profiles as profiles_module
+from llm import request_config
+from llm.run_context import RunContext
+from llm.session import TranslationSession
 from llm.profiles import json_v3
 from llm.profiles.base import ProfileContext
 from llm import settings as llm_settings
+from llm import token_budget
 from llm import transport_util
 from llm import backends as backends_module
 from llm.backends import (
@@ -63,10 +67,6 @@ LLM_REASONING_EFFORT = llm_settings.LLM_REASONING_EFFORT
 
 DEFAULT_TARGET_LANG = llm_settings.DEFAULT_TARGET_LANG
 
-_env_float = llm_settings._env_float
-_env_int_clamped = llm_settings._env_int_clamped
-
-TRANSLATION_MAX_TOKENS = llm_settings.TRANSLATION_MAX_TOKENS
 TRANSLATION_TEMPERATURE = llm_settings.TRANSLATION_TEMPERATURE
 TRANSLATION_TOP_P = llm_settings.TRANSLATION_TOP_P
 TRANSLATION_BATCH_SIZE = llm_settings.TRANSLATION_BATCH_SIZE
@@ -154,7 +154,7 @@ def _effective_reasoning_effort(override: str | None = None) -> str:
     if callable(supports) and not supports():
         return ""
     return _normalize_reasoning_effort(
-        override or os.getenv("LLM_REASONING_EFFORT", LLM_REASONING_EFFORT)
+        override or request_config.getenv("LLM_REASONING_EFFORT", LLM_REASONING_EFFORT)
     )
 
 
@@ -162,6 +162,15 @@ def _effective_prompt_version() -> str:
     # The active profile produces different text for the same source lines, so
     # profiles must not share cache/memory entries. The profile signature
     # (id@version) is the version string folded into every cache/memory key.
+    #
+    # The task's own profile when there is one, rather than a fresh selection.
+    # Selecting again here is how a cache key came to name a *different*
+    # contract than the one that produced the text it keys: detection reads
+    # configuration the settings panel can rewrite mid-run, so the second
+    # selection is not required to agree with the first.
+    profile = request_config.current_profile()
+    if profile is not None:
+        return profile.cache_signature()
     return profiles_module.select_profile().cache_signature()
 
 
@@ -315,11 +324,18 @@ def translate_segments(
         # and inflate per-request latency past the watchdog timeouts.
         effective_max_workers = min(
             effective_max_workers,
-            _env_int_clamped("LLAMACPP_PARALLEL", 8, 1, 16),
+            env_int("LLAMACPP_PARALLEL", 8, minimum=1, maximum=16),
         )
     # Selected before sizing because a model contract may impose a stricter
-    # hard cap (Hy-MT2 is deliberately one cue per request).
-    profile = profiles_module.select_profile()
+    # hard cap (Hy-MT2 is deliberately one cue per request), and selected
+    # exactly once - from the leased backend and the task's frozen endpoint
+    # snapshot, not from live configuration. Both halves matter: a second
+    # selection later disagreed with this one, and either selection reading the
+    # settings panel disagreed with the model the requests actually went to.
+    profile = profiles_module.select_profile(
+        backend=backend_name,
+        model_name=request_config.getenv("LLM_MODEL_NAME", ""),
+    )
     effective_batch_size = _auto_translation_batch_size(len(segments))
     profile_batch_cap = profile.max_batch_size()
     if profile_batch_cap is not None:
@@ -333,6 +349,20 @@ def translate_segments(
     effective_target_lang = (target_lang or DEFAULT_TARGET_LANG).strip() or DEFAULT_TARGET_LANG
     effective_glossary = normalize_glossary_text(glossary)
     effective_character_reference = (character_reference or "").strip()
+    # Everything both passes have to agree about, settled once. The repair pass
+    # takes this object rather than eight parallel arguments it could be handed
+    # inconsistently - see `llm.session`.
+    session = TranslationSession(
+        backend_name=backend_name,
+        profile=profile,
+        batch_size=effective_batch_size,
+        max_workers=effective_max_workers,
+        cache_path=effective_cache_path,
+        target_lang=effective_target_lang,
+        glossary=effective_glossary,
+        character_reference=effective_character_reference,
+        reasoning_effort=_effective_reasoning_effort(reasoning_effort),
+    )
     _warn_about_inert_context(
         profile,
         glossary=effective_glossary,
@@ -341,147 +371,138 @@ def translate_segments(
     previous_retry_events = getattr(_RETRY_CONTEXT, "events", None)
     retry_events: list[dict] = []
     _RETRY_CONTEXT.events = retry_events
+    # `session.bound()` binds the profile for both passes: the cache-key helpers
+    # are reached from places that never see an argument, and the repair pass
+    # has to write its corrected text back under the key the batch pass used.
     try:
-        _raise_if_cancelled(cancel_event)
-        full_context = (
-            global_context
-            if global_context is not None
-            else generate_global_context(segments)
-        )
-        context_char_limit = _translation_context_char_limit()
-        if context_char_limit > 0 and len(full_context) > context_char_limit:
-            full_context = full_context[:context_char_limit]
-        full_source_payload = _serialize_segments(segments, compact=True)
-        use_full_json_prefix = (
-            context_char_limit <= 0
-            or len(full_source_payload) <= context_char_limit
-        )
-
-        job_id_for_worker_threads = hf_progress.current_job_id()
-        run_id_for_worker_threads = hf_progress.current_run_id()
-        lease_for_worker_threads = backends_module.current_lease()
-
-        def _engine_chat(messages: list[dict], **chat_kwargs) -> str:
-            # run_batched dispatches this from a ThreadPoolExecutor pool, and a
-            # fresh worker thread has no `core.events` thread-local of its own
-            # -- a GGUF download triggered from here (llamacpp backend, first
-            # call starts the server) would otherwise emit model_download
-            # events with an empty job_id, which the frontend silently drops
-            # instead of showing a progress bar.
-            hf_progress.propagate_job_id_to_current_thread(
-                job_id_for_worker_threads,
-                run_id_for_worker_threads,
+        with session.bound():
+            _raise_if_cancelled(cancel_event)
+            full_context = (
+                global_context
+                if global_context is not None
+                else generate_global_context(segments)
             )
-            # Same reason, for the backend: a pool thread holds no lease of its
-            # own, and resolving the backend by name here is exactly the lookup
-            # the lease replaces.
-            backends_module.bind_lease(lease_for_worker_threads)
-
-            # Late global lookup keeps the _chat/_chat_with_reasoning test
-            # seams on this module working for engine-driven requests.
-            #
-            # Defaults, not overrides: the repair pass reissues at an escalated
-            # tier and passes its own `reasoning_effort`. Binding the job's here
-            # would both collide with that argument and silently undo the
-            # escalation for any caller that got past the collision.
-            chat_kwargs.setdefault("reasoning_effort", reasoning_effort)
-            return _chat_with_reasoning(messages, **chat_kwargs)
-
-        zh_texts, timings, worker_retry_events = engine_module.run_batched(
-            segments,
-            profile=profile,
-            backend_name=backend_name,
-            chat=_engine_chat,
-            backoff_sleep=_call_request_backoff_sleep,
-            crash_probe=_test_crash_translation_batch,
-            batch_size=effective_batch_size,
-            max_workers=effective_max_workers,
-            api_retries=TRANSLATION_API_RETRIES,
-            batch_repair_retries=TRANSLATION_BATCH_REPAIR_RETRIES,
-            batch_max_requests=TRANSLATION_BATCH_MAX_REQUESTS,
-            prefix_warmup=TRANSLATION_PREFIX_WARMUP,
-            # No settled rendering exists before the base pass has translated
-            # anything - see `global_glossary`. The repair pass gets one,
-            # derived from this pass's own output.
-            extra_glossary="",
-            full_context=full_context,
-            full_source_payload=full_source_payload,
-            use_full_json_prefix=use_full_json_prefix,
-            cache_path=effective_cache_path,
-            cache_lock=_cache_lock,
-            target_lang=effective_target_lang,
-            glossary=effective_glossary,
-            character_reference=effective_character_reference,
-            prompt_version=_effective_prompt_version(),
-            model_identity=_translation_model_identity(),
-            compact_system_prompt=COMPACT_SYSTEM_PROMPT,
-            reasoning_effort=_effective_reasoning_effort(reasoning_effort),
-            on_batch_done=on_batch_done,
-            on_progress=on_progress,
-            cancel_event=cancel_event,
-        )
-        retry_events.extend(worker_retry_events)
-        _raise_if_cancelled(cancel_event)
-
-        def _persist_repaired_translation_cache(repaired_texts: list[str]) -> None:
-            # Write repaired texts back under the same batch_key entries the
-            # translation phase used, so subsequent runs reuse the repair.
-            if not effective_cache_path or not segments:
-                return
-            cache_kwargs = {
-                # The base pass always ran with no settled rendering (there was
-                # none to give it yet), so its cache keys carry "" here too -
-                # this has to match or the repair is written under a key the
-                # base pass's own entries never used.
-                "extra_glossary": "",
-                "glossary": effective_glossary,
-                "target_lang": effective_target_lang,
-                "character_reference": effective_character_reference,
-                # Same two inputs the engine keyed on, or the repaired text is
-                # written under a key nothing ever reads again.
-                "reasoning_effort": reasoning_effort,
-                "prefix_mode": engine_module.prefix_mode_label(use_full_json_prefix),
-            }
-            for b_index, b_segments in enumerate(
-                _split_into_batches(segments, effective_batch_size)
-            ):
-                start = b_index * effective_batch_size
-                local_texts = [
-                    repaired_texts[start + off]
-                    if start + off < len(repaired_texts)
-                    else ""
-                    for off in range(len(b_segments))
-                ]
-                batch_key = _translation_cache_key(b_index, b_segments, **cache_kwargs)
-                _save_cache_entry(
-                    effective_cache_path, batch_key, local_texts, _cache_lock
-                )
-
-        if profile.wants_repair_pass:
-            # Derived from this pass's own output, so it only exists once
-            # there is something to measure - see `global_glossary`.
-            settled_glossary_value = resolve_settled_glossary(
-                segments, zh_texts, effective_cache_path, effective_glossary
+            context_char_limit = _translation_context_char_limit()
+            if context_char_limit > 0 and len(full_context) > context_char_limit:
+                full_context = full_context[:context_char_limit]
+            full_source_payload = _serialize_segments(segments, compact=True)
+            use_full_json_prefix = (
+                context_char_limit <= 0
+                or len(full_source_payload) <= context_char_limit
             )
-            zh_texts, repair_timing = repair_module.apply_repair_pass(
+
+            # Captured on the thread that holds the run, adopted on whichever pool
+            # thread ends up making the request. See `llm.run_context` for what each
+            # of these decides and what goes wrong when one of them is left behind.
+            run_context = RunContext.capture()
+
+            def _engine_chat(messages: list[dict], **chat_kwargs) -> str:
+                # run_batched dispatches this from a ThreadPoolExecutor pool, and a
+                # fresh worker thread holds none of the run's state.
+                run_context.adopt()
+
+                # Late global lookup keeps the _chat/_chat_with_reasoning test
+                # seams on this module working for engine-driven requests.
+                #
+                # Defaults, not overrides: the repair pass reissues at an escalated
+                # tier and passes its own `reasoning_effort`. Binding the job's here
+                # would both collide with that argument and silently undo the
+                # escalation for any caller that got past the collision.
+                chat_kwargs.setdefault("reasoning_effort", reasoning_effort)
+                return _chat_with_reasoning(messages, **chat_kwargs)
+
+            zh_texts, timings, worker_retry_events = engine_module.run_batched(
                 segments,
-                zh_texts,
-                chat=_engine_chat,
                 profile=profile,
+                backend_name=backend_name,
+                chat=_engine_chat,
+                backoff_sleep=_call_request_backoff_sleep,
+                crash_probe=_test_crash_translation_batch,
                 batch_size=effective_batch_size,
-                reasoning_effort=_effective_reasoning_effort(reasoning_effort),
+                max_workers=effective_max_workers,
+                api_retries=TRANSLATION_API_RETRIES,
+                batch_repair_retries=TRANSLATION_BATCH_REPAIR_RETRIES,
+                batch_max_requests=TRANSLATION_BATCH_MAX_REQUESTS,
+                prefix_warmup=TRANSLATION_PREFIX_WARMUP,
+                # No settled rendering exists before the base pass has translated
+                # anything - see `global_glossary`. The repair pass gets one,
+                # derived from this pass's own output.
+                extra_glossary="",
+                full_context=full_context,
+                full_source_payload=full_source_payload,
+                use_full_json_prefix=use_full_json_prefix,
+                cache_path=effective_cache_path,
+                cache_lock=_cache_lock,
                 target_lang=effective_target_lang,
                 glossary=effective_glossary,
                 character_reference=effective_character_reference,
-                extra_glossary=settled_glossary_value,
+                # This profile's signature, not a fresh selection: the key has to
+                # name the contract that produced the text it keys.
+                prompt_version=profile.cache_signature(),
+                model_identity=_translation_model_identity(),
+                compact_system_prompt=COMPACT_SYSTEM_PROMPT,
+                reasoning_effort=_effective_reasoning_effort(reasoning_effort),
+                on_batch_done=on_batch_done,
                 on_progress=on_progress,
                 cancel_event=cancel_event,
-                cache_writer=_persist_repaired_translation_cache,
             )
+            retry_events.extend(worker_retry_events)
             _raise_if_cancelled(cancel_event)
-            if repair_timing is not None:
-                timings.append(repair_timing)
-        return zh_texts, timings, list(retry_events)
+
+            def _persist_repaired_translation_cache(repaired_texts: list[str]) -> None:
+                # Write repaired texts back under the same batch_key entries the
+                # translation phase used, so subsequent runs reuse the repair.
+                if not effective_cache_path or not segments:
+                    return
+                cache_kwargs = {
+                    # The base pass always ran with no settled rendering (there was
+                    # none to give it yet), so its cache keys carry "" here too -
+                    # this has to match or the repair is written under a key the
+                    # base pass's own entries never used.
+                    "extra_glossary": "",
+                    "glossary": effective_glossary,
+                    "target_lang": effective_target_lang,
+                    "character_reference": effective_character_reference,
+                    # Same two inputs the engine keyed on, or the repaired text is
+                    # written under a key nothing ever reads again.
+                    "reasoning_effort": reasoning_effort,
+                    "prefix_mode": engine_module.prefix_mode_label(use_full_json_prefix),
+                }
+                for b_index, b_segments in enumerate(
+                    _split_into_batches(segments, effective_batch_size)
+                ):
+                    start = b_index * effective_batch_size
+                    local_texts = [
+                        repaired_texts[start + off]
+                        if start + off < len(repaired_texts)
+                        else ""
+                        for off in range(len(b_segments))
+                    ]
+                    batch_key = _translation_cache_key(b_index, b_segments, **cache_kwargs)
+                    _save_cache_entry(
+                        effective_cache_path, batch_key, local_texts, _cache_lock
+                    )
+
+            if profile.wants_repair_pass:
+                # Derived from this pass's own output, so it only exists once
+                # there is something to measure - see `global_glossary`.
+                settled_glossary_value = resolve_settled_glossary(
+                    segments, zh_texts, effective_cache_path, effective_glossary
+                )
+                zh_texts, repair_timing = repair_module.apply_repair_pass(
+                    segments,
+                    zh_texts,
+                    chat=_engine_chat,
+                    session=session,
+                    extra_glossary=settled_glossary_value,
+                    on_progress=on_progress,
+                    cancel_event=cancel_event,
+                    cache_writer=_persist_repaired_translation_cache,
+                )
+                _raise_if_cancelled(cancel_event)
+                if repair_timing is not None:
+                    timings.append(repair_timing)
+            return zh_texts, timings, list(retry_events)
     finally:
         if previous_retry_events is None:
             with contextlib.suppress(AttributeError):
@@ -504,7 +525,8 @@ def _chat_with_reasoning(
 ) -> str:
     _raise_if_cancelled(cancel_event)
     effective_effort = _normalize_reasoning_effort(
-        reasoning_effort or os.getenv("LLM_REASONING_EFFORT", LLM_REASONING_EFFORT)
+        reasoning_effort
+        or request_config.getenv("LLM_REASONING_EFFORT", LLM_REASONING_EFFORT)
     )
     chat_kwargs = {
         "expected_count": expected_count,
@@ -779,228 +801,21 @@ def _usable_retry_budget(candidate: int, *, below: int, above: int) -> bool:
     return above < candidate < below and candidate >= _MIN_MAX_TOKENS_RETRY
 
 
-def _endpoint_identity() -> tuple[str, str] | None:
-    """`(base_url, model)` for the API backend, or None when it is not in use.
+def _endpoint_capability() -> token_budget.EndpointCapability:
+    """This task's endpoint, as `llm.token_budget` sees it.
 
-    Local backends never refuse a `max_tokens`, and keying a learned limit on
-    their empty base URL would let one endpoint's ceiling answer for another.
+    The one thing the budget module cannot work out for itself: which backend
+    the *lease* points at. Re-reading the selected name instead would let a task
+    holding a claim on one instance file what it learns under another.
     """
-    if task_backend_name() != "openai":
-        return None
-    model = os.getenv("LLM_MODEL_NAME", llm_settings.LLM_MODEL_NAME).strip()
-    if not model:
-        return None
-    return os.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip(), model
-
-
-_clamp_warned: set[str] = set()
-
-
-def _resolved_max_tokens(desired: int | None, limits) -> int:
-    """The budget the caller wants, with "no preference" turned into a number.
-
-    `desired=None` is the prefix warmup and anything else with no arithmetic
-    bound of its own: it means "as much as this endpoint allows", which is the
-    named ceiling when there is one and the configured fallback only otherwise.
-    That is the *whole* job of the fallback - it stands in for a missing budget,
-    never for a ceiling, so an explicit budget is never trimmed to it.
-    """
-    if desired is not None:
-        return max(1, int(desired))
-    return int(getattr(limits, "exact_ceiling", None) or TRANSLATION_MAX_TOKENS)
-
-
-def _local_max_tokens_budget(desired: int | None) -> int:
-    """The no-endpoint case, where the configured value really is a ceiling.
-
-    A local model cannot refuse a `max_tokens`, so there is nothing to learn
-    from and nothing to fall back to - `TRANSLATION_MAX_TOKENS` is the runaway
-    backstop it has always been, and a caller-supplied budget may only lower it.
-    """
-    return min(_resolved_max_tokens(desired, None), TRANSLATION_MAX_TOKENS)
-
-
-class _EndpointCapability:
-    """What one call knows about its endpoint's `max_tokens` ceiling.
-
-    The live copy is this object; the cache file is where it is left for the
-    next call. That order is the point. Reading the state back from disk after
-    every refusal made the probe ladder depend on the cache being writable, and
-    a cache that is not - a read-only directory, a full disk - reads back as
-    "nothing known", where the next step is `budget_for(nothing, sent - 1)`,
-    i.e. `sent - 1`. The ladder then walks down one token per round trip and the
-    request fails at a budget the endpoint would have taken two halvings later.
-    A capability cache is an optimisation; a request must not need it to work.
-    """
-
-    def __init__(self, identity: tuple[str, str] | None) -> None:
-        self.identity = identity
-        self.limits = (
-            max_tokens_limits.load_limits(*identity)
-            if identity is not None
-            else max_tokens_limits.EndpointLimits()
-        )
-        # Ceiling-side observations wait here until this call generates at a
-        # smaller budget. See `_corroborate`.
-        self._staged: list[tuple[str, int]] = []
-        self._corroborated = False
-
-    def _stage(self, kind: str, value: int) -> None:
-        """Hold a refusal, or write it if this call has already been convinced."""
-        if self.identity is None:
-            return
-        if self._corroborated:
-            self._write(kind, value)
-        else:
-            self._staged.append((kind, value))
-
-    def _write(self, kind: str, value: int) -> None:
-        if kind == "exact_ceiling":
-            max_tokens_limits.record_exact_ceiling(*self.identity, value)
-        else:
-            max_tokens_limits.record_rejection(*self.identity, value)
-
-    def _corroborate(self) -> None:
-        """A budget under the refusal just generated, so the refusal can be kept.
-
-        Nothing expires any more, so the cache has no way to walk back a number
-        that should not have gone in. The check that replaces it is behavioural:
-        refuse high, generate low is what a real ceiling looks like, and a
-        message whose wording was merely read as a ceiling will not produce it.
-        Until that happens the refusal steers this call and nothing else.
-
-        The merge keeps every floor strictly under `rejected_at` and at or under
-        `exact_ceiling`, so any recorded success is by construction the one this
-        is asking about - `131072` accepted against a named `131072` corroborates
-        it exactly as much as `32768` accepted under a refused `65536` does.
-        """
-        if self._corroborated or not (
-            self.limits.rejected_at or self.limits.exact_ceiling
-        ):
-            return
-        self._corroborated = True
-        for kind, value in self._staged:
-            self._write(kind, value)
-        self._staged.clear()
-
-    def _observe(
-        self,
-        *,
-        exact_ceiling: int | None = None,
-        rejection: int | None = None,
-        success: int | None = None,
-    ) -> None:
-        self.limits = max_tokens_limits.merge_observation(
-            self.limits,
-            exact_ceiling=exact_ceiling,
-            rejection=rejection,
-            success=success,
-        )
-
-    def record_exact_ceiling(self, ceiling: int, *, persist: bool = True) -> None:
-        """The endpoint named its ceiling. The one kind that clamps."""
-        if ceiling <= 0:
-            return
-        self._observe(exact_ceiling=int(ceiling))
-        if persist:
-            self._stage("exact_ceiling", int(ceiling))
-
-    def record_rejection(self, sent: int, *, persist: bool = True) -> None:
-        """`sent` was refused, so everything at or above it is out.
-
-        `persist=False` keeps a refusal that is about this request rather than
-        about the endpoint - a combined input+output limit - inside this call.
-        It still drives the bisection, because a smaller budget really does fit;
-        it just never becomes a fact about an endpoint that will see shorter
-        prompts than this one.
-        """
-        if sent <= 0:
-            return
-        self._observe(rejection=int(sent))
-        if persist:
-            self._stage("rejection", int(sent))
-
-    def record_success(self, accepted: int, *, persist: bool = True) -> None:
-        """`accepted` went out and was generated against. A lower bound.
-
-        `persist=False` is the first-try case: the endpoint took the number, so
-        this call now knows a floor, but writing "at least this much works" on
-        every batch would be a disk write per request to store something no
-        refusal has bounded. The memory half is never optional - it is what the
-        rest of this call bisects against.
-        """
-        if accepted <= 0:
-            return
-        self._observe(success=int(accepted))
-        # Before the floor itself: whatever was refused above it is what makes
-        # this number worth having on disk at all.
-        self._corroborate()
-        if persist and self.identity is not None:
-            max_tokens_limits.record_success(*self.identity, int(accepted))
-
-    def budget(self, desired: int | None, *, warn: bool = False) -> int:
-        """What to actually ask for, given what this endpoint has said so far."""
-        if self.identity is None:
-            return _local_max_tokens_budget(desired)
-        resolved = _resolved_max_tokens(desired, self.limits)
-        budget = max_tokens_limits.budget_for(self.limits, resolved)
-        if warn and budget < resolved and desired is not None:
-            self._warn_clamped(resolved, budget)
-        return budget
-
-    def _warn_clamped(self, resolved: int, budget: int) -> None:
-        """Shrinking a computed budget is the silent half of this: the request
-        simply goes out with less room, and if the reply is then cut off the
-        truncation escalation cannot raise it back past the same line. Said once
-        per endpoint per process - a per-batch line would be noise."""
-        key = max_tokens_limits.endpoint_key(*self.identity)
-        if key in _clamp_warned:
-            return
-        _clamp_warned.add(key)
-        source = (
-            f"端点上限 {self.limits.exact_ceiling}"
-            if self.limits.exact_ceiling
-            else (
-                f"端点已拒绝过 {self.limits.rejected_at}"
-                if self.limits.rejected_at
-                else f"TRANSLATION_MAX_TOKENS={TRANSLATION_MAX_TOKENS}"
-            )
-        )
-        print(
-            f"[WARN] 本次翻译预算 {resolved} 被压到 {budget}（{source}）。"
-            "回复被切断时将无法再向上重试；如需更大预算请调高 "
-            "TRANSLATION_MAX_TOKENS 或调小批次/推理配额。",
-            flush=True,
-        )
-
-    def next_probe_after(self, sent: int) -> int:
-        """The next value to try after `sent` was refused.
-
-        Read off the bracket this call has already narrowed, so the step is the
-        midpoint of what is still possible. Only an endpoint that has said
-        nothing at all - a local backend - falls back to halving, which is the
-        same thing with no information.
-        """
-        if not self.limits.known_anything:
-            return sent // 2
-        candidate = max_tokens_limits.budget_for(self.limits, sent - 1)
-        return candidate if 0 < candidate < sent else sent // 2
-
-
-def _plain_max_tokens_budget(desired: int | None) -> int:
-    """`_max_tokens_budget` without the warning. Safe to call for a preview."""
-    return _EndpointCapability(_endpoint_identity()).budget(desired)
+    return token_budget.EndpointCapability(
+        token_budget.endpoint_identity(task_backend_name())
+    )
 
 
 def _max_tokens_budget(desired: int | None) -> int:
-    """What to actually ask for, and say so the first time it is less.
-
-    Reads the cache, so this answers for a request that has not started yet.
-    Within one `_chat` the same question goes to that call's own capability
-    state instead, which knows what this one cannot: what the endpoint has said
-    in the last few seconds.
-    """
-    return _EndpointCapability(_endpoint_identity()).budget(desired, warn=True)
+    """What to actually ask for, and say so the first time it is less."""
+    return _endpoint_capability().budget(desired, warn=True)
 
 
 def _chat(
@@ -1024,7 +839,7 @@ def _chat(
     # has already refused - and by `TRANSLATION_MAX_TOKENS` only until it does.
     # One state for the whole call, so the escalation below sizes itself from
     # what the requests above it just learned rather than from the cache.
-    capability = _EndpointCapability(_endpoint_identity())
+    capability = _endpoint_capability()
     effective_max_tokens = capability.budget(max_tokens, warn=True)
 
     def _dispatch(budget: int) -> str:

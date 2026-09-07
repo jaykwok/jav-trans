@@ -304,7 +304,7 @@ def test_an_empty_forwarded_knob_falls_back_instead_of_crashing(monkeypatch):
             "pause_reading": "blank",
             "speech_threshold": 0.5,
         }
-        assert asr_pipeline._env_int("ASR_FEATURE_BATCH_SIZE", "4") == 4
+        assert asr_pipeline.env_int("ASR_FEATURE_BATCH_SIZE", 4, minimum=1) == 4
 
     # A real value still wins, or the fallback would be hiding the setting.
     monkeypatch.setenv("ASR_CHUNK_MAX_S", "18.5")

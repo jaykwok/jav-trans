@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import json
-import os
-import re
 import time
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Callable
 
+from pipeline import artifact_store
 from utils.model_paths import PROJECT_ROOT
 
 
@@ -80,35 +80,25 @@ def serialize_asr_artifacts(artifacts: AsrArtifacts) -> dict:
 
 
 def _project_relative(path: str | Path | None) -> str | None:
-    if path is None:
-        return None
-    raw = str(path)
-    if not raw:
-        return raw
-    project_root_text = PROJECT_ROOT.resolve().as_posix()
-    normalized = raw.replace("\\", "/")
-    root_pattern = re.compile(re.escape(project_root_text) + r"/?", re.IGNORECASE)
-    normalized = root_pattern.sub("", normalized)
-    if normalized != raw.replace("\\", "/"):
-        return normalized or "."
-    candidate = Path(raw)
-    try:
-        if candidate.is_absolute():
-            return candidate.resolve().relative_to(PROJECT_ROOT).as_posix()
-    except (OSError, ValueError):
-        return raw.replace("\\", "/")
-    return raw.replace("\\", "/")
+    # One implementation of "what does this path look like in the snapshot",
+    # shared with the timings/quality writers. Two copies of a path rule is two
+    # rules the moment one of them is fixed - which is what happened here.
+    return artifact_store.project_relative(path, project_root=PROJECT_ROOT)
 
 
 def _write_json_atomic(path: str | Path, payload: dict) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target.with_name(f"{target.name}.{os.getpid()}.tmp")
-    tmp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    tmp_path.replace(target)
+    tmp_path = artifact_store.temp_publish_path(target)
+    try:
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(target)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
 
 
 def write_translation_artifacts_snapshot(

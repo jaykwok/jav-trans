@@ -99,7 +99,7 @@ def test_translation_uses_pre_normalized_cues(monkeypatch, tmp_path):
     assert "00:00:00,000 --> 00:00:00,916" in srt_content
 
     sidecar = json.loads(
-        (tmp_path / "jobs" / "clip" / "clip.bilingual.json").read_text(encoding="utf-8")
+        Path(artifacts.bilingual_json_path).read_text(encoding="utf-8")
     )
     assert sidecar["blocks"][0]["end"] == pytest.approx(expected_end)
     assert sidecar["blocks"][0]["zh_text"] == "zh-0"
@@ -154,7 +154,7 @@ def test_pretranslation_cue_plan_preserves_model_routed_cues(monkeypatch, tmp_pa
     assert [item["text"] for item in translated] == ["私", "私", "私", "今日はいい天気ですね"]
 
     aligned_payload = json.loads(
-        (tmp_path / "jobs" / "clip" / "clip.aligned_segments.json").read_text(encoding="utf-8")
+        Path(artifacts.aligned_segments_path).read_text(encoding="utf-8")
     )
     assert "subtitle_display_policy" not in aligned_payload["asr_details"]
     plan = aligned_payload["asr_details"]["subtitle_cue_plan"]
@@ -179,7 +179,6 @@ def test_cue_summary_exposes_measured_map_skip_without_display_clamp():
     cues, summary = main._prepare_translation_cues(
         [{"start": 0.0, "end": 20.0, "text": text, "words": words}],
         subtitle_options=SubtitleOptions(),
-        bilingual=True,
     )
 
     assert len(cues) == 1
@@ -257,7 +256,6 @@ def test_local_ctc_words_stay_completely_mapped_through_cue_planning(monkeypatch
             }
         ],
         subtitle_options=SubtitleOptions(),
-        bilingual=True,
     )
 
     assert [cue["ja_text"] for cue in cues] == ["先", "後"]
@@ -312,7 +310,6 @@ def test_postgate_flags_survive_from_segment_to_cue_plan():
     cues, summary = main._prepare_translation_cues(
         segments,
         subtitle_options=SubtitleOptions(),
-        bilingual=False,
     )
 
     flagged = [cue for cue in cues if cue.get("postgate_flags")]
@@ -373,7 +370,7 @@ def test_postgate_flags_reach_the_bilingual_sidecar(monkeypatch, tmp_path):
     main.run_translation_and_write(str(video_path), artifacts, ctx=ctx, job_id="clip")
 
     blocks = json.loads(
-        (tmp_path / "jobs" / "clip" / "clip.bilingual.json").read_text(encoding="utf-8")
+        Path(artifacts.bilingual_json_path).read_text(encoding="utf-8")
     )["blocks"]
     flagged = [block for block in blocks if "postgate_flags" in block]
     assert [block["ja_text"] for block in flagged] == ["今日はいい天気ですね"]

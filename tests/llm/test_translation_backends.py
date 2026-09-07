@@ -48,7 +48,6 @@ def test_openai_backend():
     backend = OpenAICompatBackend()
 
     # 测试功能支持
-    assert backend.supports_streaming() is True
     assert backend.supports_reasoning() is True
     print(f"[test] OpenAI backend JSON schema support: {backend.supports_json_schema()}")
 

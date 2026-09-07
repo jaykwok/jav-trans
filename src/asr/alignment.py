@@ -1028,16 +1028,9 @@ def blank_bias_from_env() -> float:
     on a stage whose whole design is to degrade instead of taking transcription
     down, and 0.0 is the behaviour that was actually measured.
     """
-    import os
+    from core.typed_config import env_float
 
-    raw = (os.environ.get(ALIGNMENT_BLANK_BIAS_ENV) or "").strip()
-    if not raw:
-        return 0.0
-    try:
-        value = float(raw)
-    except ValueError:
-        return 0.0
-    return value if value > 0.0 else 0.0
+    return env_float(ALIGNMENT_BLANK_BIAS_ENV, 0.0, minimum=0.0)
 
 
 def alignment_head_configured() -> bool:

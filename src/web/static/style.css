@@ -565,7 +565,7 @@ main {
 }
 .job-card:hover::before { opacity: 1; }
 .job-card:has(.badge-done)::before      { background: linear-gradient(180deg, var(--success), var(--success-deep)); }
-.job-card:has(.badge-failed)::before    { background: linear-gradient(180deg, var(--error), var(--error-deep)); }
+.job-card:has(.badge-failed, .badge-save_failed, .badge-publish_failed, .badge-export_failed)::before { background: linear-gradient(180deg, var(--error), var(--error-deep)); }
 .job-card:has(.badge-cancelled)::before { background: rgba(255, 255, 255, 0.22); }
 .job-card:has(.badge-pending)::before   { background: linear-gradient(180deg, var(--warn), #f59e0b); }
 .job-card:has(.badge-asr)::before       { background: linear-gradient(180deg, var(--accent2), var(--accent2-deep)); }
@@ -591,7 +591,7 @@ main {
   width: 5px; height: 5px; border-radius: 50%;
   background: currentColor;
 }
-.badge-asr::before, .badge-translating::before, .badge-writing::before, .badge-queued::before, .badge-cancelling::before {
+.badge-asr::before, .badge-translating::before, .badge-writing::before, .badge-queued::before, .badge-cancelling::before, .badge-saving::before {
   animation: badge-breathe 1.6s ease-in-out infinite;
 }
 @keyframes badge-breathe {
@@ -603,8 +603,9 @@ main {
 .badge-asr         { background: var(--accent2-soft);       color: var(--accent2); border-color: rgba(103, 232, 249, 0.28); }
 .badge-translating { background: var(--accent-soft);        color: var(--accent);  border-color: rgba(167, 139, 250, 0.30); }
 .badge-writing     { background: var(--accent-soft);        color: var(--accent);  border-color: rgba(167, 139, 250, 0.30); }
+.badge-saving      { background: var(--accent-soft);        color: var(--accent);  border-color: rgba(167, 139, 250, 0.30); }
 .badge-done        { background: var(--success-soft);       color: var(--success); border-color: rgba(52, 211, 153, 0.30); }
-.badge-failed      { background: var(--error-soft);         color: var(--error);   border-color: rgba(251, 113, 133, 0.30); }
+.badge-failed, .badge-save_failed, .badge-publish_failed, .badge-export_failed { background: var(--error-soft); color: var(--error); border-color: rgba(251, 113, 133, 0.30); }
 .badge-cancelled   { background: rgba(255, 255, 255, 0.04); color: var(--muted);   border-color: rgba(255, 255, 255, 0.08); }
 /* 停止中:已请求取消但还没停下来,用警告色和呼吸点表示"仍在运行" */
 .badge-cancelling  { background: var(--warn-soft);          color: var(--warn);    border-color: rgba(251, 191, 36, 0.26); }

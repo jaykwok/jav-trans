@@ -7,7 +7,9 @@ implements them now, so a future subsystem gets them by construction:
 * a late cleanup cannot touch the resource that replaced its target,
 * a cleanup never targets a live resource somebody is using,
 * a stop that has finished but not committed cannot be claimed again,
-* nothing gets past GPU admission while an owner has not confirmed it let go.
+* nothing gets past GPU admission while an owner has not confirmed it let go,
+* every pending record has a live watchdog behind it, with no exit window a
+  registration can fall into.
 """
 
 from __future__ import annotations
@@ -18,6 +20,10 @@ import time
 import pytest
 
 from core import resources
+
+# Captured before the autouse fixture below silences it, so the watchdog tests
+# can put the real one back for the few cases that are *about* the watchdog.
+_REAL_START_WATCHDOG = resources._start_watchdog
 
 
 class _FakeProcess:
@@ -341,6 +347,105 @@ def test_a_stopper_that_raises_is_an_unknown_not_an_exit():
     assert result.process_state == "unknown"
     assert resources.gpu_blocked() is True  # unknown never frees the card
     assert resources.is_registered("worker", 1) is True
+
+
+def test_a_retiring_watchdog_gives_up_its_slot_before_it_stops_running():
+    """The lost wakeup, closed at its source.
+
+    The loop used to read an empty queue, release the lock and only *then*
+    return. A registration landing in that window found `_WATCHDOG.is_alive()`
+    still true, started no replacement, and the record it had just filed waited
+    for a retry that no longer had a thread behind it. With `holds_gpu` set that
+    is a permanently blocked card, recoverable only by an explicit manual
+    cleanup. Retiring means giving up the slot, under the same lock that saw the
+    queue empty - so a registrant either publishes before the scan (and the scan
+    keeps this thread alive) or arrives to find the slot free.
+    """
+    thread = threading.Thread(target=resources._watchdog_loop, daemon=True)
+    resources._WATCHDOG = thread
+    thread.start()
+    thread.join(3.0)
+
+    assert thread.is_alive() is False
+    assert resources._WATCHDOG is None
+
+
+def test_a_pending_cleanup_recovers_without_anyone_pressing_a_button(monkeypatch):
+    # The point of the watchdog: a first attempt that does not confirm is
+    # retried on a backoff until it does, with no user action and no second
+    # loop of any subsystem's own.
+    monkeypatch.setattr(resources, "_start_watchdog", _REAL_START_WATCHDOG)
+    monkeypatch.setattr(resources, "RETRY_MIN_S", 0.05)
+    released = threading.Event()
+    process = _FakeProcess(pid=7, immortal=True)
+
+    def stubborn(proc, job_handle):
+        if proc.stops == 0:
+            proc.stops += 1
+            return resources.StopOutcome(process_state="alive", job_handle=job_handle)
+        proc.alive = False
+        released.set()
+        return resources.StopOutcome(process_state="gone", job_handle=None)
+
+    resources.register(
+        resource_id="worker",
+        generation=1,
+        kind="asr_worker",
+        description="worker",
+        process=process,
+        stopper=stubborn,
+        holds_gpu=True,
+        state="stopping",
+        process_state="unknown",
+    )
+
+    assert released.wait(5.0)
+    deadline = time.monotonic() + 2.0
+    while resources.gpu_blocked() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert resources.gpu_blocked() is False
+
+
+def test_a_registration_wakes_the_watchdog_instead_of_waiting_out_its_backoff(
+    monkeypatch,
+):
+    # A record filed while the loop sleeps is due at *its* next_retry_at, not at
+    # the end of whatever backoff the loop had computed before it existed.
+    monkeypatch.setattr(resources, "_start_watchdog", _REAL_START_WATCHDOG)
+    monkeypatch.setattr(resources, "RETRY_MIN_S", 30.0)
+    resources.register(
+        resource_id="slow",
+        generation=1,
+        kind="asr_worker",
+        description="worker",
+        process=_FakeProcess(pid=1, immortal=True),
+        stopper=lambda process, handle: resources.StopOutcome(
+            process_state="alive", job_handle=handle
+        ),
+        holds_gpu=True,
+        state="stopping",
+        process_state="unknown",
+    )
+    time.sleep(0.1)  # let the loop park on that 30s schedule
+
+    retried = threading.Event()
+    monkeypatch.setattr(resources, "RETRY_MIN_S", 0.05)
+    resources.register(
+        resource_id="prompt",
+        generation=1,
+        kind="asr_worker",
+        description="worker",
+        process=_FakeProcess(pid=2),
+        stopper=lambda process, handle: (
+            retried.set(),
+            resources.StopOutcome(process_state="gone", job_handle=None),
+        )[1],
+        holds_gpu=True,
+        state="stopping",
+        process_state="unknown",
+    )
+
+    assert retried.wait(3.0)
 
 
 def test_confirm_gone_keeps_a_record_that_still_holds_a_handle():

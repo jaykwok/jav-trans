@@ -19,6 +19,8 @@ this module covers everything outside that worker.
 from __future__ import annotations
 
 import os
+
+from core.typed_config import env_float
 import threading
 
 DEFAULT_VRAM_SAFETY_RATIO = 0.95
@@ -46,11 +48,7 @@ def resolve_inference_device(requested: str | None, *, stage: str):
 def _resolve_ratio(ratio: float | None, env_key: str, default: float) -> float:
     """Explicit value, else env override, else default - clamped to a sane band."""
     if ratio is None:
-        raw = os.getenv(env_key, "").strip()
-        try:
-            ratio = float(raw) if raw else default
-        except ValueError:
-            ratio = default
+        ratio = env_float(env_key, default, minimum=0.1, maximum=1.0)
     return min(1.0, max(0.1, float(ratio)))
 
 

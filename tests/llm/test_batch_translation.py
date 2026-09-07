@@ -7,6 +7,7 @@ from collections import defaultdict
 
 import pytest
 
+from core import typed_config
 from llm import engine as engine_module
 from llm import repair as repair_module
 from llm import translator
@@ -115,24 +116,21 @@ def test_default_translation_batch_size_is_the_measured_one():
     assert DEFAULT_SETTINGS["TRANSLATION_BATCH_SIZE"] == "200"
 
 
-def test_env_float_falls_back_on_bad_value(monkeypatch):
-    monkeypatch.setenv("LLM_TEMPERATURE", "0.8")
-    assert translator._env_float("LLM_TEMPERATURE", 0.6) == 0.8
-    monkeypatch.setenv("LLM_TEMPERATURE", "not-a-number")
-    assert translator._env_float("LLM_TEMPERATURE", 0.6) == 0.6
-    monkeypatch.delenv("LLM_TEMPERATURE", raising=False)
-    assert translator._env_float("LLM_TEMPERATURE", 0.6) == 0.6
+def test_the_translation_knobs_are_read_with_the_shared_rules(monkeypatch):
+    """The settings module no longer parses its own values.
 
-
-def test_env_int_clamped_bounds_and_fallback(monkeypatch):
-    monkeypatch.setenv("TRANSLATION_BATCH_SIZE", "32")
-    assert translator._env_int_clamped("TRANSLATION_BATCH_SIZE", 64, 8, 400) == 32
+    It used to carry a private `_env_float`/`_env_int_clamped` pair, and
+    `translator` re-exported them; both are now `core.typed_config`, which is
+    the same arithmetic plus a record of what it had to correct.
+    """
     monkeypatch.setenv("TRANSLATION_BATCH_SIZE", "5000")
-    assert translator._env_int_clamped("TRANSLATION_BATCH_SIZE", 64, 8, 400) == 400
-    monkeypatch.setenv("TRANSLATION_BATCH_SIZE", "1")
-    assert translator._env_int_clamped("TRANSLATION_BATCH_SIZE", 64, 8, 400) == 8
-    monkeypatch.setenv("TRANSLATION_BATCH_SIZE", "garbage")
-    assert translator._env_int_clamped("TRANSLATION_BATCH_SIZE", 64, 8, 400) == 64
+    monkeypatch.setenv("LLM_TEMPERATURE", "not-a-number")
+
+    assert typed_config.env_int(
+        "TRANSLATION_BATCH_SIZE", 200, minimum=8, maximum=400
+    ) == 400
+    assert typed_config.env_float("LLM_TEMPERATURE", 0.6, minimum=0.0) == 0.6
+    assert not hasattr(translator, "_env_float")
 
 
 def test_translate_segments_single_batch_below_threshold(monkeypatch):

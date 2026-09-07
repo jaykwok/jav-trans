@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from llm import max_tokens_limits, translator
+from llm import max_tokens_limits, token_budget, translator
 from llm import settings as llm_settings
 from llm.backends import openai_compat
 from llm.errors import (
@@ -39,7 +39,7 @@ def _isolated_limits(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", _BASE_URL)
     monkeypatch.setenv("LLM_MODEL_NAME", _MODEL)
     monkeypatch.setattr(translator, "task_backend_name", lambda *_a, **_k: "openai")
-    translator._clamp_warned.clear()
+    token_budget._clamp_warned.clear()
 
 
 def _limits():
@@ -88,7 +88,7 @@ _MESSAGES = [
 
 
 def test_reads_the_ceiling_out_of_the_refusal_and_retries_once(monkeypatch):
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 384000)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 384000)
     sent: list[int] = []
 
     def fake_create_response(request):
@@ -112,7 +112,7 @@ def test_an_http_400_before_the_stream_is_classified_too(monkeypatch):
     # Endpoints that validate up front answer 400 while the stream is still
     # being opened, never emitting a `response.failed` frame. That path used to
     # bypass the classifier entirely and surface as a raw SDK error.
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 384000)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 384000)
     sent: list[int] = []
 
     class _BadRequest(Exception):
@@ -137,7 +137,7 @@ def test_an_http_400_before_the_stream_is_classified_too(monkeypatch):
 
 def test_a_halved_value_is_a_lower_bound_not_a_ceiling(monkeypatch):
     # The endpoint's real ceiling here is 50000, and it never says so.
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     sent: list[int] = []
 
     def fake_create_response(request):
@@ -165,7 +165,7 @@ def test_a_halved_value_is_a_lower_bound_not_a_ceiling(monkeypatch):
 
 
 def test_gives_up_after_the_second_halving(monkeypatch):
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     sent: list[int] = []
 
     def fake_create_response(request):
@@ -186,7 +186,7 @@ def test_gives_up_after_the_second_halving(monkeypatch):
 
 
 def test_a_named_ceiling_beats_the_configured_fallback(monkeypatch):
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     max_tokens_limits.record_exact_ceiling(_BASE_URL, _MODEL, 131072)
     sent: list[int] = []
 
@@ -202,7 +202,7 @@ def test_a_named_ceiling_beats_the_configured_fallback(monkeypatch):
 
 
 def test_a_first_try_success_learns_nothing(monkeypatch):
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     monkeypatch.setattr(openai_compat, "_create_response", lambda request: _ok_stream())
 
     translator._chat(_MESSAGES, expected_count=1)
@@ -251,7 +251,7 @@ def test_an_unknown_endpoint_gets_exactly_what_was_asked_for(monkeypatch):
     # it capped explicit budgets too, a batch whose computed budget already sat
     # at the fallback could be truncated and then had no escalation left: the
     # retry was clamped straight back to the number that had just been cut off.
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     sent: list[int] = []
 
     def fake_create_response(request):
@@ -283,10 +283,10 @@ def test_local_backend_keeps_the_configured_ceiling(monkeypatch):
     # refuse a `max_tokens`, so the setting is the runaway backstop it has
     # always been and a caller-supplied budget may only lower it.
     monkeypatch.setattr(translator, "task_backend_name", lambda *_a, **_k: "llamacpp")
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     max_tokens_limits.record_exact_ceiling(_BASE_URL, _MODEL, 131072)
 
-    assert translator._endpoint_identity() is None
+    assert token_budget.endpoint_identity("llamacpp") is None
     assert translator._max_tokens_budget(384000) == 65536
     assert translator._max_tokens_budget(1024) == 1024
 
@@ -307,7 +307,7 @@ def test_a_corrupt_cache_cannot_fail_a_translation(monkeypatch, tmp_path):
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     monkeypatch.setattr(openai_compat, "_create_response", lambda request: _ok_stream())
 
     assert not _limits().known_anything
@@ -327,7 +327,7 @@ def test_the_truncation_retry_does_not_restart_the_probe_ladder(monkeypatch):
     the ladder only walks *down* it spent them arriving back at 65536 - a full
     generation, billed, cut off in exactly the same place.
     """
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 131072)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 131072)
     monkeypatch.setattr(llm_settings, "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0)
     max_tokens_limits.record_rejection(_BASE_URL, _MODEL, 131072)
     max_tokens_limits.record_success(_BASE_URL, _MODEL, 65536)
@@ -354,7 +354,7 @@ def test_the_truncation_message_names_the_budget_that_was_sent(monkeypatch):
     # The retry aims at one number and the ladder may step down from it before
     # anything is generated. Reporting the number it aimed at describes a
     # request that never happened - and hands the wrong `limit` to the caller.
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     monkeypatch.setattr(llm_settings, "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0)
     sent: list[int] = []
 
@@ -430,7 +430,7 @@ def test_an_unquantified_refusal_is_retried_but_not_learned(monkeypatch):
     clamped budget is paid for in generated tokens the first time a reply is cut
     off at it.
     """
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     sent: list[int] = []
 
     def fake_create_response(request):
@@ -454,7 +454,7 @@ def test_the_retry_log_carries_the_provider_message(monkeypatch, capsys):
     # it cannot place are the ones worth collecting. A refusal that is then
     # retried successfully never reaches an exception anyone reads, so the words
     # have to be in the retry line itself.
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
 
     def fake_create_response(request):
         if request["max_output_tokens"] > 40000:
@@ -482,7 +482,7 @@ def test_a_refusal_is_staged_until_a_smaller_budget_generates(monkeypatch):
     permanent. So the refusal steers this call and stays off disk until the
     endpoint behaves like a ceiling: refuse high, generate low.
     """
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     staged: list[int] = []
 
     def fake_create_response(request):
@@ -509,7 +509,7 @@ def test_an_uncorroborated_refusal_is_never_written_down(monkeypatch):
     # Same first request, but the smaller budget is refused too, so this call
     # never sees the endpoint generate anything. One bad classification would
     # otherwise pin this endpoint at 16384 with no expiry to undo it.
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
 
     monkeypatch.setattr(
         openai_compat,
@@ -527,7 +527,7 @@ def test_corroboration_does_not_promote_a_prompt_sized_refusal(monkeypatch):
     # Once a call is convinced, later refusals go straight to disk - but the
     # combined input+output limit still must not, or the flush would launder it
     # into a permanent endpoint fact.
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     sent: list[int] = []
 
     def fake_create_response(request):
@@ -562,7 +562,7 @@ def test_a_first_truncation_is_a_floor_even_with_nothing_else_known(monkeypatch)
     is correctly blocked for being a budget already outgrown, so the request
     fails at an endpoint where 60000 would have finished it.
     """
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     monkeypatch.setattr(llm_settings, "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0)
     sent: list[int] = []
 
@@ -629,7 +629,7 @@ def test_a_refusal_retires_the_recent_success_too(monkeypatch):
 
 
 def test_a_floor_never_enters_the_halving_ladder(monkeypatch):
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     sent: list[int] = []
 
     def fake_create_response(request):
@@ -649,7 +649,7 @@ def test_a_floor_never_enters_the_halving_ladder(monkeypatch):
 
 
 def test_a_combined_input_output_limit_is_retried_but_not_learned(monkeypatch):
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     sent: list[int] = []
 
     def fake_create_response(request):
@@ -692,7 +692,7 @@ def test_a_clamped_budget_is_reported_once_per_endpoint(monkeypatch, capsys):
     # The startup check only sees configuration; a budget driven over the line
     # by the actual source text shows up here and nowhere else. Once per
     # endpoint, because a line per batch would be noise on a 1500-cue film.
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     max_tokens_limits.record_exact_ceiling(_BASE_URL, _MODEL, 20000)
 
     assert translator._max_tokens_budget(50000) == 20000
@@ -730,7 +730,7 @@ def test_a_successful_probe_advances_the_bracket(monkeypatch):
     # The bracket has to move on a *win* too. Recording only after a refusal
     # left a midpoint that succeeded first try unrecorded, so every later
     # request probed the same number again and never converged.
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     max_tokens_limits.record_rejection(_BASE_URL, _MODEL, 65536)
     max_tokens_limits.record_success(_BASE_URL, _MODEL, 32768)
     sent: list[int] = []
@@ -759,7 +759,7 @@ def test_a_truncated_reply_records_the_budget_the_endpoint_accepted(monkeypatch)
     refused to reissue because the retry was not larger than the limit that had
     just bound. One truncation, no escalation, batch lost.
     """
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     monkeypatch.setattr(llm_settings, "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0)
     max_tokens_limits.record_rejection(_BASE_URL, _MODEL, 65536)
     max_tokens_limits.record_success(_BASE_URL, _MODEL, 32768)
@@ -801,7 +801,7 @@ def test_a_lowered_cap_is_re_bracketed_instead_of_walked_down(monkeypatch):
     that could not have gone anywhere, on an endpoint that would have answered
     at 30000.
     """
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     max_tokens_limits.record_exact_ceiling(_BASE_URL, _MODEL, 65536)
     sent: list[int] = []
 
@@ -831,7 +831,7 @@ def test_the_last_try_goes_to_a_budget_already_known_to_work(monkeypatch):
     request is not a probe - it is the translation, at the last budget known to
     work - so it is worth one round trip past the probe budget.
     """
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     max_tokens_limits.record_rejection(_BASE_URL, _MODEL, 65536)
     max_tokens_limits.record_success(_BASE_URL, _MODEL, 32768)
     sent: list[int] = []
@@ -859,7 +859,7 @@ def test_an_unwritable_cache_cannot_turn_the_ladder_into_a_crawl(monkeypatch):
     nothing known is `sent - 1`. Requests went 65536, 65535, 65534 and failed on
     an endpoint whose real cap was 40000.
     """
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
 
     def unwritable(_payload):
         raise OSError("read-only file system")
@@ -886,7 +886,7 @@ def test_an_unwritable_cache_cannot_turn_the_ladder_into_a_crawl(monkeypatch):
 def test_a_rejected_probe_never_drops_below_a_known_good_budget(monkeypatch):
     # Halving off the refused value would land under a budget already proven to
     # work; the next step has to come from the narrowed bracket instead.
-    monkeypatch.setattr(translator, "TRANSLATION_MAX_TOKENS", 65536)
+    monkeypatch.setattr(token_budget, "CONFIGURED_MAX_TOKENS", 65536)
     max_tokens_limits.record_rejection(_BASE_URL, _MODEL, 65536)
     max_tokens_limits.record_success(_BASE_URL, _MODEL, 32768)
     sent: list[int] = []

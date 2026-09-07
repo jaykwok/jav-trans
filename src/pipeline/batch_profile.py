@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+from core.typed_config import env_bool, env_float, env_int, env_text
 from utils.runtime_paths import runtime_path
 
 
@@ -41,36 +42,23 @@ _DEFAULT_MAX_ENTRIES = 16
 
 
 def enabled() -> bool:
-    return os.getenv("GPU_BATCH_PROFILE_ENABLED", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
+    return env_bool("GPU_BATCH_PROFILE_ENABLED", True)
 
 
 def growth_threshold() -> float:
-    try:
-        value = float(os.getenv("GPU_BATCH_PROFILE_GROWTH_THRESHOLD", "0.80"))
-    except (TypeError, ValueError):
-        value = 0.80
-    return min(0.95, max(0.10, value))
+    return env_float(
+        "GPU_BATCH_PROFILE_GROWTH_THRESHOLD", 0.80, minimum=0.10, maximum=0.95
+    )
 
 
 def max_entries() -> int:
-    try:
-        value = int(float(os.getenv("GPU_BATCH_PROFILE_MAX_ENTRIES", "16")))
-    except (TypeError, ValueError):
-        value = _DEFAULT_MAX_ENTRIES
-    return max(1, value)
+    return env_int("GPU_BATCH_PROFILE_MAX_ENTRIES", _DEFAULT_MAX_ENTRIES, minimum=1)
 
 
 def profile_path() -> Path:
-    raw = os.getenv(
-        "GPU_BATCH_PROFILE_PATH",
-        "tmp/cache/gpu_batch_profiles.json",
-    ).strip()
-    return runtime_path(raw or "tmp/cache/gpu_batch_profiles.json")
+    return runtime_path(
+        env_text("GPU_BATCH_PROFILE_PATH", "tmp/cache/gpu_batch_profiles.json")
+    )
 
 
 def identity_key(identity: Mapping[str, Any]) -> str:

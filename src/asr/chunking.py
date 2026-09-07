@@ -5,18 +5,15 @@ import wave
 from pathlib import Path
 from typing import Callable
 
+from core.typed_config import env_bool, env_text
+
 
 def current_asr_chunk_root() -> Path:
-    return Path(os.getenv("ASR_CHUNK_ROOT", Path("tmp") / "chunks")).resolve()
+    return Path(env_text("ASR_CHUNK_ROOT", str(Path("tmp") / "chunks"))).resolve()
 
 
 def keep_asr_chunks() -> bool:
-    return os.getenv("KEEP_ASR_CHUNKS", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return env_bool("KEEP_ASR_CHUNKS", False)
 
 
 def _get_wav_duration(audio_path: str) -> float:

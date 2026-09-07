@@ -69,6 +69,9 @@ class JobContext:
     run_log_dir: str = "./tmp/log"
     llm_reasoning_effort: str = "medium"
     advanced: dict[str, str] = field(default_factory=dict)
+    output_target: str = ""
+    output_generation: int = 0
+    output_run_id: str = ""
 
     @classmethod
     def from_spec(

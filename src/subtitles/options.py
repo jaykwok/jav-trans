@@ -1,22 +1,19 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from dataclasses import asdict
+
+from core.typed_config import FALL_BACK, env_bool, env_choice, env_float, env_int, env_text
 
 
 # Fixed display-time baseline for frame-derived subtitle constraints.
 # This is not the source video FPS.
 BASE_FPS = 24000 / 1001
 
-
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name, "1" if default else "0").strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    return default
+# `alignment`/`aligned`/`raw` keep the measured cue window; anything else runs
+# the reading-time model. An unrecognised value used to fall into the reading
+# model silently, which is a different subtitle timeline than the one asked for.
+TIMELINE_MODES = ("alignment", "aligned", "raw", "reading")
 
 
 # There is one layout and one timing model, and these two names are what every
@@ -130,72 +127,84 @@ class SubtitleOptions:
 
     @classmethod
     def from_env(cls) -> "SubtitleOptions":
+        """Read the layout and timing settings, with every field bounded.
+
+        Ranges are declared rather than assumed: a ratio is a ratio, a duration
+        is not negative, and a reading speed of zero divides. Out-of-range and
+        unparseable values are recorded field by field (see `core.typed_config`)
+        instead of raising here, so a mistyped `.env` produces a list of what is
+        wrong rather than a traceback from whichever field parsed first.
+
+        The two version stamps stay strict - `__post_init__` refuses them.
+        """
         return cls(
-            layout_engine=os.getenv("SUBTITLE_LAYOUT_ENGINE", LAYOUT_ENGINE).strip(),
-            timing_model=os.getenv("SUBTITLE_TIMING_MODEL", TIMING_MODEL).strip(),
-            max_source_chars=max(
-                1,
-                int(os.getenv("SUBTITLE_MAX_SOURCE_CHARS", "20")),
+            layout_engine=env_text("SUBTITLE_LAYOUT_ENGINE", LAYOUT_ENGINE),
+            timing_model=env_text("SUBTITLE_TIMING_MODEL", TIMING_MODEL),
+            max_source_chars=env_int("SUBTITLE_MAX_SOURCE_CHARS", 20, minimum=1),
+            max_display_duration_s=env_float(
+                "SUBTITLE_MAX_DISPLAY_DURATION_S", 7.0, minimum=0.0
             ),
-            max_display_duration_s=max(
-                0.0,
-                float(os.getenv("SUBTITLE_MAX_DISPLAY_DURATION_S", "7.0")),
+            min_duration=env_float(
+                "SUBTITLE_MIN_DURATION",
+                env_float("MIN_SUBTITLE_DURATION", 0.6, minimum=0.0),
+                minimum=0.0,
             ),
-            min_duration=float(
-                os.getenv(
-                    "SUBTITLE_MIN_DURATION",
-                    os.getenv("MIN_SUBTITLE_DURATION", "0.6"),
-                )
+            reading_cps=env_float("SUBTITLE_READING_CPS", 7.0, minimum=1.0, out_of_range=FALL_BACK),
+            reading_base=env_float("SUBTITLE_READING_BASE", 0.35, minimum=0.0),
+            duration_ratio_cap=env_float(
+                "SUBTITLE_DURATION_RATIO_CAP", 1.65, minimum=1.0
             ),
-            reading_cps=max(1.0, float(os.getenv("SUBTITLE_READING_CPS", "7.0"))),
-            reading_base=float(os.getenv("SUBTITLE_READING_BASE", "0.35")),
-            duration_ratio_cap=max(
-                1.0,
-                float(os.getenv("SUBTITLE_DURATION_RATIO_CAP", "1.65")),
+            duration_grace=env_float("SUBTITLE_DURATION_GRACE", 0.9, minimum=0.0),
+            timeline_mode=env_choice(
+                "SUBTITLE_TIMELINE_MODE", "alignment", choices=TIMELINE_MODES
             ),
-            duration_grace=float(os.getenv("SUBTITLE_DURATION_GRACE", "0.9")),
-            timeline_mode=os.getenv("SUBTITLE_TIMELINE_MODE", "alignment").strip().lower(),
-            bilingual_secondary_weight=float(
-                os.getenv("SUBTITLE_BILINGUAL_SECONDARY_WEIGHT", "0.4")
+            bilingual_secondary_weight=env_float(
+                "SUBTITLE_BILINGUAL_SECONDARY_WEIGHT", 0.4, minimum=0.0, maximum=1.0
             ),
-            ascii_char_weight=float(os.getenv("SUBTITLE_ASCII_CHAR_WEIGHT", "0.55")),
-            line_max_chars=max(0, int(os.getenv("SRT_LINE_MAX_CHARS", "16"))),
-            ja_line_max_chars=max(0, int(os.getenv("SRT_JA_LINE_MAX_CHARS", "13"))),
-            timing_polish_enabled=_env_bool("SUBTITLE_TIMING_POLISH_ENABLED", True),
-            short_gap_collapse_s=max(
-                0.0,
-                float(os.getenv("SUBTITLE_SHORT_GAP_COLLAPSE_S", "0.5")),
+            ascii_char_weight=env_float(
+                "SUBTITLE_ASCII_CHAR_WEIGHT", 0.55, minimum=0.0, maximum=1.0
             ),
-            linger_s=max(0.0, float(os.getenv("SUBTITLE_LINGER_S", "0.5"))),
-            max_display_shift_from_acoustic_end_s=max(
-                0.0,
-                float(os.getenv("SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_END_S", "0.5")),
+            line_max_chars=env_int("SRT_LINE_MAX_CHARS", 16, minimum=0),
+            ja_line_max_chars=env_int("SRT_JA_LINE_MAX_CHARS", 13, minimum=0),
+            timing_polish_enabled=env_bool("SUBTITLE_TIMING_POLISH_ENABLED", True),
+            short_gap_collapse_s=env_float(
+                "SUBTITLE_SHORT_GAP_COLLAPSE_S", 0.5, minimum=0.0
             ),
-            drop_vocalisation_only_cues=_env_bool(
+            linger_s=env_float("SUBTITLE_LINGER_S", 0.5, minimum=0.0),
+            max_display_shift_from_acoustic_end_s=env_float(
+                "SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_END_S", 0.5, minimum=0.0
+            ),
+            drop_vocalisation_only_cues=env_bool(
                 "SUBTITLE_DROP_VOCALISATION_ONLY_CUES", True
             ),
-            vocalisation_min_run=max(
-                1, int(os.getenv("SUBTITLE_VOCALISATION_MIN_RUN", "2"))
+            vocalisation_min_run=env_int(
+                "SUBTITLE_VOCALISATION_MIN_RUN", 2, minimum=1
             ),
-            vocalisation_use_acoustics=_env_bool(
+            vocalisation_use_acoustics=env_bool(
                 "SUBTITLE_VOCALISATION_USE_ACOUSTICS", True
             ),
-            vocalisation_vocal_speech_max=float(
-                os.getenv("SUBTITLE_VOCALISATION_VOCAL_SPEECH_MAX", "0.10")
+            vocalisation_vocal_speech_max=env_float(
+                "SUBTITLE_VOCALISATION_VOCAL_SPEECH_MAX", 0.10, minimum=0.0, maximum=1.0
             ),
-            vocalisation_vocal_speech_run_max_s=float(
-                os.getenv("SUBTITLE_VOCALISATION_VOCAL_SPEECH_RUN_MAX_S", "0.30")
+            vocalisation_vocal_speech_run_max_s=env_float(
+                "SUBTITLE_VOCALISATION_VOCAL_SPEECH_RUN_MAX_S", 0.30, minimum=0.0
             ),
-            vocalisation_kana_speech_max=float(
-                os.getenv("SUBTITLE_VOCALISATION_KANA_SPEECH_MAX", "0.05")
+            vocalisation_kana_speech_max=env_float(
+                "SUBTITLE_VOCALISATION_KANA_SPEECH_MAX", 0.05, minimum=0.0, maximum=1.0
             ),
-            vocalisation_kana_vocalisation_min=float(
-                os.getenv("SUBTITLE_VOCALISATION_KANA_VOCALISATION_MIN", "0.60")
+            vocalisation_kana_vocalisation_min=env_float(
+                "SUBTITLE_VOCALISATION_KANA_VOCALISATION_MIN",
+                0.60,
+                minimum=0.0,
+                maximum=1.0,
             ),
-            vocalisation_vocal_text_speech_min=float(
-                os.getenv("SUBTITLE_VOCALISATION_VOCAL_TEXT_SPEECH_MIN", "0.30")
+            vocalisation_vocal_text_speech_min=env_float(
+                "SUBTITLE_VOCALISATION_VOCAL_TEXT_SPEECH_MIN",
+                0.30,
+                minimum=0.0,
+                maximum=1.0,
             ),
-            vocalisation_split_mixed_cues=_env_bool(
+            vocalisation_split_mixed_cues=env_bool(
                 "SUBTITLE_VOCALISATION_SPLIT_MIXED_CUES", True
             ),
         )

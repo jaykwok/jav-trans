@@ -95,9 +95,14 @@ def test_incomplete_cleanup_snapshot_is_unknown():
 
 @pytest.mark.parametrize("value", ["nan", "inf", "0", "-1"])
 def test_admission_deadline_must_be_finite_positive(monkeypatch, value):
+    from core.typed_config import configuration_problems
+
     monkeypatch.setenv("LOCAL_BACKEND_WAIT_TIMEOUT_S", value)
-    with pytest.raises(ValueError):
-        backends._admission_timeout_s()
+    assert backends._admission_timeout_s() == 600.0
+    assert any("LOCAL_BACKEND_WAIT_TIMEOUT_S" in problem for problem in configuration_problems())
+    monkeypatch.setenv("LOCAL_BACKEND_WAIT_TIMEOUT_S", "1.5")
+    assert backends._admission_timeout_s() == 1.5
+    assert not any("LOCAL_BACKEND_WAIT_TIMEOUT_S" in problem for problem in configuration_problems())
 
 
 @pytest.fixture

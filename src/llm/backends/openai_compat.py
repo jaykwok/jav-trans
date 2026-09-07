@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import os
 import re
 import threading
 import time
@@ -29,6 +28,7 @@ from urllib.parse import urlsplit
 from openai import AsyncOpenAI, OpenAI
 
 from core.stage_errors import MISSING_MODEL
+from llm import request_config
 from llm import settings as llm_settings
 from llm import transport_util
 from llm.async_transport import close_quietly, run_cancellable_request
@@ -156,9 +156,9 @@ def _get_client() -> OpenAI:
     # Ask first, so a forgotten API key reads as the setting it is instead of
     # the SDK's "The api_key client option must be set ..." from __init__.
     require_translation_config("openai")
-    current_key = os.getenv("API_KEY", "").strip() or None
+    current_key = request_config.getenv("API_KEY", "").strip() or None
     current_url = _normalize_openai_compat_base_url(
-        os.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip()
+        request_config.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip()
     )
     key_tuple = (current_key or "", current_url or "")
     with _CLIENT_LOCK:
@@ -232,9 +232,9 @@ def _make_async_client() -> AsyncOpenAI:
     no shared client for a cancelled job to close out from under another one.
     """
     require_translation_config("openai")
-    api_key = os.getenv("API_KEY", "").strip() or None
+    api_key = request_config.getenv("API_KEY", "").strip() or None
     base_url = _normalize_openai_compat_base_url(
-        os.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip()
+        request_config.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip()
     )
     return AsyncOpenAI(api_key=api_key, base_url=base_url)
 
@@ -624,13 +624,22 @@ def _chat_responses(
     max_tokens: int | None = None,
 ) -> str:
     _raise_if_cancelled(cancel_event)
-    model_name = os.getenv("LLM_MODEL_NAME", llm_settings.LLM_MODEL_NAME).strip()
+    # Endpoint, credential, model and default tier all come from the task's
+    # frozen configuration - see `llm.request_config`. Reading them live meant a
+    # request could be built for a model other than the one whose cache identity
+    # the engine had already taken, and the reply then landed under that other
+    # model's key.
+    model_name = request_config.getenv(
+        "LLM_MODEL_NAME", llm_settings.LLM_MODEL_NAME
+    ).strip()
     if not model_name:
         raise RuntimeError(MISSING_MODEL)
 
     effective_reasoning_effort = llm_settings._normalize_reasoning_effort(
         reasoning_effort
-        or os.getenv("LLM_REASONING_EFFORT", llm_settings.LLM_REASONING_EFFORT)
+        or request_config.getenv(
+            "LLM_REASONING_EFFORT", llm_settings.LLM_REASONING_EFFORT
+        )
     )
     effective_temperature = (
         llm_settings.TRANSLATION_TEMPERATURE if temperature is None else temperature
@@ -639,7 +648,7 @@ def _chat_responses(
     effective_max_tokens = (
         llm_settings.TRANSLATION_MAX_TOKENS if max_tokens is None else max_tokens
     )
-    base_url = os.getenv("OPENAI_COMPATIBILITY_BASE_URL", "")
+    base_url = request_config.getenv("OPENAI_COMPATIBILITY_BASE_URL", "")
     request = {
         "model": model_name,
         "input": _build_responses_input(messages),
@@ -819,15 +828,20 @@ class OpenAICompatBackend(BaseTranslationBackend):
         return "openai"
 
     def cache_identity(self) -> str:
-        model_name = os.getenv("LLM_MODEL_NAME", "").strip()
+        # The same frozen configuration the request is built from. These two
+        # reads are the pair that has to agree: this one names what a reply may
+        # be cached as, `_chat_responses` decides who actually produces it.
+        model_name = request_config.getenv("LLM_MODEL_NAME", "").strip()
         base_url = _normalize_openai_compat_base_url(
-            os.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip()
+            request_config.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip()
         )
         return f"openai:{base_url or 'default'}:{model_name}"
 
     def supports_json_schema(self) -> bool:
         return (
-            _structured_output_mode(os.getenv("OPENAI_COMPATIBILITY_BASE_URL", ""))
+            _structured_output_mode(
+                request_config.getenv("OPENAI_COMPATIBILITY_BASE_URL", "")
+            )
             == "json_schema"
         )
 
@@ -845,16 +859,14 @@ class OpenAICompatBackend(BaseTranslationBackend):
         top_p: float = 0.9,
         max_tokens: int = 65536,
         response_format: dict | None = None,
-        stream: bool = True,
         reasoning_effort: str | None = None,
         expected_count: int = 0,
         cancel_event=None,
         on_progress: Callable[[dict], None] | None = None,
         on_usage: Callable[[dict], None] | None = None,
     ) -> str:
-        # The canonical OpenAI transport is streaming. ``stream`` remains in
-        # the cross-backend signature but direct calls still return final text.
-        del stream
+        # This transport streams internally - that is how it collects progress
+        # and notices a truncated answer - and returns the finished text.
         self._raise_if_cancelled(cancel_event)
 
         return _chat_responses(

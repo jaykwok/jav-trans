@@ -184,16 +184,23 @@ class TestRepairTier:
         from llm import profiles as profiles_module
         from llm import repair as repair_module
 
+        from llm.session import TranslationSession
+
         repair_module.apply_repair_pass(
             [{"text": "これは翻訳されるべきです。"}],
             ["これは翻訳されるべきです。"],
             chat=fake_chat,
-            profile=profiles_module.select_profile(),
-            batch_size=10,
-            reasoning_effort="low",
-            target_lang="简体中文",
-            glossary="",
-            character_reference="",
+            session=TranslationSession(
+                backend_name="openai",
+                profile=profiles_module.select_profile(),
+                batch_size=10,
+                max_workers=1,
+                cache_path="",
+                target_lang="简体中文",
+                glossary="",
+                character_reference="",
+                reasoning_effort="low",
+            ),
         )
 
         # Cheap none-tier attempt first, then escalated because the reply is

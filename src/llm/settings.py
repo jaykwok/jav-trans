@@ -16,36 +16,38 @@ from core.config import (
     normalize_reasoning_effort,
     recognized_reasoning_effort,
 )
+from core.typed_config import env_float, env_int, env_text
 
 load_config()
 
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, "").strip() or default)
-    except (TypeError, ValueError):
-        return default
+def normalize_backend_name(name: str) -> str:
+    normalized = str(name or "").strip().lower()
+    if not normalized:
+        raise ValueError("Translation backend name must not be empty")
+    return normalized
 
 
-def _env_int_clamped(name: str, default: int, low: int, high: int) -> int:
-    try:
-        value = int(os.getenv(name, "").strip() or default)
-    except (TypeError, ValueError):
-        value = default
-    return max(low, min(high, value))
+def selected_backend_name(name: str | None = None) -> str:
+    """Which backend the settings currently name.
+
+    Here rather than in `llm.backends` because it is a question about
+    configuration, and the registry is the one thing that must not have to be
+    imported to answer it - `llm.preflight` asks before any backend exists, and
+    importing the registry to find out is how the preflight check ended up
+    inside an import cycle with the engine it runs before.
+    """
+    return normalize_backend_name(
+        name if name is not None else env_text("TRANSLATION_BACKEND", "openai")
+    )
 
 
 DEFAULT_TARGET_LANG = "简体中文"
 
-OPENAI_COMPATIBILITY_BASE_URL = (
-    os.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip() or None
-)
-API_KEY = os.getenv("API_KEY", "").strip() or None
-LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "").strip()
-LLM_REASONING_EFFORT = (
-    os.getenv("LLM_REASONING_EFFORT", DEFAULT_REASONING_EFFORT).strip()
-    or DEFAULT_REASONING_EFFORT
-)
+OPENAI_COMPATIBILITY_BASE_URL = env_text("OPENAI_COMPATIBILITY_BASE_URL", "") or None
+API_KEY = env_text("API_KEY", "") or None
+LLM_MODEL_NAME = env_text("LLM_MODEL_NAME", "")
+LLM_REASONING_EFFORT = env_text("LLM_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
 # Which output constraint the endpoint gets, and how hard to insist on it.
 # Empty is the rule in `_structured_output_mode`: ask for a strict `json_schema`
 # everywhere except DeepSeek's own API, which has no such thing, and accept
@@ -56,7 +58,7 @@ LLM_REASONING_EFFORT = (
 # model whose upstreams cannot enforce the schema fails instead of quietly
 # answering without one. Env only: it is a property of the deployment, not a
 # per-job choice.
-LLM_STRUCTURED_OUTPUT = os.getenv("LLM_STRUCTURED_OUTPUT", "").strip().lower()
+LLM_STRUCTURED_OUTPUT = env_text("LLM_STRUCTURED_OUTPUT", "", lower=True)
 
 # Fallback ceiling on `max_tokens`, used only until the endpoint tells us its
 # real one (`llm.max_tokens_limits`). Not a target either: every real request is
@@ -72,8 +74,8 @@ LLM_STRUCTURED_OUTPUT = os.getenv("LLM_STRUCTURED_OUTPUT", "").strip().lower()
 # thinking + 28/item structure + 1.5x source chars), so the fallback does not
 # bind at defaults. Raising it is what the env override is for; raise it too far
 # and the endpoint's refusal teaches the real number.
-TRANSLATION_MAX_TOKENS = _env_int_clamped(
-    "TRANSLATION_MAX_TOKENS", 65536, 1024, 1_000_000
+TRANSLATION_MAX_TOKENS = env_int(
+    "TRANSLATION_MAX_TOKENS", 65536, minimum=1024, maximum=1_000_000
 )
 # Arithmetic bound on how long a reply may legitimately get, so a model that
 # falls into a repetition loop stops at the bound instead of at
@@ -85,7 +87,9 @@ TRANSLATION_MAX_TOKENS = _env_int_clamped(
 # while still being far under a loop. Validated against 20 real 12-line batches:
 # none would have been cut, tightest margin 1.76x. Raising it only costs time on
 # runaway replies; lowering it below ~1.3 starts truncating real translations.
-TRANSLATION_OUTPUT_CHAR_RATIO = _env_float("TRANSLATION_OUTPUT_CHAR_RATIO", 1.5)
+TRANSLATION_OUTPUT_CHAR_RATIO = env_float(
+    "TRANSLATION_OUTPUT_CHAR_RATIO", 1.5, minimum=0.1, maximum=100.0
+)
 # One escalation when a reply is cut off at the budget above. Hitting an
 # arithmetic bound on a legitimate translation means one of two things, and the
 # transport cannot tell them apart: the bound was too tight for this batch, or
@@ -93,8 +97,8 @@ TRANSLATION_OUTPUT_CHAR_RATIO = _env_float("TRANSLATION_OUTPUT_CHAR_RATIO", 1.5)
 # second costs one extra request and then fails anyway. Before this existed the
 # failure was terminal, so a single cut reply killed a whole film - sample-b on
 # 2026-08-13 died with 1,310 of 1,701 cues already translated and paid for.
-TRANSLATION_TRUNCATION_RETRY_FACTOR = _env_float(
-    "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0
+TRANSLATION_TRUNCATION_RETRY_FACTOR = env_float(
+    "TRANSLATION_TRUNCATION_RETRY_FACTOR", 2.0, minimum=1.0, maximum=10.0
 )
 # Room for the thinking the answer is not made of. The ratio above models the
 # visible reply, but it is sent as `max_tokens`, which on a reasoning request
@@ -123,10 +127,10 @@ TRANSLATION_TRUNCATION_RETRY_FACTOR = _env_float(
 # Over-allowing costs time on a runaway and nothing else: the token budget is
 # not the only loop guard - `bounded_schema` caps each translation's length
 # independently, and that is the guard that actually catches 嗯嗯嗯….
-TRANSLATION_REASONING_TOKEN_ALLOWANCE = _env_int_clamped(
-    "TRANSLATION_REASONING_TOKEN_ALLOWANCE", 32000, 0, 200000
+TRANSLATION_REASONING_TOKEN_ALLOWANCE = env_int(
+    "TRANSLATION_REASONING_TOKEN_ALLOWANCE", 32000, minimum=0, maximum=200000
 )
-TRANSLATION_TEMPERATURE = _env_float("LLM_TEMPERATURE", 0.6)
+TRANSLATION_TEMPERATURE = env_float("LLM_TEMPERATURE", 0.6, minimum=0.0, maximum=2.0)
 TRANSLATION_TOP_P = 0.9
 # Cues per request, and since the worker coupling was removed on 2026-08-24 this
 # is the operating point rather than a ceiling - the only number deciding how
@@ -145,7 +149,7 @@ TRANSLATION_TOP_P = 0.9
 # 200 is where those two meet on the films measured so far. The per-line quality
 # that a smaller batch used to protect is now covered by `bounded_schema`, which
 # caps each translation independently of the batch, and by the repair pass.
-TRANSLATION_BATCH_SIZE = _env_int_clamped("TRANSLATION_BATCH_SIZE", 200, 8, 400)
+TRANSLATION_BATCH_SIZE = env_int("TRANSLATION_BATCH_SIZE", 200, minimum=8, maximum=400)
 COMPACT_SYSTEM_PROMPT = False
 TRANSLATION_API_RETRIES = 4
 TRANSLATION_BATCH_REPAIR_RETRIES = 2
@@ -174,8 +178,8 @@ TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS = 180000
 # 12 would have left 159 of them untranslated. Sized to clear that rate on a
 # long film with headroom, and it still bounds cost - the pass groups ids into
 # `TRANSLATION_BATCH_SIZE`-sized requests rather than one request per cue.
-TRANSLATION_REPAIR_MAX_IDS = _env_int_clamped(
-    "TRANSLATION_REPAIR_MAX_IDS", 400, 0, 4000
+TRANSLATION_REPAIR_MAX_IDS = env_int(
+    "TRANSLATION_REPAIR_MAX_IDS", 400, minimum=0, maximum=4000
 )
 # Widened 2026-09-01 alongside the none-first repair cascade: a none-tier
 # repair request has to lean on local context instead of reasoning, so it
@@ -187,9 +191,9 @@ TRANSLATION_REPAIR_LENGTH_RATIO_MAX = 4.0
 # `_repair_reasoning_effort` (the base tier, floored at `low`); a tier name pins
 # it instead, which is how a job buys back the old always-escalate behaviour
 # (`high`) for a film where the base pass is struggling.
-TRANSLATION_REPAIR_REASONING_EFFORT = os.getenv(
-    "TRANSLATION_REPAIR_REASONING_EFFORT", ""
-).strip().lower()
+TRANSLATION_REPAIR_REASONING_EFFORT = env_text(
+    "TRANSLATION_REPAIR_REASONING_EFFORT", "", lower=True
+)
 
 
 _normalize_reasoning_effort = normalize_reasoning_effort

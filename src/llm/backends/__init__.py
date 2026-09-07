@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from core.typed_config import FALL_BACK, env_float
+
 import os
 import math
 import threading
@@ -13,7 +15,10 @@ from typing import Protocol
 
 from core import resources
 from core.cancellation import raise_if_cancelled
+from llm import request_config
 from llm.errors import BackendLeaseInvalidatedError, BackendUnavailableError
+from llm.settings import normalize_backend_name as _normalize_name
+from llm.settings import selected_backend_name
 
 
 class TranslationBackend(Protocol):
@@ -53,14 +58,7 @@ _ACTIVE = threading.local()
 # It keeps waiting afterwards: attaching to a generation that is on its way out
 # is exactly what retirement exists to prevent, and killing the task that still
 # holds it is a different, explicit operation.
-_RETIRE_WAIT_S = float(os.getenv("LOCAL_RETIRE_WAIT_S", "600") or 600)
-
-
-def _normalize_name(name: str) -> str:
-    normalized = str(name or "").strip().lower()
-    if not normalized:
-        raise ValueError("Translation backend name must not be empty")
-    return normalized
+_RETIRE_WAIT_S = env_float("LOCAL_RETIRE_WAIT_S", 600.0, minimum=0.001, out_of_range=FALL_BACK)
 
 
 def register_backend(
@@ -88,12 +86,6 @@ def register_backend(
         _BACKEND_REGISTRY[normalized] = factory
     if previous is not None:
         _finish_close(normalized, previous)
-
-
-def selected_backend_name(name: str | None = None) -> str:
-    return _normalize_name(
-        name if name is not None else os.getenv("TRANSLATION_BACKEND", "openai")
-    )
 
 
 def _get_backend_locked(normalized: str) -> TranslationBackend:
@@ -130,10 +122,7 @@ def _validate_lifecycle(instance) -> None:
 
 def _admission_timeout_s() -> float:
     # Read when a task starts, after application configuration has been loaded.
-    value = float(os.getenv("LOCAL_BACKEND_WAIT_TIMEOUT_S", "600") or 600)
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError("LOCAL_BACKEND_WAIT_TIMEOUT_S must be finite and positive")
-    return value
+    return env_float("LOCAL_BACKEND_WAIT_TIMEOUT_S", 600.0, minimum=0.001, out_of_range=FALL_BACK)
 
 
 def get_backend(name: str | None = None) -> TranslationBackend:
@@ -161,14 +150,24 @@ def backend_lease(name: str, cancel_event=None) -> Iterator[TranslationBackend]:
     block (a retiring generation has to go first) and therefore takes the task's
     cancel event: this runs before the request layer exists, so it is the only
     thing that can stop the wait.
+
+    The endpoint configuration is frozen here for the same reason and at the
+    same moment. Naming the instance settles *which process or adapter* answers;
+    it settles nothing about which model or endpoint the adapter is pointed at,
+    and the settings page rewrites those while a job runs. One instance can
+    serve two different models over a task's lifetime, which is how a reply from
+    one ended up cached under the other's key - see `llm.request_config`.
     """
     normalized = selected_backend_name(name)
     instance = _claim_backend(normalized, cancel_event)
     previous = getattr(_ACTIVE, "lease", None)
     _ACTIVE.lease = (normalized, instance)
+    previous_config = request_config.current()
+    request_config.bind(request_config.capture())
     try:
         yield instance
     finally:
+        request_config.bind(previous_config)
         _ACTIVE.lease = previous
         _release_backend_lease(normalized, instance)
 
@@ -188,6 +187,27 @@ def bind_lease(lease: tuple[str, TranslationBackend] | None) -> None:
     _ACTIVE.lease = lease
 
 
+def _refuse_unleased_lookup(caller: str) -> None:
+    """Refuse to resolve a backend by name while the process is running tasks.
+
+    Resolving by name is a legitimate answer for a caller that never took a
+    lease - the CLI, a preflight check, a test. It is never the right answer for
+    a thread *inside* a task that lost its binding: that thread would translate
+    through whatever the settings panel currently names, which is the substitution
+    the lease exists to prevent, and it would do it silently. The two cases are
+    told apart by whether anything in this process holds a lease at all.
+    """
+    with _REGISTRY_LOCK:
+        leased = any(_BACKEND_LEASES.values())
+    if not leased:
+        return
+    raise BackendLeaseInvalidatedError(
+        f"{caller}：当前线程没有任务租约，但本进程有任务正在翻译。"
+        "按名称解析后端会让这个线程用上另一套设置，因此拒绝。"
+        "线程池派发前请携带 llm.run_context.RunContext。"
+    )
+
+
 def task_backend() -> TranslationBackend:
     """The instance this task leased; the selected one when there is no lease.
 
@@ -198,6 +218,7 @@ def task_backend() -> TranslationBackend:
     """
     lease = getattr(_ACTIVE, "lease", None)
     if lease is None:
+        _refuse_unleased_lookup("task_backend")
         return get_backend()
     normalized, instance = lease
     with _REGISTRY_LOCK:
@@ -218,7 +239,10 @@ def task_backend() -> TranslationBackend:
 def task_backend_name() -> str:
     """The backend this task is actually translating through."""
     lease = getattr(_ACTIVE, "lease", None)
-    return lease[0] if lease is not None else selected_backend_name()
+    if lease is not None:
+        return lease[0]
+    _refuse_unleased_lookup("task_backend_name")
+    return selected_backend_name()
 
 
 def _instance_invalidated(instance) -> bool:
@@ -452,12 +476,7 @@ def _start_close(normalized: str, instance) -> _CloseOperation:
 def _finish_close(normalized: str, instance) -> bool:
     """Bound the caller's wait, never the lifetime of the resource owner."""
     # A typo in configuration must not prevent cleanup from starting.
-    try:
-        timeout = float(os.getenv("LOCAL_BACKEND_CLOSE_WAIT_S", "15") or 15)
-        if not math.isfinite(timeout) or timeout <= 0:
-            timeout = 15.0
-    except ValueError:
-        timeout = 15.0
+    timeout = env_float("LOCAL_BACKEND_CLOSE_WAIT_S", 15.0, minimum=0.001, out_of_range=FALL_BACK)
     operation = _start_close(normalized, instance)
     if not operation.done.wait(timeout):
         print(f"[WARN] 后端 {normalized} 清理超过 {timeout:g}s；后台继续清理，不会启动替代实例。", flush=True)

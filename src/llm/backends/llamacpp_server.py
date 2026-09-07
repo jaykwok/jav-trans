@@ -28,10 +28,11 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
-from core import resources
+from core import gpu_admission, resources
+from core.typed_config import env_int
 from llm.async_transport import close_quietly, run_cancellable_request
 from llm.backends.base import ManagedTranslationBackend
-from llm.errors import BackendLeaseInvalidatedError
+from llm.errors import BackendLeaseInvalidatedError, TranslationCancelledError
 from utils.model_paths import PROJECT_ROOT
 from utils.subprocess_tools import (
     child_state,
@@ -41,6 +42,11 @@ from utils.subprocess_tools import (
 
 _SERVER_EXE_NAMES = ("llama-server.exe", "llama-server")
 _LOCAL_KIND = "local_server"
+# How often a task waiting out someone else's model load re-checks: short
+# enough that 取消 feels immediate, long enough not to spin.
+_STARTUP_WAIT_POLL_S = 0.2
+# Same, for the thread resolving (and possibly downloading) the GGUF.
+_MODEL_RESOLVE_POLL_S = 0.1
 _NO_CLEANUP = {
     "stuck": False,
     "pid": None,
@@ -58,12 +64,13 @@ def _env(name: str, default: str = "") -> str:
     return str(os.getenv(name, default) or "").strip()
 
 
-def _env_int(name: str, default: int, low: int, high: int) -> int:
-    try:
-        value = int(float(_env(name, str(default)) or default))
-    except (TypeError, ValueError):
-        value = default
-    return max(low, min(high, value))
+def server_limits() -> dict[str, int]:
+    return {
+        "ctx": env_int("LLAMACPP_CTX_SIZE", 1024, minimum=1024, maximum=131072),
+        "gpu_layers": env_int("LLAMACPP_N_GPU_LAYERS", 999, minimum=0, maximum=999),
+        "parallel": env_int("LLAMACPP_PARALLEL", 8, minimum=1, maximum=16),
+        "startup_s": env_int("LLAMACPP_STARTUP_TIMEOUT_S", 300, minimum=10, maximum=3600),
+    }
 
 
 def resolve_server_executable() -> str:
@@ -98,7 +105,9 @@ def resolve_server_executable() -> str:
     )
 
 
-def resolve_gguf_model_path(*, download_enabled: bool = True) -> str:
+def resolve_gguf_model_path(
+    *, download_enabled: bool = True, cancel_event=None
+) -> str:
     """Explicit local GGUF path wins; otherwise download the configured repo
     file into the project Hugging Face cache (honours HF_HOME and proxy env)."""
     explicit = _env("LLAMACPP_GGUF_PATH")
@@ -127,7 +136,9 @@ def resolve_gguf_model_path(*, download_enabled: bool = True) -> str:
     return hf_hub_download(
         repo_id=repo,
         filename=filename,
-        tqdm_class=hf_progress.tqdm_class(),
+        # The 4.6GB one. Without the event the transfer has no way of hearing
+        # that the task asking for it has been cancelled.
+        tqdm_class=hf_progress.tqdm_class(cancel_event),
     )
 
 
@@ -347,10 +358,14 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        # "A start is in progress" is state, not a held lock: a task that
+        # arrives during one waits here, where its cancel event can end the
+        # wait, instead of blocking on `_lock` where nothing can.
+        self._startup_done = threading.Condition(self._lock)
+        self._starting = False
         self._proc: subprocess.Popen | None = None
         self._job_handle = None
         self._port: int | None = None
-        self._client = None
         self._model_path = ""
         self._log_path: Path | None = None
         # Set when a request was abandoned while the server was still working on
@@ -390,9 +405,8 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         return log_dir / "llamacpp_server.log"
 
     def _build_command(self, exe: str, model_path: str, port: int) -> list[str]:
-        ctx = _env_int("LLAMACPP_CTX_SIZE", 1024, 1024, 131072)
-        ngl = _env_int("LLAMACPP_N_GPU_LAYERS", 999, 0, 999)
-        parallel = _env_int("LLAMACPP_PARALLEL", 8, 1, 16)
+        limits = server_limits()
+        ctx, ngl, parallel = limits["ctx"], limits["gpu_layers"], limits["parallel"]
         # -c is the total context; llama-server splits it across -np slots, so
         # the env var means "context per slot". Flash attention stays on the
         # server's own default ("auto" on current builds).
@@ -426,116 +440,300 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             return ""
         return text[-max_chars:]
 
+    def _acquire_gpu_permit(self, cancel_event) -> gpu_admission.GpuPermit:
+        """Wait for the card, and let 取消 end the wait.
+
+        The wait itself is the point: another job's ASR stage can run for
+        minutes, and the answer to "when can I load the model" is "when it
+        finishes, or when you cancel". What it must never be is "stop their
+        worker", which is what asking for the device by tearing the ASR worker
+        down amounted to.
+        """
+        try:
+            return gpu_admission.acquire(
+                gpu_admission.LOCAL_LLM,
+                cancel=cancel_event,
+                description="llama-server",
+            )
+        except gpu_admission.GpuAdmissionCancelled as exc:
+            self._raise_if_cancelled(cancel_event)
+            raise TranslationCancelledError("任务已取消") from exc
+
+    def _server_ready_locked(self) -> bool:
+        """A server that is running *and* answering. Callers hold `_lock`.
+
+        `_port` is set only once the health check passes, so this cannot report
+        a model that is still loading as usable - which matters now that a
+        second task consults it instead of queueing behind the load.
+        """
+        return self._proc is not None and self._proc.poll() is None and bool(self._port)
+
+    def _claim_startup(self, cancel_event) -> bool:
+        """True if this thread is the one that must start the server.
+
+        False means someone else already has it running. The waiting is done
+        here, on a condition, rather than on `_lock`: the lock is held across
+        the parts of a start that must not interleave, and a thread blocked on
+        a lock cannot be cancelled - the same shape of bug as waiting for the
+        ASR module lock, one layer up.
+        """
+        while True:
+            self._raise_if_cancelled(cancel_event)
+            with self._lock:
+                # Re-checked every pass: a reset can land while we wait, and an
+                # instance out of service starts nothing and hands out nothing.
+                self._raise_if_invalidated()
+                if self._server_ready_locked():
+                    return False
+                if not self._starting:
+                    self._starting = True
+                    return True
+                # Releases `_lock` while it waits, and the starter notifies on
+                # its way out - success or failure, so a failed start hands the
+                # attempt to the next waiter rather than stranding it.
+                self._startup_done.wait(_STARTUP_WAIT_POLL_S)
+
     def _ensure_server(self, cancel_event=None) -> None:
         # Before the fast path: an instance taken out of service must not start a
         # server, and must not hand out the one it still has.
         self._raise_if_invalidated()
-        with self._lock:
-            self._raise_if_invalidated()  # the reset may have landed while we waited
-            if self._proc is not None and self._proc.poll() is None and self._port:
-                return
-            # Doubles as the re-check: a process that has since exited on its
-            # own confirms here and clears the state. Only a server that is
-            # still unaccounted for blocks the start - loading a second
-            # multi-GB model next to one that still holds its VRAM is the
-            # failure this exists to prevent.
-            if not self._teardown_locked():
-                status = self.cleanup_status()
-                raise RuntimeError(
-                    "上一个 llama-server 未确认退出，拒绝启动新的本地翻译服务器"
-                    f"（pid={status.get('pid')}，已重试 {status.get('attempts')} 次，"
-                    f"原因：{status.get('last_error') or '未知'}）。"
-                    "可在任务页点击「重试清理」/「重新检查」，或查看诊断信息。"
-                )
+        if not self._claim_startup(cancel_event):
+            return
+        try:
+            self._start_server(cancel_event)
+        finally:
+            with self._lock:
+                self._starting = False
+                self._startup_done.notify_all()
 
-            exe = resolve_server_executable()
-            model_path = resolve_gguf_model_path()
-            port = _pick_free_port()
-            _release_asr_worker_vram()
+    def _require_clean_slate_locked(self) -> None:
+        """Refuse to start while a previous server is still unaccounted for.
 
-            self._log_path = self._server_log_path()
-            command = self._build_command(exe, model_path, port)
-            env = server_environment()
-            devices = probe_compute_devices(exe, env)
-            if not devices and _env_int("LLAMACPP_N_GPU_LAYERS", 999, 0, 999) > 0:
-                # Not fatal - a CPU-only build is a legitimate choice - but it
-                # is a 40x slowdown that otherwise shows up only as "翻译很慢".
-                print(
-                    "[WARN] llama-server 看不到任何 GPU 设备，将以 CPU 运行（会慢几十倍）。"
-                    "CUDA 版还需要 cuBLAS 运行库：确认 llama-server.exe 是 CUDA 构建，"
-                    "或解压对应 release 的 cudart-llama-bin-win-cuda-*.zip 到同一目录。",
-                    flush=True,
-                )
-            with open(self._log_path, "ab") as log_file:
-                log_file.write(
-                    (
-                        "\n=== llama-server start: "
-                        + " ".join(command)
-                        + "\n=== devices: "
-                        + ("; ".join(devices) or "(none - CPU only)")
-                        + "\n"
-                    ).encode("utf-8")
-                )
-                self._proc = subprocess.Popen(
-                    command,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(PROJECT_ROOT),
-                    env=env,
-                    **no_window_subprocess_kwargs(),
-                )
-            self._server_generation += 1
-            self._retiring = False
-            self._job_handle = _bind_kill_on_close_job(self._proc)
-            resources.register(
-                resource_id=self._resource_id(),
-                generation=self._server_generation,
-                kind=_LOCAL_KIND,
-                description="llama-server",
-                process=self._proc,
-                job_handle=self._job_handle,
-                stopper=self._stop_server,
-                holds_gpu=True,
-            )
-            # Invalidation may have landed after the startup entrance check
-            # but before registration. Whichever side wins must publish stop
-            # intent, so a timed-out close never makes this live owner invisible
-            # to GPU admission or to the cleanup watchdog.
-            if self.is_invalidated():
-                resources.schedule_stop(self._resource_id(), self._server_generation)
-            self._port = port
-
-            timeout_s = _env_int("LLAMACPP_STARTUP_TIMEOUT_S", 300, 10, 3600)
-            deadline = time.monotonic() + timeout_s
-            while time.monotonic() < deadline:
-                self._raise_if_cancelled(cancel_event)
-                exit_code = self._proc.poll()
-                if exit_code is not None:
-                    tail = self._log_tail()
-                    self._teardown_locked()
-                    raise RuntimeError(
-                        f"llama-server 启动即退出（exit={exit_code}），"
-                        f"日志尾部：{tail}"
-                    )
-                if self._health_ok(port):
-                    self._client = self._make_client(port)
-                    return
-                time.sleep(0.5)
-            tail = self._log_tail()
-            self._teardown_locked()
-            raise RuntimeError(
-                f"llama-server {timeout_s}s 内未就绪（模型加载超时），日志尾部：{tail}"
-            )
-
-    def _make_client(self, port: int):
-        from openai import OpenAI
-
-        return OpenAI(
-            base_url=f"http://127.0.0.1:{port}/v1",
-            api_key="local-llamacpp",
-            timeout=600.0,
-            max_retries=0,
+        Doubles as the re-check: a process that has since exited on its own
+        confirms here and clears the state. Only a server that is still
+        unaccounted for blocks the start - loading a second multi-GB model next
+        to one that still holds its VRAM is the failure this exists to prevent.
+        """
+        if self._teardown_locked():
+            return
+        status = self.cleanup_status()
+        raise RuntimeError(
+            "上一个 llama-server 未确认退出，拒绝启动新的本地翻译服务器"
+            f"（pid={status.get('pid')}，已重试 {status.get('attempts')} 次，"
+            f"原因：{status.get('last_error') or '未知'}）。"
+            "可在任务页点击「重试清理」/「重新检查」，或查看诊断信息。"
         )
+
+    def _resolve_model_path(self, cancel_event) -> str:
+        """Locate the GGUF, cancellably - which on a first run means a download.
+
+        Two mechanisms, because neither is sufficient alone. The progress bar
+        carries the cancel into the transfer itself, but huggingface_hub owns
+        the thread the bytes arrive on and what it does with an exception from a
+        progress bar is its business, not a contract. So the *wait* is made
+        cancellable here regardless: the resolution runs on its own thread and
+        this one stops waiting when asked. A download that keeps going anyway
+        lands in the cache and the next attempt starts from it.
+
+        A new thread inherits no run: `core.events`'s job_id is thread-local, and
+        hf_progress's module-level fallback is shared, so without this the
+        download's progress would arrive unattributed - or, if another job's ASR
+        model was downloading at the same time, under *that* job's id, which
+        passes every check the receiving end makes.
+        """
+        from utils import hf_progress
+
+        identity = hf_progress.current_identity()
+        resolved: list[str] = []
+        failure: list[BaseException] = []
+        finished = threading.Event()
+
+        def resolve() -> None:
+            hf_progress.adopt_identity(identity)
+            try:
+                resolved.append(resolve_gguf_model_path(cancel_event=cancel_event))
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                failure.append(exc)
+            finally:
+                finished.set()
+
+        threading.Thread(
+            target=resolve, name="llamacpp-model-resolve", daemon=True
+        ).start()
+        while not finished.wait(_MODEL_RESOLVE_POLL_S):
+            self._raise_if_cancelled(cancel_event)
+        self._raise_if_cancelled(cancel_event)
+        if failure:
+            raise failure[0]
+        return resolved[0]
+
+    def _start_server(self, cancel_event) -> None:
+        # Before any waiting: a server we could not confirm dead is still
+        # holding the card, so queueing for a permit behind it would be waiting
+        # for a thing that is never coming. It is our own process either way -
+        # this stops it, which is not the same as asking for the device by
+        # stopping the *ASR* worker below.
+        with self._lock:
+            self._raise_if_invalidated()
+            self._require_clean_slate_locked()
+
+        # Preparation, holding neither the instance lock nor the card. Resolving
+        # the GGUF is a 4.6GB download on a first run: under `_lock` it blocked
+        # every sibling task on a *lock*, where a cancel event cannot reach them
+        # (they never got as far as the condition they were supposed to wait
+        # on); holding the permit across it would keep an ASR stage off a card
+        # that nothing has loaded yet.
+        self._raise_if_cancelled(cancel_event)
+        exe = resolve_server_executable()
+        model_path = self._resolve_model_path(cancel_event)
+        env = server_environment()
+
+        # Exclusive use of the card, taken *before* the instance lock and before
+        # the ASR worker is stopped. Stopping it used to be how this path asked
+        # for the device - `_release_asr_worker_vram()` blocked inside
+        # `shutdown_global_worker()` on the ASR module lock, held for the whole
+        # of another job's transcription, where no cancel event could reach it.
+        permit = self._acquire_gpu_permit(cancel_event)
+        handed_over = False
+        proc: subprocess.Popen | None = None
+        generation = 0
+        port = 0
+        try:
+            # Asks the driver what it can see, so it belongs after the permit -
+            # and outside the lock, where its 120s timeout cannot strand anyone.
+            devices = probe_compute_devices(exe, env)
+            with self._lock:
+                self._raise_if_invalidated()
+                self._raise_if_cancelled(cancel_event)
+                # Again, holding the permit this time: the waits above are long
+                # enough for a server to have appeared and died in them.
+                self._require_clean_slate_locked()
+
+                port = _pick_free_port()
+                _release_asr_worker_vram()
+
+                self._log_path = self._server_log_path()
+                command = self._build_command(exe, model_path, port)
+                if not devices and server_limits()["gpu_layers"] > 0:
+                    # Not fatal - a CPU-only build is a legitimate choice - but
+                    # it is a 40x slowdown that otherwise shows up only as
+                    # "翻译很慢".
+                    print(
+                        "[WARN] llama-server 看不到任何 GPU 设备，将以 CPU 运行（会慢几十倍）。"
+                        "CUDA 版还需要 cuBLAS 运行库：确认 llama-server.exe 是 CUDA 构建，"
+                        "或解压对应 release 的 cudart-llama-bin-win-cuda-*.zip 到同一目录。",
+                        flush=True,
+                    )
+                with open(self._log_path, "ab") as log_file:
+                    log_file.write(
+                        (
+                            "\n=== llama-server start: "
+                            + " ".join(command)
+                            + "\n=== devices: "
+                            + ("; ".join(devices) or "(none - CPU only)")
+                            + "\n"
+                        ).encode("utf-8")
+                    )
+                    self._proc = subprocess.Popen(
+                        command,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        cwd=str(PROJECT_ROOT),
+                        env=env,
+                        **no_window_subprocess_kwargs(),
+                    )
+                self._server_generation += 1
+                self._retiring = False
+                self._job_handle = _bind_kill_on_close_job(self._proc)
+                resources.register(
+                    resource_id=self._resource_id(),
+                    generation=self._server_generation,
+                    kind=_LOCAL_KIND,
+                    description="llama-server",
+                    process=self._proc,
+                    job_handle=self._job_handle,
+                    stopper=self._stop_server,
+                    holds_gpu=True,
+                )
+                # Handed over, never released: exclusive use becomes a resident
+                # claim on the identity just registered, in one lock section.
+                # Registering and then releasing are two steps with a gap
+                # between them, and an ASR admission check taken before the
+                # first could be acted on after the second - which is a
+                # transcription starting beside a resident model.
+                gpu_admission.handover(
+                    permit,
+                    resource_id=self._resource_id(),
+                    generation=self._server_generation,
+                )
+                handed_over = True
+                # Invalidation may have landed after the startup entrance check
+                # but before registration. Whichever side wins must publish stop
+                # intent, so a timed-out close never makes this live owner
+                # invisible to GPU admission or to the cleanup watchdog.
+                if self.is_invalidated():
+                    resources.schedule_stop(self._resource_id(), self._server_generation)
+                proc = self._proc
+                generation = self._server_generation
+        finally:
+            # Only the paths that never got as far as registering: nothing
+            # is resident, so the card goes back. After the handover there
+            # is nothing to release - the claim ends with its record, whose
+            # lifetime the registry (and its watchdog) already owns.
+            if not handed_over:
+                gpu_admission.release(permit)
+
+        self._await_ready(proc, generation, port, cancel_event)
+
+    def _await_ready(self, proc, generation: int, port: int, cancel_event) -> None:
+        """Wait for the model to load, without holding the instance lock.
+
+        A load is minutes on a large model. Holding `_lock` across it made 关闭
+        and every sibling task wait behind it; the process this loop is watching
+        is named by argument, so nothing here needs the lock except the short
+        writes that publish the result.
+        """
+        timeout_s = server_limits()["startup_s"]
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            self._raise_if_cancelled(cancel_event)
+            with self._lock:
+                current = self._proc
+                current_generation = self._server_generation
+            if current is not proc or current_generation != generation:
+                # Closed or replaced while it was loading. Reporting that as a
+                # startup failure of *this* server would name the wrong process.
+                raise RuntimeError(
+                    "本地翻译服务器在启动过程中被关闭或替换；请重新运行该任务。"
+                )
+            exit_code = proc.poll()
+            if exit_code is not None:
+                tail = self._log_tail()
+                self._teardown_if_current(proc)
+                raise RuntimeError(
+                    f"llama-server 启动即退出（exit={exit_code}），"
+                    f"日志尾部：{tail}"
+                )
+            if self._health_ok(port):
+                with self._lock:
+                    if self._proc is not proc:
+                        raise RuntimeError(
+                            "本地翻译服务器在启动过程中被关闭或替换；请重新运行该任务。"
+                        )
+                    self._port = port
+                return
+            time.sleep(0.5)
+        tail = self._log_tail()
+        self._teardown_if_current(proc)
+        raise RuntimeError(
+            f"llama-server {timeout_s}s 内未就绪（模型加载超时），日志尾部：{tail}"
+        )
+
+    def _teardown_if_current(self, proc) -> None:
+        """Stop the server this start produced, and only that one."""
+        with self._lock:
+            if self._proc is proc:
+                self._teardown_locked()
 
     def _make_async_client(self, port: int):
         # Built per request, on that request's loop - see the note in
@@ -612,9 +810,8 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         """
         proc = self._proc
         generation = self._server_generation
-        # The client and port are dropped either way: whatever this process is
-        # doing, nothing may be sent to it again.
-        self._client = None
+        # The port is dropped either way: whatever this process is doing,
+        # nothing may be sent to it again.
         self._port = None
         if proc is None:
             self._retiring = False
@@ -818,14 +1015,13 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         top_p: float = 0.9,
         max_tokens: int = 4096,
         response_format: dict | None = None,
-        stream: bool = True,
         reasoning_effort: str | None = None,
         expected_count: int = 0,
         cancel_event=None,
         on_progress: Callable[[dict], None] | None = None,
         on_usage: Callable[[dict], None] | None = None,
     ) -> str:
-        del stream, reasoning_effort
+        del reasoning_effort
         self._raise_if_cancelled(cancel_event)
         # Checked at the moment of use, not only by whoever resolved this object:
         # a reset can land between a caller's lease check and this call.

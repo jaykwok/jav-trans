@@ -14,23 +14,11 @@ from asr import chunking as _chunking_module
 from asr import result_cache as _result_cache_module
 from asr.result_cache import _is_timed_out_result
 from asr.text_normalize import strip_text_punctuation
+from core.typed_config import env_float, env_text
 from asr.local_backend import LocalAsrBackend
 
 
 logger = logging.getLogger(__name__)
-
-
-def _env_float(name: str, default: float) -> float:
-    """Empty means "use the default", as everywhere else in the tree.
-
-    Both callers below read forwarded `ASR_*` knobs, and the 「参数调优」 box
-    passes `KEY=` through with an empty value, so an unguarded `float()` here
-    ends the stage on a bare `ValueError`.
-    """
-    try:
-        return float(os.getenv(name, "").strip() or default)
-    except (TypeError, ValueError):
-        return float(default)
 
 
 def _emit_progress(on_stage: Callable[[str], None] | None, message: str) -> None:
@@ -45,21 +33,18 @@ _TRIVIAL_SEGMENT = re.compile(
 
 
 def _asr_invalid_segment_duration_s() -> float:
-    return _env_float("ASR_INVALID_SEGMENT_DURATION", 0.1)
+    return env_float("ASR_INVALID_SEGMENT_DURATION", 0.1, minimum=0.0)
 
 
 def _asr_min_repaired_segment_duration_s() -> float:
-    return _env_float("ASR_MIN_REPAIRED_SEGMENT_DURATION", 0.6)
+    return env_float("ASR_MIN_REPAIRED_SEGMENT_DURATION", 0.6, minimum=0.0)
 
 
 def _vram_budget_mb() -> float:
-    raw = os.getenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "0").strip().lower()
-    if raw in {"", "0", "false", "no", "off", "none"}:
+    raw = env_text("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "0", lower=True)
+    if raw in {"0", "false", "no", "off", "none"}:
         return 0.0
-    try:
-        return max(0.0, float(raw))
-    except (TypeError, ValueError):
-        return 0.0
+    return env_float("ASR_STAGE_WORKER_VRAM_BUDGET_MB", 0.0, minimum=0.0)
 
 
 def _enforce_vram_budget(stage: str, on_stage: Callable[[str], None] | None) -> None:

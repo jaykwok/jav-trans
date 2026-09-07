@@ -66,7 +66,7 @@ def test_job_tempdir_groups_temp_outputs_and_keeps_srt_at_output_root(monkeypatc
         ),
     )
 
-    run_pipeline(video_path, ctx)
+    published = {Path(path).name: Path(path) for path in run_pipeline(video_path, ctx)}
 
     job_dir = temp_root / "sample"
     assert Path(seen_audio_path["path"]).is_file()
@@ -80,7 +80,7 @@ def test_job_tempdir_groups_temp_outputs_and_keeps_srt_at_output_root(monkeypatc
         "bilingual.json",
         "timings.json",
     ):
-        assert (job_dir / f"sample.{suffix}").is_file()
+        assert published[f"sample.{suffix}"].is_file()
         assert not (output_dir / f"sample.{suffix}").exists()
 
     timings = json.loads((job_dir / "sample.timings.json").read_text(encoding="utf-8"))
@@ -95,7 +95,7 @@ def test_job_tempdir_groups_temp_outputs_and_keeps_srt_at_output_root(monkeypatc
     assert timings["outputs"]["srt"] == main._project_relative(str(output_dir / "sample.ja.srt"))
     assert timings["outputs"]["run_log"] is None
     _assert_no_project_absolute_path((job_dir / "sample.timings.json").read_text(encoding="utf-8"))
-    _assert_no_project_absolute_path((job_dir / "sample.aligned_segments.json").read_text(encoding="utf-8"))
+    _assert_no_project_absolute_path(published["sample.aligned_segments.json"].read_text(encoding="utf-8"))
     _assert_no_project_absolute_path((job_dir / "sample.asr_manifest.json").read_text(encoding="utf-8"))
 
 
@@ -262,8 +262,9 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
     assert timings_log_path.parent == log_dir / "sample"
     assert timings_log_path.is_file()
     assert json.loads(timings_log_path.read_text(encoding="utf-8"))["job_id"] == "sample"
-    assert str(run_log_path) in output_paths
-    assert str(timings_log_path) in output_paths
+    published = {Path(path).name: Path(path) for path in output_paths}
+    assert published[run_log_path.name].read_bytes() == run_log_path.read_bytes()
+    assert published[timings_log_path.name].read_bytes() == timings_log_path.read_bytes()
 
 
 def test_run_log_filename_components_are_bounded():

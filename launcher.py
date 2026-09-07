@@ -33,6 +33,7 @@ for _SRC in (_RESOURCE_ROOT / "src", _ROOT / "src"):
         sys.path.insert(0, str(_SRC))
 
 from utils.subprocess_tools import no_window_subprocess_kwargs
+from core.typed_config import env_int
 from utils.ffmpeg_runtime import configure_ffmpeg_shared_runtime
 
 _BIN_DIR = _RESOURCE_ROOT / "bin"
@@ -75,10 +76,10 @@ def _first_free_port(preferred: int, attempts: int = 20) -> int:
     return preferred
 
 
-PORT = _first_free_port(int(os.getenv("JAV_TRANS_PORT", "2233")))
-EVENTS_PORT = _first_free_port(int(os.getenv("JAV_TRANS_EVENTS_PORT", "2234")))
+PORT = _first_free_port(env_int("JAV_TRANS_PORT", 2233, minimum=1, maximum=65535))
+EVENTS_PORT = _first_free_port(env_int("JAV_TRANS_EVENTS_PORT", 2234, minimum=1, maximum=65535))
 if EVENTS_PORT == PORT:
-    EVENTS_PORT = _first_free_port(PORT + 1)
+    EVENTS_PORT = _first_free_port(PORT + 1 if PORT < 65535 else 2234)
 
 # Globs inside tmp/ that are always safe to remove (one-time run artifacts).
 # Coverage note: atexit cleanup is best-effort; it only sweeps these top-level
@@ -95,8 +96,196 @@ _CLEAN_GLOBS = [
 ]
 
 
-def _cleanup_temp() -> None:
-    tmp = _ROOT / "tmp"
+# Which windows are running out of this workspace. The sweep below deletes
+# tmp/chunks and every job's audio/, and a second window is not a second
+# workspace: ports step forward on collision, so two instances share one tmp/
+# and the first one closed used to delete the chunks the other was still
+# transcribing. A file per instance, held open for the life of the process, is
+# what makes "someone else is still running" a fact rather than an assumption.
+_INSTANCE_DIR_NAME = "launcher"
+_instance_slot = None
+
+# A slot only proves nobody else was there at the instant of the scan, and the
+# sweep runs after the scan has let go. Without a gate a second window could
+# publish its slot in between - passing unseen - and start writing chunks that
+# the first window's sweep then deleted. Publishing a slot and scanning-then-
+# sweeping each take this one OS-held lock, which leaves only two orderings, both
+# safe: the newcomer is already visible to the scan (veto), or it arrives after
+# the sweep finished (and had nothing there to lose).
+_GATE_NAME = "workspace.gate"
+_GATE_CLAIM_WAIT_S = 20.0
+_GATE_SWEEP_WAIT_S = 5.0
+_GATE_POLL_S = 0.05
+
+
+def _instance_dir(root: Path) -> Path:
+    return root / "tmp" / _INSTANCE_DIR_NAME
+
+
+def _try_lock(handle) -> bool:
+    """Take the OS lock on an open handle without waiting for it."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _acquire_gate(root: Path, wait_s: float, note: str = ""):
+    """The workspace gate, or None if it stays held for longer than `wait_s`.
+
+    The lock lives in the OS, so a window that crashes while holding it releases
+    it on the way out rather than freezing every future window.
+    """
+    try:
+        directory = _instance_dir(root)
+        directory.mkdir(parents=True, exist_ok=True)
+        handle = open(directory / _GATE_NAME, "a+", encoding="utf-8")
+    except OSError:
+        return None
+    deadline = time.monotonic() + max(0.0, wait_s)
+    announced = False
+    while True:
+        if _try_lock(handle):
+            return handle
+        if time.monotonic() >= deadline:
+            handle.close()
+            return None
+        if note and not announced:
+            announced = True
+            print(note, flush=True)
+        time.sleep(_GATE_POLL_S)
+
+
+def _release_gate(handle) -> None:
+    if handle is None:
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+def _claim_instance_slot(root: Path):
+    """Publish this window's slot under the gate, or None if it cannot be.
+
+    None is not "start anyway without cleaning up on the way out". A window
+    writes chunk audio into the same tmp/ everyone sweeps, so an unregistered
+    window is invisible to the next scan and its work is a deletion target -
+    which is the whole failure this slot exists to prevent. Whoever cannot
+    register does not start (see the `__main__` block).
+    """
+    gate = _acquire_gate(
+        root,
+        _GATE_CLAIM_WAIT_S,
+        note="[launcher] 另一个窗口正在清理临时文件，等待它完成…",
+    )
+    if gate is None:
+        print(
+            f"[launcher] 等待另一个窗口清理超过 {int(_GATE_CLAIM_WAIT_S)} 秒，放弃登记。",
+            flush=True,
+        )
+        return None
+    try:
+        return _publish_instance_slot(root)
+    finally:
+        _release_gate(gate)
+
+
+def _publish_instance_slot(root: Path):
+    """Write and hold this window's slot file. Callers must hold the gate."""
+    try:
+        directory = _instance_dir(root)
+        directory.mkdir(parents=True, exist_ok=True)
+        handle = open(
+            directory / f"instance-{os.getpid()}.lock", "w", encoding="utf-8"
+        )
+    except OSError:
+        return None
+    try:
+        handle.write(json.dumps({"pid": os.getpid(), "started": time.time()}))
+        handle.flush()
+        if os.name != "nt":
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def _slot_is_held(path: Path) -> bool:
+    """Is a live process still holding this slot?
+
+    Two mechanisms because the platforms answer differently. On Windows an open
+    file cannot be unlinked, so a failed delete *is* the liveness proof, and a
+    successful one clears a slot left behind by a crash. Elsewhere the delete
+    would always succeed, so the lock has to be asked directly.
+    """
+    if os.name == "nt":
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return False
+    try:
+        import fcntl
+
+        with open(path, "r+", encoding="utf-8") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # Unreadable is not "nobody owns it": refuse to sweep on a maybe.
+        return True
+    path.unlink(missing_ok=True)
+    return False
+
+
+def _other_instances_running(root: Path, *, own_slot=None) -> bool:
+    own_name = Path(getattr(own_slot, "name", "")).name
+    try:
+        slots = sorted(_instance_dir(root).glob("instance-*.lock"))
+    except OSError:
+        return True
+    for slot in slots:
+        if slot.name == own_name:
+            continue
+        if _slot_is_held(slot):
+            return True
+    return False
+
+
+def _sweep_temp(root: Path) -> None:
+    tmp = root / "tmp"
     if not tmp.exists():
         return
 
@@ -117,6 +306,35 @@ def _cleanup_temp() -> None:
                 audio_dir = job_dir / "audio"
                 if audio_dir.exists():
                     shutil.rmtree(audio_dir, ignore_errors=True)
+
+
+def _cleanup_temp() -> None:
+    global _instance_slot
+    slot = _instance_slot
+    try:
+        # No slot means we never established who owns this workspace, and a
+        # sweep on a guess is what this guard exists to stop.
+        if slot is None:
+            return
+        # Scan and sweep are one step, not two: a window registering right now
+        # is invisible to the scan, so if the gate cannot be taken the sweep is
+        # skipped outright rather than run against a list already out of date.
+        gate = _acquire_gate(_ROOT, _GATE_SWEEP_WAIT_S)
+        if gate is None:
+            return
+        try:
+            if not _other_instances_running(_ROOT, own_slot=slot):
+                _sweep_temp(_ROOT)
+        finally:
+            _release_gate(gate)
+    finally:
+        _instance_slot = None
+        if slot is not None:
+            try:
+                slot.close()
+                Path(slot.name).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _version_tuple(value: str | None) -> tuple[int, ...]:
@@ -351,6 +569,7 @@ if _SMOKE_IMPORTS:
         raise SystemExit(1)
 
 
+_instance_slot = _claim_instance_slot(_ROOT)
 atexit.register(_cleanup_temp)
 
 
@@ -423,6 +642,18 @@ def _signal_app_ready() -> None:
 _shutdown = threading.Event()
 
 if __name__ == "__main__":
+    if _instance_slot is None:
+        # Starting anyway is the failure, not the fallback: this window would
+        # write chunk audio into a tmp/ it has no registered claim on, where the
+        # window that is sweeping right now cannot see it and will delete it.
+        print("\n没能登记这个工作目录的使用权，界面未启动。", flush=True)
+        print(
+            "另一个窗口可能正在清理临时文件；请等它结束后重试。"
+            "若反复出现，检查 tmp/launcher/ 是否可写。",
+            flush=True,
+        )
+        raise SystemExit(1)
+
     print(f"jav-trans: http://127.0.0.1:{PORT}", flush=True)
     t = threading.Thread(target=_run_server, daemon=True)
     t.start()

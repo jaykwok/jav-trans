@@ -15,6 +15,7 @@ import re
 from typing import Any
 
 from asr.subtitle_timing import build_aligned_word_timestamps
+from core.typed_config import env_float, env_text
 from utils.model_paths import PROJECT_ROOT
 
 
@@ -28,7 +29,7 @@ DEFAULT_MIN_DELTA_MS = 20.0
 
 
 def shadow_head_reference() -> str:
-    return os.getenv(SHADOW_HEAD_PATH_ENV, "").strip()
+    return env_text(SHADOW_HEAD_PATH_ENV, "")
 
 
 def shadow_enabled() -> bool:
@@ -36,11 +37,7 @@ def shadow_enabled() -> bool:
 
 
 def shadow_min_delta_ms() -> float:
-    try:
-        value = float(os.getenv(SHADOW_MIN_DELTA_MS_ENV, str(DEFAULT_MIN_DELTA_MS)))
-    except (TypeError, ValueError):
-        return DEFAULT_MIN_DELTA_MS
-    return max(0.0, value)
+    return env_float(SHADOW_MIN_DELTA_MS_ENV, DEFAULT_MIN_DELTA_MS, minimum=0.0)
 
 
 def compare_alignment_heads(

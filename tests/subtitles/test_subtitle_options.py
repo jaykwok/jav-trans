@@ -126,7 +126,6 @@ def test_prepare_bilingual_keeps_adjacent_cues_separate(tmp_path):
             {"start": 1.05, "end": 2.0, "ja_text": "君", "zh_text": "乙"},
         ],
         options=options,
-        mode="bilingual",
     )
 
     subtitle.write_bilingual_srt(

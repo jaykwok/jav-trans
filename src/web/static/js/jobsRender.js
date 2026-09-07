@@ -8,6 +8,8 @@ const STATUS_LABEL = {
   pending: '待开始', queued: '排队中', asr: 'ASR转写', translating: '翻译中',
   writing: '写入中', done: '完成', failed: '失败', cancelled: '已取消',
   cancelling: '停止中',
+  saving: '保存中', save_failed: '保存失败', export_failed: '字幕导出失败',
+  publish_failed: '产物提交失败',
 };
 
 const STAGE_LABEL = {
@@ -29,10 +31,18 @@ const STAGE_LABEL = {
   translation_context: '翻译上下文',
   translation:         '翻译中',
   write_output:        '写入字幕',
+  saving:              '正在确认保存',
+  save_failed:         '请重试保存（不会重新翻译）',
+  publish_failed:      '请重试提交已保存的产物',
+  export_failed:       '产物已保存，请重试导出',
   model_download:      '模型下载',
 };
 
-const PROGRESS_PCT = { queued: 0, asr: 20, translating: 60, writing: 90, done: 100, failed: 100, cancelled: 0, cancelling: 0 };
+const PROGRESS_PCT = {
+  queued: 0, asr: 20, translating: 60, writing: 90,
+  saving: 99, save_failed: 99, publish_failed: 98, export_failed: 99,
+  done: 100, failed: 100, cancelled: 0, cancelling: 0,
+};
 // Rebalanced on 2026-07-31: the five boundary stages that used to fill 3->38%
 // no longer run, and chunking now costs one encoder pass instead of five models.
 const STAGE_PCT = {
@@ -63,7 +73,7 @@ function clampPct(value) {
   return Math.min(100, Math.max(0, n));
 }
 
-export const CLEARABLE = new Set(['done', 'failed', 'cancelled']);
+export const CLEARABLE = new Set(['done', 'failed', 'cancelled', 'publish_failed', 'export_failed']);
 
 // Our own messages name the missing setting and the panel that fills it in, so
 // they are shown whole (wrapped, never ellipsised). Only a payload long enough
@@ -140,7 +150,8 @@ export function renderJobs() {
     const current = job.progress?.current ?? job.progress?.extra?.current;
     const total = job.progress?.total ?? job.progress?.extra?.total;
     const terminalStage = CLEARABLE.has(job.status) ? job.status : null;
-    const activeStage = terminalStage || job.progress?.stage || job.current_stage || job.status;
+    const savingStage = ['saving', 'save_failed', 'publish_failed', 'export_failed'].includes(job.status) ? job.status : null;
+    const activeStage = savingStage || terminalStage || job.progress?.stage || job.current_stage || job.status;
     const translatedRatio = translated != null && expected
       ? Math.min(1, Math.max(0, translated / expected))
       : null;
@@ -160,7 +171,7 @@ export function renderJobs() {
       }
     }
     pct = clampPct(pct);
-    const fillClass = job.status === 'done' ? ' done' : job.status === 'failed' ? ' error' : '';
+    const fillClass = job.status === 'done' ? ' done' : ['failed', 'save_failed', 'publish_failed', 'export_failed'].includes(job.status) ? ' error' : '';
     const stage = STAGE_LABEL[activeStage] ?? STAGE_LABEL[job.status] ?? activeStage;
     const progressInfo = terminalStage
       ? ''
@@ -169,24 +180,27 @@ export function renderJobs() {
       : current != null ? ` ${current}/${total ?? '?'}` : '';
 
     const isDone = job.status === 'done';
-    const isRetryable = ['failed', 'cancelled'].includes(job.status);
+    const readable = isDone || job.status === 'export_failed' || (job.status === 'save_failed' && ['done', 'export_failed'].includes(job.pending_status));
+    const deliveryRetry = ['save_failed', 'publish_failed', 'export_failed'].includes(job.status);
+    const isRetryable = ['failed', 'cancelled', 'save_failed', 'publish_failed', 'export_failed'].includes(job.status);
     const isCancellable = ['queued', 'asr', 'translating', 'writing'].includes(job.status);
     const retryStage = job.progress?.stage || job.current_stage || '';
     const translationRetry = ['translation_context', 'translation', 'write_output'].includes(retryStage);
     const retryBtn = isRetryable
       ? `<button class="btn-sm btn-retry" data-retry="${escHtml(id)}" title="${
-          translationRetry
+          deliveryRetry ? '使用已保存的计算结果重试，不重新翻译' : translationRetry
             ? '优先复用已完成的 ASR 产物，仅重试翻译/写出'
             : '重新运行 ASR 转写与字幕时间轴，复用仍然有效的缓存'
-        }">↺ ${translationRetry ? '重试翻译' : '重试'}</button>`
+        }">↺ ${job.status === 'save_failed' ? '重试保存' : job.status === 'publish_failed' ? '重试提交' : job.status === 'export_failed' ? '重试导出' : translationRetry ? '重试翻译' : '重试'}</button>`
       : '';
 
-    const srtArtifacts = isDone ? job.artifacts.filter(p => /\.srt$/i.test(p)) : [];
-    const otherArtifacts = isDone ? job.artifacts.filter(p => !/\.srt$/i.test(p)) : [];
+    const srtArtifacts = readable ? job.artifacts.filter(p => /\.srt$/i.test(p)) : [];
+    const otherArtifacts = readable ? job.artifacts.filter(p => !/\.srt$/i.test(p)) : [];
 
     const srtBtns = srtArtifacts.map(p => {
       const name = p.split(/[\\/]/).pop() || '';
-      return `<button class="btn-sm btn-open-artifact" data-open-artifact="${escHtml(id)}" data-file="${escHtml(name)}" title="用系统默认程序打开 ${escHtml(name)}">↗ ${escHtml(name)}</button>`;
+      return `<button class="btn-sm btn-open-artifact" data-open-artifact="${escHtml(id)}" data-file="${escHtml(name)}" title="用系统默认程序打开 ${escHtml(name)}">↗ ${escHtml(name)}</button>
+        <button class="btn-sm btn-dl" data-dl="${escHtml(id)}" data-file="${escHtml(name)}" title="下载 ${escHtml(name)}">⬇ 下载 SRT</button>`;
     }).join('');
 
     const otherSection = otherArtifacts.length ? `
@@ -204,19 +218,19 @@ export function renderJobs() {
 
     // The report is opt-in, so the button only exists when the run actually
     // wrote one - otherwise it would open a panel that can only apologise.
-    const hasQualityReport = isDone && job.artifacts.some(p => /\.quality_report\.md$/i.test(p));
+    const hasQualityReport = readable && job.artifacts.some(p => /\.quality_report\.md$/i.test(p));
     const qcBtn = hasQualityReport
       ? `<button class="btn-sm btn-qc" data-qc="${escHtml(id)}" title="查看质量报告（切分、布局、复读、交付规格）">📊 质检</button>`
       : '';
 
-    const folderPath = isDone
-      ? (srtArtifacts[0] || job.artifacts[0] || job.spec?.video_paths?.[0] || '')
+    const folderPath = readable
+      ? (job.output_target || srtArtifacts[0] || job.artifacts[0] || job.spec?.video_paths?.[0] || '')
       : '';
     const openFolderBtn = folderPath
       ? `<button class="btn-sm btn-folder" data-folder="${escHtml(folderPath)}" title="打开输出文件夹">📂 文件夹</button>`
       : '';
 
-    const errorMsg = job.status === 'failed' ? renderJobError(job.error) : '';
+    const errorMsg = renderJobError(job.storage_error || (['failed', 'publish_failed', 'export_failed'].includes(job.status) ? job.error : ''));
 
     const dl = job._download;
     const dlPct = dl ? clampPct(dl.pct ?? 0) : 0;
@@ -296,8 +310,7 @@ export function renderJobs() {
 
 // fetchAllJobs and syncSettings are injected from main.js to avoid circular
 // imports. syncSettings pushes the panel's current values to the server before a
-// retry, so 重试 honours a setting the user just changed - which is usually why
-// they are retrying at all.
+// computation retry. Restoring saved results needs no translation settings.
 export function installJobAreaHandlers(fetchAllJobs, syncSettings = null) {
   jobArea.addEventListener('click', async e => {
     const pending = e.target.closest('[data-remove-pending]');
@@ -360,7 +373,8 @@ export function installJobAreaHandlers(fetchAllJobs, syncSettings = null) {
       const job = state.jobs[retry.dataset.retry];
       if (job?.spec) {
         try {
-          if (syncSettings) await syncSettings();
+          const deliveryRetry = ['save_failed', 'publish_failed', 'export_failed'].includes(job.status);
+          if (syncSettings && !deliveryRetry) await syncSettings();
           const r = await fetch(`/api/jobs/${retry.dataset.retry}/retry`, { method: 'POST' });
           if (r.ok) {
             const retried = await r.json();

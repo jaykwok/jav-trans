@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from llm import token_budget
 from llm import translator
 from llm.backends import openai_compat
 
@@ -158,7 +159,7 @@ def test_a_generic_endpoint_gets_the_strict_schema(monkeypatch):
     assert "tools" not in request
     assert "web_search_options" not in request
     assert "include_reasoning" not in request
-    assert request["max_output_tokens"] == translator.TRANSLATION_MAX_TOKENS
+    assert request["max_output_tokens"] == token_budget.CONFIGURED_MAX_TOKENS
     assert request["temperature"] == translator.TRANSLATION_TEMPERATURE
     assert request["top_p"] == translator.TRANSLATION_TOP_P
 
@@ -477,7 +478,7 @@ def test_responses_progress_translating_done(monkeypatch):
     assert requests[0]["reasoning"] == {"effort": "low"}
     assert requests[0]["input"][0]["role"] == "system"
     assert requests[0]["input"][0]["content"][0]["type"] == "input_text"
-    assert requests[0]["max_output_tokens"] == translator.TRANSLATION_MAX_TOKENS
+    assert requests[0]["max_output_tokens"] == token_budget.CONFIGURED_MAX_TOKENS
     phases = [event["phase"] for event in events]
     assert phases[0] == "thinking"
     assert "translating" in phases
@@ -540,7 +541,7 @@ def test_grok_responses_uses_standard_openai_shape(monkeypatch):
         text_format["schema"]["properties"]["translations"]["items"]["required"]
         == ["id", "text"]
     )
-    assert request["max_output_tokens"] == translator.TRANSLATION_MAX_TOKENS
+    assert request["max_output_tokens"] == token_budget.CONFIGURED_MAX_TOKENS
     assert request["temperature"] == translator.TRANSLATION_TEMPERATURE
     assert request["top_p"] == translator.TRANSLATION_TOP_P
     assert "max_tokens" not in request

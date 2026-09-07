@@ -238,7 +238,6 @@ class TestContinuityCountsReachTheCuePlan:
         cues, summary = main._prepare_translation_cues(
             [_long_cue()],
             subtitle_options=SubtitleOptions(),
-            bilingual=False,
         )
 
         assert len(cues) > 1
@@ -264,7 +263,6 @@ class TestContinuityCountsReachTheCuePlan:
         cues, summary = main._prepare_translation_cues(
             [_long_cue(start=0.0, end=3.0, text="はい")],
             subtitle_options=SubtitleOptions(),
-            bilingual=False,
         )
 
         assert len(cues) == 1

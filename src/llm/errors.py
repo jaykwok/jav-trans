@@ -85,6 +85,25 @@ class MaxTokensRejectedError(TranslationError):
         self.learnable = bool(learnable)
 
 
+# The failures no retry, no narrowing and no tier change can help, in the order
+# they tend to appear: the caller asked to stop, the instance this task held is
+# gone, the provider judged the text that was sent. Each class already says so
+# in its own docstring; naming them together is what lets a multi-stage caller
+# ask the question once instead of remembering three answers.
+#
+# The repair pass is why this exists. Its per-stage `except Exception` caught a
+# content refusal, escalated the reasoning tier, reissued the same text, and
+# reported `translation_repair_failed` - a documented terminal condition turned
+# into a generic one, with a second refusal paid for on the way. Anything listed
+# here propagates through every stage unchanged, so the type that reaches the
+# caller is the type that was raised.
+TERMINAL_TRANSLATION_ERRORS: tuple[type[BaseException], ...] = (
+    TranslationCancelledError,
+    BackendLeaseInvalidatedError,
+    ContentPolicyRefusalError,
+)
+
+
 class ResponseTruncatedError(TranslationError):
     """The model stopped because it hit this request's output-token budget.
 

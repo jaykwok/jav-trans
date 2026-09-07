@@ -1,6 +1,7 @@
 import os
 import re
 
+from core.typed_config import env_float
 from subtitles.options import BASE_FPS
 from subtitles.ja_style import (
     count_banned_ja_punctuation,
@@ -16,26 +17,19 @@ from subtitles.zh_style import (
 )
 
 
-def _env_float(key: str, default: float) -> float:
-    try:
-        return float(os.getenv(key, str(default)))
-    except (ValueError, TypeError):
-        return default
-
-
 def _append_asr_generation_warnings(
     warnings: list[str],
     *,
     asr_generation_error_count: int,
     asr_generation_overflow_count: int,
 ) -> None:
-    if asr_generation_error_count > _env_float("QC_MAX_ASR_GENERATION_ERRORS", 0.0):
+    if asr_generation_error_count > env_float("QC_MAX_ASR_GENERATION_ERRORS", 0.0):
         warnings.append(
-            f"asr_generation_error_count={asr_generation_error_count} > QC_MAX_ASR_GENERATION_ERRORS={_env_float('QC_MAX_ASR_GENERATION_ERRORS', 0.0):.0f}"
+            f"asr_generation_error_count={asr_generation_error_count} > QC_MAX_ASR_GENERATION_ERRORS={env_float('QC_MAX_ASR_GENERATION_ERRORS', 0.0):.0f}"
         )
-    if asr_generation_overflow_count > _env_float("QC_MAX_ASR_GENERATION_OVERFLOWS", 0.0):
+    if asr_generation_overflow_count > env_float("QC_MAX_ASR_GENERATION_OVERFLOWS", 0.0):
         warnings.append(
-            f"asr_generation_overflow_count={asr_generation_overflow_count} > QC_MAX_ASR_GENERATION_OVERFLOWS={_env_float('QC_MAX_ASR_GENERATION_OVERFLOWS', 0.0):.0f}"
+            f"asr_generation_overflow_count={asr_generation_overflow_count} > QC_MAX_ASR_GENERATION_OVERFLOWS={env_float('QC_MAX_ASR_GENERATION_OVERFLOWS', 0.0):.0f}"
         )
 
 
@@ -383,12 +377,12 @@ _SPEC_SHARE_THRESHOLDS = {
 
 def _append_spec_warnings(warnings: list[str], spec_stats: dict) -> None:
     for key, env_name in _SPEC_COUNT_THRESHOLDS.items():
-        limit = _env_float(env_name, 0.0)
+        limit = env_float(env_name, 0.0)
         value = spec_stats.get(key, 0)
         if value > limit:
             warnings.append(f"{key}={value} > {env_name}={limit:.0f}")
     for key, (env_name, default) in _SPEC_SHARE_THRESHOLDS.items():
-        limit = _env_float(env_name, default)
+        limit = env_float(env_name, default)
         value = float(spec_stats.get(key, 0.0))
         if value > limit:
             warnings.append(f"{key}={value:.3f} > {env_name}={limit:.3f}")
@@ -763,29 +757,29 @@ def compute_quality_report(
 
     # Threshold checks
     warnings: list[str] = []
-    if empty_zh_ratio > _env_float("QC_MAX_EMPTY_ZH", 0.02):
+    if empty_zh_ratio > env_float("QC_MAX_EMPTY_ZH", 0.02):
         warnings.append(
-            f"empty_zh_ratio={empty_zh_ratio:.3f} > QC_MAX_EMPTY_ZH={_env_float('QC_MAX_EMPTY_ZH', 0.02)}"
+            f"empty_zh_ratio={empty_zh_ratio:.3f} > QC_MAX_EMPTY_ZH={env_float('QC_MAX_EMPTY_ZH', 0.02)}"
         )
-    if repetition_ratio > _env_float("QC_MAX_REPETITION", 0.05):
+    if repetition_ratio > env_float("QC_MAX_REPETITION", 0.05):
         warnings.append(
-            f"repetition_ratio={repetition_ratio:.3f} > QC_MAX_REPETITION={_env_float('QC_MAX_REPETITION', 0.05)}"
+            f"repetition_ratio={repetition_ratio:.3f} > QC_MAX_REPETITION={env_float('QC_MAX_REPETITION', 0.05)}"
         )
-    if kana_only_ratio > _env_float("QC_MAX_KANA_ONLY", 0.30):
+    if kana_only_ratio > env_float("QC_MAX_KANA_ONLY", 0.30):
         warnings.append(
-            f"kana_only_ratio={kana_only_ratio:.3f} > QC_MAX_KANA_ONLY={_env_float('QC_MAX_KANA_ONLY', 0.30)}"
+            f"kana_only_ratio={kana_only_ratio:.3f} > QC_MAX_KANA_ONLY={env_float('QC_MAX_KANA_ONLY', 0.30)}"
         )
-    if short_segment_ratio > _env_float("QC_MAX_SHORT_SEG", 0.15):
+    if short_segment_ratio > env_float("QC_MAX_SHORT_SEG", 0.15):
         warnings.append(
-            f"short_segment_ratio={short_segment_ratio:.3f} > QC_MAX_SHORT_SEG={_env_float('QC_MAX_SHORT_SEG', 0.15)}"
+            f"short_segment_ratio={short_segment_ratio:.3f} > QC_MAX_SHORT_SEG={env_float('QC_MAX_SHORT_SEG', 0.15)}"
         )
-    if per_min_subtitle_count > _env_float("QC_MAX_PER_MIN", 8.0):
+    if per_min_subtitle_count > env_float("QC_MAX_PER_MIN", 8.0):
         warnings.append(
-            f"per_min_subtitle_count={per_min_subtitle_count:.1f} > QC_MAX_PER_MIN={_env_float('QC_MAX_PER_MIN', 8.0)}"
+            f"per_min_subtitle_count={per_min_subtitle_count:.1f} > QC_MAX_PER_MIN={env_float('QC_MAX_PER_MIN', 8.0)}"
         )
-    if glossary_hit_rate is not None and glossary_hit_rate < _env_float("QC_MIN_GLOSSARY_HIT", 0.80):
+    if glossary_hit_rate is not None and glossary_hit_rate < env_float("QC_MIN_GLOSSARY_HIT", 0.80):
         warnings.append(
-            f"glossary_hit_rate={glossary_hit_rate:.3f} < QC_MIN_GLOSSARY_HIT={_env_float('QC_MIN_GLOSSARY_HIT', 0.80)}"
+            f"glossary_hit_rate={glossary_hit_rate:.3f} < QC_MIN_GLOSSARY_HIT={env_float('QC_MIN_GLOSSARY_HIT', 0.80)}"
         )
     if overlap_stats["subtitle_overlap_count"] > 0:
         warnings.append(

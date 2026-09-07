@@ -24,6 +24,8 @@ checkpoint digest.
 import hashlib
 import json
 import os
+
+from core.typed_config import env_bool, env_text
 import uuid
 import wave
 from pathlib import Path
@@ -37,19 +39,19 @@ CACHE_SCHEMA = "asr_result_cache_v1"
 
 
 def _env_text(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
+    return env_text(name, default)
 
 
 def _env_lower(name: str, default: str = "") -> str:
-    return _env_text(name, default).lower()
+    return env_text(name, default, lower=True)
 
 
 def result_cache_enabled() -> bool:
-    return _env_lower("ASR_RESULT_CACHE_ENABLED", "1") not in {"0", "false", "no", "off"}
+    return env_bool("ASR_RESULT_CACHE_ENABLED", True)
 
 
 def result_cache_root() -> Path:
-    return Path(os.getenv("ASR_RESULT_CACHE_ROOT", Path("tmp") / "asr_cache")).resolve()
+    return Path(env_text("ASR_RESULT_CACHE_ROOT", str(Path("tmp") / "asr_cache"))).resolve()
 
 
 def _is_timed_out_result(result: dict) -> bool:
@@ -199,15 +201,33 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
             pass
 
 
+def _read_entry(entry_path: Path) -> dict | None:
+    """Read one cache entry, or None for anything that is not a usable one.
+
+    The parse and the shape check belong to the same best-effort boundary. Split
+    apart, a file holding `[]` or `null` parses fine and then raises
+    AttributeError on the first `.get` - out of the `except`, up through
+    finalize, and out of a job that only ever consulted an accelerator. A cache
+    is allowed to be a miss; it is not allowed to be a source of failure.
+    """
+    try:
+        if not entry_path.exists():
+            return None
+        payload = json.loads(entry_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def lookup(chunk_path: str | Path) -> dict | None:
     if not result_cache_enabled():
         return None
     try:
         entry_path = _cache_dir(model_signature()) / f"{chunk_audio_sha256(chunk_path)}.json"
-        if not entry_path.exists():
-            return None
-        payload = json.loads(entry_path.read_text(encoding="utf-8"))
     except Exception:
+        return None
+    payload = _read_entry(entry_path)
+    if payload is None:
         return None
     if payload.get("schema") != CACHE_SCHEMA:
         return None
@@ -367,10 +387,10 @@ def finalize_lookup(chunk_path: str | Path, *, text: str) -> tuple[dict, list[st
         return None
     try:
         entry_path = _cache_dir(signature) / f"{chunk_audio_sha256(chunk_path)}.json"
-        if not entry_path.exists():
-            return None
-        payload = json.loads(entry_path.read_text(encoding="utf-8"))
     except Exception:
+        return None
+    payload = _read_entry(entry_path)
+    if payload is None:
         return None
     if payload.get("schema") != CACHE_SCHEMA or payload.get("stage") != "final":
         return None

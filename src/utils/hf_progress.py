@@ -98,16 +98,44 @@ def _current_video() -> str:
         return ""
 
 
-def _emit(phase: str, extra: dict[str, Any]) -> None:
+def current_identity() -> tuple[str, str, str]:
+    """``(job_id, run_id, video)`` as this thread would emit them right now.
+
+    Captured by anyone about to hand work to another thread, and by every
+    progress bar as it is built: a download reports for minutes, and the run it
+    reports under is the one that asked for it, not whichever run happens to be
+    current when a chunk lands.
+    """
+    return (_current_job_id(), _current_run_id(), _current_video())
+
+
+def adopt_identity(identity: tuple[str, str, str]) -> None:
+    """Re-establish a captured identity on this thread."""
+    job_id, run_id, video = identity
+    propagate_job_id_to_current_thread(job_id, run_id)
     try:
         from core import events
 
+        events._thread_local.video = video
+    except Exception:
+        pass
+
+
+def _emit(
+    phase: str,
+    extra: dict[str, Any],
+    identity: tuple[str, str, str] | None = None,
+) -> None:
+    try:
+        from core import events
+
+        job_id, run_id, video = identity if identity is not None else current_identity()
         events.emit(
             {
                 "ts": _event_ts(),
-                "job_id": _current_job_id(),
-                "run_id": _current_run_id(),
-                "video": _current_video(),
+                "job_id": job_id,
+                "run_id": run_id,
+                "video": video,
                 "stage": "model_download",
                 "phase": phase,
                 "extra": extra,
@@ -190,13 +218,20 @@ class HfDownloadProgressTqdm(_base_tqdm):  # type: ignore[misc, valid-type]
         self._hf_progress_last_emit = 0.0
         self._hf_progress_last_pct = -1
         self._hf_progress_finished = False
+        # Bound once, here. huggingface_hub builds the bar on the thread that
+        # asked for the file but drives `update` from its own transfer threads,
+        # where neither the thread-local nor the module-level fallback describes
+        # the run that wanted this model - and the fallback is shared, so a
+        # concurrent job's ASR download would otherwise be the identity a
+        # translation model's progress arrived under.
+        self._hf_identity = current_identity()
         super().__init__(*args, **kwargs)
         if self._hf_should_emit:
             extra: dict[str, Any] = {"file": self._hf_progress_file}
             size_mb = _mb(self._hf_progress_total)
             if size_mb is not None:
                 extra["size_mb"] = size_mb
-            _emit("start", extra)
+            _emit("start", extra, self._hf_identity)
 
     @property
     def _hf_should_emit(self) -> bool:
@@ -224,6 +259,7 @@ class HfDownloadProgressTqdm(_base_tqdm):  # type: ignore[misc, valid-type]
                             2,
                         ),
                     },
+                    self._hf_identity,
                 )
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -239,6 +275,7 @@ class HfDownloadProgressTqdm(_base_tqdm):  # type: ignore[misc, valid-type]
                     ),
                     "error": str(exc_value or exc_type.__name__),
                 },
+                self._hf_identity,
             )
         return super().__exit__(exc_type, exc_value, traceback)
 
@@ -277,12 +314,36 @@ class HfDownloadProgressTqdm(_base_tqdm):  # type: ignore[misc, valid-type]
         speed_mb = _mb(rate)
         if speed_mb is not None:
             extra["speed_mb"] = speed_mb
-        _emit("progress", extra)
+        _emit("progress", extra, self._hf_identity)
 
 
-def tqdm_class() -> type:
+class DownloadCancelled(RuntimeError):
+    """Raised through the progress bar to stop a download that is under way.
+
+    huggingface_hub offers no cancellation token, but it does call into the
+    progress bar as bytes land, so this is the one place a caller's decision can
+    reach a transfer already in flight. Best effort by design: the exception has
+    to travel out through code we do not own, and a partial file is resumable,
+    so nothing is lost if it does not.
+    """
+
+
+def tqdm_class(cancel_event=None) -> type:
     """The tqdm subclass to pass as ``tqdm_class=`` to huggingface_hub's
     ``snapshot_download``/``hf_hub_download``. Both accept the kwarg directly
     on the huggingface-hub version this project pins, so no monkeypatching of
-    huggingface_hub internals or version-compatibility fallback is needed."""
-    return HfDownloadProgressTqdm
+    huggingface_hub internals or version-compatibility fallback is needed.
+
+    With a `cancel_event`, the bar also carries the caller's decision into the
+    transfer: the next chunk that reports progress raises instead of continuing.
+    """
+    if cancel_event is None:
+        return HfDownloadProgressTqdm
+
+    class _CancellableHfDownloadProgressTqdm(HfDownloadProgressTqdm):
+        def update(self, n=1):
+            if cancel_event.is_set():
+                raise DownloadCancelled("下载已取消")
+            return super().update(n)
+
+    return _CancellableHfDownloadProgressTqdm

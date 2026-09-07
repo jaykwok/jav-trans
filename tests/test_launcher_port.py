@@ -95,13 +95,24 @@ def test_giving_up_returns_the_preferred_port() -> None:
         held.close()
 
 
-def test_the_two_defaults_do_not_collide() -> None:
+def test_the_two_defaults_do_not_collide(monkeypatch) -> None:
+    from core.typed_config import env_int
+
     source = (PROJECT_ROOT / "launcher.py").read_text(encoding="utf-8")
-    assert 'os.getenv("JAV_TRANS_PORT", "2233")' in source
-    assert 'os.getenv("JAV_TRANS_EVENTS_PORT", "2234")' in source
-    # The console port and the SSE port are resolved independently, so they can
-    # land on the same number; the launcher has to notice.
-    assert "if EVENTS_PORT == PORT:" in source
+    start = source.index("\nPORT = ")
+    declarations = compile(source[start:source.index("\n\n", start)], "launcher.py", "exec")
+    namespace = {"env_int": env_int, "_first_free_port": lambda preferred: preferred}
+    monkeypatch.delenv("JAV_TRANS_PORT", raising=False)
+    monkeypatch.delenv("JAV_TRANS_EVENTS_PORT", raising=False)
+    exec(declarations, namespace)
+    assert (namespace["PORT"], namespace["EVENTS_PORT"]) == (2233, 2234)
+    # Equal requested ports at the upper boundary must also remain distinct,
+    # without ever passing an out-of-range number to bind().
+    monkeypatch.setenv("JAV_TRANS_PORT", "65535")
+    monkeypatch.setenv("JAV_TRANS_EVENTS_PORT", "65535")
+    exec(declarations, namespace)
+    assert namespace["PORT"] == 65535
+    assert 1 <= namespace["EVENTS_PORT"] < 65535
 
 
 def test_the_resolved_events_port_is_published_not_defaulted() -> None:
