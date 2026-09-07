@@ -44,6 +44,7 @@ from asr.alignment import (  # noqa: E402
 from audio.loading import load_audio_16k_mono  # noqa: E402
 from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
 from asr.encoder_features import EncoderFeatureConfig, Qwen3AsrEncoder  # noqa: E402
+from tools.align.checkpoint_io import resolve_device  # noqa: E402
 
 SAMPLE_RATE = 16000
 FEATURE_DIM = 2048
@@ -219,6 +220,7 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=20260731)
     args = parser.parse_args()
+    device = resolve_device()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -308,7 +310,7 @@ def main() -> None:
 
     apply_vram_safety_cap(0.95)
     extractor = Qwen3AsrEncoder(
-        EncoderFeatureConfig(model_path=args.model_path or "", device="cuda")
+        EncoderFeatureConfig(model_path=args.model_path or "", device=str(device))
     )
 
     index_path = output_dir / "index.jsonl"

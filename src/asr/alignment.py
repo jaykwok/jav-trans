@@ -1112,6 +1112,13 @@ class AlignmentHead:
     def load(cls, checkpoint_path: str, *, device=None, blank_bias=None) -> "AlignmentHead":
         import torch
 
+        from utils.gpu_safety import resolve_inference_device
+
+        resolved = (
+            device
+            if device is not None
+            else resolve_inference_device("auto", stage="CTC alignment")
+        )
         resolved_path = resolve_alignment_head_path(checkpoint_path)
         # `weights_only=True` because this file is not always one the user made:
         # `hf:<repo>@<sha>#<file>` downloads it, and the permissive loader
@@ -1156,9 +1163,6 @@ class AlignmentHead:
             frame_classes=len(frame_classes),
         )
         module.load_state_dict(payload["state_dict"])
-        resolved = device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
         module.to(resolved).eval()
         return cls(
             module,

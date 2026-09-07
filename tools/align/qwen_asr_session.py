@@ -21,6 +21,8 @@ from typing import Any
 
 import numpy as np
 
+from tools.align.checkpoint_io import resolve_device
+
 
 @dataclass(frozen=True)
 class QwenAsrSession:
@@ -38,6 +40,8 @@ class QwenAsrSession:
 
     @classmethod
     def load(cls, *, download: bool = True, vram_cap: float = 0.95) -> "QwenAsrSession":
+        device = resolve_device()
+
         import torch
         from transformers import AutoModelForMultimodalLM, AutoProcessor
 
@@ -51,8 +55,7 @@ class QwenAsrSession:
             active_qwen_asr_model_id(),
             download=download,
         )
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        dtype = torch.bfloat16
         processor = AutoProcessor.from_pretrained(model_spec)
         model = AutoModelForMultimodalLM.from_pretrained(
             model_spec, dtype=dtype, device_map=str(device)

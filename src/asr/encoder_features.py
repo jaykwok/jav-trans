@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 
 from asr.backends.qwen import QWEN_ASR_REPO_ID
+from utils.gpu_safety import resolve_inference_device
 from utils.model_paths import resolve_model_spec
 
 
@@ -63,10 +64,13 @@ class Qwen3AsrEncoder:
     """
 
     def __init__(self, config: EncoderFeatureConfig | None = None) -> None:
-        import torch
+        self.config = config or EncoderFeatureConfig()
+        self.device = resolve_inference_device(
+            self.config.device, stage="Qwen3-ASR encoder"
+        )
+
         from transformers import AutoModelForMultimodalLM, AutoProcessor
 
-        self.config = config or EncoderFeatureConfig()
         self.repo_id = self.config.repo_id.strip()
         self.model_path = resolve_model_spec(
             self.config.model_path or None,
@@ -81,10 +85,6 @@ class Qwen3AsrEncoder:
                 "or rerun without --no-download."
             )
         self.torch_dtype = torch_dtype_from_name(self.config.dtype)
-        want_cuda = self.config.device != "cpu"
-        self.device = torch.device(
-            self.config.device if not want_cuda or torch.cuda.is_available() else "cpu"
-        )
         model_kwargs: dict[str, Any] = {
             "dtype": self.torch_dtype,
             "device_map": str(self.device),

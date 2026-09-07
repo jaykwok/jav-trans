@@ -13,8 +13,9 @@ having decided the file is theirs.
 
 **`torch.device("cuda" if torch.cuda.is_available() else "cpu")`** turns a
 missing driver into a training run that is a hundred times slower and finishes
-looking exactly like a successful one. A CPU run is a legitimate thing to want -
-a smoke test on a laptop - but it has to be the thing that was asked for.
+looking exactly like a successful one. Training, feature extraction and batch
+evaluation require CUDA. Tiny tensor tests can use CPU without making it an
+option in the real workflow.
 """
 
 from __future__ import annotations
@@ -29,8 +30,7 @@ TRUST_HELP = (
 )
 
 DEVICE_HELP = (
-    "auto (default) uses CUDA and fails when it is unavailable; cuda requires "
-    "it; cpu asks for it deliberately"
+    "auto (default) and cuda both require CUDA; CPU execution is unsupported"
 )
 
 
@@ -40,13 +40,7 @@ def add_checkpoint_arguments(parser: argparse.ArgumentParser) -> None:
 
 def add_device_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--device", choices=("auto", "cuda", "cpu"), default="auto", help=DEVICE_HELP
-    )
-    parser.add_argument(
-        "--allow-cpu",
-        action="store_true",
-        help="permit falling back to CPU when CUDA is unavailable; without it "
-        "an unavailable GPU is an error rather than a very slow run",
+        "--device", choices=("auto", "cuda"), default="auto", help=DEVICE_HELP
     )
 
 
@@ -67,28 +61,18 @@ def load_checkpoint(path: str | Path, *, trusted: bool = False) -> Any:
         ) from exc
 
 
-def resolve_device(requested: str = "auto", *, allow_cpu: bool = False):
-    """The device to train on, or an error saying why there is not one.
+def resolve_device(requested: str = "auto"):
+    """Require CUDA before a tool reads data, downloads weights or starts work."""
+    from utils.gpu_safety import resolve_inference_device
 
-    `auto` means "the GPU this workflow is written for". It does not mean "CPU
-    if that is all there is": a silent fallback is how a run that was supposed to
-    take two hours takes a week and is only noticed at the end.
-    """
-    import torch
-
-    choice = str(requested or "auto").strip().lower()
-    if choice == "cpu":
-        return torch.device("cpu")
-    available = torch.cuda.is_available()
-    if available:
-        return torch.device("cuda")
-    if choice == "auto" and allow_cpu:
-        print("[device] CUDA 不可用，按 --allow-cpu 在 CPU 上运行（会非常慢）")
-        return torch.device("cpu")
-    raise SystemExit(
-        "CUDA 不可用。这个流程是为 GPU 写的，静默退回 CPU 会把两小时的训练变成"
-        "几天而不报错。确认驱动/环境后重试，或显式使用 --device cpu / --allow-cpu。"
-    )
+    try:
+        return resolve_inference_device(requested, stage="alignment tools")
+    except RuntimeError as exc:
+        raise SystemExit(
+            "对齐训练与评估必须使用 CUDA，不能使用 CPU。"
+            "请检查 NVIDIA 驱动和项目 PyTorch CUDA 环境后重试。"
+            f"（{exc}）"
+        ) from exc
 
 
 __all__ = [

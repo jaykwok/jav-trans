@@ -28,17 +28,18 @@ DEFAULT_HOST_MEMORY_RATIO = 0.95
 
 
 def resolve_inference_device(requested: str | None, *, stage: str):
-    """Resolve a model device without silently falling back from CUDA to CPU."""
+    """Require CUDA for model workloads, including an explicit device choice."""
     import torch
 
     value = str(requested or "auto").strip().lower()
     if value == "auto":
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                f"{stage} requires CUDA for runtime inference; CPU fallback is disabled"
-            )
         value = "cuda"
-    if value.startswith("cuda") and not torch.cuda.is_available():
+    if not value.startswith("cuda"):
+        raise RuntimeError(
+            f"{stage} requires CUDA; device {value!r} is unsupported; "
+            "CPU fallback is disabled"
+        )
+    if not torch.cuda.is_available():
         raise RuntimeError(
             f"{stage} requested CUDA but CUDA is unavailable; CPU fallback is disabled"
         )

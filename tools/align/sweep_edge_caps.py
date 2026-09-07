@@ -145,7 +145,9 @@ def summarize(errors: list[float]) -> dict:
     }
 
 
-def load_head(checkpoint: Path, model_path: str, *, trusted: bool, device_choice: str, allow_cpu: bool):
+def load_head(checkpoint: Path, model_path: str, *, trusted: bool, device_choice: str):
+    device = resolve_device(device_choice)
+
     import torch
 
     apply_vram_safety_cap(0.95)
@@ -154,7 +156,6 @@ def load_head(checkpoint: Path, model_path: str, *, trusted: bool, device_choice
         raise SystemExit(f"not an alignment checkpoint: {payload.get('schema')!r}")
     vocab = AlignmentVocab.from_payload(payload["vocab"])
     upsample = int(payload["upsample"])
-    device = resolve_device(device_choice, allow_cpu=allow_cpu)
     head = build_head(
         vocab_size=vocab.size,
         input_dim=int(payload.get("input_dim", 2048)),
@@ -205,6 +206,7 @@ def main() -> None:
     add_checkpoint_arguments(parser)
     add_device_arguments(parser)
     args = parser.parse_args()
+    resolve_device(args.device)
 
     onset_caps = [float(p) for p in str(args.onset_caps).split(",") if p.strip()]
     coda_caps = [float(p) for p in str(args.coda_caps).split(",") if p.strip()]
@@ -233,7 +235,6 @@ def main() -> None:
         args.model_path,
         trusted=args.trust_checkpoint,
         device_choice=args.device,
-        allow_cpu=args.allow_cpu,
     )
 
     rows = read_jsonl(resolve(args.composites))

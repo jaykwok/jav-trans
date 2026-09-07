@@ -6,8 +6,8 @@ these scripts take the path from the command line. And
 `"cuda" if torch.cuda.is_available() else "cpu"` turns a missing driver into a
 run that is a hundred times slower and looks like a success at the end of it.
 
-Neither is wrong to want - a file you produced, a smoke test on a laptop - but
-both have to be asked for.
+Permissive loading requires explicit trust. Real training and evaluation
+require CUDA; tiny tensor unit tests do not need a CPU workflow option.
 """
 
 from __future__ import annotations
@@ -53,23 +53,22 @@ def with_cuda(monkeypatch):
 
 
 class TestChoosingADevice:
-    def test_a_missing_gpu_is_an_error_not_a_slower_run(self, without_cuda):
+    @pytest.mark.parametrize("requested", ["auto", "cuda"])
+    def test_a_missing_gpu_is_an_error_not_a_slower_run(self, without_cuda, requested):
         with pytest.raises(SystemExit, match="CUDA"):
-            checkpoint_io.resolve_device("auto")
+            checkpoint_io.resolve_device(requested)
 
-    def test_cpu_is_available_to_whoever_asks_for_it(self, without_cuda):
-        assert checkpoint_io.resolve_device("cpu") == "cpu"
-        assert checkpoint_io.resolve_device("auto", allow_cpu=True) == "cpu"
+    def test_cpu_is_refused_even_when_explicitly_requested(self, without_cuda):
+        with pytest.raises(SystemExit, match="CUDA"):
+            checkpoint_io.resolve_device("cpu")
 
-    def test_pinning_cuda_still_fails_when_there_is_none(self, without_cuda):
-        # `--device cuda --allow-cpu` is a contradiction, and the explicit half
-        # of it wins: the run asked for the GPU by name.
-        with pytest.raises(SystemExit):
-            checkpoint_io.resolve_device("cuda", allow_cpu=True)
+    def test_cpu_is_not_reinterpreted_as_cuda_when_a_gpu_exists(self, with_cuda):
+        with pytest.raises(SystemExit, match="CUDA"):
+            checkpoint_io.resolve_device("cpu")
 
     def test_a_present_gpu_is_used(self, with_cuda):
         assert checkpoint_io.resolve_device("auto") == "cuda"
-        assert checkpoint_io.resolve_device("cpu") == "cpu"
+        assert checkpoint_io.resolve_device("cuda") == "cuda"
 
 
 class TestLoadingACheckpoint:

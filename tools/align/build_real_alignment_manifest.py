@@ -44,6 +44,7 @@ from asr.alignment import ENCODER_FPS, normalize_text  # noqa: E402
 from asr.cue_features import build_candidate  # noqa: E402
 from asr.postgate import PostGateConfig, review  # noqa: E402
 from audio.loading import load_audio_16k_mono  # noqa: E402
+from tools.align.checkpoint_io import resolve_device  # noqa: E402
 from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
 
 MANIFEST_SCHEMA = "real_alignment_clip_manifest_v1"
@@ -101,6 +102,7 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=160)
     parser.add_argument("--seed", type=int, default=20260731)
     args = parser.parse_args()
+    device = resolve_device()
 
     import torch
     from transformers import AutoModelForMultimodalLM, AutoProcessor
@@ -133,8 +135,7 @@ def main() -> None:
     model_spec = resolve_model_spec(
         active_qwen_asr_model_path() or None, active_qwen_asr_model_id(), download=True
     )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    dtype = torch.bfloat16
     processor = AutoProcessor.from_pretrained(model_spec)
     model = AutoModelForMultimodalLM.from_pretrained(
         model_spec, dtype=dtype, device_map=str(device)

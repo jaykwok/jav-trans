@@ -252,8 +252,9 @@ def measure(
     limit: int,
     trusted: bool = False,
     device_choice: str = "auto",
-    allow_cpu: bool = False,
 ) -> dict[str, object]:
+    device = resolve_device(device_choice)
+
     import torch
 
     from tools.align.train_ctc_aligner import FeatureCache
@@ -264,7 +265,6 @@ def measure(
     vocab = AlignmentVocab.from_payload(payload["vocab"])
     upsample = int(payload["upsample"])
     frame_s = ENCODER_FRAME_S / float(upsample)
-    device = resolve_device(device_choice, allow_cpu=allow_cpu)
     # This measurement is entirely about the CTC blank column and does not read
     # the frame classes at all - but a v2 checkpoint carries the extra layer, and
     # `load_state_dict` is strict, so the head has to be built with it or the
@@ -472,7 +472,6 @@ def main() -> None:
         checkpoint=resolve_repo_path(args.checkpoint),
         trusted=args.trust_checkpoint,
         device_choice=args.device,
-        allow_cpu=args.allow_cpu,
         cache_dir=resolve_repo_path(args.cache_dir),
         teacher_results=resolve_repo_path(args.teacher_results),
         teacher_manifest=resolve_repo_path(args.teacher_manifest),

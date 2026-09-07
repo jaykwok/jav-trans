@@ -26,6 +26,7 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
 from asr.alignment import AlignmentHead, normalize_text  # noqa: E402
 from asr.encoder_features import qwen3_asr_audio_output_lengths  # noqa: E402
 from audio.loading import load_audio_16k_mono  # noqa: E402
+from tools.align.checkpoint_io import resolve_device  # noqa: E402
 from tools.audits.audit_nav import audit_generated_at  # noqa: E402
 from utils.gpu_safety import apply_vram_safety_cap  # noqa: E402
 
@@ -70,6 +71,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--seed", type=int, default=20260809)
     args = parser.parse_args()
+    device = resolve_device()
 
     import torch
     from transformers import AutoModelForMultimodalLM, AutoProcessor
@@ -98,8 +100,7 @@ def main() -> None:
     model_spec = resolve_model_spec(
         active_qwen_asr_model_path() or None, active_qwen_asr_model_id(), download=True
     )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    dtype = torch.bfloat16
     processor = AutoProcessor.from_pretrained(model_spec)
     model = AutoModelForMultimodalLM.from_pretrained(
         model_spec, dtype=dtype, device_map=str(device)

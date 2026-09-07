@@ -595,6 +595,7 @@ def main() -> None:
     add_checkpoint_arguments(parser)
     add_device_arguments(parser)
     args = parser.parse_args()
+    device = resolve_device(args.device)
 
     # Scoped by cache rather than by domain. A domain is a mixture label used to
     # balance the loss, and it can legitimately gather several caches - galgame
@@ -719,9 +720,6 @@ def main() -> None:
         count for char, count in counts.items() if is_acoustic_char(char)
     )
 
-    # Explicit, because a training run that silently moves to CPU does not fail
-    # - it takes days and looks like a success at the end of them.
-    device = resolve_device(args.device, allow_cpu=args.allow_cpu)
     head = build_head(
         vocab_size=vocab.size,
         hidden_dim=args.hidden_dim,

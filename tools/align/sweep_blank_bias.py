@@ -119,6 +119,7 @@ def main() -> None:
     add_checkpoint_arguments(parser)
     add_device_arguments(parser)
     args = parser.parse_args()
+    device = resolve_device(args.device)
 
     biases = sorted(set(args.bias or [0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]))
     if 0.0 not in biases:
@@ -132,7 +133,6 @@ def main() -> None:
         raise SystemExit(f"not an alignment checkpoint: {payload.get('schema')!r}")
     vocab = AlignmentVocab.from_payload(payload["vocab"])
     upsample = int(payload["upsample"])
-    device = resolve_device(args.device, allow_cpu=args.allow_cpu)
     head = build_head(
         vocab_size=vocab.size,
         input_dim=int(payload.get("input_dim", 2048)),

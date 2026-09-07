@@ -51,6 +51,10 @@ _FEATURE_CHUNK_S = 30.0
 
 
 def _load_asr_model_for_features() -> tuple[Any, Any]:
+    from utils.gpu_safety import resolve_inference_device
+
+    device = resolve_inference_device("cuda", stage="Qwen3-ASR feature extraction")
+
     import torch
     from transformers import AutoModelForMultimodalLM, AutoProcessor
 
@@ -60,8 +64,7 @@ def _load_asr_model_for_features() -> tuple[Any, Any]:
     spec = resolve_model_spec(
         active_qwen_asr_model_path() or None, active_qwen_asr_model_id(), download=True
     )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    dtype = torch.bfloat16
     processor = AutoProcessor.from_pretrained(spec)
     model = AutoModelForMultimodalLM.from_pretrained(
         spec, dtype=dtype, device_map=str(device)
