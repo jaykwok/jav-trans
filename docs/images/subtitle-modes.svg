@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="580" viewBox="0 0 1440 580" role="img" aria-labelledby="title description">
+  <title id="title">同一句对白的日文、译文与双语字幕</title>
+  <desc id="description">自造对白“雨がやんだら、出かけよう。”译为“等雨停了，我们再出发。”。三种输出使用相同的十二至十六秒时间轴，双语日文在上、译文在下。文字经过项目实际 SRT 写入器排版；背景为示意，字体与位置取决于播放器。</desc>
+  <defs>
+    <linearGradient id="backdrop" x2="1" y2="1">
+      <stop stop-color="#172c46"/>
+      <stop offset="1" stop-color="#18152d"/>
+    </linearGradient>
+    <linearGradient id="shade" x2="0" y2="1">
+      <stop stop-color="#070a11" stop-opacity="0"/>
+      <stop offset="1" stop-color="#070a11" stop-opacity=".95"/>
+    </linearGradient>
+  </defs>
+  <rect width="1440" height="580" rx="22" fill="#0c101c"/>
+  <g font-family="Segoe UI, Microsoft YaHei, Noto Sans CJK SC, sans-serif">
+    <text x="32" y="50" font-size="28" font-weight="700" fill="#f1f4ff">同一句对白，三种字幕输出</text>
+    <text x="32" y="82" font-size="17" fill="#a6b3cf">按日语原文断句后翻译 · 共享同一条时间轴 · 自造对白示意</text>
+    <g transform="translate(32 110)">
+      <rect width="448" height="392" rx="16" fill="#151b2b" stroke="#334059"/>
+      <text x="22" y="43" font-size="24" font-weight="700" fill="#e8e7ff">仅日文</text>
+      <text x="426" y="42" text-anchor="end" font-size="16" fill="#b8a3f7">JA</text>
+      <rect x="20" y="66" width="408" height="250" rx="12" fill="url(#backdrop)"/>
+      <path d="M20 219 Q136 151 260 205 T428 185 V304 Q428 316 416 316 H32 Q20 316 20 304Z" fill="#314259" opacity=".42"/>
+      <rect x="20" y="160" width="408" height="156" rx="12" fill="url(#shade)"/>
+      <text x="40" y="98" font-size="15" fill="#a9bad0">sample-a · 00:12 — 00:16</text>
+      <text x="224" y="273" text-anchor="middle" font-size="26" fill="white" stroke="#090d16" stroke-width="3" paint-order="stroke" font-family="Yu Gothic, Meiryo, Noto Sans CJK JP, sans-serif">雨がやんだら 出かけよう</text>
+      <text x="22" y="354" font-size="18" fill="#d8e0f2">保留日语原文</text>
+      <text x="22" y="379" font-size="15" fill="#9daac3">无需配置翻译服务</text>
+    </g>
+    <g transform="translate(496 110)">
+      <rect width="448" height="392" rx="16" fill="#151b2b" stroke="#334059"/>
+      <text x="22" y="43" font-size="24" font-weight="700" fill="#d7f5ff">仅译文</text>
+      <text x="426" y="42" text-anchor="end" font-size="16" fill="#82d8ea">ZH</text>
+      <rect x="20" y="66" width="408" height="250" rx="12" fill="url(#backdrop)"/>
+      <path d="M20 219 Q136 151 260 205 T428 185 V304 Q428 316 416 316 H32 Q20 316 20 304Z" fill="#314259" opacity=".42"/>
+      <rect x="20" y="160" width="408" height="156" rx="12" fill="url(#shade)"/>
+      <text x="40" y="98" font-size="15" fill="#a9bad0">sample-a · 00:12 — 00:16</text>
+      <text x="224" y="273" text-anchor="middle" font-size="28" fill="white" stroke="#090d16" stroke-width="3" paint-order="stroke">等雨停了 我们再出发</text>
+      <text x="22" y="354" font-size="18" fill="#d8e0f2">只显示目标语言</text>
+      <text x="22" y="379" font-size="15" fill="#9daac3">图中以简体中文为例</text>
+    </g>
+    <g transform="translate(960 110)">
+      <rect width="448" height="392" rx="16" fill="#151b2b" stroke="#334059"/>
+      <text x="22" y="43" font-size="24" font-weight="700" fill="#e0f7ef">双语</text>
+      <text x="426" y="42" text-anchor="end" font-size="16" fill="#89ddbf">JA + ZH</text>
+      <rect x="20" y="66" width="408" height="250" rx="12" fill="url(#backdrop)"/>
+      <path d="M20 219 Q136 151 260 205 T428 185 V304 Q428 316 416 316 H32 Q20 316 20 304Z" fill="#314259" opacity=".42"/>
+      <rect x="20" y="160" width="408" height="156" rx="12" fill="url(#shade)"/>
+      <text x="40" y="98" font-size="15" fill="#a9bad0">sample-a · 00:12 — 00:16</text>
+      <g text-anchor="middle" fill="white" stroke="#090d16" stroke-width="3" paint-order="stroke">
+        <text x="224" y="236" font-size="26" font-family="Yu Gothic, Meiryo, Noto Sans CJK JP, sans-serif">雨がやんだら 出かけよう</text>
+        <text x="224" y="278" font-size="28">等雨停了 我们再出发</text>
+      </g>
+      <text x="22" y="354" font-size="18" fill="#d8e0f2">日文在上，译文在下</text>
+      <text x="22" y="379" font-size="15" fill="#9daac3">原文与译文在同一条字幕内</text>
+    </g>
+    <text x="32" y="548" font-size="18" fill="#a6b3cf">SRT 保存文字与时间轴；字体、大小、颜色和位置由播放器决定。</text>
+  </g>
+</svg>
