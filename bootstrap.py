@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.request
 import zipfile
@@ -535,14 +536,47 @@ def run_streaming(command: list[str]) -> int:
         return 1
 
 
+def _read_toml(path: Path) -> tuple[bytes, dict | None]:
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return b"<missing>", None
+    try:
+        return raw, tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return raw, None
+
+
 def lock_digest() -> str:
-    """Identity of the dependency set, so a patched release re-syncs itself."""
+    """Identity of the dependency set, so a patched release re-syncs itself.
+
+    The project's own version number is left out. Every release bumps it in
+    pyproject.toml and in the lock's entry for the project, yet uv records the
+    project as virtual - no build backend, never installed into .venv - so the
+    number changes nothing there. Hashing it made every upgrade look like a
+    dependency change: a sync with nothing to install, preceded by the speed
+    test and the proxy question. The number is only left out when the lock says
+    the project is virtual; a missing or unreadable file is hashed as it is,
+    and the worst a changed digest costs is one sync.
+    """
+    lock_raw, lock = _read_toml(LOCK_PATH)
+    project_raw, project = _read_toml(ROOT / "pyproject.toml")
+    roots = [
+        package
+        for package in (lock or {}).get("package") or []
+        if isinstance(package, dict) and package.get("source") == {"virtual": "."}
+    ]
     digest = hashlib.sha256()
-    for path in (LOCK_PATH, ROOT / "pyproject.toml"):
-        try:
-            digest.update(path.read_bytes())
-        except OSError:
-            digest.update(b"<missing>")
+    if lock is None or project is None or len(roots) != 1:
+        digest.update(lock_raw)
+        digest.update(project_raw)
+        return digest.hexdigest()
+    roots[0].pop("version", None)
+    if isinstance(project.get("project"), dict):
+        project["project"].pop("version", None)
+    for data in (lock, project):
+        digest.update(json.dumps(data, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8"))
+        digest.update(b"\0")
     return digest.hexdigest()
 
 

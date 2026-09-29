@@ -301,6 +301,87 @@ class TestReadiness:
         assert bootstrap.lock_digest() != before
 
 
+class TestVersionOnlyRelease:
+    """Every release bumps the project's own version in pyproject.toml and in
+    the lock. The project is never installed into .venv, so a release that
+    changes nothing else must not look like a dependency change: that costs a
+    pointless sync and, before it, the speed test and the proxy question."""
+
+    @staticmethod
+    def _dependency_files(root: Path, *, version: str = "1.8.2", numpy: str = "2.3.0",
+                          source: str = 'virtual = "."', requirement: str = "numpy>=2") -> None:
+        (root / "pyproject.toml").write_text(
+            f'[project]\nname = "jav-trans"\nversion = "{version}"\ndependencies = ["{requirement}"]\n',
+            encoding="utf-8",
+        )
+        (root / "uv.lock").write_text(
+            'version = 1\nrevision = 3\nrequires-python = ">=3.12"\n\n'
+            f'[[package]]\nname = "jav-trans"\nversion = "{version}"\nsource = {{ {source} }}\n'
+            'dependencies = [{ name = "numpy" }]\n\n'
+            f'[[package]]\nname = "numpy"\nversion = "{numpy}"\n'
+            'source = { registry = "https://pypi.org/simple" }\n',
+            encoding="utf-8",
+        )
+
+    @pytest.fixture
+    def root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+        monkeypatch.setattr(bootstrap, "LOCK_PATH", tmp_path / "uv.lock")
+        return tmp_path
+
+    def test_a_version_bump_keeps_an_installed_environment_current(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        python = root / ".venv" / ("Scripts/python.exe" if bootstrap.os.name == "nt" else "bin/python")
+        python.parent.mkdir(parents=True)
+        python.write_text("", encoding="utf-8")
+        stamp = root / ".venv" / "stamp"
+        monkeypatch.setattr(bootstrap, "VENV_PATH", root / ".venv")
+        monkeypatch.setattr(bootstrap, "STAMP_PATH", stamp)
+        self._dependency_files(root, version="1.8.2")
+        stamp.write_text(bootstrap.lock_digest(), encoding="utf-8")
+        self._dependency_files(root, version="1.8.3")
+        assert bootstrap.environment_is_current() is True
+
+    @pytest.mark.parametrize(
+        "change",
+        [{"numpy": "2.3.1"}, {"requirement": "numpy>=2.3"}],
+        ids=["locked-version", "declared-requirement"],
+    )
+    def test_a_dependency_change_still_forces_a_resync(self, root: Path, change: dict) -> None:
+        self._dependency_files(root)
+        before = bootstrap.lock_digest()
+        self._dependency_files(root, version="1.8.3", **change)
+        assert bootstrap.lock_digest() != before
+
+    def test_the_version_counts_once_the_project_is_installed(self, root: Path) -> None:
+        """An editable install writes the version into .venv; only a virtual
+        project may leave it out."""
+        self._dependency_files(root, source='editable = "."')
+        before = bootstrap.lock_digest()
+        self._dependency_files(root, version="1.8.3", source='editable = "."')
+        assert bootstrap.lock_digest() != before
+
+    def test_the_shipped_dependency_files_ignore_a_version_bump(self, root: Path) -> None:
+        """Against the real files, so a change in uv's lock format that hides
+        the project entry fails here instead of silently re-prompting users."""
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        lock = (ROOT / "uv.lock").read_text(encoding="utf-8")
+        version = bootstrap.tomllib.loads(pyproject)["project"]["version"]
+        (root / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+        (root / "uv.lock").write_text(lock, encoding="utf-8")
+        before = bootstrap.lock_digest()
+
+        project_line = f'version = "{version}"'
+        lock_entry = f'name = "jav-trans"\nversion = "{version}"'
+        assert pyproject.count(project_line) == 1 and lock.count(lock_entry) == 1
+        (root / "pyproject.toml").write_text(pyproject.replace(project_line, 'version = "99.0.0"'), encoding="utf-8")
+        (root / "uv.lock").write_text(
+            lock.replace(lock_entry, 'name = "jav-trans"\nversion = "99.0.0"'), encoding="utf-8"
+        )
+        assert bootstrap.lock_digest() == before
+
+
 class TestUvDiscovery:
     def test_the_bundled_copy_wins_over_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
