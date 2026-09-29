@@ -68,7 +68,7 @@ def server_limits() -> dict[str, int]:
     return {
         "ctx": env_int("LLAMACPP_CTX_SIZE", 1024, minimum=1024, maximum=131072),
         "gpu_layers": env_int("LLAMACPP_N_GPU_LAYERS", 999, minimum=0, maximum=999),
-        "parallel": env_int("LLAMACPP_PARALLEL", 8, minimum=1, maximum=16),
+        "parallel": env_int("LLAMACPP_PARALLEL", 4, minimum=1, maximum=16),
         "startup_s": env_int("LLAMACPP_STARTUP_TIMEOUT_S", 300, minimum=10, maximum=3600),
     }
 
@@ -136,7 +136,7 @@ def resolve_gguf_model_path(
     return hf_hub_download(
         repo_id=repo,
         filename=filename,
-        # The 4.6GB one. Without the event the transfer has no way of hearing
+        # The 6.2GB one. Without the event the transfer has no way of hearing
         # that the task asking for it has been cancelled.
         tqdm_class=hf_progress.tqdm_class(cancel_event),
     )
@@ -177,6 +177,14 @@ def cuda_library_dirs() -> tuple[str, ...]:
 
 def server_environment() -> dict[str, str]:
     env = dict(os.environ)
+    # `--fit` (on by default in current builds) may only change arguments left
+    # unset, and `_build_command` sets them all. With the Q6_K default, less
+    # than fit's 1024 MiB margin stays free on an 8GB card, so fit logged
+    # "failed to fit params ... abort" on every start and then loaded exactly
+    # as asked. Off rather than tolerated: that line reads like the fault in a
+    # user's uploaded log. The env form is silently ignored by builds that
+    # predate the option, where `--fit off` would stop the server starting.
+    env["LLAMA_ARG_FIT"] = "off"
     extra = cuda_library_dirs()
     if extra:
         env["PATH"] = os.pathsep.join([*extra, env.get("PATH", "")])
@@ -409,7 +417,15 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         ctx, ngl, parallel = limits["ctx"], limits["gpu_layers"], limits["parallel"]
         # -c is the total context; llama-server splits it across -np slots, so
         # the env var means "context per slot". Flash attention stays on the
-        # server's own default ("auto" on current builds).
+        # server's own default ("auto" on current builds), which a quantized V
+        # cache needs.
+        #
+        # q8_0 KV is what lets the Q6_K default fit the 8GB floor. Measured
+        # 2026-09-28 on an 8GB card at 8 slots x 1024: Q6_K with f16 KV took
+        # 7077 MiB and began spilling to shared memory; with q8_0 it took 6663
+        # MiB and did not (6389 MiB at the 4-slot default). Greedy output matched f16 KV on 249/266 real and
+        # 204/210 authored cues. Checked on the CUDA build and on winget's
+        # Vulkan build (b11193).
         command = [
             exe,
             "-m", model_path,
@@ -418,6 +434,8 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             "-c", str(ctx * parallel),
             "-np", str(parallel),
             "-ngl", str(ngl),
+            "-ctk", "q8_0",
+            "-ctv", "q8_0",
             "--no-webui",
         ]
         return command
@@ -578,7 +596,7 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             self._require_clean_slate_locked()
 
         # Preparation, holding neither the instance lock nor the card. Resolving
-        # the GGUF is a 4.6GB download on a first run: under `_lock` it blocked
+        # the GGUF is a 6.2GB download on a first run: under `_lock` it blocked
         # every sibling task on a *lock*, where a cancel event cannot reach them
         # (they never got as far as the condition they were supposed to wait
         # on); holding the permit across it would keep an ASR stage off a card
@@ -1021,8 +1039,13 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         on_progress: Callable[[dict], None] | None = None,
         on_usage: Callable[[dict], None] | None = None,
         sampling_parameters: dict | None = None,
+        grammar: str | None = None,
     ) -> str:
         del reasoning_effort
+        if grammar is not None and response_format is not None:
+            # The server compiles a schema into a grammar of its own; one
+            # request cannot be held to two.
+            raise ValueError("llama-server takes a grammar or a response schema, not both")
         self._raise_if_cancelled(cancel_event)
         # Checked at the moment of use, not only by whoever resolved this object:
         # a reset can land between a caller's lease check and this call.
@@ -1044,6 +1067,8 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             for key in ("top_k", "repeat_penalty")
             if sampling_parameters is not None and key in sampling_parameters
         }
+        if grammar is not None:
+            extra_body["grammar"] = grammar
         if extra_body:
             request["extra_body"] = extra_body
         wrapped = _wrap_response_format(response_format)

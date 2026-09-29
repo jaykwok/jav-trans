@@ -640,6 +640,44 @@ def _subtitle_density_audit_stats(
     }
 
 
+def _translation_review_stats(segments: list[dict]) -> dict:
+    """Lines that finished but should get a human look.
+
+    A count and where to look, deliberately without a threshold warning: a
+    constrained retry is how a job survives a line the model kept echoing, and
+    `QC_HARD_FAIL` must not turn that survival back into a failed job.
+    """
+    examples = [
+        {
+            "index": index,
+            "start": segment.get("start"),
+            "end": segment.get("end"),
+            "reason": review.get("reason"),
+            "rejected": review.get("rejected"),
+        }
+        for index, segment in enumerate(segments)
+        if isinstance(review := segment.get("translation_review"), dict)
+    ]
+    # Cues the vocalisation filter kept but wants a human to listen to. The
+    # count already arrives with the cue plan (`vocalisation_cues_marked`); this
+    # is where to find them.
+    listen = [
+        {
+            "index": index,
+            "start": segment.get("start"),
+            "end": segment.get("end"),
+            "verdict": segment.get("vocalisation_verdict"),
+        }
+        for index, segment in enumerate(segments)
+        if segment.get("vocalisation_verdict")
+    ]
+    return {
+        "translation_review_cue_count": len(examples),
+        "translation_review_examples": examples[:50],
+        "vocalisation_review_examples": listen[:50],
+    }
+
+
 def compute_quality_report(
     segments: list[dict],
     video_duration_s: float,
@@ -671,6 +709,7 @@ def compute_quality_report(
     chunk_cut_stats = _chunk_cut_stats(chunk_cuts)
     cue_continuity_stats = _cue_continuity_stats(cue_plan)
     postgate_stats = _postgate_chunk_stats(postgate)
+    review_stats = _translation_review_stats(segments)
     alignment_issue_total = max(int(total_segments or 0), 0)
 
     n = len(segments)
@@ -702,6 +741,7 @@ def compute_quality_report(
             **chunk_cut_stats,
             **cue_continuity_stats,
             **postgate_stats,
+            **review_stats,
             "warnings": warnings,
         }
 
@@ -813,6 +853,7 @@ def compute_quality_report(
         **chunk_cut_stats,
         **cue_continuity_stats,
         **postgate_stats,
+        **review_stats,
         "warnings": warnings,
     }
     return report

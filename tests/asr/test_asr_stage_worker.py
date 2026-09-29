@@ -492,7 +492,7 @@ def test_full_observed_batch_updates_profile(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     ("backend", "minimum_mb"),
     [
-        ("jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf", 6144),
+        ("jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf", 7168),
     ],
 )
 def test_repo_physical_vram_floor_accepts_exact_minimum(backend, minimum_mb):
@@ -508,7 +508,7 @@ def test_repo_physical_vram_floor_accepts_exact_minimum(backend, minimum_mb):
 @pytest.mark.parametrize(
     ("backend", "minimum_mb"),
     [
-        ("jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf", 6144),
+        ("jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf", 7168),
     ],
 )
 def test_repo_physical_vram_floor_rejects_lower_card_without_fallback(
@@ -527,6 +527,17 @@ def test_repo_physical_vram_floor_rejects_lower_card_without_fallback(
     detail = str(exc_info.value)
     assert "Shared VRAM" in detail
     assert f"required_mb={minimum_mb}" in detail
+
+
+@pytest.mark.parametrize(("total_mb", "accepted"), [(8187.5, True), (8163.0, True), (6144.0, False)])
+def test_the_eight_gigabyte_floor_admits_what_8gb_cards_report(total_mb, accepted):
+    """8GB cards report a little under 8192 MiB; 6GB cards must still stop."""
+    env = {"ASR_BACKEND": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"}
+    if accepted:
+        gpu_worker._enforce_min_physical_vram(total_mb=total_mb, env=env)
+    else:
+        with pytest.raises(RuntimeError, match="below supported minimum"):
+            gpu_worker._enforce_min_physical_vram(total_mb=total_mb, env=env)
 
 
 def test_explicit_vram_budget_sets_worker_allocator_fraction(monkeypatch):

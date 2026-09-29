@@ -333,8 +333,31 @@ def run_batched(
         return _to_target_variant(_normalize_text(text) or "")
 
     timings_by_batch: dict[int, dict] = {}
-    cache_map = translation_cache._load_translation_cache(cache_path) if cache_path else {}
-    memory_map = translation_cache._load_translation_memory(cache_path) if cache_path else {}
+    cache_reviews: dict[str, list] = {}
+    memory_reviews: dict[str, dict] = {}
+    cache_map = (
+        translation_cache._load_translation_cache(cache_path, cache_reviews) if cache_path else {}
+    )
+    memory_map = (
+        translation_cache._load_translation_memory(cache_path, memory_reviews) if cache_path else {}
+    )
+    # Cues whose accepted text should get a human look, by global index. A line
+    # that only passed once a grammar forbade kana is a finished translation, not
+    # a verified one (a constrained `ｺﾝﾆﾁﾊ` came back as a transliteration), so
+    # the job completes and says which lines those were. Stored beside the text
+    # in both caches, because a restored run must not forget it.
+    review_by_index: dict[int, dict] = {}
+
+    def _batch_review(start: int, count: int) -> list[dict]:
+        return [
+            {"offset": index - start, **review_by_index[index]}
+            for index in range(start, start + count)
+            if index in review_by_index
+        ]
+
+    def _review_field(ids) -> dict:
+        entries = [{"id": index, **review_by_index[index]} for index in ids if index in review_by_index]
+        return {"translation_review": entries} if entries else {}
     pending_batches: list[tuple[int, list[dict]]] = []
     worker_retry_events: list[dict] = []
     warmup_timing: dict | None = None
@@ -394,6 +417,12 @@ def run_batched(
             print(f"[translation-cache] restored batch {batch_index} cache_key={batch_key}")
             for offset, text in enumerate(cached_texts):
                 zh_texts[start_index + offset] = _final_text(text)
+            for record in cache_reviews.get(batch_key) or []:
+                offset = record.get("offset") if isinstance(record, dict) else None
+                if isinstance(offset, int) and 0 <= offset < len(batch_segments):
+                    review_by_index[start_index + offset] = {
+                        key: value for key, value in record.items() if key != "offset"
+                    }
             timing = {
                 "batch_index": batch_index,
                 "start_index": start_index,
@@ -412,6 +441,7 @@ def run_batched(
                 "cache_hit": True,
                 "cache_hit_type": "exact_batch",
                 "translation_memory_hit_count": 0,
+                **_review_field(range(start_index, start_index + len(batch_segments))),
             }
             timings_by_batch[batch_index] = timing
             _emit_progress(
@@ -434,11 +464,14 @@ def run_batched(
                 source_text
             ):
                 continue
-            memory_text = memory_map.get(_memory_key_for(source_text, start_index + offset))
+            memory_key = _memory_key_for(source_text, start_index + offset)
+            memory_text = memory_map.get(memory_key)
             if valid_cached(source_text, memory_text):
                 global_index = start_index + offset
                 zh_texts[global_index] = _final_text(memory_text)
                 memory_hit_ids.append(global_index)
+                if memory_reviews.get(memory_key):
+                    review_by_index[global_index] = dict(memory_reviews[memory_key])
 
         if memory_hit_ids:
             translation_memory_hit_count += len(memory_hit_ids)
@@ -453,10 +486,15 @@ def run_batched(
                 for offset in range(len(batch_segments))
             ]
             if cache_path:
+                batch_review = _batch_review(start_index, len(batch_segments))
                 translation_cache._save_cache_entry(
-                    cache_path, batch_key, local_texts, cache_lock
+                    cache_path, batch_key, local_texts, cache_lock, review=batch_review
                 )
                 cache_map[batch_key] = local_texts
+                if batch_review:
+                    cache_reviews[batch_key] = batch_review
+                else:
+                    cache_reviews.pop(batch_key, None)
             timing = {
                 "batch_index": batch_index,
                 "start_index": start_index,
@@ -475,6 +513,7 @@ def run_batched(
                 "cache_hit": True,
                 "cache_hit_type": "translation_memory",
                 "translation_memory_hit_count": len(memory_hit_ids),
+                **_review_field(range(start_index, start_index + len(batch_segments))),
             }
             timings_by_batch[batch_index] = timing
             _emit_progress(
@@ -590,6 +629,7 @@ def run_batched(
         start_index = batch_starts[batch_index]
         local_texts: list[str] = []
         memory_entries: list[tuple[str, str]] = []
+        memory_review: dict[str, dict] = {}
         for offset in range(len(segments)):
             global_index = start_index + offset
             text = batch_results[global_index] or zh_texts[global_index] or ""
@@ -605,20 +645,32 @@ def run_batched(
                     source_text
                 )
             ):
-                memory_entries.append((_memory_key_for(source_text, global_index), text))
+                memory_key = _memory_key_for(source_text, global_index)
+                memory_entries.append((memory_key, text))
+                if global_index in review_by_index:
+                    memory_review[memory_key] = review_by_index[global_index]
         if not cache_path:
             return
         batch_key = _batch_key_for(batch_index, segments)
+        batch_review = _batch_review(start_index, len(segments))
         translation_cache._save_cache_entry(
-            cache_path, batch_key, local_texts, cache_lock
+            cache_path, batch_key, local_texts, cache_lock, review=batch_review
         )
         cache_map[batch_key] = local_texts
+        if batch_review:
+            cache_reviews[batch_key] = batch_review
+        else:
+            cache_reviews.pop(batch_key, None)
         if memory_entries:
             translation_cache._save_memory_entries(
-                cache_path, memory_entries, cache_lock
+                cache_path, memory_entries, cache_lock, reviews=memory_review
             )
             for memory_key, memory_text in memory_entries:
                 memory_map[memory_key] = memory_text
+                if memory_key in memory_review:
+                    memory_reviews[memory_key] = memory_review[memory_key]
+                else:
+                    memory_reviews.pop(memory_key, None)
         print(f"[translation-cache] saved batch {batch_index} cache_key={batch_key}")
 
     def run_batch(
@@ -705,6 +757,28 @@ def run_batched(
         # It descends only on failure and never grows back within a batch,
         # because whatever made the model lose the id sequence is still true.
         request_span_limit = max(1, len(expected_ids))
+        # Same one-way rule for output constraints: once the profile names a
+        # grammar that excludes what was just rejected, every later request in
+        # this batch carries it.
+        output_grammar: str | None = None
+        constrained_after: str = ""
+
+        def constrain_output(exc: RetryableTranslationFormatError) -> None:
+            nonlocal output_grammar, constrained_after
+            if output_grammar is not None or backend_name != "llamacpp":
+                return
+            output_grammar = profile.retry_grammar(exc, target_lang)
+            if output_grammar is not None:
+                constrained_after = str(getattr(exc, "reason", "") or type(exc).__name__)
+                emit_batch_diagnostic(
+                    {
+                        "phase": "batch_output_constrained",
+                        **trace_base,
+                        "pending_count": len(pending_ids),
+                        "request_index": request_count,
+                        "error": str(exc)[:300],
+                    }
+                )
 
         def narrow_request_span() -> None:
             """Halve what the next request asks for, and say so."""
@@ -736,7 +810,7 @@ def run_batched(
                 ) from last_retry_error
             if attempts_for_pending >= retry_limit_for_pending:
                 raise RuntimeError(
-                    "Batch translation returned invalid or incomplete JSON after "
+                    "Batch translation got no usable reply after "
                     f"{request_count} attempts: batch={batch_index}, "
                     f"start_index={start_index}, size={expected_count}, "
                     f"pending_ids={pending_ids[:50]}, error={last_retry_error}"
@@ -783,6 +857,8 @@ def run_batched(
                 # gets the JSON one by default. Sending a grammar to Hy-MT2 is
                 # the 152/300 failure, so "unset" and "none" must not collapse.
                 request_kwargs["response_schema"] = profile.schema
+                if output_grammar is not None:
+                    request_kwargs["output_grammar"] = output_grammar
                 raw_output = chat(
                     request_messages,
                     expected_count=request_expected_count,
@@ -810,6 +886,12 @@ def run_batched(
                         # degenerate reply into "" - which this loop's own
                         # `is None` missing-check would then count as answered.
                         batch_results[idx] = _to_target_variant(parsed[idx])
+                        if output_grammar is not None:
+                            review_by_index[idx] = {
+                                "reason": "constrained_retry",
+                                "rejected": constrained_after,
+                                "requests": request_count,
+                            }
                 missing_indexes = [
                     index
                     for index in all_batch_ids
@@ -849,6 +931,7 @@ def run_batched(
                 last_retry_error = exc
                 attempts_for_pending += 1
                 narrow_request_span()
+                constrain_output(exc)
 
             if attempts_for_pending < retry_limit_for_pending:
                 sleep_attempt = max(0, attempts_for_pending - 1)
@@ -860,7 +943,7 @@ def run_batched(
                 continue
 
             raise RuntimeError(
-                "Batch translation returned invalid or incomplete JSON after "
+                "Batch translation got no usable reply after "
                 f"{request_count} attempts: batch={batch_index}, "
                 f"start_index={start_index}, size={expected_count}, "
                 f"pending_ids={pending_ids[:50]}, error={last_retry_error}"
@@ -905,6 +988,7 @@ def run_batched(
             "missing_indexes": missing_indexes,
             "translation_memory_hit_count": expected_count - len(expected_ids),
             "cache_hit_type": "mixed" if len(expected_ids) < expected_count else "miss",
+            **_review_field(all_batch_ids),
         }
         persist_batch(batch_index, batch_results)
         return batch_index, batch_results, timing, batch_retry_events

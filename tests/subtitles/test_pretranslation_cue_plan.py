@@ -378,3 +378,65 @@ def test_postgate_flags_reach_the_bilingual_sidecar(monkeypatch, tmp_path):
     assert flagged[0]["zh_text"] == "zh-0"
     # Absent, not an empty list: the clean cues stay out of the way of a grep.
     assert sum("postgate_flags" in block for block in blocks) == 1
+
+
+def test_lines_to_review_reach_the_sidecar_and_the_quality_report(monkeypatch, tmp_path):
+    """The engine reports reviews per batch timing; the sidecar is where they
+    become lines, and the quality report is where they become a count."""
+    from pipeline import quality as quality_module
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"fake-video")
+    segments = [
+        {"start": 0.0, "end": 1.2, "text": "こんにちは",
+         "words": [{"word": "こんにちは", "start": 0.0, "end": 1.2}]},
+        {"start": 2.0, "end": 3.0, "text": "そうですね",
+         "words": [{"word": "そうですね", "start": 2.0, "end": 3.0}]},
+    ]
+    artifacts = _artifacts(tmp_path, segments)
+    ctx = make_job_context(
+        video_path, tmp_path / "out", tmp_path / "jobs",
+        subtitle_mode="zh", translation_max_workers=1, keep_temp_files=True,
+    )
+    monkeypatch.setattr(main, "_print_timing_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main.asr_module, "get_backend_label", lambda: "mock_asr")
+    monkeypatch.setattr(main.translator_module, "generate_global_context", lambda items: "")
+    review = {"reason": "constrained_retry", "rejected": "source_echo", "requests": 2}
+    monkeypatch.setattr(
+        main.translator_module,
+        "translate_segments",
+        lambda items, **_kwargs: (
+            [f"zh-{index}" for index, _ in enumerate(items)],
+            [{"batch_index": 0, "translation_review": [{"id": 0, **review}]}],
+            [],
+        ),
+    )
+    real_prepare = main.subtitle_module.prepare_srt_blocks
+
+    def marking_prepare(*args, **kwargs):
+        cues = real_prepare(*args, **kwargs)
+        cues[1] = {**cues[1], "vocalisation_verdict": "silence_diluted_vocal_audio"}
+        return cues
+
+    monkeypatch.setattr(main.subtitle_module, "prepare_srt_blocks", marking_prepare)
+    captured = {}
+    real_write = quality_module.write_quality_report
+
+    def spy_write(**kwargs):
+        captured["segments"] = kwargs["aligned_segments"]
+        return real_write(**kwargs)
+
+    monkeypatch.setattr(quality_module, "write_quality_report", spy_write)
+
+    main.run_translation_and_write(str(video_path), artifacts, ctx=ctx, job_id="clip")
+
+    blocks = json.loads(Path(artifacts.bilingual_json_path).read_text(encoding="utf-8"))["blocks"]
+    flagged = [block for block in blocks if "translation_review" in block]
+    assert [block["ja_text"] for block in flagged] == ["こんにちは"]
+    assert flagged[0]["translation_review"] == review
+    assert [bool(seg.get("translation_review")) for seg in captured["segments"]] == [True, False]
+    listen = [block for block in blocks if "vocalisation_verdict" in block]
+    assert [block["ja_text"] for block in listen] == ["そうですね"]
+    assert [seg.get("vocalisation_verdict") for seg in captured["segments"]] == [
+        None, "silence_diluted_vocal_audio"
+    ]

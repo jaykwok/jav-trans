@@ -39,6 +39,18 @@ class RetryableTranslationFormatError(RetryableTranslationError):
     """The model returned incomplete or invalid structured output."""
 
 
+class UntranslatedOutputError(RetryableTranslationFormatError):
+    """Well-formed reply that is not a finished translation.
+
+    `reason` is the `output_checks` verdict, so a retry can target what went
+    wrong rather than reissue the same request.
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class ContentPolicyRefusalError(TranslationError):
     """The provider's content filter rejected the request or its reply.
 

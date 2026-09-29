@@ -2203,6 +2203,14 @@ def _run_translation_and_write_impl(
         )
         _raise_if_cancelled(cancel_event)
 
+    # Lines that finished but should get a human look (for now: passed only
+    # under the kana-free retry grammar). Carried per cue like postgate_flags.
+    translation_review_by_id = {
+        int(entry["id"]): {key: value for key, value in entry.items() if key != "id"}
+        for timing in translation_request_timings
+        for entry in (timing.get("translation_review") or [])
+        if isinstance(entry, dict) and isinstance(entry.get("id"), int)
+    }
     srt_blocks = [
         {
             "start": seg["start"],
@@ -2232,6 +2240,11 @@ def _run_translation_and_write_impl(
                 if seg.get("postgate_flags")
                 else {}
             ),
+            **(
+                {"translation_review": dict(translation_review_by_id[index])}
+                if index in translation_review_by_id
+                else {}
+            ),
             **{
                 key: seg[key]
                 for key in (
@@ -2245,11 +2258,14 @@ def _run_translation_and_write_impl(
                     "source_char_violation",
                     "duration_soft_cap_violation",
                     "exact_measured_timeline",
+                    # Kept but marked by the acoustic verdict: the cue a human
+                    # should listen to. Only present on marked cues.
+                    "vocalisation_verdict",
                 )
                 if key in seg
             },
         }
-        for seg, zh_text in zip(translation_segments, zh_texts)
+        for index, (seg, zh_text) in enumerate(zip(translation_segments, zh_texts))
     ]
     pipeline_timings["translation_s"] = time.perf_counter() - translation_started
     _log_stage(

@@ -448,3 +448,29 @@ class TestSignatureCoversWhatChangesTheTranslation:
         monkeypatch.setattr(translator, "get_backend", lambda *_a, **_k: _Minimal())
         monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
         assert translator._effective_reasoning_effort() == "high"
+
+
+def test_review_records_round_trip_and_a_later_clean_entry_clears_them(tmp_path):
+    import threading
+
+    lock = threading.Lock()
+    path = tmp_path / "cache.jsonl"
+    review = [{"offset": 0, "reason": "constrained_retry", "rejected": "source_echo", "requests": 2}]
+    translator._save_cache_entry(path, "k1", ["你好。"], lock, review=review)
+    translator._save_cache_entry(path, "k2", ["谢谢。"], lock)
+    reviews: dict = {}
+    assert translator._load_translation_cache(path, reviews) == {"k1": ["你好。"], "k2": ["谢谢。"]}
+    assert reviews == {"k1": review}
+    # Old readers and callers that do not ask are unaffected.
+    assert translator._load_translation_cache(path) == {"k1": ["你好。"], "k2": ["谢谢。"]}
+
+    translator._save_cache_entry(path, "k1", ["您好。"], lock)
+    reviews = {}
+    translator._load_translation_cache(path, reviews)
+    assert reviews == {}
+
+    record = {"reason": "constrained_retry", "rejected": "japanese_remaining", "requests": 3}
+    translator._save_memory_entries(path, [("tm1", "你好。"), ("tm2", "谢谢。")], lock, reviews={"tm1": record})
+    memory_reviews: dict = {}
+    assert translator._load_translation_memory(path, memory_reviews) == {"tm1": "你好。", "tm2": "谢谢。"}
+    assert memory_reviews == {"tm1": record}

@@ -22,12 +22,15 @@ from __future__ import annotations
 import logging
 import re
 
-from llm.errors import RetryableTranslationFormatError
+from llm.errors import RetryableTranslationFormatError, UntranslatedOutputError
 from llm.profiles.base import ProfileContext, TranslationProfile
 from llm.profiles.json_v3 import _normalize_translation_text
 from llm.glossary import parse_glossary_pairs
-from llm.output_checks import invalid_line_output
+from llm.output_checks import (
+    KANA_REASONS, NO_KANA_GRAMMAR, invalid_line_output, is_chinese_target,
+)
 from llm.context import source_text
+from llm import zh_variant
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,22 @@ CONTEXT_PROMPT = (
     "【背景信息】\n{background}\n\n"
     "请结合背景信息将以下文本翻译为{target_lang}。\n\n【待翻译文本】\n{text}"
 )
+
+# The card asks a Chinese prompt for the language's Chinese name from its own
+# table, and the UI labels are not those names. Measured 2026-09-28 on the four
+# prompts issue #2 failed on: "简体中文" echoed 73/120 samples, "中文" failed
+# 22/120; first requests over that whole film, 9 vs 3 rejections of 798. The
+# script itself is still enforced afterwards by `zh_variant`, from the UI label.
+_CARD_NAME_BY_VARIANT = {"simplified": "中文", "traditional": "繁体中文"}
+_CARD_NAME_BY_LABEL = {"english": "英语", "英文": "英语"}
+
+
+def card_target_name(target_lang: str) -> str:
+    label = (target_lang or "简体中文").strip() or "简体中文"
+    variant = zh_variant.target_variant(label)
+    if variant is not None:
+        return _CARD_NAME_BY_VARIANT[variant]
+    return _CARD_NAME_BY_LABEL.get(label.lower(), label)
 
 _THINK_BLOCK_RE = re.compile(r"(?s)^.*</think>")
 # Cheap per-character bound on the reply, same reasoning as the JSON profile's
@@ -55,7 +74,7 @@ class HyMt2Profile(TranslationProfile):
     """One preplanned source cue per request with native context and terms."""
 
     id = "hymt2"
-    version = "hymt2-context-v4"
+    version = "hymt2-context-v6"
 
     # No repair pass and no partial reissue: both are batch concepts. A request
     # here is one cue, so a bad reply is retried as a whole by the engine's
@@ -74,7 +93,24 @@ class HyMt2Profile(TranslationProfile):
     def validate_translation(self, source: str, target: str, target_lang: str) -> None:
         reason = invalid_line_output(source, target, target_lang)
         if reason:
-            raise RetryableTranslationFormatError(f"Hy-MT2 returned unusable content: {reason}")
+            raise UntranslatedOutputError(
+                f"Hy-MT2 reply is not a {target_lang} translation: {reason}", reason=reason
+            )
+
+    def retry_grammar(self, rejected: BaseException, target_lang: str) -> str | None:
+        # Some cues this model hands back as Japanese on most samples: issue #2's
+        # film died on `こんにちは。`, echoed on 26/40 native samples of its two
+        # prompts, and `んく` echoed 20/20, so four identical retries could not
+        # save it. Excluding kana from the grammar answered all 80 samples of the
+        # four failing prompts (2026-09-28). The first request stays native; only
+        # a reply the check below already refused is replaced.
+        if (
+            isinstance(rejected, UntranslatedOutputError)
+            and rejected.reason in KANA_REASONS
+            and is_chinese_target(target_lang)
+        ):
+            return NO_KANA_GRAMMAR
+        return None
 
     def max_batch_size(self) -> int | None:
         return 1
@@ -114,7 +150,7 @@ class HyMt2Profile(TranslationProfile):
         if len(segments) != 1 or len(ids) != 1:
             raise ValueError(f"{self.id} requires exactly one source cue per request")
         text = source_text(segments[0])
-        target_lang = (ctx.target_lang or "简体中文").strip() or "简体中文"
+        target_lang = card_target_name(ctx.target_lang)
         background: list[str] = []
         if ctx.source_context is not None:
             focus = ctx.source_context.focus(ids, radius=3, context_chars=240)

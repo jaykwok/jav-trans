@@ -82,6 +82,10 @@ def quality_segments_from_blocks(blocks: list[dict]) -> list[dict]:
             "ja": str(block.get("ja_text") or block.get("text") or block.get("ja") or ""),
             "zh": str(block.get("zh_text") or block.get("zh") or ""),
         }
+        if isinstance(block.get("translation_review"), dict):
+            segment["translation_review"] = dict(block["translation_review"])
+        if block.get("vocalisation_verdict"):
+            segment["vocalisation_verdict"] = str(block["vocalisation_verdict"])
         quality_segments.append(segment)
     return quality_segments
 
@@ -177,6 +181,7 @@ def _quality_report_markdown(video_stem: str, report: dict) -> str:
         "postgate_alignment_score_checked",
         "postgate_flagged_cue_count",
         "postgate_flagged_cue_share",
+        "translation_review_cue_count",
     ]
     lines = [
         f"# Quality Report: {video_stem}",
@@ -211,6 +216,30 @@ def _quality_report_markdown(video_stem: str, report: dict) -> str:
             lines.append(
                 f"| `{name}` | {_format_report_value(chunk_flags.get(name, 0))} "
                 f"| {_format_report_value(cue_flags.get(name, 0))} |"
+            )
+
+    review_examples = list(report.get("translation_review_examples") or [])
+    if review_examples:
+        lines.extend(["", "## Translation Review", ""])
+        for item in review_examples:
+            lines.append(
+                "- "
+                f"#{item.get('index')} "
+                f"{_format_report_value(item.get('start'))}-"
+                f"{_format_report_value(item.get('end'))}: "
+                f"{item.get('reason')} after {item.get('rejected') or '-'}"
+            )
+
+    listen_examples = list(report.get("vocalisation_review_examples") or [])
+    if listen_examples:
+        lines.extend(["", "## Listen Review", ""])
+        for item in listen_examples:
+            lines.append(
+                "- "
+                f"#{item.get('index')} "
+                f"{_format_report_value(item.get('start'))}-"
+                f"{_format_report_value(item.get('end'))}: "
+                f"{item.get('verdict')}"
             )
 
     examples = list(report.get("subtitle_overlap_examples") or [])

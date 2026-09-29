@@ -342,6 +342,27 @@ class TestTheJointVerdict:
         assert not verdict.drop
         assert verdict.reason == "lexical_text_vocal_audio"
 
+    # Anonymous sample A's surviving `んく`: almost no speech, half silence.
+    DILUTED = CueAcoustics(
+        silence=0.506, vocalisation=0.492, speech=0.0017, speech_max_run_s=0.0
+    )
+
+    def test_a_silence_padded_moan_is_marked_for_listening_not_dropped(self):
+        """Silence dilutes the absolute share below the 0.60 bar while the cue's
+        sound is 99.7% vocalisation. Nobody has listened to such cues yet, so the
+        verdict points at them and the deletion threshold is left alone."""
+        for text in ("んく", "くちゅ", "気持ちいい"):
+            verdict = classify_cue(text, self.DILUTED)
+            assert not verdict.drop, text
+            assert verdict.reason == "silence_diluted_vocal_audio", text
+
+    def test_dilution_reaches_neither_protected_words_nor_real_speech(self):
+        assert classify_cue("うん", self.DILUTED).reason == "protected"
+        some_speech = CueAcoustics(
+            silence=0.5, vocalisation=0.3, speech=0.2, speech_max_run_s=0.5
+        )
+        assert classify_cue("くちゅ", some_speech).reason == "kept"
+
     def test_without_acoustics_it_falls_back_to_the_text_rule(self):
         """A v1 head produces no frame classes, and a promoted head outlives the
         code that trained it - so rolling back must not disable the filter."""
@@ -400,6 +421,21 @@ class TestTheJointVerdict:
 
         assert kept[0]["vocalisation_verdict"] == "lexical_text_vocal_audio"
         assert diagnostics["vocalisation_cues_marked"] == 1
+
+    def test_a_diluted_cue_survives_and_says_why(self):
+        blocks = [
+            {"text": "そうなんだ"},
+            {"text": "んく", "acoustic_classes": {
+                "silence": 0.506, "vocalisation": 0.492, "speech": 0.0017,
+                "speech_max_run_s": 0.0}},
+            {"text": "本当に？"},
+        ]
+        kept, diagnostics = drop_vocalisation_runs(blocks, min_run=2)
+
+        assert [b["text"] for b in kept] == ["そうなんだ", "んく", "本当に？"]
+        assert kept[1]["vocalisation_verdict"] == "silence_diluted_vocal_audio"
+        assert diagnostics["vocalisation_cues_marked"] == 1
+        assert diagnostics["vocalisation_cues_dropped"] == 0
 
     def test_switching_the_acoustics_off_restores_the_text_only_behaviour(self):
         blocks = [

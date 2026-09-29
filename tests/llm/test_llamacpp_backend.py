@@ -102,12 +102,20 @@ def test_build_command_shape(monkeypatch):
     assert command[command.index("--host") + 1] == "127.0.0.1"
 
 
-def test_build_command_defaults_to_eight_slots_for_the_7b_q4_model():
+def test_build_command_defaults_to_one_slot_per_default_worker():
     command = LlamaCppServerBackend()._build_command(
         "llama-server.exe", "D:\\m.gguf", 12345
     )
-    assert command[command.index("-np") + 1] == "8"
-    assert command[command.index("-c") + 1] == "8192"
+    assert command[command.index("-np") + 1] == "4"
+    assert command[command.index("-c") + 1] == "4096"
+
+
+def test_the_kv_cache_is_q8_so_the_q6_default_fits_eight_gigabytes():
+    command = LlamaCppServerBackend()._build_command(
+        "llama-server.exe", "D:\\m.gguf", 12345
+    )
+    assert command[command.index("-ctk") + 1] == "q8_0"
+    assert command[command.index("-ctv") + 1] == "q8_0"
 
 
 def test_cache_identity_reflects_model(monkeypatch):
@@ -213,6 +221,11 @@ def test_a_torch_without_cublas_adds_nothing(monkeypatch, tmp_path):
     assert cuda_library_dirs() == ()
     monkeypatch.setenv("PATH", "C:\\existing")
     assert server_environment()["PATH"] == "C:\\existing"
+
+
+def test_the_server_is_told_not_to_refit_arguments_it_was_given(monkeypatch):
+    monkeypatch.setenv("LLAMA_ARG_FIT", "on")
+    assert server_environment()["LLAMA_ARG_FIT"] == "off"
 
 
 def test_a_missing_torch_adds_nothing(monkeypatch):

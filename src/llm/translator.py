@@ -331,7 +331,7 @@ def translate_segments(
         # and inflate per-request latency past the watchdog timeouts.
         effective_max_workers = min(
             effective_max_workers,
-            env_int("LLAMACPP_PARALLEL", 8, minimum=1, maximum=16),
+            env_int("LLAMACPP_PARALLEL", 4, minimum=1, maximum=16),
         )
     # Selected before sizing because a model contract may impose a stricter
     # hard cap (Hy-MT2 is deliberately one cue per request), and selected
@@ -565,6 +565,7 @@ def _chat_with_reasoning(
     cancel_event: threading.Event | None = None,
     bounded_response_schema: dict | None = None,
     response_schema: dict | None = _SCHEMA_UNSET,
+    output_grammar: str | None = None,
 ) -> str:
     _raise_if_cancelled(cancel_event)
     effective_effort = _normalize_reasoning_effort(
@@ -583,6 +584,8 @@ def _chat_with_reasoning(
         chat_kwargs["bounded_response_schema"] = bounded_response_schema
     if response_schema is not _SCHEMA_UNSET:
         chat_kwargs["response_schema"] = response_schema
+    if output_grammar is not None:
+        chat_kwargs["output_grammar"] = output_grammar
     if on_usage is not None:
         chat_kwargs["on_usage"] = on_usage
     try:
@@ -870,6 +873,7 @@ def _chat(
     response_schema: dict | None = _SCHEMA_UNSET,
     response_schema_name: str = "subtitle_translations",
     bounded_response_schema: dict | None = None,
+    output_grammar: str | None = None,
 ) -> str:
     _raise_if_cancelled(cancel_event)
     if response_schema is _SCHEMA_UNSET:
@@ -894,6 +898,8 @@ def _chat(
             model_options = {}
             if task_backend_name() == "llamacpp" and sampling:
                 model_options["sampling_parameters"] = sampling
+            if task_backend_name() == "llamacpp" and output_grammar is not None:
+                model_options["grammar"] = output_grammar
             return backend.chat_completion(
                 messages,
                 temperature=float(sampling.get("temperature", TRANSLATION_TEMPERATURE)),

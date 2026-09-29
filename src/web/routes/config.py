@@ -105,7 +105,7 @@ def _initial_env_template_lines() -> list[str]:
         "# ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4\n",
         "# ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto\n",
         "# ASR_STAGE_WORKER_VRAM_RATIO=0.95\n",
-        "# ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144\n",
+        "# ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=7168\n",
         "# ASR_STAGE_WORKER_RAM_RATIO=0.95\n",
         "# ASR_STAGE_WORKER_HEARTBEAT_S=10\n",
         "# GPU_BATCH_PROFILE_ENABLED=1\n",

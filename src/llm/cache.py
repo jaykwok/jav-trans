@@ -10,13 +10,15 @@ def _warn_translation_cache(message: str) -> None:
     print(f"[WARN] translation cache {message}", flush=True)
 
 
-def _load_translation_cache(path) -> dict:
+def _load_translation_cache(path, reviews: dict | None = None) -> dict:
+    """Batch texts by key. `reviews`, when given, collects each key's review
+    records (see `_save_cache_entry`)."""
     if not path:
         return {}
     try:
         cache_path = _translation_cache_jsonl_path(Path(path))
         if cache_path.exists():
-            return _read_translation_cache_jsonl(cache_path)
+            return _read_translation_cache_jsonl(cache_path, reviews)
         return {}
     except Exception as exc:
         _warn_translation_cache(f"load failed for {path}: {exc}")
@@ -32,7 +34,7 @@ def _translation_memory_jsonl_path(path: Path) -> Path:
     return cache_path.with_name(f"{cache_path.stem}.memory.jsonl")
 
 
-def _read_translation_cache_jsonl(path: Path) -> dict:
+def _read_translation_cache_jsonl(path: Path, reviews: dict | None = None) -> dict:
     cache: dict[str, list] = {}
     if not path.exists():
         return {}
@@ -55,42 +57,50 @@ def _read_translation_cache_jsonl(path: Path) -> dict:
             value = item.get("value")
             if isinstance(key, str) and isinstance(value, list):
                 cache[key] = value
+                if reviews is not None:
+                    # Last entry wins for the review exactly as for the text: a
+                    # rewrite without one means the new text needs none.
+                    review = item.get("review")
+                    if isinstance(review, list) and review:
+                        reviews[key] = review
+                    else:
+                        reviews.pop(key, None)
     if skipped:
         _warn_translation_cache(f"skipped {skipped} corrupt line(s) in {path}")
     return cache
 
 
-def _save_cache_entry(path, batch_key, zh_texts, lock) -> None:
+def _save_cache_entry(path, batch_key, zh_texts, lock, review: list[dict] | None = None) -> None:
+    """Append one batch. `review` lists the cues that need a human look as
+    `{"offset": <index in batch>, ...}`; it is how a restored run still knows a
+    line only passed after a constrained retry."""
     if not path:
         return
     raw_path = Path(path)
     cache_path = _translation_cache_jsonl_path(raw_path)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"key": str(batch_key), "value": list(zh_texts)}
+    if review:
+        entry["review"] = list(review)
     with lock:
         with cache_path.open("a", encoding="utf-8") as writer:
-            writer.write(
-                json.dumps(
-                    {"key": str(batch_key), "value": list(zh_texts)},
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+            writer.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def _load_translation_memory(path) -> dict:
+def _load_translation_memory(path, reviews: dict | None = None) -> dict:
     if not path:
         return {}
     try:
         memory_path = _translation_memory_jsonl_path(Path(path))
         if memory_path.exists():
-            return _read_translation_memory_jsonl(memory_path)
+            return _read_translation_memory_jsonl(memory_path, reviews)
         return {}
     except Exception as exc:
         _warn_translation_cache(f"memory load failed for {path}: {exc}")
         return {}
 
 
-def _read_translation_memory_jsonl(path: Path) -> dict:
+def _read_translation_memory_jsonl(path: Path, reviews: dict | None = None) -> dict:
     memory: dict[str, str] = {}
     if not path.exists():
         return {}
@@ -111,12 +121,22 @@ def _read_translation_memory_jsonl(path: Path) -> dict:
             value = item.get("value")
             if isinstance(key, str) and isinstance(value, str):
                 memory[key] = value
+                if reviews is not None:
+                    review = item.get("review")
+                    if isinstance(review, dict) and review:
+                        reviews[key] = review
+                    else:
+                        reviews.pop(key, None)
     if skipped:
         _warn_translation_cache(f"skipped {skipped} corrupt line(s) in memory {path}")
     return memory
 
 
-def _save_memory_entries(path, entries: list[tuple[str, str]], lock) -> None:
+def _save_memory_entries(
+    path, entries: list[tuple[str, str]], lock, reviews: dict | None = None
+) -> None:
+    """Append remembered lines. `reviews` maps a key to that line's review
+    record, so a line restored from memory keeps it too."""
     if not path or not entries:
         return
     memory_path = _translation_memory_jsonl_path(Path(path))
@@ -124,13 +144,11 @@ def _save_memory_entries(path, entries: list[tuple[str, str]], lock) -> None:
     with lock:
         with memory_path.open("a", encoding="utf-8") as writer:
             for key, value in entries:
-                writer.write(
-                    json.dumps(
-                        {"key": str(key), "value": str(value)},
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+                entry = {"key": str(key), "value": str(value)}
+                review = (reviews or {}).get(key)
+                if review:
+                    entry["review"] = dict(review)
+                writer.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def _optional_signature_parts(*, reasoning_effort: str = "", prefix_mode: str = "") -> str:

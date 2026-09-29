@@ -16,8 +16,11 @@ QWEN_ASR_BACKEND_REPOS: dict[str, str] = {
 DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO: dict[str, int] = {
     QWEN_ASR_17B_REPO_ID: 4,
 }
+# 8GB is the project floor, but an 8GB card reports less than 8192 MiB (an RTX
+# 4060 Ti 8GB: 8188 via torch, 8163 via Vulkan). No 7GB card is sold, so a 7GB
+# gate sits above every 6GB card and below every 8GB one.
 DEFAULT_QWEN_ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO: dict[str, int] = {
-    QWEN_ASR_17B_REPO_ID: 6144,
+    QWEN_ASR_17B_REPO_ID: 7168,
 }
 
 

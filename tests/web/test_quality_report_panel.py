@@ -248,3 +248,12 @@ def test_qc_panel_is_reachable_from_a_finished_job() -> None:
     assert "/\\.quality_report\\.md$/i.test(p)" in jobs_js
     assert "data-qc=" in jobs_js
     assert "openQcReport(jobId" in jobs_js
+
+
+def test_the_panel_labels_lines_to_review():
+    panel = (STATIC / "js" / "qcReport.js").read_text(encoding="utf-8")
+    assert "['translation_review_cue_count', '建议复查译文数']" in panel
+    assert "report.translation_review_examples" in panel
+    assert "'translation_review_examples'," in panel
+    assert "report.vocalisation_review_examples" in panel
+    assert "'vocalisation_review_examples'," in panel

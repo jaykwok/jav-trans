@@ -78,6 +78,17 @@ class TranslationProfile(abc.ABC):
         """Raise on unusable content independently of the wire format."""
         del source, target, target_lang
 
+    def retry_grammar(self, rejected: BaseException, target_lang: str) -> str | None:
+        """llama.cpp GBNF grammar for the requests after `rejected`, or None.
+
+        Only for a rejection whose whole failure set a grammar can exclude:
+        reissuing the unconstrained request just samples the same odds again.
+        The engine applies it on llama.cpp only and keeps it for the rest of the
+        batch; the first request is never constrained.
+        """
+        del rejected, target_lang
+        return None
+
     def response_token_budget(
         self,
         segments: list[dict],

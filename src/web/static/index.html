@@ -155,7 +155,7 @@
               <span>翻译后端</span>
               <select id="translation-backend">
                 <option value="openai" selected>API 调用（OpenAI 兼容）</option>
-                <option value="llamacpp">本地翻译（Hy-MT2-7B Q4 · llama.cpp）</option>
+                <option value="llamacpp">本地翻译（Hy-MT2-7B Q6 · llama.cpp）</option>
               </select>
             </label>
 
@@ -213,7 +213,7 @@
               <p class="field-hint">
                 先安装 llama.cpp：<code>winget install -e --id ggml.llamacpp</code>（Vulkan 版，装好后上方可留空）；
                 追求速度可用 N 卡版，GitHub Releases 下载 <code>llama-*-bin-win-cuda-*.zip</code> 解压后点 📁 选文件夹。<br>
-                固定使用 Hy-MT2-7B Q4_K_M，首次翻译自动下载约 4.6GB（建议开代理），期间临时释放 ASR 显存，用完自动重载。<br>
+                固定使用 Hy-MT2-7B Q6_K，首次翻译自动下载约 6.2GB（建议开代理），期间临时释放 ASR 显存，用完自动重载。<br>
                 按日语原文断句后逐条翻译，结合附近原文和当前句命中的用户术语；角色参考与全片参考仅用于 API 翻译。
               </p>
             </div>

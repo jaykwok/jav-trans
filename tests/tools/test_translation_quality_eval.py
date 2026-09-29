@@ -94,3 +94,50 @@ def test_synthetic_source_fixture_keeps_complete_negation_before_translation():
     assert len(raw) == 200 and len(planned) == 210
     targets = [case["text"] for case in planned if case["case_id"] == "split-negation"]
     assert targets == ["一緒に来るのは嫌なの？", "行きたくないわけじゃない。", "今日は少し疲れているだけ。"]
+
+
+def test_local_evaluation_forwards_the_constrained_retry_and_records_it(evaluator, monkeypatch, tmp_path):
+    from llm import engine, repair
+    from llm.backends import llamacpp_server
+    from llm.profiles.hymt2 import HyMt2Profile
+    from llm.profiles.json_v3 import JsonProfile
+    from llm.output_checks import NO_KANA_GRAMMAR
+
+    for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "LLAMACPP_GGUF_PATH", "TRANSLATION_BACKEND"):
+        monkeypatch.setenv(name, "")
+    monkeypatch.setattr(llamacpp_server, "resolve_gguf_model_path", lambda **_kw: "synthetic.gguf")
+    monkeypatch.setattr(evaluator, "baseline_modules", lambda _p: (JsonProfile(), HyMt2Profile(), repair, engine))
+    cues = [{"text": text, "start": i * 2, "end": i * 2 + 1} for i, text in enumerate(
+        ["こんにちは。", "ありがとう。", "待って。", "さようなら。"])]
+    monkeypatch.setattr(evaluator, "build_cases", lambda: cues)
+    monkeypatch.setattr(evaluator, "plan_source_cases", lambda rows: rows)
+    calls = []
+
+    class Backend:
+        def cache_identity(self):
+            return "synthetic"
+
+        def chat_completion(self, messages, **kwargs):
+            calls.append(kwargs)
+            if messages[0]["content"].endswith("こんにちは。") and not kwargs.get("grammar"):
+                return "こんにちは。"
+            return "你好。"
+
+    @contextmanager
+    def lease(_name):
+        yield Backend()
+
+    monkeypatch.setattr(evaluator, "backend_lease", lease)
+    args = SimpleNamespace(
+        output=str(tmp_path / "run"), baseline="unused", backend="llamacpp", server="",
+        max_usd=None, input_price=None, output_price=None, max_requests=10, max_output_tokens=128,
+        cues=4, workers=1, batch_size=1, review_limit=8, glossary="",
+        arms=["candidate"], review_fixture=False, review_from="",
+    )
+    assert evaluator.run(args) == 0
+    assert len(calls) == 5
+    assert [call.get("grammar") for call in calls[:2]] == [None, NO_KANA_GRAMMAR]
+    report = json.loads((tmp_path / "run/report.json").read_text(encoding="utf-8"))
+    assert report["arms"]["candidate"]["timings"][0]["translation_review"][0]["reason"] == "constrained_retry"
+    traces = [json.loads(p.read_text(encoding="utf-8")) for p in (tmp_path / "run").rglob("request-*.json")]
+    assert sum(trace.get("grammar") == NO_KANA_GRAMMAR for trace in traces) == 1

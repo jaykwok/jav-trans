@@ -82,7 +82,9 @@ TRANSLATION_SEMANTIC_REVIEW_MAX_IDS=80
 winget install -e --id ggml.llamacpp
 ```
 
-已安装并能自动查找到的 `llama-server` 无需重复填写路径。手动下载时，在控制台填写 `llama-server.exe` 所在文件夹或 exe 路径。翻译模型固定为 `Hy-MT2-7B-Q4_K_M.gguf`，首次翻译自动下载约 4.6 GB。
+已安装并能自动查找到的 `llama-server` 无需重复填写路径。手动下载时，在控制台填写 `llama-server.exe` 所在文件夹或 exe 路径。翻译模型固定为 `HY-MT2-7B-Q6_K.gguf`，首次翻译自动下载约 6.2 GB；服务器使用 q8_0 KV 缓存和 4 个并行槽，加载后约占 6.2 GB 专用显存。
+
+本地中文翻译会检查全角及半角假名残留，失败后使用排除假名的语法重试；中点、长音符等单独符号不会被当作漏译证据。此检查只约束字符，不能保证语义准确，短句和孤立发声仍需复查；经这种重试才通过的条目会列在质量报告的“建议复查的译文”中。
 
 ### 手动选择 CUDA 版
 
@@ -102,7 +104,7 @@ NVIDIA 用户可从 [llama.cpp 官方 Releases](https://github.com/ggml-org/llam
 
 ### CUDA 不可用或显存不足
 
-正式 ASR、真实训练和批量评估要求 CUDA，不提供静默 CPU 回退。先检查 NVIDIA 驱动并关闭其他占用显卡的程序。当前 ASR 模型要求至少 6144 MiB 物理显存，推荐 8 GB 及以上。
+正式 ASR、真实训练和批量评估要求 CUDA，不提供静默 CPU 回退。先检查 NVIDIA 驱动并关闭其他占用显卡的程序。程序最低要求 8 GB 物理显存。
 
 保留默认 `ASR_BATCH_SIZE=auto`，程序可在 OOM 后降低批大小。当前没有更小的 ASR 模型可切换；批大小调低也不能解决驱动不可用或模型最低显存不满足的问题。
 

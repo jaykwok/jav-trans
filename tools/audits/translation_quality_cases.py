@@ -309,6 +309,61 @@ CASES = [
 ]
 
 
+# What each scene tests, on the authored line that carries it. A judge reads
+# these before the candidate translations, so "meaning right" is decided on the
+# same points every time instead of on whatever stands out. `control` scenes
+# have none on purpose: any meaning change there is a normal sentence broken.
+CHECKPOINTS = {
+    "decline-help": {1: "婉拒帮忙：不用了，我自己拿得动"},
+    "reassurance": {1: "报平安：我没事，只是吓了一跳"},
+    "decline-tea": {1: "谢绝续茶：不用了，已经喝够了（不是“很好”）"},
+    "approve-plan": {1: "同意：这样就可以（不是拒绝）"},
+    "double-negation": {0: "单纯询问“不想一起去吗”，不能变成双重否定", 1: "双重否定：并不是不想去"},
+    "not-all": {1: "部分否定：并非所有人都同意（不是“都不同意”）"},
+    "not-necessarily": {1: "贵不一定好吃（不是“贵的不好吃”）"},
+    "only-one": {1: "只剩一张"},
+    "not-yet": {1: "还没吃（未完成，不是“不吃”）"},
+    "no-longer": {1: "现在已经不去了", 3: "在（自己）附近找，不是在那家店附近"},
+    "conditional-rain": {1: "不下雨才在外面练", 2: "下雨就用体育馆"},
+    "even-if": {1: "即使下雨也不取消"},
+    "before-after": {1: "收拾完再回去", 2: "没收拾完之前不能回去"},
+    "unless": {1: "只要没收到消息就一直等", 2: "收到消息就出发（不是“他来了”）"},
+    "possibility": {1: "工作早结束的话“也许”能来（不是承诺）"},
+    "hearsay": {0: "保留传闻：听说那家店要关门", 2: "只是听邻居/旁人说的"},
+    "expected-not-certain": {1: "推测：应该今天到（不是“一定/已经到”）", 2: "好像还没到"},
+    "benefactive-received": {1: "姐姐给我的（姐姐→我）"},
+    "benefactive-gave": {1: "我送了她之前想要的书（我→妹妹）", 3: "她当天就读了（读的是妹妹）"},
+    "causative-permission": {1: "可以看，但别带走", 3: "“那给你/请看”，不是让对方拿走"},
+    "passive": {1: "被陌生人问路（问路的是陌生人）", 3: "一起走到了附近（不是走了很长一段）"},
+    "borrow-lend": {1: "我这把也是向哥哥借的（借入）"},
+    "asked-to-wait": {1: "老师让我在这里等"},
+    "polite-request": {0: "礼貌地请对方关窗"},
+    "plain-request": {0: "请对方关窗（请求，不是询问窗能否关）"},
+    "urgent-repeat": {1: "等等，行李还没拿好", 2: "不用急，还有下一班"},
+    "hesitation": {1: "还在考虑（犹豫）"},
+    "soft-disagreement": {1: "委婉否定：恐怕也不能这么说（不是同意）"},
+    "number-correction": {1: "不是七点半，是八点半", 2: "记差了一小时（保留“一小时”，不新增情节）"},
+    "remaining-quantity": {1: "要六个，有四个，还差两个", 2: "只要再买两个"},
+    "comparison": {1: "今天电车比公交快（比较方向）"},
+    "not-more-than": {1: "用不了十分钟（上限）"},
+    "only-today": {1: "只有今天半价（范围是“今天”）"},
+    "only-looking": {1: "只是看看"},
+    "request-not-question": {0: "请对方帮忙拿箱子", 2: "不是蓝的，是旁边那个白的"},
+    "permission-vs-ability": {0: "询问可否坐（许可）", 1: "请坐，没人用"},
+    "prohibition": {1: "别按那个（禁止）", 2: "按右边的蓝色按钮"},
+    "no-need": {1: "明天不用来（不必，不是“不能来”）"},
+    "must": {0: "问能否不在今天交", 1: "必须今天交"},
+    "past-regret": {0: "遗憾：昨天要是叫上我就好了", 1: "我以为你忙"},
+    "counterfactual": {0: "反事实：早点出门就赶上了（实际没赶上）"},
+    "referent-object": {2: "问“这个（蓝的）可以晚点开吗”", 3: "蓝的待会儿再开"},
+    "unknown-person": {1: "名字没听清", 2: "对方说待会儿再打来"},
+    "relative-clause": {1: "去昨天说过的那家店"},
+    "split-negation": {1: "并不是不想去（跨两条字幕的双重否定）"},
+    "split-condition": {1: "如果明天工作早结束，就过去一趟"},
+    "split-not-all": {1: "并不是全都错了（部分否定）"},
+}
+
+
 def build_cases():
     rows = []
     for scene_index, (scene_id, category, lines) in enumerate(CASES):
@@ -318,6 +373,7 @@ def build_cases():
                 "end": float(scene_index * 30 + offset * 3 + 2.8),
                 "text": ja, "case_id": scene_id, "category": category,
                 "reference": reference,
+                "checkpoint": CHECKPOINTS.get(scene_id, {}).get(offset, ""),
             }
             if category == "continuation":
                 if offset == 1:
@@ -359,6 +415,7 @@ def plan_source_cases(rows):
                 **{key: cue[key] for key in ("text", "start", "end", "continues_from_previous", "continues_into_next")},
                 "case_id": members[0]["case_id"], "category": members[0]["category"],
                 "reference": "".join(row["reference"] for row in members), "reference_source": text,
+                "checkpoint": "；".join(row["checkpoint"] for row in members if row.get("checkpoint")),
             })
     return planned
 

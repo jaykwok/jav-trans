@@ -486,3 +486,31 @@ def test_an_empty_subtitle_run_still_reports_how_it_was_cut():
 
     assert report["chunk_cut_count"] == 2
     assert report["chunk_cut_max_fallback_count"] == 2
+
+
+def test_lines_to_review_are_counted_and_listed_without_a_warning():
+    segs = [_seg("こんにちは。", "你好。", 0.0, 1.0), _seg("ありがとう。", "谢谢。", 2.0, 3.0)]
+    segs[0]["translation_review"] = {"reason": "constrained_retry", "rejected": "source_echo"}
+    report = compute_quality_report(segs, 60.0, [], 0, 2)
+    assert report["translation_review_cue_count"] == 1
+    assert report["translation_review_examples"] == [
+        {"index": 0, "start": 0.0, "end": 1.0, "reason": "constrained_retry", "rejected": "source_echo"}
+    ]
+    # Surviving an echo must not become a failed job under QC_HARD_FAIL.
+    assert not any("translation_review" in warning for warning in report["warnings"])
+
+
+def test_cues_marked_for_listening_are_listed():
+    segs = [_seg("んく", "嗯库", 5.0, 5.5), _seg("テスト", "测试")]
+    segs[0]["vocalisation_verdict"] = "silence_diluted_vocal_audio"
+    report = compute_quality_report(segs, 60.0, [], 0, 2)
+    assert report["vocalisation_review_examples"] == [
+        {"index": 0, "start": 5.0, "end": 5.5, "verdict": "silence_diluted_vocal_audio"}
+    ]
+
+
+def test_no_lines_to_review_still_reports_zero():
+    report = compute_quality_report([_seg("テスト", "测试")], 60.0, [], 0, 1)
+    assert report["translation_review_cue_count"] == 0
+    assert report["translation_review_examples"] == []
+    assert compute_quality_report([], 60.0, [], 0, 0)["translation_review_cue_count"] == 0

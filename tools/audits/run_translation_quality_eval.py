@@ -143,7 +143,7 @@ def run(args):
         if len(cases) != len(initial_texts) or not all(isinstance(text, str) for text in initial_texts):
             raise ValueError("reused report has incomplete translations")
         input_kind = "reused_synthetic_after_repair"
-    segments = [{key: value for key, value in row.items() if key not in {"reference", "category", "case_id"}} for row in cases]
+    segments = [{key: value for key, value in row.items() if key not in {"reference", "category", "case_id", "checkpoint"}} for row in cases]
     context = SourceContext.build(segments)
     full_payload = json.dumps(list(context.rows), ensure_ascii=False, separators=(",", ":"))
     budget = Budget(maximum=args.max_usd or 0.0, input_price=args.input_price or 0.0, output_price=args.output_price or 0.0, requests=args.max_requests)
@@ -152,7 +152,10 @@ def run(args):
         "input_kind": input_kind, "source_timing": "synthetic fixture; no audio alignment measured",
         "original_cue_count": original_cue_count,
         "source_signature": context.signature, "backend": args.backend,
-        "configured_model": os.getenv("LLM_MODEL_NAME", "") if args.backend == "api" else "Hy-MT2-7B-Q4_K_M",
+        # File name only: an explicit GGUF path would put a local directory in the report.
+        "configured_model": os.getenv("LLM_MODEL_NAME", "") if args.backend == "api" else Path(
+            os.getenv("LLAMACPP_GGUF_PATH", "") or os.getenv("LLAMACPP_MODEL_FILE", "")
+        ).name,
         "glossary": args.glossary, "cue_count": len(cases), "cases": cases, "arms": {},
         "maximum_usd": args.max_usd, "prices_per_million": {"input": args.input_price, "output": args.output_price},
     }
@@ -194,12 +197,14 @@ def run(args):
                 run_context = RunContext.capture()
 
                 def chat(messages, *, expected_count=0, max_tokens=None, response_schema=None, bounded_response_schema=None,
-                         reasoning_effort=None, on_usage=None, on_progress=None, cancel_event=None):
+                         reasoning_effort=None, on_usage=None, on_progress=None, cancel_event=None, output_grammar=None):
                     run_context.adopt()
                     bound = min(args.max_output_tokens, max_tokens or args.max_output_tokens)
                     request_id = budget.reserve(messages, bound, paid=args.backend == "api")
                     sampling = profile.sampling_parameters()
                     extra = {"sampling_parameters": sampling} if args.backend == "llamacpp" and sampling else {}
+                    if args.backend == "llamacpp" and output_grammar is not None:
+                        extra["grammar"] = output_grammar
 
                     def usage(row):
                         with budget.lock:
@@ -208,7 +213,8 @@ def run(args):
                             on_usage(row)
 
                     trace = {"arm": arm, "request_id": request_id, "messages": messages,
-                             "schema": bounded_response_schema or response_schema, "max_tokens": bound}
+                             "schema": bounded_response_schema or response_schema, "max_tokens": bound,
+                             "grammar": extra.get("grammar")}
                     try:
                         response = backend.chat_completion(
                             messages, expected_count=expected_count,

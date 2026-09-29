@@ -240,14 +240,35 @@ REASON_VOCAL_AUDIO = "vocal_text_vocal_audio"
 REASON_KANA_VOCAL_AUDIO = "kana_text_vocal_audio"
 REASON_VOCAL_TEXT_SPEECH_AUDIO = "vocal_text_speech_audio"
 REASON_LEXICAL_VOCAL_AUDIO = "lexical_text_vocal_audio"
+REASON_DILUTED_VOCAL_AUDIO = "silence_diluted_vocal_audio"
 REASON_KEPT = "kept"
 
-# Verdicts that survive but want a human. Both are cases where text and
+# Verdicts that survive but want a human. All are cases where text and
 # acoustics disagree in the direction that keeps the cue, which is the safe
 # direction to be wrong in and the interesting one to look at.
 _MARKED_REASONS = frozenset(
-    {REASON_VOCAL_TEXT_SPEECH_AUDIO, REASON_LEXICAL_VOCAL_AUDIO}
+    {REASON_VOCAL_TEXT_SPEECH_AUDIO, REASON_LEXICAL_VOCAL_AUDIO, REASON_DILUTED_VOCAL_AUDIO}
 )
+
+
+def _diluted_vocalisation(acoustics: CueAcoustics, *, speech_max: float, vocalisation_min: float) -> bool:
+    """Almost no speech, and vocalisation dominates what is not silence.
+
+    The absolute share misses a short cue padded with silence: anonymous sample A
+    kept a two-kana cue at speech 0.0017 / vocalisation 0.49 / silence 0.51,
+    which is 99.7% vocalisation of its sound. Measured read-only on that film's
+    266 surviving cues, this adds four cues. Listened to on 2026-09-29: two were
+    pure vocalisation, one was unclear, and one was a moaned word ("kimoji")
+    that the ASR had written as kana noise and the frame head scored as speech
+    0.022. Deleting on this rule would have removed that line, so it only marks,
+    and the deletion threshold stays where it is.
+    """
+    sounded = acoustics.vocalisation + acoustics.speech
+    return (
+        acoustics.speech < speech_max
+        and sounded > 0
+        and acoustics.vocalisation / sounded > vocalisation_min
+    )
 
 
 def classify_cue(
@@ -310,6 +331,10 @@ def classify_cue(
             and acoustics.vocalisation > kana_vocalisation_min
         ):
             return CueVerdict(True, REASON_KANA_VOCAL_AUDIO)
+        if _diluted_vocalisation(
+            acoustics, speech_max=kana_speech_max, vocalisation_min=kana_vocalisation_min
+        ):
+            return CueVerdict(False, REASON_DILUTED_VOCAL_AUDIO)
         return CueVerdict(False, REASON_KEPT)
     # Kanji, latin or digits. Never dropped here: the ASR hallucinating a word
     # over moaning is real - one was found by ear in the 60-cue audit - but the
@@ -323,6 +348,10 @@ def classify_cue(
         and acoustics.vocalisation > kana_vocalisation_min
     ):
         return CueVerdict(False, REASON_LEXICAL_VOCAL_AUDIO)
+    if _diluted_vocalisation(
+        acoustics, speech_max=kana_speech_max, vocalisation_min=kana_vocalisation_min
+    ):
+        return CueVerdict(False, REASON_DILUTED_VOCAL_AUDIO)
     return CueVerdict(False, REASON_KEPT)
 
 

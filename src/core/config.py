@@ -87,7 +87,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # A numeric MB value remains available as an exact expert override.
     "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "auto",
     "ASR_STAGE_WORKER_VRAM_RATIO": "0.95",
-    "ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144",
+    "ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=7168",
     "ASR_STAGE_WORKER_RAM_RATIO": "0.95",
     # The Windows PDH shared-VRAM counter jitters by a few MB even when the
     # allocator is hard-capped and cannot spill; only growth beyond this
@@ -171,7 +171,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
 
     # --- LLM Translation Settings ---
     # Translation backend type: openai (OpenAI-compatible API) | llamacpp
-    # (fixed Hy-MT2-7B Q4_K_M GGUF served by llama.cpp).
+    # (fixed Hy-MT2-7B Q6_K GGUF served by llama.cpp).
     "TRANSLATION_BACKEND": "openai",
     # Base URL for providers that expose an OpenAI-compatible API; OpenRouter by
     # default. DeepSeek's own endpoint is `https://api.deepseek.com` (no version
@@ -215,12 +215,14 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # ggml.llamacpp, which is the Vulkan build; the CUDA zip is faster on
     # NVIDIA and has to be pointed at explicitly).
     "LLAMACPP_SERVER_PATH": "",
-    # Default model: official Hy-MT2-7B Q4_K_M (7.5B parameters, 4.62GB GGUF),
+    # Default model: official Hy-MT2-7B Q6_K (7.5B parameters, 6.16GB GGUF),
     # driven by the `hymt2` per-line profile rather than the JSON batch contract.
-    # Q4 leaves the necessary runtime/KV headroom on an 8GB card; larger
-    # quantizations are not the shipped default.
+    # 8GB of VRAM is the project minimum; Q6 fits it only with the q8_0 KV cache
+    # the server command sets (see `llamacpp_server._build_command`). Measured
+    # 2026-09-28 against Q4_K_M: no kana-rejected first replies left on the
+    # issue #2 film. Note the upstream file name really starts with "HY-".
     "LLAMACPP_MODEL_REPO": "tencent/Hy-MT2-7B-GGUF",
-    "LLAMACPP_MODEL_FILE": "Hy-MT2-7B-Q4_K_M.gguf",
+    "LLAMACPP_MODEL_FILE": "HY-MT2-7B-Q6_K.gguf",
     # Explicit local GGUF path wins over repo+file download.
     "LLAMACPP_GGUF_PATH": "",
     # Context per server slot; total server context is CTX_SIZE * PARALLEL.
@@ -235,13 +237,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # weights and per-slot compute buffers now dominate instead.
     "LLAMACPP_CTX_SIZE": "1024",
     "LLAMACPP_N_GPU_LAYERS": "999",
-    # More slots than the old default because the per-line requests are tiny:
-    # measured 2026-09-01 (RTX 4060 Ti 8GB, 40 concurrent single-cue
-    # requests), ctx=1024/parallel=8 used 5,665MB VRAM (vs the old
-    # ctx=8192/parallel=2's 6,697MB) and pushed throughput from 7.76 to
-    # 12.72 req/s (+64%) with zero kana-residue regressions. Smaller ctx
-    # frees more than the extra slots cost.
-    "LLAMACPP_PARALLEL": "8",
+    # One slot per translation worker. The web default sends 4 concurrent
+    # requests and translation caps workers at this value, so slots past 4
+    # only held KV cache. Measured 2026-09-28 (RTX 4060 Ti 8GB, Q6_K, q8_0 KV,
+    # whole film at 4 workers): 4 slots took 6389 MiB and 37-38 s, 8 slots
+    # 6663 MiB and 49-53 s. On the 8GB floor those 274 MiB are headroom.
+    "LLAMACPP_PARALLEL": "4",
     "LLAMACPP_STARTUP_TIMEOUT_S": "300",
     # Admission may fail without abandoning the retiring resource owner.
     "LOCAL_BACKEND_WAIT_TIMEOUT_S": "600",

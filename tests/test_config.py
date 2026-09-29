@@ -126,7 +126,7 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_VRAM_BUDGET_MB"] == "auto"
     assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_VRAM_RATIO"] == "0.95"
     minimum_vram_table = config.DEFAULT_SETTINGS["ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO"]
-    assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144" in minimum_vram_table
+    assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=7168" in minimum_vram_table
     # The 0.6B tier was dropped on 2026-07-31; a leftover row would
     # advertise a model that no longer ships.
     assert "0.6B" not in minimum_vram_table

@@ -115,6 +115,7 @@ const METRIC_GROUPS = [
       ['repetition_ratio', '重复译文占比'],
       ['kana_only_ratio', '纯假名占比'],
       ['glossary_hit_rate', '术语命中率'],
+      ['translation_review_cue_count', '建议复查译文数'],
     ],
   },
   {
@@ -152,6 +153,8 @@ const STRUCTURED_KEYS = new Set([
   'spec_review_examples',
   'subtitle_density_review_examples',
   'subtitle_overlap_examples',
+  'translation_review_examples',
+  'vocalisation_review_examples',
 ]);
 
 const GROUPED_KEYS = new Set(
@@ -309,6 +312,28 @@ function renderReport(report) {
       '每条 cue 是因为什么断开的：标点、强停顿，还是只能按词间隔切。',
     ),
     renderPostgateFlagTable(report),
+    renderExamples(
+      '建议复查的译文',
+      '首轮译文含日文被拒、禁假名重试后才通过的条目。能完成任务，但不代表含义已核实，请对照原文检查。',
+      report.translation_review_examples,
+      [
+        ['#', item => item.index],
+        ['起点', item => timecode(item.start)],
+        ['终点', item => timecode(item.end)],
+        ['被拒原因', item => item.rejected || '-'],
+      ],
+    ),
+    renderExamples(
+      '建议听音复查的 cue',
+      '纯人声过滤保留但声学判断存疑的条目（未删除）。按时间码听一下，确认是台词还是人声。',
+      report.vocalisation_review_examples,
+      [
+        ['#', item => item.index],
+        ['起点', item => timecode(item.start)],
+        ['终点', item => timecode(item.end)],
+        ['判断', item => item.verdict || '-'],
+      ],
+    ),
     renderExamples(
       '规格问题样例',
       '按时间码到播放器里核对；这里只列前若干条。',
