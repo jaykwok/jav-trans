@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -35,7 +36,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 _FROZEN = bool(getattr(sys, "frozen", False))
 ROOT = (Path(sys.executable) if _FROZEN else Path(__file__)).resolve().parent
@@ -67,6 +68,16 @@ CRITICAL_IMPORT_ROOTS = {
 # Files that travel in the archive. uv can rebuild .venv from these; it cannot
 # rebuild these, so a missing one is reported as "re-extract", never "repair".
 PAYLOAD_PATHS = ("launcher.py", "pyproject.toml", "src")
+
+# Every file the archive carries, written at build time. Upgrading by extracting
+# a new release over the old folder replaces files but never removes one, so a
+# module or FFmpeg DLL the new release dropped would stay behind - and a stale
+# package directory shadows a new module of the same name. The index is what lets
+# a launch tell "shipped by this release" from "left over by an older one".
+RELEASE_INDEX_NAME = "release-files.json"
+RELEASE_INDEX_SCHEMA = "jav_trans_release_files_v1"
+# Stale files are moved here, not deleted: someone may have edited one.
+LEFTOVERS_DIR = Path("tmp") / "upgrade-leftovers"
 
 # Must match core.config._PROXY_ENV_KEYS. Both cases are set because parts of
 # the stack read only the lowercase names.
@@ -635,6 +646,167 @@ def missing_payload_paths() -> list[str]:
     return [name for name in PAYLOAD_PATHS if not (ROOT / name).exists()]
 
 
+def write_release_index(payload: Path) -> Path:
+    """Record every file of a staged release, for `prune_stale_release_files`.
+
+    The build calls this on the staged payload before hashing it, so the index
+    travels in the archive and appears in the release manifest like any file.
+    """
+    index = payload / RELEASE_INDEX_NAME
+    files = sorted(
+        path.relative_to(payload).as_posix()
+        for path in payload.rglob("*")
+        if path.is_file() and path != index
+    )
+    index.write_text(
+        json.dumps({"schema": RELEASE_INDEX_SCHEMA, "files": files}, ensure_ascii=False, indent=1) + "\n",
+        encoding="utf-8",
+    )
+    return index
+
+
+def read_release_index(root: Path) -> frozenset[str] | None:
+    """The files this release shipped, or None when there is no usable index.
+
+    An index that does not list launcher.py and something under src/ is treated
+    as absent: every path it leaves out counts as stale, so a truncated one would
+    otherwise empty src/.
+    """
+    try:
+        data = json.loads((root / RELEASE_INDEX_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("schema") != RELEASE_INDEX_SCHEMA:
+        return None
+    files = data.get("files")
+    if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
+        return None
+    shipped = frozenset(files)
+    if "launcher.py" not in shipped or not any(item.startswith("src/") for item in shipped):
+        return None
+    return shipped
+
+
+# FFmpeg Shared is all a release puts in bin/, and only names that are
+# recognisably FFmpeg's are the release's to remove. Other tools live there too -
+# the uv the first run downloads, a llama.cpp build with its own DLLs - and
+# moving half of one breaks it.
+_FFMPEG_BINARY = re.compile(
+    r"(?:avcodec|avdevice|avfilter|avformat|avutil|postproc|swresample|swscale)-\d+\.dll"
+    r"|ffmpeg\.exe|ffprobe\.exe|ffplay\.exe",
+    re.IGNORECASE,
+)
+
+
+def _is_release_binary(name: str) -> bool:
+    return _FFMPEG_BINARY.fullmatch(name) is not None
+
+
+def _path_key(relative: str) -> str:
+    # Windows paths ignore case, and copying src/llm/ over an old src/LLM/ writes
+    # into the existing folder under its old spelling. A case-sensitive match
+    # would then move the new release's own files out. Folding on every platform
+    # can only err towards keeping a file.
+    return relative.casefold()
+
+
+def stale_release_paths(root: Path, shipped: frozenset[str]) -> list[str]:
+    """Paths under src/ and bin/ that this release did not ship.
+
+    src/ belongs to the release entirely. An unlisted directory goes as a whole,
+    bytecode cache included, because a leftover package directory would shadow a
+    new module of the same name. An unlisted file goes on its own. Bytecode
+    caches inside shipped directories stay: Python never imports a cached module
+    whose source is gone. Names are compared the way Windows compares them.
+    """
+    shipped_files = {_path_key(item) for item in shipped}
+    shipped_dirs = {
+        _path_key(parent.as_posix()) for item in shipped for parent in PurePosixPath(item).parents
+    }
+    stale: list[str] = []
+    for current, dirs, files in os.walk(root / "src"):
+        here = Path(current).relative_to(root).as_posix()
+        descend = []
+        for name in sorted(dirs):
+            if name.casefold() == "__pycache__":
+                continue
+            relative = f"{here}/{name}"
+            if _path_key(relative) in shipped_dirs:
+                descend.append(name)
+            else:
+                stale.append(relative)
+        dirs[:] = descend
+        stale.extend(
+            f"{here}/{name}"
+            for name in sorted(files)
+            if _path_key(f"{here}/{name}") not in shipped_files
+        )
+    bin_dir = root / "bin"
+    if bin_dir.is_dir():
+        for path in sorted(bin_dir.iterdir()):
+            relative = f"bin/{path.name}"
+            if (
+                path.is_file()
+                and _is_release_binary(path.name)
+                and _path_key(relative) not in shipped_files
+            ):
+                stale.append(relative)
+    return stale
+
+
+def prune_stale_release_files(root: Path | None = None) -> tuple[list[str], Path | None]:
+    """Move what an older release left in src/ and bin/ out of the way.
+
+    This is what makes extracting a new release over the old folder a complete
+    upgrade. Nothing happens in a git checkout (src/ is the developer's) or
+    without an index (an older archive). A path that cannot be moved is
+    reported and skipped: a leftover costs less than a launcher that refuses to
+    start.
+    """
+    root = root or ROOT
+    if (root / ".git").exists():
+        return [], None
+    shipped = read_release_index(root)
+    if shipped is None:
+        return [], None
+    stale = stale_release_paths(root, shipped)
+    if not stale:
+        return [], None
+    base = root / LEFTOVERS_DIR / time.strftime("%Y%m%d_%H%M%S")
+    target, attempt = base, 1
+    while target.exists():
+        target = base.with_name(f"{base.name}-{attempt}")
+        attempt += 1
+    moved = []
+    for relative in stale:
+        destination = target / relative
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(root / relative), str(destination))
+        except OSError as error:
+            log(f"  无法移走旧版本文件 {relative}: {error}")
+            continue
+        moved.append(relative)
+    return moved, (target if moved else None)
+
+
+def enclosing_install(root: Path | None = None) -> Path | None:
+    """The older install this folder was extracted into, if the parent is one.
+
+    Extracting a release *into* the old folder instead of over it nests a second
+    copy inside the first, which then installs a fresh environment and downloads
+    every model again while the old ones sit one level up.
+    """
+    root = root or ROOT
+    parent = root.parent
+    if parent == root:
+        return None
+    looks_installed = (parent / ".venv").is_dir() or (parent / "models").is_dir()
+    if (parent / "launcher.py").is_file() and (parent / "src").is_dir() and looks_installed:
+        return parent
+    return None
+
+
 def ffmpeg_problem() -> str:
     """"" when ffmpeg is usable, else what is wrong with it.
 
@@ -1001,6 +1173,13 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.setdefault("UV_CACHE_DIR", str(ROOT / "tmp" / "cache" / "uv"))
         os.environ.setdefault("UV_PYTHON_INSTALL_DIR", str(ROOT / "tmp" / "python"))
 
+    # Before anything reads src/: an upgrade extracted over the old folder is
+    # only finished once what the old release left behind is out of the way.
+    moved, leftovers = prune_stale_release_files()
+    if moved and leftovers is not None:
+        log(f"已把旧版本遗留、本版本不再使用的 {len(moved)} 个程序文件移到 "
+            f"{leftovers.relative_to(ROOT)}（覆盖升级的正常现象，程序正常后可删除）")
+
     # A structural check on every run, not just the first: the stamp says the
     # install once completed, which stops being true the moment someone deletes a
     # folder out of .venv to reclaim disk space. Cheap (a handful of stat calls);
@@ -1043,10 +1222,18 @@ def main(argv: list[str] | None = None) -> int:
             allow_repair=may_repair,
         )
 
+    if not venv_python().is_file() and (nested := enclosing_install()) is not None:
+        log(f"\n注意：上一级目录 {nested} 看起来是已经装好的 jav-trans。")
+        log("升级应把新版压缩包里的 jav-trans 文件夹解压到旧版 jav-trans 文件夹所在的位置，")
+        log("替换同名文件；像现在这样解压进旧版目录里面，会重新安装运行环境、重新下载模型。")
+        if interactive() and not args.yes and not ask_yes("仍要在这里全新安装吗？"):
+            log("已取消。请关闭窗口，按上面的方式重新解压。")
+            return 1
+
     if report["payload"]:
         log("\n程序文件不完整，缺少：" + "、".join(report["payload"]))
-        log("这些文件在压缩包里，无法自动补回：请重新解压一份完整的程序目录")
-        log("（.venv、models、.env 可以从旧目录搬过去，不用重新下载）。")
+        log("这些文件在压缩包里，无法自动补回：请把发布包重新解压并覆盖到本目录，")
+        log("替换同名文件即可；.venv、models、.env 都会保留，不用重新下载。")
         return 1
 
     if needs_install and is_source_checkout() and not args.allow_source_checkout:

@@ -12,7 +12,25 @@ offline fallback.
 Produces `dist/release-assets/release-<timestamp>-<id>/jav-trans-windows-x64.zip`
 (~100 MB), with `release-manifest.json` and a `.zip.sha256` file. Its payload
 is `jav-trans.exe`, `bin/` (FFmpeg Shared), `src/`, `launcher.py`,
-`pyproject.toml`, `uv.lock`, and `README.txt`. FFmpeg is most of the size.
+`pyproject.toml`, `uv.lock`, `README.txt`, and `release-files.json`. FFmpeg is
+most of the size.
+
+Users upgrade by copying a new archive's files over the old folder, which keeps
+`.venv`, `models/`, `.env`, and `tmp/`. Copying replaces files but never
+removes one, so `release-files.json` (written by `write_release_index.py` just
+before the manifest is recorded) lists every file the release ships. On each
+start, `bootstrap.py` moves the files the index does not list into
+`tmp/upgrade-leftovers/<timestamp>/`. This covers anything under `src/`, and
+files in `bin/` whose names identify them as FFmpeg's (`ffmpeg.exe`,
+`avcodec-*.dll` and the like). The index matters most for a leftover package
+directory, which would otherwise shadow a new module of the same name. Paths
+are compared ignoring case, as Windows does: copying `src/llm/` over an old
+`src/LLM/` keeps the old spelling.
+
+Nothing is moved in a git checkout, or when the index is missing or does not
+list `launcher.py` and `src/`. Anything else in `bin/` stays, such as the
+downloaded `uv.exe` or a llama.cpp build with its own DLLs. The first run also
+warns before installing into a folder nested inside an existing install.
 
 The exe is named `jav-trans.exe`, not `jav-trans-setup.exe`: installing is only
 what the first run does, and it is the launcher on every run after that. Both

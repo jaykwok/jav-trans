@@ -10,6 +10,7 @@ ready.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -383,3 +384,247 @@ class TestUvDownload:
         except Exception:  # noqa: BLE001 - offline is not a failure of this code
             pytest.skip("PyPI unreachable")
         assert bootstrap.latest_uv_wheel_url(index).endswith("win_amd64.whl")
+
+
+class TestOverwriteUpgrade:
+    """Extracting a new release over the old folder replaces files, never removes
+    one. What the new release dropped stays behind - and a leftover package
+    directory shadows a new module of the same name - unless the launch moves it
+    out of the way using the index the build ships."""
+
+    SHIPPED = (
+        "launcher.py",
+        "src/main.py",
+        "src/llm/__init__.py",
+        "src/llm/backend.py",
+        "bin/ffmpeg.exe",
+        "bin/avcodec-62.dll",
+    )
+
+    @staticmethod
+    def _touch(root: Path, *paths: str) -> None:
+        for relative in paths:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
+
+    def _upgraded(self, root: Path, *leftovers: str) -> Path:
+        """An install that had an older release and then got this one on top."""
+        self._touch(root, *self.SHIPPED)
+        bootstrap.write_release_index(root)
+        self._touch(root, *leftovers)
+        return root
+
+    def _run_build_script(self, payload: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(ROOT / "packaging" / "write_release_index.py"), "--payload", str(payload)],
+            capture_output=True,
+        )
+
+    def test_the_index_lists_every_shipped_file_but_itself(self, tmp_path: Path) -> None:
+        self._touch(tmp_path, *self.SHIPPED)
+        index = bootstrap.write_release_index(tmp_path)
+        assert index.name == bootstrap.RELEASE_INDEX_NAME
+        assert bootstrap.read_release_index(tmp_path) == frozenset(self.SHIPPED)
+
+    def test_a_package_directory_left_by_an_older_release_is_moved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The case that breaks a launch: src/llm/backend/ wins over the
+        src/llm/backend.py the new release ships."""
+        monkeypatch.setattr(bootstrap.time, "strftime", lambda _: "20260929_120000")
+        root = self._upgraded(
+            tmp_path,
+            "src/llm/backend/__init__.py",
+            "src/llm/backend/__pycache__/__init__.cpython-314.pyc",
+        )
+        moved, leftovers = bootstrap.prune_stale_release_files(root)
+        assert moved == ["src/llm/backend"]
+        assert leftovers == root / bootstrap.LEFTOVERS_DIR / "20260929_120000"
+        assert (root / "src/llm/backend.py").is_file()
+        assert not (root / "src/llm/backend").exists()
+        # Moved, not deleted: someone may have edited it.
+        assert (leftovers / "src/llm/backend/__init__.py").is_file()
+
+    def test_dropped_modules_and_ffmpeg_dlls_go_and_the_rest_stays(self, tmp_path: Path) -> None:
+        root = self._upgraded(
+            tmp_path,
+            "src/llm/old_client.py",
+            "src/retired/__init__.py",
+            "bin/avcodec-61.dll",
+            # Not the release's: uv is downloaded on the first run, and a cache
+            # is harmless once its source is gone.
+            "bin/uv.exe",
+            "src/llm/__pycache__/backend.cpython-314.pyc",
+        )
+        moved, _ = bootstrap.prune_stale_release_files(root)
+        assert sorted(moved) == ["bin/avcodec-61.dll", "src/llm/old_client.py", "src/retired"]
+        for relative in (*self.SHIPPED, "bin/uv.exe", "src/llm/__pycache__/backend.cpython-314.pyc"):
+            assert (root / relative).is_file(), relative
+
+    def test_other_tools_in_bin_are_left_whole(self, tmp_path: Path) -> None:
+        """A llama.cpp build unpacked into bin/ carries its own DLLs. Moving
+        those but not llama-server.exe would break local translation."""
+        tools = (
+            "bin/llama-server.exe",
+            "bin/llama.dll",
+            "bin/ggml-cuda.dll",
+            "bin/ggml-base.dll",
+            "bin/cudart64_12.dll",
+        )
+        root = self._upgraded(tmp_path, *tools, "bin/postproc-58.dll", "bin/SWSCALE-9.DLL")
+        moved, _ = bootstrap.prune_stale_release_files(root)
+        assert sorted(moved) == ["bin/SWSCALE-9.DLL", "bin/postproc-58.dll"]
+        for relative in tools:
+            assert (root / relative).is_file(), relative
+
+    def test_an_old_spelling_of_a_shipped_path_is_the_same_path(self, tmp_path: Path) -> None:
+        """Copying src/llm/ over an old src/LLM/ writes into the existing folder
+        and keeps its spelling, as Windows does. The new release's files in it
+        are not leftovers."""
+        payload = tmp_path / "payload"
+        self._touch(payload, *self.SHIPPED)
+        bootstrap.write_release_index(payload)
+        root = tmp_path / "install"
+        self._touch(
+            root,
+            "launcher.py",
+            "src/Main.py",
+            "src/LLM/__init__.py",
+            "src/LLM/Backend.py",
+            "bin/FFmpeg.exe",
+            "bin/AVCODEC-62.DLL",
+        )
+        shutil.copy2(payload / bootstrap.RELEASE_INDEX_NAME, root / bootstrap.RELEASE_INDEX_NAME)
+        assert bootstrap.prune_stale_release_files(root) == ([], None)
+        assert (root / "src/LLM/Backend.py").is_file()
+
+    def test_a_second_upgrade_in_the_same_second_keeps_the_first_leftovers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(bootstrap.time, "strftime", lambda _: "20260929_120000")
+        root = self._upgraded(tmp_path, "src/old.py")
+        earlier = root / bootstrap.LEFTOVERS_DIR / "20260929_120000"
+        self._touch(earlier, "src/old.py")
+        _, leftovers = bootstrap.prune_stale_release_files(root)
+        assert leftovers == earlier.with_name("20260929_120000-1")
+        assert (earlier / "src/old.py").is_file()
+
+    def test_a_file_that_will_not_move_is_skipped_not_fatal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A leftover costs less than a launcher that refuses to start."""
+        root = self._upgraded(tmp_path, "src/locked.py", "src/old.py")
+        real_move = bootstrap.shutil.move
+
+        def move(source: str, destination: str) -> str:
+            if source.endswith("locked.py"):
+                raise PermissionError("in use")
+            return real_move(source, destination)
+
+        monkeypatch.setattr(bootstrap.shutil, "move", move)
+        moved, _ = bootstrap.prune_stale_release_files(root)
+        assert moved == ["src/old.py"]
+        assert (root / "src/locked.py").is_file()
+
+    def test_a_git_checkout_is_never_touched(self, tmp_path: Path) -> None:
+        """src/ there is the developer's work in progress."""
+        root = self._upgraded(tmp_path, "src/new_module.py")
+        (root / ".git").mkdir()
+        assert bootstrap.prune_stale_release_files(root) == ([], None)
+        assert (root / "src/new_module.py").is_file()
+
+    def test_without_an_index_nothing_is_touched(self, tmp_path: Path) -> None:
+        """Archives from before the index existed ship none."""
+        self._touch(tmp_path, *self.SHIPPED, "src/old.py")
+        assert bootstrap.prune_stale_release_files(tmp_path) == ([], None)
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            '{"schema": "jav_trans_release_files_v1", "files": ["README.txt"]}',
+            '{"schema": "jav_trans_release_files_v1", "files": ["launcher.py"]}',
+            '{"schema": "some_other_schema", "files": ["launcher.py", "src/main.py"]}',
+            '{"schema": "jav_trans_release_files_v1", "files": [',
+        ],
+    )
+    def test_an_index_that_would_empty_src_is_ignored(self, tmp_path: Path, content: str) -> None:
+        """Everything an index leaves out counts as stale, so a truncated one
+        must read as no index at all."""
+        self._touch(tmp_path, *self.SHIPPED)
+        (tmp_path / bootstrap.RELEASE_INDEX_NAME).write_text(content, encoding="utf-8")
+        assert bootstrap.read_release_index(tmp_path) is None
+        assert bootstrap.prune_stale_release_files(tmp_path) == ([], None)
+        assert (tmp_path / "src/llm/backend.py").is_file()
+
+    def test_the_launch_prunes_before_anything_reads_src(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = self._upgraded(tmp_path, "src/llm/backend/__init__.py")
+        monkeypatch.setattr(bootstrap, "ROOT", root)
+        seen = []
+
+        class Stop(Exception):
+            pass
+
+        def diagnose(*args, **kwargs):
+            seen.append((root / "src/llm/backend").exists())
+            raise Stop
+
+        monkeypatch.setattr(bootstrap, "diagnose", diagnose)
+        with pytest.raises(Stop):
+            bootstrap.main([])
+        assert seen == [False]
+
+    def test_the_build_script_writes_an_index_the_launcher_accepts(self, tmp_path: Path) -> None:
+        self._touch(tmp_path, *self.SHIPPED)
+        completed = self._run_build_script(tmp_path)
+        assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")
+        assert bootstrap.read_release_index(tmp_path) == frozenset(self.SHIPPED)
+
+    def test_the_build_script_refuses_a_payload_the_launcher_would_ignore(self, tmp_path: Path) -> None:
+        """Shipping an unusable index would silently turn the cleanup off."""
+        self._touch(tmp_path, "launcher.py")
+        assert self._run_build_script(tmp_path).returncode == 1
+
+
+class TestNestedExtraction:
+    """Extracting the new release *into* the old folder, rather than over it,
+    starts a second install that downloads every model again."""
+
+    def test_an_installed_parent_is_recognised(self, tmp_path: Path) -> None:
+        (tmp_path / "launcher.py").write_text("", encoding="utf-8")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "models").mkdir()
+        assert bootstrap.enclosing_install(tmp_path / "jav-trans") == tmp_path
+
+    def test_a_parent_that_never_installed_is_not(self, tmp_path: Path) -> None:
+        """An extracted-but-never-run copy one level up has nothing to lose."""
+        (tmp_path / "launcher.py").write_text("", encoding="utf-8")
+        (tmp_path / "src").mkdir()
+        assert bootstrap.enclosing_install(tmp_path / "jav-trans") is None
+
+    def test_an_ordinary_parent_is_not(self, tmp_path: Path) -> None:
+        (tmp_path / "models").mkdir()
+        assert bootstrap.enclosing_install(tmp_path / "jav-trans") is None
+
+    def test_the_first_run_asks_before_installing_a_second_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "launcher.py").write_text("", encoding="utf-8")
+        (tmp_path / "src").mkdir()
+        (tmp_path / ".venv").mkdir()
+        nested = tmp_path / "jav-trans"
+        (nested / "src").mkdir(parents=True)
+        (nested / "launcher.py").write_text("", encoding="utf-8")
+        (nested / "pyproject.toml").write_text("", encoding="utf-8")
+        monkeypatch.setattr(bootstrap, "ROOT", nested)
+        monkeypatch.setattr(bootstrap, "VENV_PATH", nested / ".venv")
+        monkeypatch.setattr(bootstrap, "LOCK_PATH", nested / "uv.lock")
+        monkeypatch.setattr(bootstrap, "STAMP_PATH", nested / ".venv" / "stamp")
+        monkeypatch.setattr(bootstrap, "interactive", lambda: True)
+        questions = []
+        monkeypatch.setattr(bootstrap, "ask_yes", lambda question, **_: questions.append(question) or False)
+        monkeypatch.setattr(bootstrap, "ensure_uv", lambda: pytest.fail("declined, nothing to install"))
+        assert bootstrap.main([]) == 1
+        assert len(questions) == 1

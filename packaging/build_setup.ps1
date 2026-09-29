@@ -144,6 +144,14 @@ Copy-Item -LiteralPath (Join-Path $Root "src") -Destination $SrcDestination -Rec
 Get-ChildItem -Path $SrcDestination -Directory -Recurse -Filter "__pycache__" |
     Remove-Item -Recurse -Force
 
+# The file index lets the launcher move files an older release left behind, so
+# extracting this archive over an existing install is a complete upgrade. Written
+# before hashing, so the manifest covers it like any other payload file.
+& uv run --no-sync python "packaging/write_release_index.py" --payload $Payload
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
 $SizeMb = [math]::Round(
     ((Get-ChildItem -Path $Payload -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB), 1)
 Write-Host "Payload: $Payload ($SizeMb MB)"
