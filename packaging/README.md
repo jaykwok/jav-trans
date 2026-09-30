@@ -36,7 +36,7 @@ The exe is named `jav-trans.exe`, not `jav-trans-setup.exe`: installing is only
 what the first run does, and it is the launcher on every run after that. Both
 specs therefore build a target named `jav-trans`, so this build stages its
 payload under `dist/setup-payload/jav-trans` and passes its own `--workpath`
-(`build/jav-trans-setup`) - one PyInstaller cache shared by two different
+(`build/jav-trans-setup`). One PyInstaller cache shared by two different
 Analysis inputs is a stale-build trap.
 
 Python, PyTorch, the ASR weights, and the CTC head are not in the archive. The
@@ -51,16 +51,16 @@ FFmpeg travels with the archive because TorchCodec loads its shared DLLs at
 import time and uv cannot install them. `launcher.py` finds them at `bin/`.
 
 uv is not bundled. The first run uses one already on `PATH`, and otherwise
-downloads the Windows wheel from PyPI into `bin/` - the same host the dependency
-install needs a moment later, so shipping 50-80 MB of uv would buy no
-reachability that the rest of the install does not already require. `-BundleUv`
-includes it anyway, for building an archive that has to travel to a network
-where PyPI itself is blocked.
+downloads the Windows wheel from PyPI into `bin/`. The dependency install needs
+the same host a moment later, so shipping 50-80 MB of uv would not make the
+install work anywhere it otherwise could not. `-BundleUv` includes it anyway,
+for an archive that has to reach a network where PyPI itself is blocked.
 
-Options: `-SkipArchive` stops after the payload directory, `-UvExe` /
-`-FfmpegExe` / `-FfprobeExe` override tool discovery, `-ArchiveName` renames the
-zip. zip rather than the `.7z` below because this archive is small enough that
-the ratio does not matter and Windows opens zip with nothing installed.
+Options: `-SkipArchive` stops after the payload directory; `-UvExe`,
+`-FfmpegExe` and `-FfprobeExe` override tool discovery; `-ArchiveName` renames
+the zip. The setup build uses zip rather than the `.7z` of the full bundle:
+at this size the compression ratio hardly matters, and Windows opens zip with
+nothing extra installed.
 
 Keep `build_setup.ps1` ASCII-only: Windows PowerShell 5.1 reads a BOM-less
 `.ps1` as the system code page, so a Chinese string literal in it ships as
@@ -83,14 +83,15 @@ It bundles:
   `PATH`, or from `-FfmpegExe` / `-FfprobeExe`
 - `src/assets/images/icon.png` for the in-app header, drop zone image, and PNG favicon
 - `src/assets/images/icon.ico` for the pywebview native window icon and packaged executable icon
-- `models/ctc_aligner.pt`, the CTC alignment head
-- the bundled Hugging Face inference model directory
+- the default CTC alignment head under `models/`, currently
+  `ctc_aligner_jav_vocalisation_v3.pt`
+- the Hugging Face inference model directory
   `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`
 
-The build script prepares that Hugging Face model before running
-PyInstaller. Training-only files such as `optimizer.pt`, scheduler state,
-trainer state, RNG state, and `training_args.bin` are excluded from the package
-even if they exist in the local `models/` directories.
+The build script prepares that Hugging Face model before running PyInstaller.
+Training-only files such as `optimizer.pt`, scheduler state, trainer state, RNG
+state, and `training_args.bin` are excluded from the package even if they exist
+in the local `models/` directories.
 
 On Windows, install the FFmpeg Shared package before building:
 
@@ -105,17 +106,18 @@ The directory selected for `ffmpeg.exe` must also contain `avcodec-*.dll`,
 Shared executables explicitly with `-FfmpegExe` and `-FfprobeExe`.
 
 For a small development build only, pass `-SkipModels`. That skips model
-preparation and leaves the Hugging Face model directories out of the PyInstaller
-package. Do not use `-SkipModels` for user-facing Windows builds.
+preparation and leaves the Hugging Face model directories and the CTC head out
+of the PyInstaller package. Do not use `-SkipModels` for user-facing Windows
+builds.
 
 The CTC alignment head is downloaded at build time from the same Hugging Face
 repo as the ASR weights, at the commit sha pinned in
-`DEFAULT_SETTINGS["ASR_ALIGNMENT_HEAD_PATH"]`, and placed at `models/ctc_aligner.pt`
-inside the package. The spec reads that default rather than hardcoding the sha,
-so the head the build ships is always the head a source checkout would download.
-The packaged app prefers this bundled copy over the Hub, so a first run without
-network still produces real word-level timing instead of falling back to
-proportional timestamps. `-SkipModels` skips it along with the ASR models.
+`DEFAULT_SETTINGS["ASR_ALIGNMENT_HEAD_PATH"]`, and placed under `models/` in
+the package with its Hub filename. The spec reads that default rather than
+hardcoding the sha, so the build always ships the head a source checkout would
+download. The packaged app prefers this bundled copy over the Hub, so a first
+run without network still produces measured word-level timing instead of
+falling back to proportional timestamps.
 
 It does not bundle Microsoft Edge WebView2. Users still need the WebView2
 runtime, which is already present on most supported Windows systems. If the app
@@ -161,11 +163,10 @@ ZIP described above, alongside the release notes and source archives.
 ## Reproducibility: pinned weights and a hash manifest
 
 The full bundle's ASR model is downloaded at a pinned commit, recorded in
-`packaging/model-pins.json`. `build_windows.ps1` refuses to build without a valid
-full commit SHA,
-because a release that says "the 1.7B ASR model" and takes whatever the branch
-points at that afternoon is not the same package twice. Refresh the pin
-deliberately, as its own step:
+`packaging/model-pins.json`. `build_windows.ps1` refuses to build without a
+valid full commit SHA: a release that says "the 1.7B ASR model" and takes
+whatever the branch points at that afternoon is not the same package twice.
+Refresh the pin deliberately, as its own step:
 
 ```powershell
 $env:PYTHONIOENCODING = "utf-8"
@@ -181,7 +182,8 @@ receipt. A modified or incomplete pinned directory is refused; an unrelated
 cached model cannot satisfy the pin. There is no unpinned full-build option.
 The CTC alignment head is pinned by SHA through
 `DEFAULT_SETTINGS["ASR_ALIGNMENT_HEAD_PATH"]`, and the packaged app loads it with
-`weights_only=True` - a head fetched from the Hub is not a file the user wrote.
+`weights_only=True`, because a head fetched from the Hub is not a file the user
+wrote.
 
 After PyInstaller succeeds, the build records
 `dist/release-assets/release-manifest.json`: SHA256 of every payload file,
