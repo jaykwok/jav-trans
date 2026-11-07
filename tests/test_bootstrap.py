@@ -105,6 +105,15 @@ class TestEnvFile:
         assert "# PROXY_HOST=example\n" in text
         assert "PROXY_HOST=127.0.0.1\n" in text
 
+    def test_duplicate_and_exported_settings_cannot_restore_the_old_proxy(self, tmp_path):
+        from dotenv import dotenv_values
+
+        path = tmp_path / ".env"
+        path.write_text("PROXY_PORT=7890\nexport PROXY_PORT=8080\nAPI_KEY=test-key\n", encoding="utf-8")
+        bootstrap.update_env_file({"PROXY_PORT": "1080"}, path)
+        assert dotenv_values(path) == {"PROXY_PORT": "1080", "API_KEY": "test-key"}
+        assert path.read_text(encoding="utf-8").count("PROXY_PORT=") == 1
+
     def test_writing_to_a_missing_file_creates_it(self, tmp_path: Path) -> None:
         path = tmp_path / ".env"
         bootstrap.update_env_file({"PROXY_HOST": "127.0.0.1"}, path)
@@ -450,6 +459,10 @@ class TestUvDownload:
     def test_an_empty_index_yields_nothing_rather_than_raising(self) -> None:
         assert bootstrap.latest_uv_wheel_url("") == ""
 
+    @pytest.mark.skipif(
+        bootstrap.os.getenv("JAV_TRANS_NETWORK_TESTS") != "1",
+        reason="Set JAV_TRANS_NETWORK_TESTS=1 to check the live PyPI index",
+    )
     def test_the_real_index_still_parses(self) -> None:
         """Guards against PyPI changing its simple-index markup: the installer
         would otherwise report "没有 Windows 版 uv" on a machine that has none."""

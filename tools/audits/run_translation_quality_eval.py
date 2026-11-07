@@ -29,7 +29,6 @@ load_config()
 from llm import engine, global_glossary, repair, semantic_review, settings
 from llm.backends import backend_lease
 from llm.context import SourceContext
-from llm.profiles.base import ProfileContext
 from llm.profiles.hymt2 import HyMt2Profile
 from llm.profiles.json_v3 import JsonProfile
 from llm.run_context import RunContext
@@ -197,7 +196,8 @@ def run(args):
                 run_context = RunContext.capture()
 
                 def chat(messages, *, expected_count=0, max_tokens=None, response_schema=None, bounded_response_schema=None,
-                         reasoning_effort=None, on_usage=None, on_progress=None, cancel_event=None, output_grammar=None):
+                         reasoning_effort=None, on_usage=None, on_progress=None, cancel_event=None, output_grammar=None,
+                         run_context=run_context, profile=profile, arm=arm):
                     run_context.adopt()
                     bound = min(args.max_output_tokens, max_tokens or args.max_output_tokens)
                     request_id = budget.reserve(messages, bound, paid=args.backend == "api")

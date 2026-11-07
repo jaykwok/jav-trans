@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows checks
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONDONTWRITEBYTECODE: '1'
+      CUDA_VISIBLE_DEVICES: ''
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_TOKEN: ''
+      API_KEY: test-only-key
+      OPENAI_API_KEY: test-only-key
+      OPENAI_COMPATIBILITY_BASE_URL: https://api.example.test/v1
+      JAV_TRANS_NETWORK_TESTS: '0'
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.7'
+          python-version: '3.14.6'
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Node for frontend regression tests
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.22.2'
+          package-manager-cache: false
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Verify the Windows CUDA build
+        # Hosted runners exercise synthetic tensors and CUDA admission checks;
+        # production inference still requires an NVIDIA GPU and never falls back.
+        run: >-
+          uv run --no-sync python -c
+          "import sys, torch; assert sys.platform == 'win32';
+          assert torch.version.cuda, 'Expected CUDA-enabled PyTorch from uv.lock';
+          print('PyTorch', torch.__version__, 'CUDA', torch.version.cuda)"
+
+      - name: Check Python code
+        run: uv run --no-sync ruff check src tests tools packaging bootstrap.py launcher.py
+
+      - name: Check JavaScript and PowerShell syntax
+        run: |
+          foreach ($file in Get-ChildItem src/web/static/js -Filter *.js) {
+            node --check $file.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          foreach ($file in Get-ChildItem packaging, tools -Filter *.ps1 -Recurse) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $file.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count) { throw ($errors.Message -join "`n") }
+          }
+
+      - name: Run regression tests
+        run: uv run --no-sync pytest -q -ra --junitxml=tmp/ci/pytest-results.xml
+
+      - name: Retain test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-test-results
+          path: tmp/ci/pytest-results.xml
+          retention-days: 7
+          if-no-files-found: ignore

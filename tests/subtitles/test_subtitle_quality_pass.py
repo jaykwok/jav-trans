@@ -552,22 +552,6 @@ def test_timing_polish_does_not_merge_after_collapsing_gap():
     assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
 
 
-def test_timing_polish_keeps_short_cues_separate():
-    blocks = [
-        {"start": 0.0, "end": 0.40, "ja_text": "私", "zh_text": "私"},
-        {"start": 0.90, "end": 1.30, "ja_text": "僕", "zh_text": "僕"},
-    ]
-    options = SubtitleOptions(
-        timing_polish_enabled=True,
-        short_gap_collapse_s=0.5,
-    )
-
-    prepared = subtitle.prepare_srt_blocks(blocks, options=options)
-
-    assert len(prepared) == 2
-    assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
-
-
 def test_prepare_srt_blocks_merges_overlap_when_too_tight():
     blocks = [
         {

@@ -1126,11 +1126,11 @@ def worker_main(parent_conn: Connection) -> None:
                     )
                     stage_memory = _CudaStageMemoryTracker(torch_module)
 
-                def _on_stage(message: str) -> None:
+                def _on_stage(message: str, *, tracker=stage_memory, request_job_id=job_id) -> None:
                     nonlocal active_stage
                     stage_hint = (
-                        stage_memory.observe(message)
-                        if stage_memory is not None
+                        tracker.observe(message)
+                        if tracker is not None
                         else _oom_stage_from_message(message)
                     )
                     if stage_hint:
@@ -1139,7 +1139,7 @@ def worker_main(parent_conn: Connection) -> None:
                         parent_conn,
                         {
                             "op": "stage",
-                            "job_id": job_id,
+                            "job_id": request_job_id,
                             "message": str(message),
                         },
                     )

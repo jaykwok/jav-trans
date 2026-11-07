@@ -61,9 +61,7 @@ class TestNoDeadReExports:
     # picked a better one.
     RETIRED = {
         "_is_timed_out_result": (result_cache, "_is_timed_out_result"),
-        "_checkpointable_text_results": (result_cache, "_cacheable_text_results"),
         "_chunk_duration": (chunking, "_chunk_duration"),
-        "ASRWorkerSystemError": (transcribe, "ASRWorkerSystemError"),
         "_strip_punctuation": (transcribe, "_strip_punctuation"),
         "_collapse_repeated_noise": (transcribe, "_collapse_repeated_noise"),
         "_is_low_value_text": (transcribe, "_is_low_value_text"),

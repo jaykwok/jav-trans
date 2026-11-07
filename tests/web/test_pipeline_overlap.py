@@ -4,7 +4,6 @@ import asyncio
 import time
 from pathlib import Path
 
-import pytest
 
 import web as _web_package
 

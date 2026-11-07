@@ -25,7 +25,7 @@ from contextvars import ContextVar
 from typing import Callable
 from urllib.parse import urlsplit
 
-from openai import AsyncOpenAI, OpenAI
+from openai import AsyncOpenAI
 
 from core.stage_errors import MISSING_MODEL
 from llm import request_config
@@ -72,10 +72,6 @@ _DEFAULT_OUTPUT_SCHEMA = {
     },
     "required": ["translations"],
 }
-
-_CLIENT: OpenAI | None = None
-_CLIENT_KEY: tuple[str, str] = ("", "")
-_CLIENT_LOCK = threading.Lock()
 
 # The async client the current request owns. A ContextVar rather than an
 # argument so `_create_response` keeps its `(request, cancel_event)` shape, and
@@ -149,23 +145,6 @@ def _structured_output_mode(base_url: str | None) -> str:
     if pinned in ("json_schema", "json_object"):
         return pinned
     return "json_object" if _is_official_deepseek_base_url(base_url) else "json_schema"
-
-
-def _get_client() -> OpenAI:
-    global _CLIENT, _CLIENT_KEY
-    # Ask first, so a forgotten API key reads as the setting it is instead of
-    # the SDK's "The api_key client option must be set ..." from __init__.
-    require_translation_config("openai")
-    current_key = request_config.getenv("API_KEY", "").strip() or None
-    current_url = _normalize_openai_compat_base_url(
-        request_config.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip()
-    )
-    key_tuple = (current_key or "", current_url or "")
-    with _CLIENT_LOCK:
-        if _CLIENT is None or key_tuple != _CLIENT_KEY:
-            _CLIENT = OpenAI(api_key=current_key, base_url=current_url)
-            _CLIENT_KEY = key_tuple
-    return _CLIENT
 
 
 def _responses_text_format(

@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -35,6 +37,7 @@ import threading
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -245,7 +248,7 @@ def update_env_file(updates: dict[str, str], path: Path | None = None) -> None:
     target = path or ENV_PATH
     try:
         lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
-    except OSError:
+    except FileNotFoundError:
         lines = []
 
     remaining = dict(updates)
@@ -253,8 +256,11 @@ def update_env_file(updates: dict[str, str], path: Path | None = None) -> None:
     for line in lines:
         stripped = line.strip()
         key = stripped.partition("=")[0].strip() if "=" in stripped else ""
-        if key in remaining and not stripped.startswith("#"):
-            out.append(f"{key}={remaining.pop(key)}\n")
+        if key.startswith("export "):
+            key = key[7:].strip()
+        if key in updates and not stripped.startswith("#"):
+            if key in remaining:
+                out.append(f"{key}={remaining.pop(key)}\n")
         else:
             out.append(line)
     if remaining:
@@ -265,7 +271,9 @@ def update_env_file(updates: dict[str, str], path: Path | None = None) -> None:
         out.append("# --- network proxy (written by the first-run installer) ---\n")
         out.extend(f"{key}={value}\n" for key, value in remaining.items())
 
-    target.write_text("".join(out), encoding="utf-8")
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_text("".join(out), encoding="utf-8")
+    os.replace(temporary, target)
 
 
 def proxy_url_from(values: dict[str, str]) -> str:
@@ -287,6 +295,28 @@ def apply_proxy(proxy_url: str) -> None:
     uv and huggingface_hub both read these, so setting them here is what makes
     one console answer cover dependency install and model download alike.
     """
+    proxy_url = proxy_url.strip()
+    settings = {"PROXY_PROTOCOL": "http", "PROXY_HOST": "", "PROXY_PORT": ""}
+    if proxy_url:
+        parsed = urllib.parse.urlsplit(proxy_url)
+        if (
+            parsed.scheme not in SUPPORTED_PROXY_PROTOCOLS
+            or not parsed.hostname
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("代理 URL 必须是 http://、https:// 或 socks5://地址:端口")
+        port = parsed.port
+        host = parsed.netloc.rsplit(":", 1)[0] if port is not None else parsed.netloc
+        port = port if port is not None else {"http": 80, "https": 443, "socks5": 1080}[parsed.scheme]
+        if not 1 <= port <= 65535:
+            raise ValueError("代理端口必须是 1-65535 的数字")
+        settings = {"PROXY_PROTOCOL": parsed.scheme, "PROXY_HOST": host, "PROXY_PORT": str(port)}
+        proxy_url = proxy_url_from(settings)
+    # Export the app's keys too: load_config protects process values from .env.
+    # In particular, an explicit --proxy must survive the hand-off to launcher.
+    os.environ.update(settings)
     for key in PROXY_ENV_KEYS:
         if proxy_url:
             os.environ[key] = proxy_url
@@ -335,6 +365,77 @@ def _total_from_headers(response, read_fallback: int) -> int:
     return read_fallback
 
 
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise OSError("SOCKS5 代理在握手完成前断开连接")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _socks5_socket(proxy_url: str, address: tuple[str, int], timeout) -> socket.socket:
+    """RFC 1928 CONNECT with proxy-side DNS; no installed packages required."""
+    proxy = urllib.parse.urlsplit(proxy_url)
+    host, port = address
+    username = urllib.parse.unquote(proxy.username or "").encode("utf-8")
+    password = urllib.parse.unquote(proxy.password or "").encode("utf-8")
+    if len(username) > 255 or len(password) > 255:
+        raise OSError("SOCKS5 用户名或密码过长")
+    encoded_host = host.encode("idna")
+    if ":" in host:
+        destination = b"\x04" + socket.inet_pton(socket.AF_INET6, host)
+    elif len(encoded_host) <= 255:
+        destination = b"\x03" + bytes([len(encoded_host)]) + encoded_host
+    else:
+        raise OSError("SOCKS5 目标主机名过长")
+    sock = socket.create_connection((proxy.hostname, proxy.port or 1080), timeout)
+    try:
+        method = 2 if proxy.username is not None else 0
+        sock.sendall(bytes([5, 1, method]))
+        if _recv_exact(sock, 2) != bytes([5, method]):
+            raise OSError("SOCKS5 代理不接受所配置的认证方式")
+        if method == 2:
+            sock.sendall(b"\x01" + bytes([len(username)]) + username + bytes([len(password)]) + password)
+            if _recv_exact(sock, 2) != b"\x01\x00":
+                raise OSError("SOCKS5 代理认证失败")
+        sock.sendall(b"\x05\x01\x00" + destination + port.to_bytes(2, "big"))
+        version, status, reserved, address_type = _recv_exact(sock, 4)
+        if version != 5 or reserved != 0 or status != 0:
+            raise OSError(f"SOCKS5 代理连接目标失败（状态 {status}）")
+        if address_type == 1:
+            address_size = 4
+        elif address_type == 4:
+            address_size = 16
+        elif address_type == 3:
+            address_size = _recv_exact(sock, 1)[0]
+        else:
+            raise OSError("SOCKS5 代理返回无效的地址类型")
+        _recv_exact(sock, address_size + 2)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+class _BootstrapProxyHandler(urllib.request.ProxyHandler):
+    def proxy_open(self, req, proxy, type):
+        if urllib.parse.urlsplit(proxy).scheme != "socks5":
+            return super().proxy_open(req, proxy, type)
+        if req.host and urllib.request.proxy_bypass(req.host):
+            return None
+
+        def connection(host, **kwargs):
+            cls = http.client.HTTPSConnection if type == "https" else http.client.HTTPConnection
+            conn = cls(host, **kwargs)
+            # Keep stdlib TLS/hostname verification; replace only the socket dialer.
+            conn._create_connection = lambda address, timeout, *_args: _socks5_socket(proxy, address, timeout)
+            return conn
+
+        return urllib.request.HTTPHandler().do_open(connection, req)
+
+
 def _opener() -> urllib.request.OpenerDirector:
     """Build a fresh opener per probe.
 
@@ -345,10 +446,9 @@ def _opener() -> urllib.request.OpenerDirector:
     proxies = {}
     for scheme in ("http", "https"):
         value = os.environ.get(f"{scheme.upper()}_PROXY") or os.environ.get(f"{scheme}_proxy")
-        # urllib speaks no socks; uv still gets it through the environment.
-        if value and not value.lower().startswith("socks"):
+        if value:
             proxies[scheme] = value
-    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+    return urllib.request.build_opener(_BootstrapProxyHandler(proxies))
 
 
 def measure_download(url: str = "") -> tuple[float, int] | None:
@@ -941,7 +1041,7 @@ def ensure_proxy_configured(*, assume_yes: bool) -> None:
     """Settle the proxy question before anything large is downloaded."""
     proxy_url = proxy_url_from(read_env_file())
     if proxy_url:
-        log(f"使用 .env 中已配置的代理: {proxy_url}")
+        log("使用 .env 中已配置的代理")
         apply_proxy(proxy_url)
         return
     if assume_yes or not interactive():
@@ -958,10 +1058,7 @@ def ensure_proxy_configured(*, assume_yes: bool) -> None:
     update_env_file(settings)
     proxy_url = proxy_url_from(settings)
     apply_proxy(proxy_url)
-    log(f"已写入 {ENV_PATH.name}，代理: {proxy_url}")
-    if proxy_url.startswith("socks5"):
-        log("（socks5 代理无法在此复测，uv 下载时仍会使用）")
-        return
+    log(f"代理设置已写入 {ENV_PATH.name}")
     log("正在用代理复测 ...")
     log(f"  {describe_speed(measure_download())}")
 
@@ -1280,8 +1377,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.proxy:
-        apply_proxy(args.proxy.strip())
-        log(f"使用命令行指定的代理: {args.proxy.strip()}")
+        try:
+            apply_proxy(args.proxy)
+        except ValueError:
+            log("代理 URL 无效，请使用 http://、https:// 或 socks5://地址:端口（端口 1-65535）。")
+            return 2
+        log("使用命令行指定的代理")
     elif needs_install:
         ensure_proxy_configured(assume_yes=args.yes)
     else:

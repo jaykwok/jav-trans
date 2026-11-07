@@ -185,7 +185,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # `deepseek-chat` does not). The default is spelled the canonical way so it
     # cannot start failing when a second model matches the short name.
     "LLM_MODEL_NAME": "deepseek/deepseek-v4-flash",
-    # Thinking budget for models that support it. Valid values: none, medium, max.
+    # Thinking budget for models that support it. Valid values: none, low, high.
     "LLM_REASONING_EFFORT": "low",
     # Sampling temperature for translation. Higher = more colloquial/varied; the
     # JSON-format retry loop tolerates the extra variance. Read at import time; a
@@ -359,11 +359,8 @@ REASONING_EFFORTS = ("none", "low", "high")
 # fold down to `high`, which is both the nearest surviving tier and the cheaper
 # direction - the point of the change.
 _RETIRED_REASONING_EFFORTS = {"medium": "high", "xhigh": "high", "max": "high"}
-# `none` costs the least and, since 2026-08-24, is safe to default to: the
-# repair pass escalates the failures it is known to produce. Thinking-off alone
-# left 171/1,700 cues (10.1%) of sample-b with the Japanese source copied
-# through untranslated, which is why it was retired as a standalone tier on
-# 2026-08-14; the default is one step up from it for that reason.
+# Keep the default aligned with DEFAULT_SETTINGS and all job/settings readers.
+# `none` remains an explicit choice; the default enables a low thinking budget.
 DEFAULT_REASONING_EFFORT = "low"
 
 
@@ -419,6 +416,7 @@ _PROXY_ENV_KEYS = (
     "all_proxy",
 )
 _NO_PROXY_ENV_KEYS = ("NO_PROXY", "no_proxy")
+NETWORK_PROXY_ENV_KEYS = ("PROXY_PROTOCOL", "PROXY_HOST", "PROXY_PORT") + _PROXY_ENV_KEYS + _NO_PROXY_ENV_KEYS
 # The llamacpp backend talks to a llama-server it started itself on 127.0.0.1,
 # and neither urllib nor httpx exempts loopback on its own (verified: with
 # HTTP_PROXY set, `proxy_bypass("127.0.0.1")` is False and httpx picks the proxy

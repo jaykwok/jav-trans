@@ -1,12 +1,12 @@
 [project]
 name = "jav-trans"
-version = "1.8.2"
+version = "1.8.3"
 requires-python = ">3.14"
 dependencies = [
     "accelerate",
     "fastapi",
-    "huggingface-hub>=0.25",
-    "httpx",
+    "huggingface-hub>=1.29",
+    "httpx[socks]",
     "numpy",
     "openai",
     # Pure-Python OpenCC port: forces translated output into the Chinese variant
@@ -49,6 +49,7 @@ dependencies = [
 dev = [
     "pyinstaller",
     "pytest",
+    "ruff==0.17.4",
     "scikit-learn",
 ]
 
@@ -58,7 +59,7 @@ dev = [
 # link against torch 2.9.x/cu128 and would either downgrade torch or mismatch
 # the libtorch ABI. CTC forced alignment is therefore implemented in
 # `src/asr/alignment.py` and verified against exhaustive path enumeration in
-# `tests/test_asr_alignment_head.py`.
+# `tests/asr/test_asr_alignment_head.py`.
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
@@ -84,3 +85,9 @@ norecursedirs = [
     "models",
     "video",
 ]
+
+[tool.ruff]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["F", "E9", "B012", "B020", "B023"]

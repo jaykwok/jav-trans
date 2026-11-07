@@ -152,11 +152,19 @@ export async function loadConfig() {
   } catch {}
 }
 
-export async function loadSettings() {
+export async function loadSettings({ previewsOnly = false } = {}) {
   try {
     const r = await fetch('/api/settings');
     if (!r.ok) return;
     const s = await r.json();
+
+    $('api-key-preview').textContent = s.api_key_preview
+      ? '当前：' + s.api_key_preview
+      : '当前：未设置';
+    $('api-model-preview').textContent = s.model ? '当前：' + s.model : '当前：未设置';
+    // Saving can finish after the user starts another edit. Refresh only the
+    // saved-value labels then; reloading the whole form would discard it.
+    if (previewsOnly) return;
 
     // Translation backend
     const backendSel = $('translation-backend');
@@ -166,13 +174,9 @@ export async function loadSettings() {
     }
 
     // OpenAI backend fields
-    $('api-key-preview').textContent = s.api_key_preview
-      ? '当前：' + s.api_key_preview
-      : '当前：未设置';
     if (s.base_url) $('api-base-url').value = s.base_url;
     if (s.model) {
       setModelComboboxOptions([s.model], { selected: s.model });
-      $('api-model-preview').textContent = '当前：' + s.model;
     }
 
     // llama.cpp backend. Hy-MT2 is fixed; only the server executable may be
@@ -252,12 +256,15 @@ export function readTranslationSettingsFromForm() {
 
 function updateProxyFieldsState() {
   const on = !!($('proxy-enabled')?.checked);
+  const testBtn = $('btn-proxy-test');
+  const testing = !!testBtn?.dataset.testing;
+  const enabled = $('proxy-enabled');
+  if (enabled) enabled.disabled = testing;
   for (const id of ['proxy-protocol', 'proxy-host', 'proxy-port']) {
     const el = $(id);
-    if (el) el.disabled = !on;
+    if (el) el.disabled = !on || testing;
   }
-  const testBtn = $('btn-proxy-test');
-  if (testBtn && !testBtn.dataset.testing) testBtn.disabled = !on;
+  if (testBtn) testBtn.disabled = !on || testing;
   const tag = $('proxy-status-tag');
   if (tag) {
     tag.textContent = on ? '已启用' : '未启用';
@@ -265,8 +272,8 @@ function updateProxyFieldsState() {
   }
 }
 
-function buildSettingsBodyFromForm({ includeConnection = false, includeProxy = false } = {}) {
-  const body = readTranslationSettingsFromForm();
+function buildSettingsBodyFromForm({ includeConnection = false, includeProxy = false, includeTranslation = true } = {}) {
+  const body = includeTranslation ? readTranslationSettingsFromForm() : {};
   if (includeConnection) {
     const apiKey = $('api-key').value.trim();
     const baseUrl = $('api-base-url').value.trim();
@@ -278,9 +285,11 @@ function buildSettingsBodyFromForm({ includeConnection = false, includeProxy = f
   if (includeProxy) {
     // The enable switch is the single source of truth for on/off. Switch off
     // -> clear host/port on save (the backend tears down the proxy). Switch on
-    // -> send the field values (port validated when present, null if empty).
+    // -> require both address and a valid port before saving.
     const enabled = !!$('proxy-enabled')?.checked;
+    const host = ($('proxy-host')?.value || '').trim();
     const portText = ($('proxy-port')?.value || '').trim();
+    if (enabled && (!host || !portText)) throw new Error('请填写代理地址和端口');
     let parsedPort = null;
     if (enabled && portText) {
       if (!/^\d+$/.test(portText)) {
@@ -292,7 +301,7 @@ function buildSettingsBodyFromForm({ includeConnection = false, includeProxy = f
       }
     }
     body.proxy_protocol = $('proxy-protocol')?.value || 'http';
-    body.proxy_host = enabled ? ($('proxy-host')?.value || '').trim() : '';
+    body.proxy_host = enabled ? host : '';
     body.proxy_port = enabled && portText ? parsedPort : null;
   }
   return body;
@@ -300,19 +309,27 @@ function buildSettingsBodyFromForm({ includeConnection = false, includeProxy = f
 
 function clearApiKeyInputIfSaved(body) {
   if (!body.api_key) return;
+  if ($('api-key').value.trim() !== body.api_key) return;
   $('api-key').value = '';
   $('api-key').type = 'password';
   $('btn-show-key').textContent = '👁';
 }
 
-export async function saveSettingsBody(body) {
-  const r = await fetch('/api/settings', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+let _settingsSaveQueue = Promise.resolve();
+
+export function saveSettingsBody(body) {
+  const serialized = JSON.stringify(body);
+  const saved = _settingsSaveQueue.then(async () => {
+    const r = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: serialized,
+    });
+    if (!r.ok) throw new Error(await r.text());
+    clearApiKeyInputIfSaved(body);
   });
-  if (!r.ok) throw new Error(await r.text());
-  clearApiKeyInputIfSaved(body);
+  _settingsSaveQueue = saved.catch(() => {});
+  return saved;
 }
 
 export async function syncSettingsFromFormForSubmit() {
@@ -327,42 +344,69 @@ export async function syncSettingsFromFormForSubmit() {
 export function installSettingsPanel() {
   installModelCombobox();
 
-  const saveProxySettings = async () => {
+  let proxyRevision = 0;
+  const invalidateProxyTest = () => {
+    proxyRevision += 1;
+    const result = $('proxy-test-result');
+    if (result) { result.textContent = ''; result.className = 'proxy-test-result'; }
+  };
+  const saveProxySettings = async ({ notify = true } = {}) => {
+    const revision = proxyRevision;
+    const body = buildSettingsBodyFromForm({ includeProxy: true, includeTranslation: false });
+    await saveSettingsBody(body);
+    saveFormMemory();
+    if (notify && revision === proxyRevision) {
+      showToast(body.proxy_host && body.proxy_port ? '代理设置已保存' : '代理已关闭');
+    }
+    return body;
+  };
+  const onProxyChange = async () => {
+    invalidateProxyTest();
+    const revision = proxyRevision;
+    updateProxyFieldsState();
     try {
-      await saveSettingsBody(buildSettingsBodyFromForm({ includeProxy: true }));
-      saveFormMemory();
-      const host = ($('proxy-host')?.value || '').trim();
-      const port = ($('proxy-port')?.value || '').trim();
-      showToast(host && port ? '代理设置已保存' : '代理设置已关闭');
+      await saveProxySettings();
+      if (revision === proxyRevision) updateProxyFieldsState();
     } catch (e) {
+      if (revision !== proxyRevision) return;
       showToast('保存代理设置失败：' + e.message);
+      const tag = $('proxy-status-tag');
+      if (tag) tag.textContent = '未保存';
     }
   };
   for (const id of ['proxy-protocol', 'proxy-host', 'proxy-port']) {
     const el = $(id);
-    if (el) el.addEventListener('change', saveProxySettings);
+    if (el) {
+      el.addEventListener('input', invalidateProxyTest);
+      el.addEventListener('change', onProxyChange);
+    }
   }
-  $('proxy-enabled')?.addEventListener('change', () => {
-    updateProxyFieldsState();
-    saveProxySettings();
-  });
+  $('proxy-enabled')?.addEventListener('change', onProxyChange);
 
   const proxyTestBtn = $('btn-proxy-test');
   proxyTestBtn?.addEventListener('click', async () => {
     if (proxyTestBtn.disabled) return;
     const resultEl = $('proxy-test-result');
     const prevText = proxyTestBtn.textContent;
+    const revision = proxyRevision;
     proxyTestBtn.dataset.testing = '1';
-    proxyTestBtn.disabled = true;
+    updateProxyFieldsState();
     proxyTestBtn.textContent = '测试中…';
     if (resultEl) { resultEl.textContent = ''; resultEl.className = 'proxy-test-result'; }
     try {
       // Apply the proxy to the runtime env first, then ask the backend to try
       // reaching HuggingFace through it -- a wrong port fails loud here instead
       // of silently hanging later model downloads.
-      await saveProxySettings();
+      const saved = await saveProxySettings({ notify: false });
       const r = await fetch('/api/proxy-test', { method: 'POST' });
       const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+      const current = buildSettingsBodyFromForm({ includeProxy: true, includeTranslation: false });
+      if (revision !== proxyRevision || JSON.stringify(current) !== JSON.stringify(saved)) {
+        throw new Error('代理配置已变化，请重新测试');
+      }
+      const expectedUrl = `${saved.proxy_protocol}://${saved.proxy_host}:${saved.proxy_port}`;
+      if (data.ok && data.proxy_url !== expectedUrl) throw new Error('代理配置已变化，请重新测试');
       if (resultEl) {
         if (data.ok) {
           resultEl.textContent = `✓ 经代理连通 HuggingFace（${data.elapsed_ms ?? '?'}ms）`;
@@ -430,7 +474,7 @@ export function installSettingsPanel() {
         return;
       }
       if (apiKeyInput) {
-        await loadSettings();
+        await loadSettings({ previewsOnly: true });
       }
 
       const r = await fetch('/api/models');
@@ -447,6 +491,11 @@ export function installSettingsPanel() {
         return;
       }
       const { models } = await r.json();
+      if ($('api-base-url').value.trim() !== baseUrl ||
+          ($('api-key').value.trim() && $('api-key').value.trim() !== apiKeyInput)) {
+        showToast('API 设置已变化，请重新获取模型');
+        return;
+      }
       if (!models.length) {
         alert('API 未返回任何模型，请确认 Base URL 和 Key 填写正确');
         return;
@@ -479,7 +528,7 @@ export function installSettingsPanel() {
     try {
       await saveSettingsBody(buildSettingsBodyFromForm({ includeConnection: true }));
       saveFormMemory();
-      await loadSettings();
+      await loadSettings({ previewsOnly: true });
       showToast('翻译设置已保存到 .env');
     } catch (e) {
       showToast('保存翻译设置失败：' + e.message);

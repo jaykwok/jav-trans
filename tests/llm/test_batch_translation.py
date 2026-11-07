@@ -5,7 +5,6 @@ import re
 import threading
 from collections import defaultdict
 
-import pytest
 
 from core import typed_config
 from llm import engine as engine_module
@@ -410,7 +409,6 @@ def test_batch_retry_only_requests_missing_ids(monkeypatch):
             returned_ids = [0, 1, 3]
         else:
             returned_ids = ids
-        import json
 
         return json.dumps(
             {
@@ -457,7 +455,6 @@ def test_batch_retry_gets_fresh_budget_after_missing_set_shrinks(monkeypatch):
             return json.dumps({"translations": []}, ensure_ascii=False)
         calls.append(ids)
         returned_ids = ids[:-1] if len(ids) > 1 else ids
-        import json
 
         return json.dumps(
             {

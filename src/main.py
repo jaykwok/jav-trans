@@ -6,7 +6,6 @@ import sys
 import hashlib
 import json
 import shutil
-import uuid
 from collections import Counter
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -20,7 +19,7 @@ from core import stage_errors
 from core.cancellation import PipelineCancelledError as _PipelineCancelledError
 from core.cancellation import cancel_requested as _cancel_requested_impl
 from core.cancellation import raise_if_cancelled as _raise_if_cancelled_impl
-from core.config import load_config
+from core.config import NETWORK_PROXY_ENV_KEYS, load_config
 from core.job_context import JobContext
 from asr import alignment_shadow as alignment_shadow_module
 from asr import noise as asr_noise_module
@@ -239,10 +238,13 @@ def _asr_stage_env_snapshot_for_ctx(ctx: JobContext) -> dict[str, str]:
             or name in _ASR_STAGE_ENV_SNAPSHOT_KEYS
         }
         names.update(overrides)
+        # The GPU process is persistent. Empty values also have to travel so
+        # switching a proxy off clears the settings inherited at process start.
+        names.update(NETWORK_PROXY_ENV_KEYS)
         return {
             name: os.getenv(name, "")
             for name in sorted(names)
-            if name in os.environ
+            if name in os.environ or name in NETWORK_PROXY_ENV_KEYS
         }
 
 

@@ -1,4 +1,3 @@
-import os
 import re
 
 from core.typed_config import env_float

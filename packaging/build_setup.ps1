@@ -10,7 +10,7 @@ param(
     [string]$ArchiveName = "jav-trans-windows-x64.zip"
 )
 
-# Assemble the lightweight release: the entry-point executable, uv, FFmpeg, and
+# Assemble the lightweight release: the entry-point executable, FFmpeg, and
 # the source it syncs against. Everything else - PyTorch, the ASR weights, the
 # CTC head - is fetched on the user's machine at first run, which is what takes
 # the release from ~6 GB to ~150 MB.
@@ -39,14 +39,20 @@ function Move-BuildArtifactToRm {
     if (-not (Test-Path -LiteralPath $Path)) {
         return
     }
-    $RmRoot = Join-Path $Root "agents/rm"
-    New-Item -ItemType Directory -Force -Path $RmRoot | Out-Null
-    $Stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $Destination = Join-Path $RmRoot "$($Stamp)_$Label"
-    if (Test-Path -LiteralPath $Destination) {
-        $Destination = "$Destination-$([DateTimeOffset]::Now.ToUnixTimeMilliseconds())"
+    $Resolved = (Resolve-Path -LiteralPath $Path).Path
+    $RootPrefix = $Root.Path.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if (-not $Resolved.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Build artifacts must be inside the project directory."
     }
-    Move-Item -LiteralPath $Path -Destination $Destination
+    $RmRoot = Join-Path $Root "agents/rm"
+    $Stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $ArchiveRoot = Join-Path $RmRoot "$($Stamp)_$Label-$([Guid]::NewGuid().ToString('N'))"
+    $Destination = [IO.Path]::GetFullPath((Join-Path $ArchiveRoot $Resolved.Substring($RootPrefix.Length)))
+    if (-not $Destination.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Build archive must be inside the project directory."
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
+    Move-Item -LiteralPath $Resolved -Destination $Destination
     Write-Host "Moved old build artifact to $Destination"
 }
 
@@ -92,7 +98,6 @@ foreach ($Pattern in @("avcodec-*.dll", "avformat-*.dll", "avutil-*.dll")) {
 }
 
 if ($Clean) {
-    Move-BuildArtifactToRm $Payload "dist-jav-trans-setup-payload"
     & uv run --no-sync python -m PyInstaller --noconfirm --clean --workpath $WorkPath $SpecPath
 } else {
     & uv run --no-sync python -m PyInstaller --noconfirm --workpath $WorkPath $SpecPath
@@ -106,6 +111,9 @@ if (-not (Test-Path $EntryExe)) {
     throw "Build finished but the executable was not found: $EntryExe"
 }
 
+# Always assemble a fresh payload: a non-clean build must not ship obsolete
+# modules, FFmpeg DLLs, or a uv.exe from an earlier -BundleUv build.
+Move-BuildArtifactToRm $Payload "dist-jav-trans-setup-payload"
 New-Item -ItemType Directory -Force -Path $Payload | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $Payload "bin") | Out-Null
 
@@ -137,12 +145,15 @@ Copy-Item -LiteralPath (Join-Path $Root "packaging/setup-readme.txt") `
     -Destination (Join-Path $Payload "README.txt") -Force
 
 $SrcDestination = Join-Path $Payload "src"
-if (Test-Path -LiteralPath $SrcDestination) {
-    Remove-Item -LiteralPath $SrcDestination -Recurse -Force
+$SrcRoot = (Resolve-Path -LiteralPath (Join-Path $Root "src")).Path
+Get-ChildItem -LiteralPath $SrcRoot -File -Recurse -Force | Where-Object {
+    $_.FullName -notmatch '[\\/]__pycache__[\\/]' -and $_.Extension -notin @('.pyc', '.pyo')
+} | ForEach-Object {
+    $Relative = $_.FullName.Substring($SrcRoot.Length + 1)
+    $Destination = Join-Path $SrcDestination $Relative
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
+    Copy-Item -LiteralPath $_.FullName -Destination $Destination
 }
-Copy-Item -LiteralPath (Join-Path $Root "src") -Destination $SrcDestination -Recurse -Force
-Get-ChildItem -Path $SrcDestination -Directory -Recurse -Filter "__pycache__" |
-    Remove-Item -Recurse -Force
 
 # The file index lets the launcher move files an older release left behind, so
 # extracting this archive over an existing install is a complete upgrade. Written

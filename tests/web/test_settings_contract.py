@@ -1,52 +1,14 @@
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import re
 
 from core.config import DEFAULT_SETTINGS
 from web.models import JobSpec, MAX_TRANSLATION_WORKERS, SettingsUpdate
-from web.routes import config as config_routes
 
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = ROOT / "src" / "web" / "static"
-
-
-def _same_default(example: str, configured: str) -> bool:
-    if example == configured:
-        return True
-    try:
-        return Decimal(example) == Decimal(configured)
-    except InvalidOperation:
-        return False
-
-
-def test_env_template_examples_are_live_and_do_not_drift_from_config() -> None:
-    examples: dict[str, str] = {}
-    for line in config_routes._initial_env_template_lines():
-        match = re.fullmatch(r"# ([A-Z][A-Z0-9_]*)=(.*)\n", line)
-        if match:
-            examples[match.group(1)] = match.group(2)
-
-    assert examples
-    assert not (set(examples) - set(DEFAULT_SETTINGS))
-
-    # These are intentionally useful override examples rather than restatements
-    # of the built-in value. Every other example must track config.py exactly.
-    intentional_overrides = {
-        "ASR_ALIGNMENT_HEAD_PATH",
-        "ASR_ALIGNMENT_SHADOW_HEAD_PATH",
-        "PROXY_HOST",
-        "PROXY_PORT",
-    }
-    drifted = {
-        key: (value, DEFAULT_SETTINGS[key])
-        for key, value in examples.items()
-        if key not in intentional_overrides
-        and not _same_default(value, DEFAULT_SETTINGS[key])
-    }
-    assert drifted == {}
 
 
 def test_translation_settings_have_an_explicit_env_save_path() -> None:
@@ -120,7 +82,7 @@ def test_frontend_defaults_match_backend_defaults_and_limits() -> None:
     assert 'placeholder="https://openrouter.ai/api/v1"' in html
     assert "https://api.deepseek.com" in html
     assert DEFAULT_SETTINGS["LLM_REASONING_EFFORT"] == "low"
-    # The option text carries a human-facing annotation (「medium（默认）」), so
+    # The option text carries a human-facing annotation (「low（默认）」), so
     # only the value and the `selected` marker are the contract here.
     assert '<option value="low" selected>' in html
     assert DEFAULT_SETTINGS["TARGET_LANG"] == "简体中文"

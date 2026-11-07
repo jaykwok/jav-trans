@@ -72,14 +72,6 @@ def _is_quarantined_result(result: dict) -> bool:
     )
 
 
-def _cacheable_text_results(text_results_by_index: dict[int, dict]) -> dict[int, dict]:
-    return {
-        index: result
-        for index, result in text_results_by_index.items()
-        if not _is_timed_out_result(result) and not _is_quarantined_result(result)
-    }
-
-
 def _jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {

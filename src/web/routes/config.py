@@ -18,10 +18,11 @@ from fastapi import APIRouter, HTTPException, Query
 
 from asr.backends.qwen import active_qwen_asr_model_id
 from core.config import (
+    DEFAULT_REASONING_EFFORT,
     DEFAULT_SETTINGS,
     REASONING_EFFORTS,
-    apply_network_proxy_environment,
     load_config,
+    sync_network_proxy_environment,
 )
 from utils import model_paths
 from utils.model_paths import PROJECT_ROOT
@@ -95,57 +96,9 @@ _ENV_TEMPLATE_MARKER = "# Defaults live in src/core/config.py"
 
 def _initial_env_template_lines() -> list[str]:
     return [
-        "# jav-trans local overrides.\n",
-        "# Defaults live in src/core/config.py. Keep these examples commented unless\n",
-        "# you want to override the built-in runtime defaults on this machine.\n",
+        "# Defaults live in src/core/config.py; this file stores local overrides.\n",
+        "# Keep API keys private.\n",
         "\n",
-        "# --- ASR / VRAM tuning examples ---\n",
-        "# ASR_BACKEND=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf\n",
-        "# ASR_BATCH_SIZE=auto\n",
-        "# ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4\n",
-        "# ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto\n",
-        "# ASR_STAGE_WORKER_VRAM_RATIO=0.95\n",
-        "# ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=7168\n",
-        "# ASR_STAGE_WORKER_RAM_RATIO=0.95\n",
-        "# ASR_STAGE_WORKER_HEARTBEAT_S=10\n",
-        "# GPU_BATCH_PROFILE_ENABLED=1\n",
-        "# GPU_BATCH_PROFILE_GROWTH_THRESHOLD=0.80\n",
-        "# GPU_BATCH_PROFILE_MAX_ENTRIES=16\n",
-        "# ASR_STAGE_WORKER_OOM_RETRY_LIMIT=6\n",
-        "\n",
-        "# --- Chunking / alignment examples ---\n",
-        "# The CTC alignment head is ON by default (word timing + pause cuts);\n",
-        "# set an empty ASR_ALIGNMENT_HEAD_PATH= to fall back to fixed-length\n",
-        "# chunks and the upstream coarse window - subtitles are then never\n",
-        "# split inside a segment. Nothing is dropped either way.\n",
-        "# It downloads once from the HF repo; a local path overrides that.\n",
-        "# ASR_ALIGNMENT_HEAD_PATH=./models/ctc_aligner_jav_vocalisation_v3.pt\n",
-        "# The v3 head also classifies each frame as silence / vocalisation /\n",
-        "# speech, which is what lets the subtitle filter judge a cue by sound as\n",
-        "# well as by text. Pointing this at an older head is supported and simply\n",
-        "# falls back to the text rule; it is not an error.\n",
-        "# Optional observation-only candidate; it never changes subtitle output.\n",
-        "# ASR_ALIGNMENT_SHADOW_HEAD_PATH=./models/ctc_aligner.shadow.pt\n",
-        "# ASR_ALIGNMENT_SHADOW_ROOT=./tmp/cache/alignment_shadow\n",
-        "# ASR_ALIGNMENT_SHADOW_MIN_DELTA_MS=20\n",
-        "# Chunks run to ASR_CHUNK_MAX_S; cuts take the latest pause under it.\n",
-        "# ASR_CHUNK_MAX_S=30\n",
-        "# ASR_CHUNK_MIN_PAUSE_S=0.6\n",
-        "# Decode budget = chunk duration x tokens/second, so it cannot truncate\n",
-        "# real speech. ASR_MAX_NEW_TOKENS= (empty) keeps that; a number is a hard\n",
-        "# ceiling that bounds cost and can cut dialogue.\n",
-        "# ASR_DECODE_TOKENS_PER_SECOND=10.0\n",
-        "\n",
-        "# --- Model/cache examples ---\n",
-        "# HF_HOME=./models\n",
-        "# TORCH_HOME=./tmp/cache/torch\n",
-        "# PROXY_PROTOCOL=http\n",
-        "# PROXY_HOST=127.0.0.1\n",
-        "# PROXY_PORT=7890\n",
-        "# RUN_LOG_ENABLED=1\n",
-        "# RUN_LOG_DIR=./tmp/log\n",
-        "\n",
-        "# --- Saved Web settings ---\n",
     ]
 
 
@@ -160,13 +113,8 @@ def _update_env_file(updates: dict[str, str]) -> None:
             if env_path.exists()
             else []
         )
-        # Seed on "no template yet", not on "no file yet". The first-run
-        # installer creates `.env` before this page can exist - it has to ask
-        # about the proxy before there is a web server - and bootstrap.py is
-        # frozen alone and stdlib-only, so it cannot share this template. Keying
-        # on file existence therefore handed the documented examples only to
-        # users who declined a proxy; everyone who accepted one - the audience
-        # the prompt exists for - kept a four-line `.env` forever.
+        # Add the brief header once, including to installer-created files.
+        # Keep the marker compatible with older templates and preserve edits.
         if not any(line.startswith(_ENV_TEMPLATE_MARKER) for line in lines):
             lines = _initial_env_template_lines() + lines
         pending = dict(updates)
@@ -175,8 +123,11 @@ def _update_env_file(updates: dict[str, str]) -> None:
             stripped = line.strip()
             if "=" in stripped and not stripped.startswith("#"):
                 k = stripped.split("=", 1)[0].strip()
-                if k in pending:
-                    new_lines.append(_format_env_line(k, pending.pop(k)))
+                if k.startswith("export "):
+                    k = k[7:].strip()
+                if k in updates:
+                    if k in pending:
+                        new_lines.append(_format_env_line(k, pending.pop(k)))
                     continue
             new_lines.append(line if line.endswith("\n") else line + "\n")
         for k, v in pending.items():
@@ -323,7 +274,7 @@ def _proxy_settings_from_runtime() -> tuple[str, str, int | None]:
     return protocol, host, port
 
 
-def _sync_proxy_settings(update: SettingsUpdate) -> dict[str, str] | None:
+def _proxy_settings_changes(update: SettingsUpdate) -> dict[str, str] | None:
     proxy_fields_present = any(
         value is not None
         for value in (update.proxy_protocol, update.proxy_host, update.proxy_port)
@@ -342,21 +293,12 @@ def _sync_proxy_settings(update: SettingsUpdate) -> dict[str, str] | None:
     )
     port = update.proxy_port if update.proxy_port is not None else current_port
     if not host or port is None:
-        os.environ["PROXY_PROTOCOL"] = protocol
-        os.environ["PROXY_HOST"] = ""
-        os.environ["PROXY_PORT"] = ""
-        apply_network_proxy_environment("", clear_existing=True)
         return {
             "PROXY_PROTOCOL": protocol,
             "PROXY_HOST": "",
             "PROXY_PORT": "",
         }
 
-    os.environ["PROXY_PROTOCOL"] = protocol
-    os.environ["PROXY_HOST"] = host
-    os.environ["PROXY_PORT"] = str(port)
-    proxy_url = f"{protocol}://{host}:{port}"
-    apply_network_proxy_environment(proxy_url, clear_existing=True)
     return {
         "PROXY_PROTOCOL": protocol,
         "PROXY_HOST": host,
@@ -368,7 +310,6 @@ def _clear_saved_hf_mirror_if_present(changes: dict[str, str]) -> None:
     endpoint = _runtime_or_env_or_setting("HF_ENDPOINT", "").strip().rstrip("/")
     if endpoint == "https://hf-mirror.com":
         changes["HF_ENDPOINT"] = ""
-        os.environ.pop("HF_ENDPOINT", None)
 
 
 def _strip_llm_endpoint_path(base_url: str) -> str:
@@ -516,7 +457,7 @@ async def get_settings() -> SettingsRead:
     proxy_protocol, proxy_host, proxy_port = _proxy_settings_from_runtime()
     translation_glossary = _runtime_or_env_or_setting("TRANSLATION_GLOSSARY")
     llm_reasoning_effort = _normalize_llm_reasoning_effort(
-        _runtime_or_env_or_setting("LLM_REASONING_EFFORT", "medium")
+        _runtime_or_env_or_setting("LLM_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
     )
     target_lang = _runtime_or_env_or_setting("TARGET_LANG", "简体中文")
     translation_backend = _runtime_or_env_or_setting("TRANSLATION_BACKEND", "openai")
@@ -546,19 +487,15 @@ async def post_settings(update: SettingsUpdate) -> dict:
     reset_llamacpp_translation_backend = False
     if update.api_key is not None:
         changes["API_KEY"] = update.api_key
-        os.environ["API_KEY"] = update.api_key
     if update.base_url is not None:
         changes["OPENAI_COMPATIBILITY_BASE_URL"] = update.base_url
-        os.environ["OPENAI_COMPATIBILITY_BASE_URL"] = update.base_url
     if update.model is not None:
         changes["LLM_MODEL_NAME"] = update.model
-        os.environ["LLM_MODEL_NAME"] = update.model
-    proxy_changes = _sync_proxy_settings(update)
+    proxy_changes = _proxy_settings_changes(update)
     if proxy_changes is not None:
         changes.update(proxy_changes)
     if update.translation_glossary is not None:
         changes["TRANSLATION_GLOSSARY"] = update.translation_glossary
-        os.environ["TRANSLATION_GLOSSARY"] = update.translation_glossary
     if update.llm_reasoning_effort is not None:
         if update.llm_reasoning_effort not in REASONING_EFFORTS:
             raise HTTPException(
@@ -566,10 +503,8 @@ async def post_settings(update: SettingsUpdate) -> dict:
                 detail=f"llm_reasoning_effort must be one of: {', '.join(REASONING_EFFORTS)}",
             )
         changes["LLM_REASONING_EFFORT"] = update.llm_reasoning_effort
-        os.environ["LLM_REASONING_EFFORT"] = update.llm_reasoning_effort
     if update.target_lang is not None:
         changes["TARGET_LANG"] = update.target_lang
-        os.environ["TARGET_LANG"] = update.target_lang
     if update.translation_backend is not None:
         if update.translation_backend not in {"openai", "llamacpp"}:
             raise HTTPException(
@@ -578,7 +513,6 @@ async def post_settings(update: SettingsUpdate) -> dict:
             )
         previous_backend = _runtime_or_env_or_setting("TRANSLATION_BACKEND", "openai")
         changes["TRANSLATION_BACKEND"] = update.translation_backend
-        os.environ["TRANSLATION_BACKEND"] = update.translation_backend
         reset_llamacpp_translation_backend = (
             previous_backend != update.translation_backend
             and update.translation_backend != "llamacpp"
@@ -586,7 +520,6 @@ async def post_settings(update: SettingsUpdate) -> dict:
     if update.llamacpp_server_path is not None:
         previous_server_path = _runtime_or_env_or_setting("LLAMACPP_SERVER_PATH", "")
         changes["LLAMACPP_SERVER_PATH"] = update.llamacpp_server_path
-        os.environ["LLAMACPP_SERVER_PATH"] = update.llamacpp_server_path
         # A running server keeps the old executable/process; drop it so the
         # next translation starts with the new server path.
         reset_llamacpp_translation_backend = (
@@ -595,7 +528,17 @@ async def post_settings(update: SettingsUpdate) -> dict:
         )
     if changes:
         _clear_saved_hf_mirror_if_present(changes)
-        _update_env_file(changes)
+        try:
+            _update_env_file(changes)
+        except OSError as exc:
+            raise HTTPException(status_code=503, detail="保存设置失败，请检查程序目录的写入权限和磁盘空间。") from exc
+        # Publish only after persistence succeeds. A failed save must leave the
+        # running app using the same settings the next launch will read.
+        os.environ.update(changes)
+        if changes.get("HF_ENDPOINT") == "":
+            os.environ.pop("HF_ENDPOINT", None)
+        if proxy_changes is not None:
+            sync_network_proxy_environment(clear_existing=True)
     if reset_llamacpp_translation_backend:
         from llm.backends import reset_backend
 
@@ -609,10 +552,9 @@ async def post_settings(update: SettingsUpdate) -> dict:
 async def test_proxy_connection() -> dict:
     """Verify the configured network proxy can actually reach HuggingFace.
 
-    httpx trusts HTTP(S)_PROXY/ALL_PROXY env by default; the proxy-settings
-    sync writes those into os.environ, so a plain client.get() exercises the
-    proxy. Any HTTP response (even 4xx) means the proxy transport works -- only
-    a connection-level failure (timeout / refused / bad auth) means the proxy is
+    Use the configured proxy explicitly so NO_PROXY cannot turn this check
+    into a direct request. Any HTTP response (even 4xx) means the transport
+    works -- only a connection-level failure (timeout / refused / bad auth) means the proxy is
     broken. Used by the Web「测试连接」button so a wrong port fails loud instead
     of silently hanging model downloads.
     """
@@ -623,9 +565,17 @@ async def test_proxy_connection() -> dict:
         return {"ok": False, "proxy_url": "", "error": "未启用代理，或地址/端口为空"}
     started = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            proxy=proxy_url, timeout=8.0, follow_redirects=True
+        ) as client:
             resp = await client.get("https://huggingface.co/")
-    except httpx.HTTPError as exc:
+    except ImportError:
+        return {
+            "ok": False,
+            "proxy_url": proxy_url,
+            "error": "代理依赖不完整，请更新运行环境（SOCKS5 需要 httpx[socks] / socksio）",
+        }
+    except (httpx.HTTPError, ValueError) as exc:
         return {"ok": False, "proxy_url": proxy_url, "error": f"经代理连接失败：{exc}"}
     elapsed_ms = int((time.monotonic() - started) * 1000)
     return {

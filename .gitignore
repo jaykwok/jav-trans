@@ -76,12 +76,4 @@ CLAUDE.md
 AGENTS.md
 
 
-# pyproject.toml is the source of truth; `uv sync` is the documented install.
-# (requirements.txt was removed 2026-07-31 - it duplicated the dependency list
-# but omitted the [tool.uv.sources] cu132 pin, so following it produced a CPU
-# torch. Kept at agents/rm/20260731_170000_requirements_txt_superseded_by_pyproject/.)
-#
-# uv.lock is deliberately NOT ignored. The release ships it and installs with
-# `uv sync --frozen`, so an untracked lockfile means a fresh clone cannot build
-# the release anyone is actually running. It holds nothing private - package
-# names, versions, hashes, and index URLs.
+# Keep pyproject.toml and uv.lock tracked: releases install with uv sync --frozen.

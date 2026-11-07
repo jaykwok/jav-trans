@@ -12,13 +12,12 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from llm import token_budget
 from llm import settings as llm_settings
 from llm.profiles import get_profile
 from llm.profiles.json_v3 import _reasoning_token_allowance
-from llm.profiles.base import ProfileContext, TranslationProfile
+from llm.profiles.base import TranslationProfile
 
 
 def _segments(*texts: str) -> list[dict]:

@@ -9,6 +9,7 @@ _MAX_TRANSLATION_WORKERS = 64
 
 from core.config import (
     DEFAULT_SETTINGS,
+    DEFAULT_REASONING_EFFORT,
     normalize_reasoning_effort,
 )
 
@@ -67,7 +68,7 @@ class JobContext:
     keep_temp_files: bool
     run_log_enabled: bool = True
     run_log_dir: str = "./tmp/log"
-    llm_reasoning_effort: str = "medium"
+    llm_reasoning_effort: str = DEFAULT_REASONING_EFFORT
     advanced: dict[str, str] = field(default_factory=dict)
     output_target: str = ""
     output_generation: int = 0
@@ -134,7 +135,7 @@ class JobContext:
                     advanced,
                     "LLM_REASONING_EFFORT",
                     "llm_reasoning_effort",
-                    "medium",
+                    DEFAULT_REASONING_EFFORT,
                 )
             ),
             advanced=advanced,

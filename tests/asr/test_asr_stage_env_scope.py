@@ -7,6 +7,26 @@ from helpers import ASR_17B_BACKEND, make_job_context
 from pipeline import audio as pipeline_audio
 
 
+def test_proxy_changes_and_cleared_values_reach_a_persistent_worker(monkeypatch):
+    from core.config import NETWORK_PROXY_ENV_KEYS
+    from types import SimpleNamespace
+
+    for key in NETWORK_PROXY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    ctx = SimpleNamespace(advanced={})
+    monkeypatch.setenv("PROXY_PROTOCOL", "socks5")
+    monkeypatch.setenv("PROXY_HOST", "127.0.0.1")
+    monkeypatch.setenv("PROXY_PORT", "1080")
+    monkeypatch.setenv("HTTPS_PROXY", "socks5://127.0.0.1:1080")
+    snapshot = main._asr_stage_env_snapshot_for_ctx(ctx)
+    assert snapshot["HTTPS_PROXY"] == "socks5://127.0.0.1:1080"
+    assert snapshot["PROXY_PORT"] == "1080"
+    for key in NETWORK_PROXY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    cleared = main._asr_stage_env_snapshot_for_ctx(ctx)
+    assert all(cleared[key] == "" for key in NETWORK_PROXY_ENV_KEYS)
+
+
 def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path):
     video_path = tmp_path / "sample.mp4"
     video_path.write_bytes(b"fake-video")

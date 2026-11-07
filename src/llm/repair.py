@@ -41,7 +41,6 @@ from llm.errors import (
     TranslationCancelledError,
 )
 from llm.profiles import json_v3
-from llm.profiles.base import TranslationProfile
 from llm.session import TranslationSession
 from llm.context import SourceContext, cue_item
 

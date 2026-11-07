@@ -370,10 +370,11 @@ def _download_snapshot(
         from huggingface_hub import snapshot_download
     except ImportError as exc:
         raise ImportError(
-            "Model download requires huggingface_hub. Install huggingface_hub>=0.25."
+            "Model download requires huggingface_hub. Install huggingface_hub>=1.29."
         ) from exc
 
     from utils import hf_progress
+    from utils.hf_download import download_session
 
     effective_ignore_patterns = _merge_ignore_patterns(ignore_patterns)
     existed_before = target_dir.exists()
@@ -382,15 +383,16 @@ def _download_snapshot(
     print(f"[models] downloading {repo_id} -> {_project_relative(target_dir)}", flush=True)
     try:
         endpoint = normalize_hf_endpoint() or DEFAULT_HF_ENDPOINT
-        snapshot_download(
-            repo_id=repo_id,
-            revision=revision,
-            local_dir=target_dir,
-            allow_patterns=allow_patterns,
-            ignore_patterns=effective_ignore_patterns,
-            endpoint=endpoint,
-            tqdm_class=hf_progress.tqdm_class(),
-        )
+        with download_session():
+            snapshot_download(
+                repo_id=repo_id,
+                revision=revision,
+                local_dir=target_dir,
+                allow_patterns=allow_patterns,
+                ignore_patterns=effective_ignore_patterns,
+                endpoint=endpoint,
+                tqdm_class=hf_progress.tqdm_class(),
+            )
     except BaseException:
         if not existed_before:
             try:

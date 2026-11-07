@@ -329,7 +329,7 @@ def main() -> None:
             predicted = log_probs.argmax(dim=-1).cpu().numpy()
             total_frames = int(predicted.shape[0])
 
-            def blank_rate(begin_s: float, finish_s: float) -> float | None:
+            def blank_rate(begin_s: float, finish_s: float, *, total_frames=total_frames, predicted=predicted) -> float | None:
                 first = int(round(begin_s * upsample * ENCODER_FPS))
                 last = int(round(finish_s * upsample * ENCODER_FPS))
                 first = max(0, min(total_frames, first))

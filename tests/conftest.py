@@ -25,6 +25,12 @@ import pytest
 # a second process alongside the Web app's server. Individual llama.cpp tests
 # still opt in explicitly with monkeypatch.setenv after collection.
 os.environ["TRANSLATION_BACKEND"] = "openai"
+# Mocked translation tests must work without a developer's saved credentials.
+# A reserved .test endpoint also makes an accidentally unmocked request unable
+# to reach a real provider with a real key.
+os.environ["API_KEY"] = "test-only-key"
+os.environ["OPENAI_COMPATIBILITY_BASE_URL"] = "https://api.example.test/v1"
+os.environ["LLM_MODEL_NAME"] = "test-model"
 
 
 @pytest.fixture(autouse=True)

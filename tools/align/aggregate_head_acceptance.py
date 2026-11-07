@@ -124,7 +124,7 @@ def main() -> None:
             if base not in report["heads"]:
                 continue
 
-            def scores(group: str, head=head) -> list[float]:
+            def scores(group: str, head=head, report=report) -> list[float]:
                 values = (
                     cue_score(cue, head)
                     for cue in report["cues"]

@@ -11,7 +11,6 @@ weight `vocalisation` by how rare it is.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import sys
 

@@ -21,17 +21,13 @@ from llm.context import SourceContext
 from llm import settings as llm_settings
 from llm import token_budget
 from llm import transport_util
-from llm import backends as backends_module
 from llm.backends import (
-    get_backend,
-    selected_backend_name,
     task_backend,
     task_backend_name,
 )
 from llm.backends import openai_compat as openai_transport
 from llm.glossary import normalize_glossary_text
 from llm import prompt as prompt_module
-from utils import hf_progress
 from llm.errors import (
     MaxTokensRejectedError,
     ResponseTruncatedError,
@@ -114,7 +110,6 @@ def _normalize_reasoning_effort(
 
 
 _normalize_openai_compat_base_url = openai_transport._normalize_openai_compat_base_url
-_get_client = openai_transport._get_client
 
 
 def _current_retry_events() -> list[dict] | None:

@@ -572,7 +572,7 @@ class RunOutputs:
         self._generation_dir.parent.mkdir(parents=True, exist_ok=True)
         # Preparing is durable but invisible. The fixed per-run name lets a
         # restart find it without needing another pointer write to succeed.
-        with _target_lock(self.lease.target, project_root=self.project_root) as root:
+        with _target_lock(self.lease.target, project_root=self.project_root):
             if self._generation_dir.exists():
                 _validated_manifest(self._generation_dir / "manifest.json", self.lease, verify=True)
                 self.discard()

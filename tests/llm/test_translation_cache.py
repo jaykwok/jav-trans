@@ -445,7 +445,7 @@ class TestSignatureCoversWhatChangesTheTranslation:
             def name(self) -> str:
                 return "shim"
 
-        monkeypatch.setattr(translator, "get_backend", lambda *_a, **_k: _Minimal())
+        monkeypatch.setattr(translator, "task_backend", lambda: _Minimal())
         monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
         assert translator._effective_reasoning_effort() == "high"
 

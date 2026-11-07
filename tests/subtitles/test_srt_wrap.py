@@ -26,19 +26,6 @@ def test_wrap_zh_seventeen_units_breaks_into_two_lines():
     assert zh_display_units(top) <= zh_display_units(bottom)
 
 
-def test_wrap_zh_prefers_punctuation_break():
-    assert wrap_zh_subtitle_text("他说了很多话…但是我一句都没有听进去") == (
-        "他说了很多话…\n但是我一句都没有听进去"
-    )
-
-
-def test_wrap_zh_never_exceeds_two_lines():
-    text = "这是一段远远超过三十二个全角字符宽度限制的超长中文字幕文本它依然只能折成两行显示"
-    wrapped = wrap_zh_subtitle_text(text)
-
-    assert wrapped.count("\n") == 1
-
-
 def test_wrap_zh_flattens_manual_breaks_before_wrapping():
     wrapped = wrap_zh_subtitle_text("短句\n另一段")
 

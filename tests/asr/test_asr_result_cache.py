@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import struct
 import wave
 from pathlib import Path
@@ -10,7 +9,6 @@ import pytest
 from helpers import ASR_17B_BACKEND
 
 from asr import result_cache
-from asr.result_cache import _cacheable_text_results
 
 
 def _write_wav(path: Path, *, seconds: float = 0.05, rate: int = 16000, value: int = 0) -> None:
@@ -177,23 +175,6 @@ def test_restore_text_result_rehydrates_for_current_chunk(monkeypatch, tmp_path)
     assert restored["normalized_path"] == str(wav.resolve())
     assert restored["duration"] == 0.1
     assert any("ASR result cache hit" in entry for entry in restored["log"])
-
-
-def test_cacheable_results_exclude_quarantined_and_timeout():
-    text_results = {
-        0: {"text": "ok", "log": [], "asr_generation": {"policy": "ok"}},
-        1: {
-            "text": "",
-            "log": ["QUARANTINED: kind=timeout, respawn_count=3"],
-            "asr_generation": {"policy": "quarantined_result"},
-        },
-        2: {"text": "ok2", "log": ["TIMEOUT: 180s"], "asr_generation": {}},
-    }
-    filtered = _cacheable_text_results(text_results)
-    # Quarantined (1) and timed-out (2) are excluded; only the clean result (0)
-    # persists, so quarantined chunks get re-transcribed on resume instead of
-    # being silently restored as empty completed results.
-    assert set(filtered.keys()) == {0}
 
 
 class _CountingTextBackend:

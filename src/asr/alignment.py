@@ -1007,16 +1007,18 @@ def resolve_alignment_head_path(reference: str, *, download: bool = True) -> str
     from huggingface_hub import hf_hub_download
 
     from utils import hf_progress
+    from utils.hf_download import download_session
     from utils.model_paths import MODELS_ROOT
 
     MODELS_ROOT.mkdir(parents=True, exist_ok=True)
-    downloaded = hf_hub_download(
-        repo_id=repo,
-        filename=filename,
-        revision=revision or None,
-        local_dir=str(MODELS_ROOT),
-        tqdm_class=hf_progress.tqdm_class(),
-    )
+    with download_session():
+        downloaded = hf_hub_download(
+            repo_id=repo,
+            filename=filename,
+            revision=revision or None,
+            local_dir=str(MODELS_ROOT),
+            tqdm_class=hf_progress.tqdm_class(),
+        )
     if revision:
         # Written after the file lands, so an interrupted download leaves no
         # marker and the next run re-fetches rather than trusting a partial.

@@ -241,11 +241,32 @@ def test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch):
     asyncio.run(_test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch))
 
 
+def test_failed_settings_save_preserves_runtime_configuration(monkeypatch):
+    from fastapi import HTTPException
+    from web.models import SettingsUpdate
+
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.setenv("API_KEY", "previous-test-key")
+    monkeypatch.setenv("PROXY_PROTOCOL", "http")
+    monkeypatch.setenv("PROXY_HOST", "127.0.0.1")
+    monkeypatch.setenv("PROXY_PORT", "7890")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    before = dict(os.environ)
+
+    def fail_write(_updates):
+        raise PermissionError("synthetic write failure")
+
+    monkeypatch.setattr(config_routes, "_update_env_file", fail_write)
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(config_routes.post_settings(SettingsUpdate(
+            api_key="new-test-key", proxy_protocol="socks5", proxy_host="127.0.0.1", proxy_port=1080,
+        )))
+    assert caught.value.status_code == 503
+    assert dict(os.environ) == before
+
+
 def test_settings_seeds_template_into_an_installer_written_env(tmp_path, monkeypatch):
-    """The installer writes `.env` before the web page can exist, so keying the
-    template off "file missing" gave the examples only to users who declined a
-    proxy - the opposite of who needs them. Seed off the marker instead, and
-    never clobber the proxy the installer just wrote."""
+    """Add the brief header once without clobbering the installer's proxy."""
     from dotenv import dotenv_values
 
     env_path = tmp_path / ".env"
@@ -259,7 +280,7 @@ def test_settings_seeds_template_into_an_installer_written_env(tmp_path, monkeyp
     config_routes._update_env_file({"TARGET_LANG": "简体中文"})
     text = env_path.read_text(encoding="utf-8")
     assert config_routes._ENV_TEMPLATE_MARKER in text
-    assert "# ASR_BATCH_SIZE_BY_REPO=" in text
+    assert "# ASR_" not in text
     values = dotenv_values(env_path)
     assert values["PROXY_HOST"] == "127.0.0.1"
     assert values["PROXY_PORT"] == "7890"
@@ -269,6 +290,17 @@ def test_settings_seeds_template_into_an_installer_written_env(tmp_path, monkeyp
     second = env_path.read_text(encoding="utf-8")
     assert second.count(config_routes._ENV_TEMPLATE_MARKER) == 1
     assert dotenv_values(env_path)["TARGET_LANG"] == "繁體中文"
+
+
+def test_settings_replaces_duplicate_and_exported_env_entries(tmp_path, monkeypatch):
+    from dotenv import dotenv_values
+
+    env_path = tmp_path / ".env"
+    env_path.write_text('PROXY_PORT=7890\nexport PROXY_PORT=8080\nAPI_KEY=test-key\n', encoding="utf-8")
+    monkeypatch.setattr(config_routes, "PROJECT_ROOT", tmp_path)
+    config_routes._update_env_file({"PROXY_PORT": "1080"})
+    assert dotenv_values(env_path) == {"PROXY_PORT": "1080", "API_KEY": "test-key"}
+    assert env_path.read_text(encoding="utf-8").count("PROXY_PORT=") == 1
 
 
 def test_settings_respects_a_user_who_deleted_the_examples(tmp_path, monkeypatch):
@@ -805,6 +837,48 @@ async def _test_proxy_test_ok_when_reachable(monkeypatch):
     assert isinstance(payload["elapsed_ms"], int)
 
 
+@pytest.mark.parametrize("protocol", ["http", "https", "socks5"])
+def test_proxy_check_explicitly_uses_selected_proxy(monkeypatch, protocol):
+    proxy_url = f"{protocol}://127.0.0.1:1080"
+    monkeypatch.setenv("PROXY_PROTOCOL", protocol)
+    monkeypatch.setenv("PROXY_HOST", "127.0.0.1")
+    monkeypatch.setenv("PROXY_PORT", "1080")
+    monkeypatch.setenv("NO_PROXY", "*")
+    captured = {}
+
+    class CapturingClient(_FakeProxyClient):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(config_routes.httpx, "AsyncClient", CapturingClient)
+    result = asyncio.run(config_routes.test_proxy_connection())
+    assert result["ok"] is True
+    assert captured["proxy"] == proxy_url
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ImportError("missing socksio"), "socksio"),
+        (httpx.ConnectError("connection refused"), "经代理连接失败"),
+        (ValueError("invalid proxy address"), "经代理连接失败"),
+    ],
+)
+def test_proxy_check_reports_initialization_failure(monkeypatch, error, expected):
+    monkeypatch.setenv("PROXY_PROTOCOL", "socks5")
+    monkeypatch.setenv("PROXY_HOST", "127.0.0.1")
+    monkeypatch.setenv("PROXY_PORT", "1080")
+
+    def failing_client(**kwargs):
+        raise error
+
+    monkeypatch.setattr(config_routes.httpx, "AsyncClient", failing_client)
+    result = asyncio.run(config_routes.test_proxy_connection())
+    assert result["ok"] is False
+    assert expected in result["error"]
+
+
 async def _test_settings_translation_fields_update_runtime_env(monkeypatch):
     for key in ("TRANSLATION_GLOSSARY", "TARGET_LANG", "LLM_REASONING_EFFORT"):
         monkeypatch.delenv(key, raising=False)
@@ -943,11 +1017,8 @@ async def _test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch):
     assert env_path.exists()
     text = env_path.read_text(encoding="utf-8")
     assert "# Defaults live in src/core/config.py" in text
-    assert "# ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto" in text
-    assert "# ASR_STAGE_WORKER_VRAM_RATIO=0.95" in text
-    assert "# ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO=" in text
-    assert "# ASR_STAGE_WORKER_MODE=subprocess" not in text
-    assert "# ASR_BATCH_SIZE_BY_REPO=" in text
+    assert "# Keep API keys private." in text
+    assert len([line for line in text.splitlines() if line.startswith("#")]) == 2
     values = dotenv_values(env_path)
     assert values["API_KEY"] == "first-run-key"
     assert values["OPENAI_COMPATIBILITY_BASE_URL"] == "https://api.example.test/v1"

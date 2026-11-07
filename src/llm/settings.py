@@ -7,7 +7,6 @@ these into its own namespace during the migration so tests that monkeypatch
 
 from __future__ import annotations
 
-import os
 
 from core.config import (
     DEFAULT_REASONING_EFFORT,

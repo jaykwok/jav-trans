@@ -43,21 +43,6 @@ def _event_ts() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-def current_job_id() -> str:
-    """The job_id this module would currently emit events under.
-
-    Public so a caller about to hand work to a new thread (e.g.
-    translator.py, before submitting to a ThreadPoolExecutor) can capture it
-    and hand it to `propagate_job_id_to_current_thread` on the other side.
-    """
-    return _current_job_id()
-
-
-def current_run_id() -> str:
-    """The run this module would emit under; captured with `current_job_id`."""
-    return _current_run_id()
-
-
 def _current_job_id() -> str:
     # 先试线程本地（主线程调用路径有效）
     try:

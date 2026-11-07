@@ -4,7 +4,7 @@
 smaller than asked for, and if the reply is then cut off the truncation
 escalation cannot raise it back past the same line. There are two checks
 because neither covers the other - this one runs at startup and knows only the
-configuration, and `token_budget.budget_with_warning` runs per request and sees
+configuration, and `EndpointCapability.budget(warn=True)` runs per request and sees
 the budget the source text actually produced.
 """
 from __future__ import annotations
@@ -66,7 +66,7 @@ def test_the_startup_check_does_not_consume_the_runtime_warning(capsys):
     assert preflight.translation_budget_warnings()
     assert "[WARN]" not in capsys.readouterr().out
 
-    token_budget.budget_with_warning(50000, backend_name="openai")
+    token_budget.EndpointCapability(token_budget.endpoint_identity("openai")).budget(50000, warn=True)
     assert "[WARN]" in capsys.readouterr().out
 
 

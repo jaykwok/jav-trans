@@ -219,9 +219,9 @@ def test_propagate_job_id_to_current_thread_sets_the_events_thread_local():
         events.set_current_job_id("")
 
 
-def test_current_job_id_reads_through_to_events_thread_local():
+def test_current_identity_reads_through_to_events_thread_local():
     events.set_current_job_id("job-99")
     try:
-        assert hf_progress.current_job_id() == "job-99"
+        assert hf_progress.current_identity()[0] == "job-99"
     finally:
         events.set_current_job_id("")

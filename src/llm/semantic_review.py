@@ -331,7 +331,7 @@ def apply_semantic_review(
                 _, labels = _verification(source_context, result, proposals, session)
                 verdicts = request_rows(
                     sorted(proposals), "verdicts",
-                    lambda targets: _verification(
+                    lambda targets, proposals=proposals: _verification(
                         source_context, result, {index: proposals[index] for index in targets}, session,
                     )[0],
                 )

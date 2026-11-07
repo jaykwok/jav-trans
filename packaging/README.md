@@ -3,6 +3,21 @@
 There are two builds. The setup build is what users get; the full bundle is the
 offline fallback.
 
+## CI and release gate
+
+The `CI` workflow runs on Windows for pushes to `main`, pull requests, and
+manual runs. It installs `uv.lock`, verifies that PyTorch includes CUDA, checks
+Python/JavaScript/PowerShell code, and runs the regression suite. Tests use
+synthetic inputs and fake API credentials; the hosted runner does not perform
+GPU inference or download models. Production support remains Windows + NVIDIA.
+The locked PyTorch wheel supplies the CUDA runtime; users need a compatible
+NVIDIA driver, not a separate CUDA Toolkit installation.
+
+Before publishing a release, require a successful `Windows checks` run for the
+exact source commit recorded in the release manifest. An older green run or a
+local test result does not satisfy this gate. Publish only after that check and
+the archive's manifest verification succeed.
+
 ## Setup build (default for releases)
 
 ```powershell
@@ -39,6 +54,10 @@ payload under `dist/setup-payload/jav-trans` and passes its own `--workpath`
 (`build/jav-trans-setup`). One PyInstaller cache shared by two different
 Analysis inputs is a stale-build trap.
 
+Every setup build assembles a fresh payload, including when `-Clean` is omitted.
+The previous payload is preserved under `agents/rm/`; stale source files,
+bytecode, FFmpeg DLLs, and an optional bundled uv cannot enter the new archive.
+
 Python, PyTorch, the ASR weights, and the CTC head are not in the archive. The
 installer obtains Python as needed and installs the locked dependencies on the
 user's machine; the first ASR task downloads the model and alignment head.
@@ -46,6 +65,8 @@ This keeps the release around 100 MB. The console stays open during `uv sync`
 so the user can see the download rate and decide whether they need a proxy;
 `bootstrap.py` measures against the real torch wheel named in `uv.lock` and
 reports the estimated time rather than applying a threshold.
+HTTP, HTTPS, and SOCKS5 proxies also cover the initial uv download and speed
+probe; the bootstrap executable implements SOCKS5 without extra Python packages.
 
 FFmpeg travels with the archive because TorchCodec loads its shared DLLs at
 import time and uv cannot install them. `launcher.py` finds them at `bin/`.

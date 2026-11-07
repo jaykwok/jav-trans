@@ -247,14 +247,3 @@ def plain_budget(desired: int | None, *, backend_name: str) -> int:
     real source text - would never say anything.
     """
     return EndpointCapability(endpoint_identity(backend_name)).budget(desired)
-
-
-def budget_with_warning(desired: int | None, *, backend_name: str) -> int:
-    """What to actually ask for, and say so the first time it is less.
-
-    Reads the cache, so this answers for a request that has not started yet.
-    Within one call the same question goes to that call's own capability state
-    instead, which knows what this one cannot: what the endpoint has said during
-    this very request.
-    """
-    return EndpointCapability(endpoint_identity(backend_name)).budget(desired, warn=True)

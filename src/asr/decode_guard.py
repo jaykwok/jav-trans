@@ -71,7 +71,6 @@ can speak. `decode_cap_truncations` is a loop counter.
 from __future__ import annotations
 
 import math
-import os
 from typing import TYPE_CHECKING, Sequence
 
 from core.typed_config import FALL_BACK, env_bool, env_float, env_int, env_text

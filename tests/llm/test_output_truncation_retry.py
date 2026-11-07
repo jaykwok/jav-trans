@@ -30,7 +30,7 @@ _REPLY = '{"translations":[{"id":0,"text":"你好"}]}'
 
 @pytest.fixture(autouse=True)
 def _openai_backend(monkeypatch):
-    monkeypatch.setattr(translator, "selected_backend_name", lambda: "openai")
+    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
 
 
 def _install(monkeypatch, transport) -> None:

@@ -707,7 +707,6 @@ def find_existing_prediction_paths(case: DatasetCase, predictions_root: Path | s
 def _asr_metrics_from_artifacts(paths: dict[str, str]) -> dict:
     timings = _load_json_if_exists(paths.get("timings"))
     quality = _load_json_if_exists(paths.get("quality_report"))
-    asr_details = timings.get("asr_details") if isinstance(timings.get("asr_details"), dict) else {}
     counts = timings.get("counts") if isinstance(timings.get("counts"), dict) else {}
     return {
         "backend": timings.get("backend") or "",

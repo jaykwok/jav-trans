@@ -2,8 +2,6 @@
 
 import os
 import sys
-import threading
-import time
 from pathlib import Path
 
 # 添加项目根目录到 path

@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 import re
 import time
 import uuid
@@ -82,10 +81,6 @@ def _enforce_vram_budget(stage: str, on_stage: Callable[[str], None] | None) -> 
     )
     _emit_progress(on_stage, f"[WARN] {detail}")
     raise RuntimeError(detail)
-
-
-class ASRWorkerSystemError(RuntimeError):
-    pass
 
 
 def _strip_punctuation(text: str) -> str:

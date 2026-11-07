@@ -13,7 +13,7 @@ $env:PYTHONIOENCODING = "utf-8"
 
 $Uv = Get-Command uv -ErrorAction SilentlyContinue
 if (-not $Uv) {
-    throw "Missing uv. Install uv, run 'uv venv', then install dependencies with 'uv pip install -r requirements.txt'."
+    throw "Missing uv. Install uv, then run 'uv sync --frozen' in the project root."
 }
 
 if ($FfmpegExe) {
@@ -31,14 +31,20 @@ function Move-BuildArtifactToRm {
     if (-not (Test-Path -LiteralPath $Path)) {
         return
     }
-    $RmRoot = Join-Path $Root "agents/rm"
-    New-Item -ItemType Directory -Force -Path $RmRoot | Out-Null
-    $Stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $Destination = Join-Path $RmRoot "$($Stamp)_$Label"
-    if (Test-Path -LiteralPath $Destination) {
-        $Destination = "$Destination-$([DateTimeOffset]::Now.ToUnixTimeMilliseconds())"
+    $Resolved = (Resolve-Path -LiteralPath $Path).Path
+    $RootPrefix = $Root.Path.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if (-not $Resolved.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Build artifacts must be inside the project directory."
     }
-    Move-Item -LiteralPath $Path -Destination $Destination
+    $RmRoot = Join-Path $Root "agents/rm"
+    $Stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $ArchiveRoot = Join-Path $RmRoot "$($Stamp)_$Label-$([Guid]::NewGuid().ToString('N'))"
+    $Destination = [IO.Path]::GetFullPath((Join-Path $ArchiveRoot $Resolved.Substring($RootPrefix.Length)))
+    if (-not $Destination.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Build archive must be inside the project directory."
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
+    Move-Item -LiteralPath $Resolved -Destination $Destination
     Write-Host "Moved old build artifact to $Destination"
 }
 

@@ -96,13 +96,11 @@ def test_the_shipped_gguf_default_is_accepted(monkeypatch):
 
 def test_the_openai_client_asks_before_the_sdk_can_complain(monkeypatch):
     monkeypatch.setenv("API_KEY", "")
-    monkeypatch.setattr(openai_compat, "_CLIENT", None)
-    monkeypatch.setattr(openai_compat, "_CLIENT_KEY", ("", ""))
 
     def fail(*args, **kwargs):
         raise AssertionError("the SDK client must not be constructed")
 
-    monkeypatch.setattr(openai_compat, "OpenAI", fail)
+    monkeypatch.setattr(openai_compat, "AsyncOpenAI", fail)
     with pytest.raises(RuntimeError) as excinfo:
-        openai_compat._get_client()
+        openai_compat._make_async_client()
     assert str(excinfo.value) == stage_errors.MISSING_API_KEY

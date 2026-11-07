@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 from typing import Callable
@@ -14,39 +13,6 @@ from subtitles.qc import compute_quality_report
 
 def parse_glossary_pairs_from_text(text: str) -> list[tuple[str, str]]:
     return parse_glossary_pairs(text)
-
-
-def load_global_glossary_pairs(
-    job_temp_dir: str,
-    video_stem: str,
-    *,
-    console: Console,
-) -> list[tuple[str, str]]:
-    pairs: list[tuple[str, str]] = []
-    root = Path(job_temp_dir)
-    candidates = [
-        root / f"{video_stem}.translation_global_glossary.json",
-        root / "translation_global_glossary.json",
-    ]
-    candidates.extend(sorted(root.glob("translation_global_glossary.*.json")))
-    for path in candidates:
-        if not path.exists():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            terms = payload.get("terms") if isinstance(payload, dict) else payload
-            if not isinstance(terms, list):
-                continue
-            for item in terms:
-                if not isinstance(item, dict):
-                    continue
-                ja = str(item.get("ja", "")).strip()
-                zh = str(item.get("zh", "")).strip()
-                if ja and zh:
-                    pairs.append((ja, zh))
-        except Exception as exc:
-            console.print(f"[yellow]WARNING: 读取全局术语表失败 {path}: {exc}[/yellow]")
-    return pairs
 
 
 def collect_glossary_pairs(

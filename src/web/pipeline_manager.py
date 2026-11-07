@@ -17,7 +17,7 @@ from weakref import WeakKeyDictionary
 from core import events
 from core import gpu_admission
 from core import resources
-from core.config import DEFAULT_SETTINGS
+from core.config import DEFAULT_REASONING_EFFORT, DEFAULT_SETTINGS
 from core.typed_config import env_int
 from core.job_context import JobContext
 from core.stage_errors import describe_stage_failure
@@ -547,7 +547,7 @@ def _current_translation_settings() -> dict[str, str]:
         "target_lang": _runtime_setting("TARGET_LANG", "简体中文") or "简体中文",
         "translation_glossary": _runtime_setting("TRANSLATION_GLOSSARY", ""),
         "llm_reasoning_effort": _normalize_llm_reasoning_effort(
-            _runtime_setting("LLM_REASONING_EFFORT", "medium")
+            _runtime_setting("LLM_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
         ),
     }
 

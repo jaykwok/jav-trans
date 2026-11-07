@@ -1,6 +1,6 @@
 # jav-trans
 
-**把 JAV 日语视频变成日文、译文或双语字幕。** 在本机控制台选好视频，程序会依次完成语音识别、时间轴对齐、翻译（可选）和字幕导出。
+**为 JAV 日语视频生成日文、译文或双语字幕。** 在本机控制台选好视频，程序会依次完成语音识别、时间轴对齐、翻译（可选）和字幕导出。
 
 [**下载 Windows 发布包**](https://github.com/jaykwok/jav-trans/releases/latest/download/jav-trans-windows-x64.zip) · [版本说明](https://github.com/jaykwok/jav-trans/releases/latest) · [快速开始](#快速开始) · [模式选择](#选择处理模式) · [升级](#升级到新版本) · [常见问题](#常见问题)
 

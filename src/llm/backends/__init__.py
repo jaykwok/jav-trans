@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from core.typed_config import FALL_BACK, env_float
 
-import os
-import math
 import threading
 import time
 from collections.abc import Callable, Iterator

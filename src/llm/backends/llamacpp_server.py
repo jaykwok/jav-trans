@@ -132,14 +132,14 @@ def resolve_gguf_model_path(
             f"本地未找到 {repo}/{filename}，且未启用自动下载。"
         )
     from utils import hf_progress
+    from utils.hf_download import download_session
 
-    return hf_hub_download(
-        repo_id=repo,
-        filename=filename,
-        # The 6.2GB one. Without the event the transfer has no way of hearing
-        # that the task asking for it has been cancelled.
-        tqdm_class=hf_progress.tqdm_class(cancel_event),
-    )
+    with download_session():
+        return hf_hub_download(
+            repo_id=repo,
+            filename=filename,
+            tqdm_class=hf_progress.tqdm_class(cancel_event),
+        )
 
 
 def _torch_library_dir() -> Path | None:

@@ -292,7 +292,6 @@ def build_l1(
             rejected["no_manifest_row"] += 1
             continue
         script = str(manifest_row.get("script_text") or manifest_row.get("text") or "")
-        stripped = str(row.get("text") or "")
         if not script.strip():
             rejected["empty_script"] += 1
             continue

@@ -11,6 +11,7 @@ jav-trans.exe 就是直接启动程序。
    要下多久」。速度可以接受就直接回车跳过；太慢或显示「连接失败」，就按
    y 填写本地代理（Clash / v2ray 等）的地址和端口。
    填写的代理会保存到 .env，之后下载 ASR 模型时也会自动使用。
+   HTTP、HTTPS 和 SOCKS5 均可用于安装、测速和模型下载。
 
 2. 安装运行环境。
    控制台会实时显示 PyTorch 等依赖的下载进度，安装后约占 3.3GB 磁盘。
@@ -58,7 +59,7 @@ jav-trans，里面那份会重新安装运行环境、重新下载模型。启�
 
 它会逐项检查程序文件、FFmpeg 和依赖（会实际导入一遍 torch 等库）并报出缺什么；
 缺依赖就当场补装（需要代理时仍读取 .env 里的设置，也可以加 --proxy 指定），
-补好后继续启动。检查结果会留在控制台窗口里，可以直接附在反馈里。
+补好后继续启动。反馈检查结果前，请删除密钥、用户目录和本地媒体路径。
 
 自检提示「程序文件不完整」时，说明缺的是压缩包里的文件，无法自动补回：按上面
 「升级到新版本」的做法，把同一版本的压缩包再覆盖一次即可，.venv、models、.env
@@ -75,7 +76,8 @@ jav-trans，里面那份会重新安装运行环境、重新下载模型。启�
   里打开「不翻译（仅日文字幕）」。
 * 如果窗口打不开，安装 Microsoft Edge WebView2 运行时：
   https://developer.microsoft.com/en-us/microsoft-edge/webview2/
-* 出问题时，tmp\log\ 下的 .run.log 可以直接附在反馈里。
+* 出问题时，可提供 tmp\log\ 下相关 .run.log 的必要片段；发送前请删除密钥、
+  用户目录、视频路径和真实片名，不要直接公开整个 .env 或完整日志目录。
 
 命令行参数（可选）
 ------------------
@@ -83,6 +85,7 @@ jav-trans，里面那份会重新安装运行环境、重新下载模型。启�
   jav-trans.exe --doctor                        检查依赖，缺失就补回来，再启动
   jav-trans.exe --keep-console                  窗口打开后保留控制台（排查问题）
   jav-trans.exe --proxy http://127.0.0.1:7890   指定代理，不询问
+  jav-trans.exe --proxy socks5://127.0.0.1:1080 使用 SOCKS5 代理
   jav-trans.exe --yes                           不提问（自检和安装都不等确认）
   jav-trans.exe --reinstall                     重装运行环境
   jav-trans.exe --install-only                  只安装/只自检，不启动
