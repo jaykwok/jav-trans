@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import time
+import threading
 from pathlib import Path
 
 
@@ -15,47 +15,49 @@ from web import pipeline_manager as pm
 from web.models import JobSpec
 
 
-async def _drain_queue(queue: asyncio.Queue) -> None:
-    while True:
-        try:
-            queue.get_nowait()
-        except asyncio.QueueEmpty:
-            return
-        queue.task_done()
-
-
-async def _reset_pm_state() -> None:
-    async with pm._state_lock:
-        pm._jobs.clear()
-        pm._cancel_events.clear()
-    await _drain_queue(pm.gpu_queue)
-    await _drain_queue(pm.trans_queue)
-    # A module-level asyncio.Queue binds to the first loop that waits on it, and
-    # every test here runs its own asyncio.run(): reuse would kill the next
-    # test's workers with "bound to a different event loop" as soon as they
-    # await an empty get(). Hand each test fresh queues instead.
-    pm.gpu_queue = asyncio.Queue()
-    pm.trans_queue = asyncio.Queue()
-
-
 def test_pipeline_workers_overlap(tmp_path, monkeypatch):
     asyncio.run(_test_pipeline_workers_overlap(tmp_path, monkeypatch))
 
 
 async def _test_pipeline_workers_overlap(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
-    await _reset_pm_state()
-    asr_done_at: dict[str, float] = {}
-    translation_started_at: dict[str, float] = {}
+    monkeypatch.setattr(pm, "_job_store_writer", pm._JobStoreWriter())
+    monkeypatch.setattr(pm, "_jobs", {})
+    monkeypatch.setattr(pm, "_cancel_events", {})
+    monkeypatch.setattr(pm, "_tombstones", {})
+    monkeypatch.setattr(pm, "gpu_queue", asyncio.Queue())
+    monkeypatch.setattr(pm, "trans_queue", asyncio.Queue())
+    first_translation = threading.Event()
+    two_translations = threading.Event()
+    all_asr_done = threading.Event()
+    release_translations = threading.Event()
+    translation_lock = threading.Lock()
+    asr_done: set[str] = set()
+    translations_started: set[str] = set()
+    created = []
+    for name in ("a", "b", "c"):
+        created.extend(await pm.create_job(JobSpec(
+            video_paths=[str(tmp_path / f"sample-{name}.mp4")], skip_translation=False,
+        )))
 
     def fake_asr(job, _cancel_event, _run_id):
-        time.sleep(0.3)
-        asr_done_at[job.id] = time.perf_counter()
+        if job.id != created[0].id:
+            # Later ASR can finish only while the first translation is running.
+            assert first_translation.wait(10)
+        asr_done.add(job.id)
+        if len(asr_done) == len(created):
+            all_asr_done.set()
         return {"job_id": job.id}
 
     def fake_translation(job, _asr_artifacts, _cancel_event, _run_id):
-        translation_started_at[job.id] = time.perf_counter()
-        time.sleep(1.0)
+        with translation_lock:
+            translations_started.add(job.id)
+            if job.id == created[0].id:
+                first_translation.set()
+            if len(translations_started) == 2:
+                two_translations.set()
+        assert release_translations.wait(10)
         return []
 
     monkeypatch.setattr(pm, "_run_asr_alignment", fake_asr)
@@ -67,36 +69,19 @@ async def _test_pipeline_workers_overlap(tmp_path, monkeypatch):
         asyncio.create_task(pm.translation_worker()),
     ]
     try:
-        started = time.perf_counter()
-        specs = [
-            JobSpec(video_paths=[f"{name}.mp4"], skip_translation=False)
-            for name in ("a", "b", "c")
-        ]
-        created = []
-        for spec in specs:
-            created.extend(await pm.create_job(spec))
-
-        deadline = time.perf_counter() + 5.0
-        while time.perf_counter() < deadline:
-            jobs = [await pm.get_job(job.id) for job in created]
-            if all(job is not None and job.status == "done" for job in jobs):
-                break
-            await asyncio.sleep(0.02)
-
-        elapsed = time.perf_counter() - started
+        # Observe actual concurrency; elapsed time also measures CI disk speed.
+        assert await asyncio.to_thread(two_translations.wait, 5)
+        assert await asyncio.to_thread(all_asr_done.wait, 5)
+        assert (await pm.get_job(created[0].id)).status == "translating"
+        release_translations.set()
+        await asyncio.wait_for(pm.gpu_queue.join(), 5)
+        await asyncio.wait_for(pm.trans_queue.join(), 5)
         jobs = [await pm.get_job(job.id) for job in created]
         assert all(job is not None and job.status == "done" for job in jobs)
-        assert elapsed < 2.4
-
-        first_job_id = created[0].id
-        assert first_job_id in asr_done_at
-        assert first_job_id in translation_started_at
-        assert translation_started_at[first_job_id] - asr_done_at[first_job_id] < 0.2
-
-        all_asr_done = max(asr_done_at.values())
-        assert translation_started_at[first_job_id] < all_asr_done
+        assert translations_started == asr_done == {job.id for job in created}
     finally:
+        release_translations.set()
+        first_translation.set()
         for worker in workers:
             worker.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
-        await _reset_pm_state()
