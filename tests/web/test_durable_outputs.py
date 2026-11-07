@@ -574,26 +574,43 @@ def test_started_atomic_replace_is_settled_before_state_transaction_finishes(wor
             video_paths=[str(workspace / "sample-a.mp4")], skip_translation=True,
         )))[0]
         entered, release = threading.Event(), threading.Event()
+        confirming, settling = asyncio.Event(), asyncio.Event()
         replace = Path.replace
-        pm._job_store_writer._CONFIRM_TIMEOUT_S = 0.05
+        writer = pm._job_store_writer
+        confirm, settle_commit = writer.confirm, writer._settle_commit
+
+        async def confirm_after_replace_started(receipt):
+            # Disk preparation may exceed 50 ms on a hosted Windows runner.
+            # Start the short deadline only once the atomic replace has begun.
+            assert await asyncio.to_thread(entered.wait, 5)
+            writer._CONFIRM_TIMEOUT_S = 0.05
+            confirming.set()
+            await confirm(receipt)
+
+        async def observe_settling(wrapped):
+            settling.set()
+            await settle_commit(wrapped)
 
         def slow_replace(path, target):
             if Path(target) == pm._jobs_path:
                 entered.set()
-                assert release.wait(3)
+                assert release.wait(10)
             return replace(path, target)
 
+        monkeypatch.setattr(writer, "confirm", confirm_after_replace_started)
+        monkeypatch.setattr(writer, "_settle_commit", observe_settling)
         monkeypatch.setattr(Path, "replace", slow_replace)
         save = asyncio.create_task(pm._set_job(job, status="done"))
         try:
-            assert await asyncio.to_thread(entered.wait, 2)
+            await asyncio.wait_for(confirming.wait(), 5)
             if interruption == "cancel":
                 save.cancel()
-            await asyncio.sleep(0.1)
+            await asyncio.wait_for(settling.wait(), 5)
             assert not save.done()
             assert (await pm.get_job(job.id)).status == "saving"
         finally:
             release.set()
+            await asyncio.gather(save, return_exceptions=True)
         await save
         assert (await pm.get_job(job.id)).status == "done"
         assert json.loads(pm._jobs_path.read_text("utf-8"))[0]["status"] == "done"
