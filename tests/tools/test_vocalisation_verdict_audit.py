@@ -58,6 +58,7 @@ def _run(
         ],
         cwd=PROJECT_ROOT,
         text=True,
+        encoding="utf-8",
         capture_output=True,
     )
     assert result.returncode == 0, result.stderr[-2000:]
@@ -151,6 +152,7 @@ def test_a_verdict_with_no_key_row_stops_the_run(tmp_path: Path) -> None:
         ],
         cwd=PROJECT_ROOT,
         text=True,
+        encoding="utf-8",
         capture_output=True,
     )
 
@@ -200,9 +202,11 @@ def test_the_split_page_reuses_the_same_arithmetic(tmp_path: Path) -> None:
     assert report["w6_unsure"] == 1
 
 
-def test_a_key_without_posteriors_does_not_crash_the_report(tmp_path: Path) -> None:
+def test_a_key_without_posteriors_does_not_crash_the_report(tmp_path: Path, monkeypatch) -> None:
     """A split key carries the fragment, not a per-cue speech share. Which clip
     a word was heard in is the finding, and it does not depend on those."""
+    # Match an English Windows runner while the child emits UTF-8 Japanese.
+    monkeypatch.setattr(subprocess, "_text_encoding", lambda: "cp1252")
     key = [
         {"row_id": "k1", "stratum": "split_kept", "text": "だめ", "start_s": 0.0,
          "end_s": 2.0},

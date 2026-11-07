@@ -76,6 +76,10 @@ addopts = [
     "-p",
     "no:cacheprovider",
 ]
+filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
 
 norecursedirs = [
     ".venv",
