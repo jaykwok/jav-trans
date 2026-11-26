@@ -1,0 +1,57 @@
+from pathlib import Path
+
+from pipeline.cleanup import cleanup_job_temp, cleanup_runtime_ephemeral_temp
+
+
+def _cleanup_job_temp(job_temp_dir: Path, translation_cache_path: str = "") -> None:
+    cleanup_job_temp(
+        str(job_temp_dir),
+        translation_cache_path,
+    )
+def test_cleanup_job_temp_removes_wav_json_and_keeps_srt(tmp_path):
+    job_dir = tmp_path / "job"
+    nested = job_dir / "audio"
+    nested.mkdir(parents=True)
+
+    wav_path = nested / "sample.wav"
+    json_path = job_dir / "sample.timings.json"
+    srt_path = job_dir / "sample.srt"
+    txt_path = job_dir / "notes.txt"
+
+    wav_path.write_bytes(b"wav")
+    json_path.write_text("{}", encoding="utf-8")
+    srt_path.write_text("1\n", encoding="utf-8")
+    txt_path.write_text("keep", encoding="utf-8")
+
+    _cleanup_job_temp(job_dir)
+
+    assert not wav_path.exists()
+    assert not json_path.exists()
+    assert not nested.exists()
+    assert not srt_path.exists()
+    assert not txt_path.exists()
+    assert not job_dir.exists()
+
+
+def test_runtime_ephemeral_cleanup_keeps_reusable_caches(tmp_path, monkeypatch):
+    tmp_root = tmp_path / "tmp"
+    jobs = tmp_root / "jobs"
+    chunks = tmp_root / "chunks"
+    hf_cache = tmp_root / "cache" / "hf"
+
+    for path in [jobs, chunks, hf_cache]:
+        path.mkdir(parents=True)
+    (hf_cache / "cache.bin").write_bytes(b"cache")
+
+    monkeypatch.setenv("JOB_TEMP_DIR", str(jobs))
+    monkeypatch.setenv("ASR_CHUNK_ROOT", str(chunks))
+
+    cleanup_runtime_ephemeral_temp(
+        job_temp_root=jobs,
+        asr_chunk_root=chunks,
+        project_root=tmp_path,
+    )
+
+    assert not jobs.exists()
+    assert not chunks.exists()
+    assert (hf_cache / "cache.bin").exists()

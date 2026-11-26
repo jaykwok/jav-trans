@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>jav-sub</title>
+  <link rel="icon" type="image/png" href="/assets/images/icon.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+  <header>
+    <img class="app-mark" src="/assets/images/icon.png" alt="" aria-hidden="true">
+    <div class="brand">
+      <span class="logo">jav-sub</span>
+      <span class="sub">字幕翻译工作台</span>
+    </div>
+    <span class="spacer"></span>
+    <button class="update-pill" id="btn-update-trigger" type="button" title="版本与在线更新">v--</button>
+    <span id="conn-dot" class="conn-dot" title="SSE 连接状态"></span>
+  </header>
+
+  <aside>
+    <!-- Submit (sticky) -->
+    <div class="panel panel-submit">
+      <button class="btn btn-primary" id="btn-submit" disabled>开始任务</button>
+    </div>
+
+    <div class="aside-scroll">
+
+      <!-- Preset chips -->
+      <div class="panel">
+        <div class="panel-title">✨ 预设</div>
+        <div class="preset-chips">
+          <button class="preset-chip" data-preset="standard">标准</button>
+          <button class="preset-chip preset-chip-custom" data-preset="custom">自定义</button>
+        </div>
+      </div>
+
+      <!-- File picker -->
+      <div class="panel">
+        <div class="panel-title">📁 选择视频</div>
+        <div class="drop-zone" id="drop-zone">
+          <img class="drop-icon" src="/assets/images/icon.png" alt="" aria-hidden="true">
+          <p><strong>点击选择（支持多选）</strong>或拖拽视频文件</p>
+          <p class="drop-exts">mp4 / mkv / avi / ts / wmv</p>
+        </div>
+        <div class="folder-row">
+          <button class="btn-sm btn-outline" id="btn-add-folder" type="button" title="选择文件夹，自动扫描其中所有视频文件">📁
+            添加文件夹</button>
+        </div>
+        <label class="field" style="margin-top:10px">
+          <span>输出目录（留空则保存到视频同目录）</span>
+          <input type="text" id="f-output-dir" placeholder="例：D:\subs\output">
+        </label>
+      </div>
+
+      <!-- Model / environment readiness. Hidden as a whole (not just the
+           inner notice) when nothing is missing, so this doesn't sit on
+           screen as an empty section with a title and no content. -->
+      <div class="panel" id="panel-model-requirements" hidden>
+        <div class="panel-title">🎯 运行环境</div>
+        <div class="form-grid">
+          <div id="model-requirements-notice" class="model-requirements-notice"></div>
+        </div>
+      </div>
+
+      <!-- Network proxy (collapsible, off by default) -->
+      <div class="panel">
+        <details class="panel-collapsible" id="panel-proxy">
+          <summary class="panel-title">
+            <span class="summary-label">
+              <span>🌐 网络代理</span>
+              <span class="status-tag" id="proxy-status-tag" data-on="off">未启用</span>
+            </span>
+          </summary>
+          <div class="form-grid">
+            <div class="toggle-row">
+              <span>启用代理（HuggingFace 模型下载加速）</span>
+              <label class="toggle"><input type="checkbox" id="proxy-enabled"><span class="slider"></span></label>
+            </div>
+            <div class="proxy-grid" id="proxy-fields">
+              <label class="field">
+                <span>协议</span>
+                <select id="proxy-protocol">
+                  <option value="http">http</option>
+                  <option value="https">https</option>
+                  <option value="socks5">socks5</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>地址</span>
+                <input type="text" id="proxy-host" placeholder="127.0.0.1">
+              </label>
+              <label class="field">
+                <span>端口</span>
+                <input type="text" id="proxy-port" inputmode="numeric" pattern="[0-9]*" placeholder="7890">
+              </label>
+            </div>
+            <div class="proxy-actions">
+              <button class="btn-sm btn-outline" id="btn-proxy-test" type="button" disabled>测试连接</button>
+              <span class="proxy-test-result" id="proxy-test-result"></span>
+            </div>
+            <p class="field-hint">填好地址端口并打开开关即可生效；关闭开关可随时禁用，无需清空字段。点「测试连接」验证能否访问 HuggingFace。</p>
+          </div>
+        </details>
+      </div>
+
+      <!-- Tuning (collapsible, custom mode only) -->
+      <div class="panel" id="section-tuning">
+        <details class="panel-collapsible" id="panel-tuning">
+          <summary class="panel-title">⚙️ 参数调优</summary>
+          <div class="form-grid">
+            <label class="field">
+              <span>字幕模式</span>
+              <select id="r-mode"></select>
+              <span class="field-hint">选项名称会随“翻译设置 → 目标语言”自动更新。</span>
+            </label>
+            <div class="toggle-row">
+              <span>不翻译（仅日文字幕）</span>
+              <label class="toggle"><input type="checkbox" id="r-skip-translation"><span class="slider"></span></label>
+            </div>
+            <label class="field">
+              <span>并行翻译 Worker 数</span>
+              <input type="number" id="t-translation-max-workers" value="4" min="1" max="64">
+              <span class="field-hint">只影响并发请求数，不影响成本；调高通常更快，遇到限速请调低。</span>
+            </label>
+            <button class="btn btn-outline" id="btn-save-custom" type="button">保存自定义任务模板</button>
+            <p class="field-hint">自定义任务模板只保存在本机浏览器中，不写入 <code>config/config.json</code>；翻译设置请使用下方的独立保存按钮。</p>
+          </div>
+        </details>
+      </div>
+
+      <!-- Translation API (collapsible) -->
+      <div class="panel">
+        <details class="panel-collapsible" id="panel-translation">
+          <summary class="panel-title">🔑 翻译设置</summary>
+          <div class="form-grid">
+
+            <label class="field">
+              <span>翻译后端</span>
+              <select id="translation-backend">
+                <option value="llamacpp" selected>本地翻译（Hy-MT3-7B Q4 · llama.cpp）</option>
+                <option value="openai">API 调用（OpenAI 兼容）</option>
+              </select>
+            </label>
+
+            <div id="openai-backend-fields" style="display:none">
+              <label class="field">
+                <span>API Key</span>
+                <div class="input-group">
+                  <input type="password" id="api-key" placeholder="留空则不修改当前值" autocomplete="new-password">
+                  <button class="btn-icon" id="btn-show-key" type="button" title="显示 / 隐藏">👁</button>
+                </div>
+                <span class="key-preview" id="api-key-preview"></span>
+              </label>
+
+              <label class="field">
+                <span>API Base URL（留空则不修改当前值）</span>
+                <input type="text" id="api-base-url" placeholder="https://openrouter.ai/api/v1">
+                <span class="field-hint">留空默认使用 OpenRouter；也可填 DeepSeek 官方（<code>https://api.deepseek.com</code>，可不带 <code>/v1</code>）等其他 OpenAI 兼容地址。<br><b>换地址后请重新点「获取」选模型</b>：不同服务商对同一模型的命名方式可能不同。</span>
+              </label>
+
+              <label class="field">
+                <span>模型</span>
+                <div class="model-row">
+                  <div id="api-model-wrap" class="model-combobox" title="请先填写并保存 API Key 和 Base URL，再点击「获取」">
+                    <input type="text" id="api-model" class="model-combobox-input" disabled
+                      autocomplete="off" placeholder="-- 填好 Key 和 URL 后点获取 --">
+                    <ul class="model-combobox-list" id="api-model-list" hidden></ul>
+                  </div>
+                  <button class="btn-sm btn-outline" id="btn-fetch-models" type="button"
+                    title="从 API 拉取可用模型列表">获取</button>
+                </div>
+                <span class="key-preview" id="api-model-preview"></span>
+                <span class="field-hint">拉取到的列表可以直接输入关键字筛选；最终只能选中列表里的一项。</span>
+              </label>
+
+              <label class="field">
+                <span>推理强度</span>
+                <select id="api-reasoning-effort">
+                  <option value="none">none（不思考，最便宜）</option>
+                  <option value="low" selected>low（默认）</option>
+                  <option value="high">high（最慢，成本最高）</option>
+                </select>
+                <span class="field-hint">决定全片翻译强度与成本（成本主要来自思维链输出）；复译可疑字幕时不降档（none 除外）。其他兼容 API 按各自规则执行。</span>
+              </label>
+            </div>
+
+            <div id="llamacpp-backend-fields">
+              <p class="field-hint">
+                启用后若 <code>models/runtime/llama-cpp/</code> 不存在，会自动下载匹配当前 CUDA 主版本的 <code>llama-server</code>（约 226MB，复用内置 CUDA 运行库并自动探测 GPU）。<br>
+                固定使用 Hy-MT3-7B Q4_K_M，首次翻译自动下载模型约 4.8GB（建议开代理），期间临时释放 ASR 显存，用完自动重载。<br>
+                与 API 共用 JSON 批翻译、术语表与局部复译流程，本地默认按 32 条/批携带邻句上下文运行，并按显存自动适配上下文与并发槽位。
+              </p>
+            </div>
+
+
+            <label class="field">
+              <span>目标语言</span>
+              <select id="api-target-lang">
+                <option value="简体中文">简体中文</option>
+                <option value="繁體中文">繁體中文</option>
+                <option value="English">English</option>
+              </select>
+            </label>
+
+            <label class="field" id="translation-glossary-field">
+              <span>术语表（每行一条，格式：日文-目标译文）</span>
+              <textarea id="api-glossary" rows="4" placeholder="ちんぽ-肉棒&#10;チンポ-肉棒"></textarea>
+            </label>
+
+            <button class="btn btn-outline" id="btn-save-translation" type="button">保存翻译设置</button>
+
+          </div>
+        </details>
+      </div>
+
+    </div><!-- /.aside-scroll -->
+  </aside>
+
+  <main>
+    <div class="job-area" id="job-area">
+      <div class="gpu-alert" id="gpu-alert" style="display:none"></div>
+      <div class="job-area-header" id="job-area-header" style="display:none">
+        <button class="btn-sm btn-clear-done" id="btn-clear-done">清空已完成</button>
+      </div>
+      <div class="empty-state" id="empty-state">
+        <div class="empty-orb"><div class="big">📭</div></div>
+        <div>还没有任务，请先选择视频或添加文件夹</div>
+      </div>
+    </div>
+
+    <div class="log-area">
+      <div class="log-header">
+        <span class="log-title"><span class="log-dot"></span>事件日志</span>
+        <span class="spacer"></span>
+        <button class="log-copy-all" id="log-copy-all">复制全部</button>
+        <button class="log-clear" id="log-clear">清空</button>
+      </div>
+      <div class="log-scroll" id="log-scroll"></div>
+    </div>
+  </main>
+
+  <!-- Online update modal -->
+  <div class="update-modal-backdrop" id="update-modal" hidden>
+    <div class="update-modal" role="dialog" aria-modal="true" aria-labelledby="update-modal-title">
+      <div class="update-modal-header">
+        <span class="update-modal-title" id="update-modal-title">版本与在线更新</span>
+        <button class="btn-icon" id="btn-update-close" type="button" title="关闭">✕</button>
+      </div>
+      <div class="update-modal-body">
+        <div class="update-version-info" id="update-version-info">当前版本：--</div>
+        <div class="update-status-text" id="update-status-text">尚未检测更新</div>
+        <div class="update-progress-wrap" id="update-progress-wrap" hidden>
+          <div class="update-progress-bar" id="update-progress-bar"></div>
+        </div>
+        <pre class="update-notes" id="update-notes" hidden></pre>
+        <div class="toggle-row update-auto-row">
+          <span>启动时自动检测新版本</span>
+          <label class="toggle"><input type="checkbox" id="update-auto-check" checked><span class="slider"></span></label>
+        </div>
+      </div>
+      <div class="update-modal-footer">
+        <button class="btn-sm btn-outline" id="btn-update-check" type="button">检查更新</button>
+        <button class="btn-sm btn-outline" id="btn-update-open" type="button" hidden>打开发布页</button>
+        <span class="spacer"></span>
+        <button class="btn-sm btn-outline" id="btn-update-cancel" type="button" hidden>取消下载</button>
+        <button class="btn-sm btn-primary" id="btn-update-start" type="button" hidden>立即升级</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+
+</html>

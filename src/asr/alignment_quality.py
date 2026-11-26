@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+from typing import Any, Literal
+
+
+AlignmentIssueType = Literal["none", "unknown"]
+
+
+# Every mode a timing pass can report. `ctc_forced_alignment` was missing from
+# 2026-08-01, when the alignment head became the default and therefore the
+# dominant mode: it fell through to "unknown", so **every successfully aligned
+# chunk** was reported as `partial` / `alignment_mode_unknown` with
+# `alignment_issue_active` set, which pinned `alignment_issue_ratio` at ~1.0 and
+# left the counters unable to show a real alignment regression. Measured on a
+# 283-chunk film: `{"nonlexical": 31, "partial": 252}` and not one `aligned`.
+#
+# `nonlexical` is here for symmetry with the quality label; no timing pass emits
+# it as a mode.
+_NORMAL_MODES = {
+    "",
+    "empty",
+    "boundary_proportional",
+    "ctc_forced_alignment",
+    "nonlexical",
+}
+
+
+def _unique(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(item for item in items if item))
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _alignment_issue_subtype(
+    *,
+    alignment_issue_type: AlignmentIssueType,
+    nonlexical_text: bool,
+    stripped_text: str,
+    duration_s: float,
+    aligned_segment_count: int,
+    align_error: str,
+) -> str:
+    if nonlexical_text:
+        return "nonlexical_text"
+    if not stripped_text and duration_s >= 1.0:
+        return "asr_empty_text"
+    if stripped_text and aligned_segment_count <= 0:
+        return "text_without_output_segment"
+    if alignment_issue_type == "unknown":
+        return "unknown_alignment_mode"
+    if align_error:
+        return "subtitle_timing_error"
+    return "none"
+
+
+def infer_alignment_issue_type(*, alignment_mode: str) -> AlignmentIssueType:
+    mode = (alignment_mode or "").strip()
+    if mode in {"boundary_proportional", "nonlexical"}:
+        return "none"
+    if mode and mode not in _NORMAL_MODES:
+        return "unknown"
+    return "none"
+
+
+def classify_alignment_quality(
+    *,
+    text: str,
+    duration_s: float,
+    nonlexical_text: bool = False,
+    alignment_mode: str = "",
+    align_error: str = "",
+    aligned_segment_count: int = 0,
+    word_stats: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Classify subtitle timing output.
+
+    Boundary chunk timing is the runtime source of truth. The label is
+    diagnostic metadata; CueQC is responsible for keep/drop routing.
+    """
+
+    stripped_text = (text or "").strip()
+    alignment_issue_type = infer_alignment_issue_type(alignment_mode=alignment_mode)
+    word_count = _safe_int((word_stats or {}).get("word_count"))
+    subtype = _alignment_issue_subtype(
+        alignment_issue_type=alignment_issue_type,
+        nonlexical_text=nonlexical_text,
+        stripped_text=stripped_text,
+        duration_s=duration_s,
+        aligned_segment_count=aligned_segment_count,
+        align_error=align_error,
+    )
+
+    reasons: list[str] = []
+    if not stripped_text and duration_s >= 1.0:
+        reasons.append("empty_text_for_chunk")
+    if nonlexical_text and not reasons:
+        return {
+            "alignment_quality": "nonlexical",
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
+            "alignment_quality_reasons": ["nonlexical_text"],
+        }
+    if stripped_text and aligned_segment_count <= 0:
+        reasons.append("text_without_output_segment")
+
+    if reasons:
+        return {
+            "alignment_quality": "drop_or_review",
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
+            "alignment_quality_reasons": _unique(reasons),
+        }
+
+    if alignment_issue_type == "unknown":
+        return {
+            "alignment_quality": "partial",
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
+            "alignment_quality_reasons": ["alignment_mode_unknown"],
+        }
+
+    if align_error:
+        return {
+            "alignment_quality": "partial",
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
+            "alignment_quality_reasons": ["subtitle_timing_error"],
+        }
+
+    mode = (alignment_mode or "").strip()
+    if mode == "ctc_forced_alignment" and (word_count > 0 or aligned_segment_count > 0):
+        # Its own label rather than sharing `boundary`: the whole point of the
+        # counters is to show when the head stopped aligning and the chunk fell
+        # back to proportional timing, and one label for both hides exactly that.
+        return {
+            "alignment_quality": "aligned",
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
+            "alignment_quality_reasons": [],
+        }
+    if mode == "boundary_proportional" and (word_count > 0 or aligned_segment_count > 0):
+        return {
+            "alignment_quality": "boundary",
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
+            "alignment_quality_reasons": [],
+        }
+    if not stripped_text or mode == "empty":
+        return {
+            "alignment_quality": "drop_or_review",
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
+            "alignment_quality_reasons": ["empty_or_unaligned_text"],
+        }
+    return {
+        "alignment_quality": "partial",
+        "alignment_issue_type": alignment_issue_type,
+        "alignment_issue_subtype": subtype,
+        "alignment_quality_reasons": ["alignment_mode_missing_or_unconfirmed"],
+    }

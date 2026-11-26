@@ -1,0 +1,69 @@
+from pathlib import Path
+
+import pytest
+
+import main
+from helpers import ASR_17B_BACKEND, make_job_context
+from pipeline import audio as pipeline_audio
+
+
+def test_asr_stage_env_restored_when_transcribe_raises(monkeypatch, tmp_path):
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"fake-video")
+    output_dir = tmp_path / "out"
+    temp_root = tmp_path / "jobs"
+    ctx = make_job_context(
+        video_path,
+        output_dir,
+        temp_root,
+        skip_translation=True,
+    )
+    # ASR_BACKEND is a deployment setting since the job-level choice was
+    # dropped; the job must pass it through unchanged and must not unset it
+    # after a failure.
+    monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
+    monkeypatch.setenv("ASR_CONTEXT", "process context")
+    monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        main.asr_module,
+        "get_backend_label",
+        lambda: f"backend:{main.os.environ['ASR_BACKEND']}",
+    )
+
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"wav")
+
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+        **_run_kwargs,
+    ):
+        assert device == "auto"
+        assert env_overrides["ASR_BACKEND"] == ASR_17B_BACKEND
+        assert "ASR_CONTEXT" not in env_overrides
+        assert job_id
+        assert cancel_requested is not None
+        raise RuntimeError("forced ASR failure")
+
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
+
+    with pytest.raises(RuntimeError, match="forced ASR failure"):
+        main.run_asr_alignment(
+            str(video_path),
+            ctx=ctx,
+            job_id=ctx.job_id,
+        )
+
+    assert main.os.environ["ASR_BACKEND"] == ASR_17B_BACKEND
+    assert main.os.environ["ASR_CONTEXT"] == "process context"

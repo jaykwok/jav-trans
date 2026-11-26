@@ -1,0 +1,389 @@
+"""Per-cue features describing what a chunk's transcript looks like.
+
+Pure description, no verdict. Every function here answers "what does this text
+and its neighbourhood look like" - character counts, repeat runs, kana/kanji
+ratios, gaps to adjacent cues - and nothing here decides whether a cue is good.
+`asr.postgate` owns that, and owns it alone.
+
+The split is the point. This file was written as `cueqc.py`, feature extraction
+for a learned CueQC model that also held the decision. Both decision models are
+retired (`tests/test_config.py::test_pre_asr_cueqc_modules_are_retired` pins
+their paths as gone); the features outlived them because describing a cue turned
+out to be the durable half and judging it the fragile one.
+"""
+from __future__ import annotations
+
+import hashlib
+import math
+import re
+from pathlib import Path
+from typing import Any, Mapping
+
+
+CUEQC_FEATURE_SCHEMA_VERSION = 1
+
+_COMPACT_TEXT_RE = re.compile(r"[^0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]+")
+_PUNCT_RE = re.compile(
+    r"[\s\u3000\u3001\u3002\uff01\uff1f\uff0c\uff0e,.!?~\u301c"
+    r"\u30fc\u2010-\u2015\u300c\u300d\u300e\u300f()\[\]{}]+"
+)
+_KANA_RE = re.compile(r"^[\u3040-\u30ff]+$")
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    parsed = _optional_float(value)
+    return default if parsed is None else parsed
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _round(value: float | None, digits: int = 6) -> float | None:
+    if value is None:
+        return None
+    if not math.isfinite(value):
+        return None
+    return round(float(value), digits)
+
+
+def _clean_text(value: Any) -> str:
+    return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split()).strip()
+
+
+def _compact_text(value: Any) -> str:
+    return _COMPACT_TEXT_RE.sub("", str(value or ""))
+
+
+def _strip_punctuation(value: Any) -> str:
+    return _PUNCT_RE.sub("", str(value or ""))
+
+
+def _text_sha1(value: str) -> str:
+    return hashlib.sha1(value.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _audio_ref(path_value: Any) -> dict[str, Any]:
+    text = str(path_value or "").strip()
+    if not text:
+        return {"path": "", "exists": False, "sha1": ""}
+    path = Path(text)
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    digest = ""
+    exists = resolved.exists()
+    if exists and resolved.is_file():
+        try:
+            hasher = hashlib.sha1()
+            with resolved.open("rb") as handle:
+                hasher.update(handle.read(1024 * 1024))
+            digest = hasher.hexdigest()
+        except Exception:
+            digest = ""
+    return {
+        "path": str(resolved),
+        "exists": bool(exists),
+        "sha1": digest,
+    }
+
+
+def _chunk_duration(chunk: Mapping[str, Any], text_result: Mapping[str, Any]) -> float:
+    duration = _optional_float(text_result.get("duration"))
+    if duration is None:
+        duration = _optional_float(chunk.get("duration"))
+    if duration is None:
+        duration = max(0.0, _safe_float(chunk.get("end")) - _safe_float(chunk.get("start")))
+    return max(0.0, duration)
+
+
+def _max_unit_repeat(compact: str) -> dict[str, Any]:
+    if not compact:
+        return {"unit": "", "unit_len": 0, "run": 0, "chars": 0, "ratio": 0.0}
+    best = {"unit": "", "unit_len": 0, "run": 1, "chars": 0, "ratio": 0.0}
+    max_unit_len = min(12, max(1, len(compact) // 2))
+    for unit_len in range(1, max_unit_len + 1):
+        index = 0
+        while index <= len(compact) - unit_len:
+            unit = compact[index : index + unit_len]
+            run = 1
+            next_index = index + unit_len
+            while (
+                next_index + unit_len <= len(compact)
+                and compact[next_index : next_index + unit_len] == unit
+            ):
+                run += 1
+                next_index += unit_len
+            repeated_chars = unit_len * run
+            ratio = repeated_chars / max(1, len(compact))
+            if run > 1 and (run, ratio, repeated_chars) > (
+                int(best["run"]),
+                float(best["ratio"]),
+                int(best["chars"]),
+            ):
+                best = {
+                    "unit": unit,
+                    "unit_len": unit_len,
+                    "run": run,
+                    "chars": repeated_chars,
+                    "ratio": round(ratio, 4),
+                }
+            index += max(1, repeated_chars if run > 1 else 1)
+    return best
+
+
+def _char_class_counts(compact: str) -> dict[str, int]:
+    return {
+        "chars": len(compact),
+        "unique_chars": len(set(compact)),
+        "kana_chars": sum(1 for char in compact if "\u3040" <= char <= "\u30ff"),
+        "kanji_chars": sum(1 for char in compact if "\u3400" <= char <= "\u9fff"),
+        "latin_digit_chars": sum(1 for char in compact if char.isascii() and char.isalnum()),
+    }
+
+
+def text_features(raw_text: Any, text: Any, *, duration_s: float) -> dict[str, Any]:
+    raw = _clean_text(raw_text)
+    display = _clean_text(text or raw)
+    compact = _strip_punctuation(display)
+    context_compact = _compact_text(display)
+    counts = _char_class_counts(compact)
+    repeat = _max_unit_repeat(context_compact)
+    chars = int(counts["chars"])
+    unique_chars = int(counts["unique_chars"])
+    kana_ratio = int(counts["kana_chars"]) / max(1, chars)
+    kanji_ratio = int(counts["kanji_chars"]) / max(1, chars)
+    unique_ratio = unique_chars / max(1, chars)
+    has_stable_vocabulary = (
+        int(counts["kanji_chars"]) > 0
+        or int(counts["latin_digit_chars"]) > 0
+        or (chars >= 5 and unique_ratio >= 0.55 and int(repeat["run"]) <= 2)
+    )
+    kana_only = bool(compact) and bool(_KANA_RE.fullmatch(compact))
+    return {
+        "raw_text": raw,
+        "text": display,
+        "text_sha1": _text_sha1(display),
+        "raw_text_sha1": _text_sha1(raw),
+        "compact_text": compact,
+        "context_compact_text": context_compact,
+        "char_count": chars,
+        "raw_char_count": len(_strip_punctuation(raw)),
+        "unique_chars": unique_chars,
+        "unique_ratio": round(unique_ratio, 4),
+        "kana_ratio": round(kana_ratio, 4),
+        "kanji_ratio": round(kanji_ratio, 4),
+        "kana_only": kana_only,
+        "has_kanji": int(counts["kanji_chars"]) > 0,
+        "has_latin_or_digit": int(counts["latin_digit_chars"]) > 0,
+        "has_stable_vocabulary": has_stable_vocabulary,
+        "chars_per_sec": round(chars / duration_s, 4) if duration_s > 0 else 0.0,
+        "repeat_profile": repeat,
+    }
+
+
+def _neighbor_features(
+    index: int,
+    chunks: list[Mapping[str, Any]],
+    text_results: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    chunk = chunks[index]
+    start = _safe_float(chunk.get("start"))
+    end = _safe_float(chunk.get("end"), start)
+    prev_gap = None
+    next_gap = None
+    prev_text_same = False
+    next_text_same = False
+    current_text = _compact_text(
+        str(text_results[index].get("text") or text_results[index].get("raw_text") or "")
+    )
+    if index > 0:
+        prev = chunks[index - 1]
+        prev_gap = max(0.0, start - _safe_float(prev.get("end"), start))
+        prev_text = _compact_text(
+            str(text_results[index - 1].get("text") or text_results[index - 1].get("raw_text") or "")
+        )
+        prev_text_same = bool(current_text and current_text == prev_text)
+    if index + 1 < len(chunks):
+        nxt = chunks[index + 1]
+        next_gap = max(0.0, _safe_float(nxt.get("start"), end) - end)
+        next_text = _compact_text(
+            str(text_results[index + 1].get("text") or text_results[index + 1].get("raw_text") or "")
+        )
+        next_text_same = bool(current_text and current_text == next_text)
+    return {
+        "prev_gap_s": _round(prev_gap, 3),
+        "next_gap_s": _round(next_gap, 3),
+        "prev_text_same": prev_text_same,
+        "next_text_same": next_text_same,
+    }
+
+
+def _run_length_features(
+    index: int,
+    chunks: list[Mapping[str, Any]],
+    text_results: list[Mapping[str, Any]],
+    *,
+    max_gap_s: float = 1.0,
+) -> dict[str, Any]:
+    compact_values = [
+        _compact_text(str(result.get("text") or result.get("raw_text") or ""))
+        for result in text_results
+    ]
+    current = compact_values[index] if 0 <= index < len(compact_values) else ""
+    if not current:
+        return {"same_text_run_length": 0, "same_text_run_position": 0}
+    left = index
+    while left > 0:
+        gap = max(
+            0.0,
+            _safe_float(chunks[left].get("start")) - _safe_float(chunks[left - 1].get("end")),
+        )
+        if gap > max_gap_s or compact_values[left - 1] != current:
+            break
+        left -= 1
+    right = index
+    while right + 1 < len(chunks):
+        gap = max(
+            0.0,
+            _safe_float(chunks[right + 1].get("start")) - _safe_float(chunks[right].get("end")),
+        )
+        if gap > max_gap_s or compact_values[right + 1] != current:
+            break
+        right += 1
+    return {
+        "same_text_run_length": right - left + 1,
+        "same_text_run_position": index - left,
+    }
+
+
+def _cue_observation_features(
+    *,
+    text_features_payload: Mapping[str, Any],
+    duration_s: float,
+) -> dict[str, Any]:
+    char_count = _safe_int(text_features_payload.get("char_count"))
+    unique_chars = _safe_int(text_features_payload.get("unique_chars"))
+    repeat = (
+        text_features_payload.get("repeat_profile")
+        if isinstance(text_features_payload.get("repeat_profile"), Mapping)
+        else {}
+    )
+    return {
+        "text_observation": {
+            "duration_s": round(duration_s, 3),
+            "char_count": char_count,
+            "raw_char_count": _safe_int(text_features_payload.get("raw_char_count")),
+            "unique_chars": unique_chars,
+            "unique_ratio": _safe_float(text_features_payload.get("unique_ratio")),
+            "kana_ratio": _safe_float(text_features_payload.get("kana_ratio")),
+            "kanji_ratio": _safe_float(text_features_payload.get("kanji_ratio")),
+            "chars_per_sec": _safe_float(text_features_payload.get("chars_per_sec")),
+            "kana_only": bool(text_features_payload.get("kana_only")),
+            "has_kanji": bool(text_features_payload.get("has_kanji")),
+            "has_latin_or_digit": bool(text_features_payload.get("has_latin_or_digit")),
+            "repeat_run": _safe_int(repeat.get("run")),
+            "repeat_unit_len": _safe_int(repeat.get("unit_len")),
+            "repeat_ratio": _safe_float(repeat.get("ratio")),
+        },
+        "repeat_profile": dict(repeat),
+    }
+
+
+def build_candidate(
+    *,
+    chunk: Mapping[str, Any],
+    text_result: Mapping[str, Any],
+    position: int,
+    chunks: list[Mapping[str, Any]],
+    text_results: list[Mapping[str, Any]],
+    audio_id: str = "",
+    video_id: str = "",
+) -> dict[str, Any]:
+    chunk_index = _safe_int(chunk.get("index"), position)
+    start = _safe_float(chunk.get("start"))
+    end = max(start, _safe_float(chunk.get("end"), start))
+    duration = _chunk_duration(chunk, text_result)
+    raw_text = str(text_result.get("raw_text") or "")
+    text = str(text_result.get("text") or raw_text)
+    features = text_features(raw_text, text, duration_s=duration)
+    observation = _cue_observation_features(
+        text_features_payload=features,
+        duration_s=duration,
+    )
+    sample_id = f"cueqc-{video_id or audio_id or 'audio'}-chunk{chunk_index:05d}"
+    return {
+        "schema": "cueqc_candidate_v4",
+        "schema_version": CUEQC_FEATURE_SCHEMA_VERSION,
+        "sample_id": sample_id,
+        "audio_id": audio_id,
+        "video_id": video_id,
+        "chunk_index": chunk_index,
+        "position": position,
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "duration_s": round(duration, 3),
+        "audio": _audio_ref(text_result.get("normalized_path") or chunk.get("path")),
+        "source_audio_path": str(chunk.get("source_audio_path") or ""),
+        "text": features["text"],
+        "raw_text": features["raw_text"],
+        "text_features": {
+            key: value
+            for key, value in features.items()
+            if key not in {"text", "raw_text", "compact_text", "context_compact_text"}
+        },
+        "text_preview": features["text"][:120],
+        "compact_text": features["compact_text"],
+        "boundary": {
+            key: chunk.get(key)
+            for key in (
+                "speech_segment_count",
+                "boundary_split_reason",
+                "boundary_parent_chunk_id",
+                "speech_island_id",
+                "speech_island_count",
+                "speech_internal_gap_count",
+                "speech_internal_gap_max_s",
+                "boundary_score",
+                "boundary_reason",
+                "boundary_source",
+                "boundary_start_refine_delta_s",
+                "boundary_end_refine_delta_s",
+                "boundary_decision_source",
+            )
+            if key in chunk
+        },
+        "adjacency": {
+            **_neighbor_features(position, chunks, text_results),
+            **_run_length_features(position, chunks, text_results),
+        },
+        "cue_features": observation,
+        "asr_signals": {
+            "avg_logprob": text_result.get("avg_logprob"),
+            "no_speech_prob": text_result.get("no_speech_prob"),
+            "compression_ratio": text_result.get("compression_ratio"),
+            "language": text_result.get("language", ""),
+            "generation": dict(text_result.get("asr_generation") or {})
+            if isinstance(text_result.get("asr_generation"), Mapping)
+            else {},
+        },
+        "subtitle_timing": {
+            "alignment_window_start_s": text_result.get("alignment_window_start_s"),
+            "alignment_window_end_s": text_result.get("alignment_window_end_s"),
+            "alignment_window_source": text_result.get("alignment_window_source", ""),
+        },
+        "labels": {},
+    }

@@ -1,0 +1,101 @@
+[project]
+name = "jav-sub"
+version = "1.0.0"
+requires-python = ">3.14"
+dependencies = [
+    "accelerate",
+    "fastapi",
+    "huggingface-hub>=1.29",
+    "httpx[socks]",
+    "numpy",
+    "openai",
+    # Pure-Python OpenCC port: forces translated output into the Chinese variant
+    # the user picked. Pure Python matters because the release is a PyInstaller
+    # bundle - the C extension build would need a toolchain on every machine.
+    "opencc-python-reimplemented",
+    "psutil",
+    "python-multipart",
+    "pywebview",
+    "rich",
+    "scipy",
+    "soundfile",
+    "torch>=2.13.0",
+    # 0.16.0 is the first release carrying the FFmpeg 9 loaders
+    # (`libtorchcodec_core9`). Unpinned, a fresh install resolves to whatever is
+    # newest at the time and 0.15.0 enumerates majors 8 down to 4 only - paired
+    # with the FFmpeg 9.x that `winget install Gyan.FFmpeg.Shared` now delivers,
+    # nothing loads and no audio decodes. The floor is what keeps the bundled
+    # DLLs and the installed wheel from drifting apart.
+    "torchcodec>=0.16.0",
+    # 5.15.0 changed Qwen3ASRProcessor.apply_transcription_request's language
+    # forcing from a system-prompt message + add_generation_prompt=True to an
+    # assistant-turn prefill + continue_final_message=True (upstream commit
+    # c7f9c881, "Add hotword parsing, and fix language parsing and training").
+    # continue_final_message requires the model's own chat template to render
+    # a trailing assistant message and stop before its closing token. This
+    # project's fine-tuned Qwen3-ASR repos (both the 1.7B and 0.6B `-hf`
+    # layouts) had their chat_template.jinja patched 2026-09-02 with an
+    # assistant-role rendering block (copied from the base Qwen3-ASR-hf
+    # template) to support it - see each repo's README changelog. No floor
+    # bump needed: the patch is additive, so 5.13.0-5.14.x still work via the
+    # old system-prompt convention.
+    "transformers>=5.13.0",
+    "uvicorn[standard]",
+    "xxhash",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller",
+    "pytest",
+    "ruff==0.17.4",
+    "scikit-learn",
+]
+
+# torchaudio is deliberately absent, and cannot be added on this stack: neither
+# the cu130 nor the cu132 index publishes a cp314 wheel for it (cu132 stops at
+# torchaudio 2.2.0 / cp312). The cu128 index does have cp314 wheels, but they
+# link against torch 2.9.x/cu128 and would either downgrade torch or mismatch
+# the libtorch ABI. CTC forced alignment is therefore implemented in
+# `src/asr/alignment.py` and verified against exhaustive path enumeration in
+# `tests/asr/test_asr_alignment_head.py`.
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "src"]
+addopts = [
+    "-p",
+    "no:cacheprovider",
+]
+filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
+
+norecursedirs = [
+    ".venv",
+    ".python",
+    ".pytest_cache",
+    "__pycache__",
+    "dev",
+    "cache",
+    "config",
+    "logs",
+    "models",
+    "outputs",
+    "video",
+]
+
+[tool.ruff]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["F", "E9", "B012", "B020", "B023"]

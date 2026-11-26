@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+import os
+
+# The 0.6B low-VRAM tier was dropped on 2026-07-31: it is not maintained, the
+# alignment head is only trained against the 1.7B encoder, and an unmaintained
+# second tier costs a per-repo dimension on every setting and registry here.
+QWEN_ASR_17B_REPO_ID = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+QWEN_ASR_REPO_ID = QWEN_ASR_17B_REPO_ID
+
+DEFAULT_QWEN_ASR_BACKEND = QWEN_ASR_REPO_ID
+QWEN_ASR_BACKEND_REPOS: dict[str, str] = {
+    QWEN_ASR_17B_REPO_ID: QWEN_ASR_17B_REPO_ID,
+}
+
+# Fallback batch size only used when LocalAsrBackend is invoked outside the
+# formula-sized GPU worker (e.g. direct unit tests with ASR_BATCH_SIZE=auto).
+DEFAULT_QWEN_ASR_FALLBACK_BATCH_SIZE = 4
+# 8GB is the project floor, but an 8GB card reports less than 8192 MiB (an RTX
+# 4060 Ti 8GB: 8188 via torch, 8163 via Vulkan). No 7GB card is sold, so a 7GB
+# gate sits above every 6GB card and below every 8GB one.
+DEFAULT_QWEN_ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO: dict[str, int] = {
+    QWEN_ASR_17B_REPO_ID: 7168,
+}
+
+
+def current_qwen_asr_backend(default: str = DEFAULT_QWEN_ASR_BACKEND) -> str:
+    return (os.getenv("ASR_BACKEND", default) or default).strip() or default
+
+
+def qwen_asr_repo_id(backend: str | None = None) -> str:
+    normalized = (backend or current_qwen_asr_backend()).strip()
+    try:
+        return QWEN_ASR_BACKEND_REPOS[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported Qwen ASR backend: {normalized!r}. "
+            f"Choose one of: {', '.join(sorted(QWEN_ASR_BACKEND_REPOS))}"
+        ) from exc
+
+
+def active_qwen_asr_model_id() -> str:
+    override = os.getenv("ASR_MODEL_ID", "").strip()
+    return override or qwen_asr_repo_id(current_qwen_asr_backend())
+
+
+def active_qwen_asr_model_path() -> str:
+    return os.getenv("ASR_MODEL_PATH", "").strip()
+
+
+def qwen_asr_min_physical_vram_mb_by_repo() -> dict[str, int]:
+    raw = os.getenv("ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO", "").strip()
+    if not raw:
+        return dict(DEFAULT_QWEN_ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO)
+    mapping = dict(DEFAULT_QWEN_ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO)
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            raise ValueError(
+                "Invalid ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO entry "
+                f"{item!r}; expected '<repo_id>=<positive_int>'"
+            )
+        repo_id, value = item.rsplit("=", 1)
+        repo_id = repo_id.strip()
+        if repo_id not in QWEN_ASR_BACKEND_REPOS:
+            raise ValueError(
+                f"Invalid ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO repo {repo_id!r}; "
+                f"expected one of {sorted(QWEN_ASR_BACKEND_REPOS)}"
+            )
+        mapping[repo_id] = max(1, int(value.strip()))
+    return mapping
+
+
+def qwen_asr_min_physical_vram_mb(backend: str | None = None) -> int:
+    repo_id = qwen_asr_repo_id(backend)
+    return qwen_asr_min_physical_vram_mb_by_repo()[repo_id]

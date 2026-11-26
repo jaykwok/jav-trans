@@ -1,0 +1,84 @@
+# Local secrets and environments
+/config/
+.env
+.env.*
+.venv/
+/.python/
+.claude/
+.codex/
+.agents/
+
+# Python/runtime caches
+__pycache__/
+.uv-cache/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local dev notes, history, experiments, and agent artifacts (never committed)
+/dev/
+/datasets/
+log/
+reports/
+subtitle_qc/output/
+video/*/subtitle_qc/
+video/subtitle_qc/
+*.quality_report.json
+*.quality_report.md
+*.bilingual.json
+*.timings.json
+*.transcript.json
+*.aligned_segments.json
+*.asr_manifest.json
+*.subtitle_compare.html
+*.vad_bilingual_compare.html
+*.line_compare.html
+*.japanese_transcript_vad_compare.html
+
+# Project runtime/cache/output/log roots.
+/logs/
+/outputs/
+/cache/
+tmp/*
+!tmp/.gitkeep
+
+# Legacy runtime root from older builds. Active code writes tmp/ instead.
+temp/
+
+# Local media, generated video outputs, and models. Keep model documentation.
+video/
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.m4v
+*.webm
+*.srt
+*.ass
+models/*
+!models/README.md
+
+# Build/package outputs. `packaging/` is deliberately NOT here: it holds the
+# Windows build recipe (build_windows.ps1, archive_release.ps1, the PyInstaller
+# spec, prepare_default_model.py), which is source, not output. It was ignored
+# until 2026-08-02, which meant a fresh clone of a Windows-distributed tool had
+# no way to produce a build. `*.spec` is scoped to the repo root so PyInstaller's
+# generated specs stay ignored while packaging/jav-sub-web.spec is tracked.
+build/
+dist/
+/*.spec
+*.7z
+*.7z.*
+*.zip
+*.rar
+*.tar
+*.tar.*
+
+# Agent project instructions are local to this workspace.
+CLAUDE.md
+AGENTS.md
+
+
+# Keep pyproject.toml and uv.lock tracked: releases install with uv sync --frozen.

@@ -1,0 +1,244 @@
+# Windows release packaging
+
+There are two builds. The setup build is what users get; the full bundle is the
+offline fallback.
+
+## CI and release gate
+
+The `CI` workflow runs on Windows for pushes to `main`, pull requests, and
+manual runs. It installs `uv.lock`, verifies that PyTorch includes CUDA, checks
+Python/JavaScript/PowerShell code, and runs the regression suite. Tests use
+synthetic inputs and fake API credentials; the hosted runner does not perform
+GPU inference or download models. Production support remains Windows + NVIDIA.
+The locked PyTorch wheel supplies the CUDA runtime; users need a compatible
+NVIDIA driver, not a separate CUDA Toolkit installation.
+
+Before publishing a release, require a successful `Windows checks` run for the
+exact source commit recorded in the release manifest. An older green run or a
+local test result does not satisfy this gate. Publish only after that check and
+the archive's manifest verification succeed.
+
+## Setup build (default for releases)
+
+```powershell
+.\packaging\build_setup.ps1 -Clean
+```
+
+Produces `dist/release-assets/release-<timestamp>-<id>/jav-sub-windows-x64.zip`
+(~100 MB), with `release-manifest.json` and a `.zip.sha256` file. Its payload
+is `jav-sub.exe`, `bin/` (FFmpeg Shared), `src/`, `launcher.py`,
+`pyproject.toml`, `uv.lock`, `README.txt`, and `release-files.json`. FFmpeg is
+most of the size.
+
+Users can upgrade either via the built-in online self-updater (Web UI header
+version trigger or `jav-sub.exe --update`) or manually by copying a new
+archive's files over the old folder, which keeps `.venv`, `.python/`, `models/`,
+`config/`, `outputs/`, and `cache/`. The online updater queries GitHub
+`releases/latest` (strict `x.y.z` stable tags only, ignoring drafts and
+prereleases), verifies `jav-sub-windows-x64.zip` against `.zip.sha256` / asset
+digest and `release-manifest.json`, extracts safely into `tmp/updates/`, and
+hands off to `bootstrap.py` (via `launcher.py` exit code `42`) to overlay only
+the files listed in `release-files.json`, swap `jav-sub.exe` via rename-aside
+`.old`, remove `tmp/updates/`, and relaunch. Copying replaces files but never
+removes one, so `release-files.json` (written by `write_release_index.py` just
+before the manifest is recorded) lists every file the release ships. On each
+start, `bootstrap.py` also removes prior `jav-sub.exe.old*` backups and stale
+`tmp/updates/` directories, moves the files the index does not list into
+`tmp/upgrade-leftovers/<timestamp>/`, deletes any legacy `.env` file (settings
+now live in `config/config.json`), and removes retired model caches under
+`models/`. This covers anything under `src/`, and files in `bin/` whose names
+identify them as FFmpeg's (`ffmpeg.exe`, `avcodec-*.dll` and the like). The
+index matters most for a leftover package directory, which would otherwise
+shadow a new module of the same name. Paths are compared ignoring case, as
+Windows does: copying `src/llm/` over an old `src/LLM/` keeps the old spelling.
+
+Nothing is moved in a git checkout, or when the index is missing or does not
+list `launcher.py` and `src/`. Anything else in `bin/` stays, such as the
+downloaded `uv.exe` or a llama.cpp build with its own DLLs. The first run also
+warns before installing into a folder nested inside an existing install.
+
+The exe is named `jav-sub.exe`, not `jav-sub-setup.exe`: installing is only
+what the first run does, and it is the launcher on every run after that. Both
+specs therefore build a target named `jav-sub`, so this build stages its
+payload under `dist/setup-payload/jav-sub` and passes its own `--workpath`
+(`build/jav-sub-setup`). One PyInstaller cache shared by two different
+Analysis inputs is a stale-build trap.
+
+Every setup build assembles a fresh payload, including when `-Clean` is omitted.
+The previous payload is preserved under `dev/rm/`; stale source files,
+bytecode, FFmpeg DLLs, and an optional bundled uv cannot enter the new archive.
+
+Python, PyTorch, the ASR weights, and the CTC head are not in the archive. The
+installer obtains Python as needed and installs the locked dependencies on the
+user's machine; the first ASR task downloads the model and alignment head.
+This keeps the release around 100 MB. The console stays open during `uv sync`
+so the user can see the download rate and decide whether they need a proxy;
+`bootstrap.py` measures against the real torch wheel named in `uv.lock` and
+reports the estimated time rather than applying a threshold.
+HTTP, HTTPS, and SOCKS5 proxies also cover the initial uv download and speed
+probe; the bootstrap executable implements SOCKS5 without extra Python packages.
+
+FFmpeg travels with the archive because TorchCodec loads its shared DLLs at
+import time and uv cannot install them. `launcher.py` finds them at `bin/`.
+
+uv is not bundled. The first run uses one already on `PATH`, and otherwise
+downloads the Windows wheel from PyPI into `bin/`. The dependency install needs
+the same host a moment later, so shipping 50-80 MB of uv would not make the
+install work anywhere it otherwise could not. `-BundleUv` includes it anyway,
+for an archive that has to reach a network where PyPI itself is blocked.
+
+Options: `-SkipArchive` stops after the payload directory; `-UvExe`,
+`-FfmpegExe` and `-FfprobeExe` override tool discovery; `-ArchiveName` renames
+the zip. The setup build uses zip rather than the `.7z` of the full bundle:
+at this size the compression ratio hardly matters, and Windows opens zip with
+nothing extra installed.
+
+Keep `build_setup.ps1` ASCII-only: Windows PowerShell 5.1 reads a BOM-less
+`.ps1` as the system code page, so a Chinese string literal in it ships as
+mojibake.
+
+## Full bundle (offline)
+
+Build from the repository root after creating the project virtual environment
+with `uv venv` and installing dependencies:
+
+```powershell
+.\packaging\build_windows.ps1 -Clean
+```
+
+The build creates `dist/jav-sub/jav-sub.exe` as an onedir PyInstaller package.
+It bundles:
+
+- the Python runtime and installed Python dependencies from the active uv-managed environment
+- `ffmpeg.exe`, `ffprobe.exe`, and FFmpeg runtime DLLs from the Shared build on
+  `PATH`, or from `-FfmpegExe` / `-FfprobeExe`
+- `src/assets/images/icon.png` for the in-app header, drop zone image, and PNG favicon
+- `src/assets/images/icon.ico` for the pywebview native window icon and packaged executable icon
+- the default CTC alignment head under `models/`, currently
+  `ctc_aligner_jav_vocalisation_v3.pt`
+- the Hugging Face inference model directory
+  `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`
+
+The build script prepares that Hugging Face model before running PyInstaller.
+Training-only files such as `optimizer.pt`, scheduler state, trainer state, RNG
+state, and `training_args.bin` are excluded from the package even if they exist
+in the local `models/` directories.
+
+On Windows, install the FFmpeg Shared package before building:
+
+```powershell
+winget uninstall --id Gyan.FFmpeg --exact
+winget install --id Gyan.FFmpeg.Shared --exact
+```
+
+The directory selected for `ffmpeg.exe` must also contain `avcodec-*.dll`,
+`avformat-*.dll`, and `avutil-*.dll`; TorchCodec cannot use the static-only
+`Gyan.FFmpeg` package. If multiple FFmpeg installations are present, pass the
+Shared executables explicitly with `-FfmpegExe` and `-FfprobeExe`.
+
+For a small development build only, pass `-SkipModels`. That skips model
+preparation and leaves the Hugging Face model directories and the CTC head out
+of the PyInstaller package. Do not use `-SkipModels` for user-facing Windows
+builds.
+
+The CTC alignment head is downloaded at build time from the same Hugging Face
+repo as the ASR weights, at the commit sha pinned in
+`DEFAULT_SETTINGS["ASR_ALIGNMENT_HEAD_PATH"]`, and placed under `models/` in
+the package with its Hub filename. The spec reads that default rather than
+hardcoding the sha, so the build always ships the head a source checkout would
+download. The packaged app prefers this bundled copy over the Hub, so a first
+run without network still produces measured word-level timing instead of
+falling back to proportional timestamps.
+
+It does not bundle Microsoft Edge WebView2. Users still need the WebView2
+runtime, which is already present on most supported Windows systems. If the app
+window does not open, install Evergreen Runtime from Microsoft's official
+WebView2 download page: https://developer.microsoft.com/en-us/microsoft-edge/webview2/.
+Use Evergreen Bootstrapper for online installs, or Evergreen Standalone
+Installer x64 for offline installs.
+
+The Windows package bundles the CUDA-enabled PyTorch runtime DLLs, but it does
+not bundle the NVIDIA display driver. The user's installed driver must support
+the CUDA runtime reported by the bundled PyTorch build. On startup/model
+selection the Web UI runs a short CUDA probe in a child process; if the driver is
+too old or CUDA cannot initialize, it shows a user-facing prompt to update the
+NVIDIA driver before running ASR.
+
+At runtime, writable files are created next to `jav-sub.exe`:
+
+- `config/config.json` for persisted local settings and API keys (isolated from logs and outputs)
+- `logs/` for process logs and per-job `.run.log` diagnostics (`logs/jobs/`)
+- `outputs/` for immutable generations of completed outputs (including SRT, sidecar JSON, and a flushed `.run.log`); these are not disposable caches and remain after deleting a job
+- `cache/` for persisted job state (`cache/web/`) and reusable caches (`asr/`, `llm/`, `torch/`, `uv/`)
+- `models/` for user-downloaded or user-replaced models and `models/runtime/`
+- `.python/` for the uv-managed standalone Python runtime
+- `tmp/` for disposable scratch files (`tmp/jobs/` for running/failed jobs, `tmp/chunks/`, `tmp/launcher/`, `tmp/updates/`, `tmp/upgrade-leftovers/`)
+
+To create one local 7-Zip archive:
+
+```powershell
+.\packaging\archive_release.ps1
+```
+
+The default output is
+`dist/release-assets/release-<timestamp>-<id>/jav-sub-windows-x64.7z`, with
+`.7z.sha256` and `release-manifest.json` beside it. The archive script creates
+a single `.7z` file and no split volumes. ZIP setup archives use the same
+publication path: freeze the build manifest, verify the source, compress in a
+private directory, extract and verify the actual archived bytes, then rename
+the complete directory into place. A failed check publishes nothing. Existing
+release directories are never overwritten. Publish this large offline bundle
+through external storage such as a netdisk. GitHub Releases use the small setup
+ZIP described above, alongside the release notes and source archives.
+
+## Reproducibility: pinned weights and a hash manifest
+
+The full bundle's ASR model is downloaded at a pinned commit, recorded in
+`packaging/model-pins.json`. `build_windows.ps1` refuses to build without a
+valid full commit SHA: a release that says "the 1.7B ASR model" and takes
+whatever the branch points at that afternoon is not the same package twice.
+Refresh the pin deliberately, as its own step:
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+uv run python packaging/prepare_default_model.py --pin
+```
+
+Pinning queries public Hub metadata; it does not download model weights.
+Preparing a full bundle downloads into `models/.pinned/<repo>/<commit>/`,
+separately from the application's ordinary model cache. A `model-revision.json`
+receipt records the repository, SHA, sizes and SHA256 hashes of every inference
+file. Preparation, spec data collection and the final payload all verify this
+receipt. A modified or incomplete pinned directory is refused; an unrelated
+cached model cannot satisfy the pin. There is no unpinned full-build option.
+The CTC alignment head is pinned by SHA through
+`DEFAULT_SETTINGS["ASR_ALIGNMENT_HEAD_PATH"]`, and the packaged app loads it with
+`weights_only=True`, because a head fetched from the Hub is not a file the user
+wrote.
+
+After PyInstaller succeeds, the build records
+`dist/release-assets/release-manifest.json`: SHA256 of every payload file,
+including code, bytecode, configuration, templates, model weights and tool
+binaries, plus `uv.lock`, `pyproject.toml`, model pins and the source commit's
+dirty status. The setup build writes `setup-manifest.json` before archiving,
+even with `-SkipArchive`. Each published generation contains its own frozen
+copy named `release-manifest.json`.
+
+The setup ZIP hashes the files it ships. Its first-run downloads are outside
+that inventory, so this does not promise an identical installed environment or
+fixed ASR weights for setup users. Use the full bundle when the model payload
+must be fixed. Neither path promises bit-for-bit identical PyInstaller archives.
+
+To check an extracted payload from the corresponding source checkout:
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+uv run python packaging/record_release_manifest.py --dist dist/jav-sub --verify dist/release-assets/release-<timestamp>-<id>/release-manifest.json
+```
+
+Paths in the manifest are relative to the payload and to the repository, so it
+carries nothing about the machine that built it.
+
+Training-only artifacts, CUDA feature caches, synthetic WAVs and sequence JSONL
+files are excluded. The full bundle ships the default ASR model and CTC head
+listed above; retired Mamba and VAD checkpoints are not release inputs.

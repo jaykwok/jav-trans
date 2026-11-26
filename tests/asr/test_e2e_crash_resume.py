@@ -1,0 +1,242 @@
+import json
+import os
+import re
+import time
+from pathlib import Path
+
+import pytest
+
+import main
+from pipeline import audio as pipeline_audio
+from pipeline.cleanup import cleanup_job_temp
+from helpers import make_job_context, run_pipeline
+
+
+def _cleanup_job_temp(job_temp_dir: Path) -> None:
+    cleanup_job_temp(str(job_temp_dir))
+
+
+def _segments(count: int = 5) -> list[dict]:
+    return [
+        {
+            "start": float(index * 2),
+            "end": float(index * 2) + 0.8,
+            "text": f"ja-{index}。",
+        }
+        for index in range(count)
+    ]
+
+
+def _batch_start_from_messages(messages) -> int:
+    match = re.search(r"requested_ids\s*=\s*(\[[^\]]*\])", messages[1]["content"])
+    if match is not None:
+        ids = json.loads(match.group(1))
+        return min(ids) if ids else 0
+    marker = "【待翻译字幕 JSON】"
+    assert marker in messages[1]["content"], messages[1]["content"]
+    payload = json.loads(messages[1]["content"].split(marker, 1)[1].strip())
+    ids = [int(item["id"]) for item in payload]
+    return min(ids) if ids else 0
+
+
+def _mock_translation_json(start: int, count: int) -> str:
+    return json.dumps(
+        {
+            "translations": [
+                {"id": index, "text": f"zh-{index}"}
+                for index in range(start, start + count)
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
+def _load_cache(path: Path) -> dict:
+    return main.translator_module._load_translation_cache(path)
+
+
+def _patch_pipeline(
+    monkeypatch,
+    *,
+    tmp_path: Path,
+    video_path: Path,
+    output_dir: Path,
+    job_temp_root: Path,
+    cache_path: Path | None = None,
+    segments: list[dict] | None = None,
+):
+    ctx = make_job_context(
+        video_path,
+        output_dir,
+        job_temp_root,
+        subtitle_mode="zh",
+        translation_max_workers=1,
+        translation_cache_path=cache_path,
+    )
+    monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "asr_root" / "chunks"))
+    monkeypatch.setattr(main.asr_module, "get_backend_label", lambda: "mock_asr")
+
+    monkeypatch.setattr(main.translator_module, "_request_backoff_sleep", lambda *_args: None)
+    monkeypatch.setattr(main.translator_module, "_auto_translation_batch_size", lambda *_args: 2)
+
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"fake-wav")
+
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+        **_run_kwargs,
+    ):
+        assert device == "auto"
+        assert env_overrides is not None
+        assert job_id
+        assert cancel_requested is not None
+        if on_stage:
+            on_stage("ASR mock")
+        return (
+            list(segments if segments is not None else _segments()),
+            ["mock asr"],
+            {"transcript_chunks": [], "stage_timings": {}},
+        )
+
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
+    return ctx
+
+
+def test_cleanup_removes_translation_cache_and_job_temp(monkeypatch, tmp_path):
+    job_dir = tmp_path / "jobs" / "clip"
+    job_dir.mkdir(parents=True)
+    (job_dir / "clip.transcript.json").write_text("{}", encoding="utf-8")
+    audio_path = job_dir / "audio" / "clip.hash.wav"
+    audio_path.parent.mkdir()
+    audio_path.write_bytes(b"wav")
+
+    cache_path = tmp_path / "translation_cache.json"
+    cache_path.write_text('{"0": ["zh-0"]}', encoding="utf-8")
+    cache_jsonl_path = tmp_path / "translation_cache.jsonl"
+    cache_jsonl_path.write_text("", encoding="utf-8")
+    cache_memory_path = tmp_path / "translation_cache.memory.jsonl"
+    cache_memory_path.write_text("", encoding="utf-8")
+    glossary_cache_path = tmp_path / "translation_global_glossary.abc123.json"
+    glossary_cache_path.write_text("{}", encoding="utf-8")
+    # The cross-job ASR result cache must survive job cleanup: that is the
+    # whole point of content addressing.
+    asr_cache_root = tmp_path / "asr_cache"
+    asr_cache_entry = asr_cache_root / "abcdef123456" / ("0" * 64 + ".json")
+    asr_cache_entry.parent.mkdir(parents=True)
+    asr_cache_entry.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv("TRANSLATION_CACHE_PATH", str(cache_path))
+    monkeypatch.setenv("ASR_RESULT_CACHE_ROOT", str(asr_cache_root))
+
+    _cleanup_job_temp(job_dir)
+
+    assert not cache_path.exists()
+    assert not cache_jsonl_path.exists()
+    assert not cache_memory_path.exists()
+    assert not glossary_cache_path.exists()
+    assert asr_cache_entry.exists()
+    assert not audio_path.exists()
+
+
+def test_translation_crash_resume_and_success_cleanup(monkeypatch, tmp_path, capsys):
+    video_path = tmp_path / "sample-j_60s.mp4"
+    video_path.write_bytes(b"fake-video")
+    output_dir = tmp_path / "out"
+    job_temp_root = tmp_path / "jobs"
+    cache_path = tmp_path / "translation_cache.jsonl"
+    chat_calls: list[int] = []
+
+    def fake_chat(messages, expected_count=0, on_progress=None, **_kwargs):
+        start = _batch_start_from_messages(messages)
+        if expected_count == 0:
+            return json.dumps({"translations": []}, ensure_ascii=False)
+        chat_calls.append(start)
+        if start == 4 and os.getenv("_TEST_CRASH_TRANSLATION_BATCH"):
+            # The last batch must still be in flight when the crash lands.
+            # Workers now write their own cache entry as soon as they finish, so
+            # a batch that completes survives the crash by design - with an
+            # instant mock this one would finish first and there would be
+            # nothing left for the resume to do.
+            time.sleep(0.5)
+        return _mock_translation_json(start, expected_count)
+
+    monkeypatch.setattr(main.translator_module, "_chat", fake_chat)
+    ctx = _patch_pipeline(
+        monkeypatch,
+        tmp_path=tmp_path,
+        video_path=video_path,
+        output_dir=output_dir,
+        job_temp_root=job_temp_root,
+        cache_path=cache_path,
+    )
+    monkeypatch.setenv("_TEST_CRASH_TRANSLATION_BATCH", "2")
+
+    with pytest.raises(SystemExit) as first_exit:
+        run_pipeline(video_path, ctx)
+
+    assert first_exit.value.code == 1
+    cache_payload = _load_cache(cache_path)
+    assert sorted(key.split("::")[1] for key in cache_payload) == ["0", "1"]
+    job_dir = job_temp_root / "sample-j_60s"
+    wav_files = list(job_dir.rglob("*.wav"))
+    assert wav_files
+
+    chat_calls.clear()
+    monkeypatch.delenv("_TEST_CRASH_TRANSLATION_BATCH", raising=False)
+
+    run_pipeline(video_path, ctx)
+    stdout = capsys.readouterr().out
+
+    assert "translation-cache" in stdout
+    assert chat_calls == [4]
+    srt_path = output_dir / "sample-j_60s.srt"
+    assert srt_path.exists()
+    assert srt_path.read_text(encoding="utf-8").count("-->") == 5
+    assert not cache_path.exists()
+    assert not list(job_dir.rglob("*.wav")) if job_dir.exists() else True
+
+
+def test_empty_asr_text_no_longer_runs_legacy_qc_gate(monkeypatch, tmp_path):
+    video_path = tmp_path / "silence_10s.mp4"
+    video_path.write_bytes(b"fake-silence")
+    output_dir = tmp_path / "out"
+    job_temp_root = tmp_path / "jobs"
+
+    ctx = _patch_pipeline(
+        monkeypatch,
+        tmp_path=tmp_path,
+        video_path=video_path,
+        output_dir=output_dir,
+        job_temp_root=job_temp_root,
+        segments=[
+            {"start": 0.0, "end": 1.0, "text": ""},
+            {"start": 1.0, "end": 2.0, "text": "   "},
+        ],
+    )
+
+    def fake_translate_segments(segments, **_kwargs):
+        return (
+            ["zh-empty" for _ in segments],
+            [],
+            [],
+        )
+
+    monkeypatch.setattr(main.translator_module, "generate_global_context", lambda _segments: "")
+    monkeypatch.setattr(main.translator_module, "translate_segments", fake_translate_segments)
+
+    run_pipeline(video_path, ctx)
+
+    assert (output_dir / "silence_10s.srt").exists()

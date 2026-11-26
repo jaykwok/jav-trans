@@ -1,0 +1,317 @@
+from pathlib import Path
+
+import pytest
+
+import main
+from helpers import ASR_17B_BACKEND, make_job_context
+from pipeline import audio as pipeline_audio
+
+
+def test_proxy_changes_and_cleared_values_reach_a_persistent_worker(monkeypatch):
+    from core.config import NETWORK_PROXY_ENV_KEYS
+    from types import SimpleNamespace
+
+    for key in NETWORK_PROXY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    ctx = SimpleNamespace()
+    monkeypatch.setenv("PROXY_PROTOCOL", "socks5")
+    monkeypatch.setenv("PROXY_HOST", "127.0.0.1")
+    monkeypatch.setenv("PROXY_PORT", "1080")
+    monkeypatch.setenv("HTTPS_PROXY", "socks5://127.0.0.1:1080")
+    snapshot = main._asr_stage_env_snapshot_for_ctx(ctx)
+    assert snapshot["HTTPS_PROXY"] == "socks5://127.0.0.1:1080"
+    assert snapshot["PROXY_PORT"] == "1080"
+    for key in NETWORK_PROXY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    cleared = main._asr_stage_env_snapshot_for_ctx(ctx)
+    assert all(cleared[key] == "" for key in NETWORK_PROXY_ENV_KEYS)
+
+
+def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path):
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"fake-video")
+    output_dir = tmp_path / "out"
+    temp_root = tmp_path / "jobs"
+    ctx = make_job_context(
+        video_path,
+        output_dir,
+        temp_root,
+        skip_translation=True,
+    )
+    # ASR_BACKEND is a deployment setting: the job carries no backend choice,
+    # so the process value must reach every stage unchanged.
+    monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
+    monkeypatch.setenv("ASR_CONTEXT", "process actor")
+    monkeypatch.setenv("ASR_CHUNK_TARGET_S", "20.0")
+    monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
+
+    seen = {}
+
+    def fake_get_backend_label():
+        seen["backend_label_env"] = {
+            "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
+            "ASR_CHUNK_TARGET_S": main.os.environ.get(
+                "ASR_CHUNK_TARGET_S"
+            ),
+        }
+        return f"backend:{main.os.environ['ASR_BACKEND']}"
+
+    def fake_try_load_aligned_segments(
+        _path,
+        _audio_key,
+        expected_backend,
+        expected_signature=None,
+    ):
+        seen["cache_backend"] = expected_backend
+        seen["cache_signature"] = expected_signature
+        seen["cache_env"] = {
+            "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
+            "ASR_CHUNK_TARGET_S": main.os.environ.get(
+                "ASR_CHUNK_TARGET_S"
+            ),
+        }
+        return None
+
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"wav")
+
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+        **_run_kwargs,
+    ):
+        seen["transcribe_env"] = {
+            "ASR_BACKEND": env_overrides.get("ASR_BACKEND"),
+            "ASR_CHUNK_TARGET_S": env_overrides.get(
+                "ASR_CHUNK_TARGET_S"
+            ),
+        }
+        assert device == "auto"
+        assert job_id
+        assert cancel_requested is not None
+        return (
+            [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+            ["mock asr"],
+            {"transcript_chunks": [], "stage_timings": {}},
+        )
+
+    monkeypatch.setattr(main.asr_module, "get_backend_label", fake_get_backend_label)
+    monkeypatch.setattr(
+        main.aligned_cache_module,
+        "try_load_aligned_segments",
+        fake_try_load_aligned_segments,
+    )
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
+
+    artifacts = main.run_asr_alignment(
+        str(video_path),
+        ctx=ctx,
+        job_id=ctx.job_id,
+    )
+
+    expected_env = {
+        "ASR_BACKEND": ASR_17B_BACKEND,
+        "ASR_CHUNK_TARGET_S": "20.0",
+    }
+    assert seen["backend_label_env"] == expected_env
+    assert seen["cache_env"] == expected_env
+    assert seen["transcribe_env"] == expected_env
+    assert seen["cache_backend"] == f"backend:{ASR_17B_BACKEND}"
+    assert seen["cache_signature"]["backend_label"] == f"backend:{ASR_17B_BACKEND}"
+    assert (
+        seen["cache_signature"]["asr_stage_config"]["ASR_CHUNK_TARGET_S"]
+        == "20.0"
+    )
+    assert "video_fps" not in seen["cache_signature"]["subtitle"]
+    assert "effective_video_fps" not in seen["cache_signature"]["subtitle"]
+    assert seen["cache_signature"]["subtitle"]["frame_gap_s"] == main.subtitle_module.SubtitleOptions().frame_gap_s
+    assert "dense_cue_merge_enabled" not in seen["cache_signature"]["subtitle"]
+    assert artifacts.backend_label == f"backend:{ASR_17B_BACKEND}"
+    assert main.os.environ["ASR_BACKEND"] == ASR_17B_BACKEND
+    assert main.os.environ["ASR_CONTEXT"] == "process actor"
+
+
+def test_asr_stage_env_scope_passes_chunking_and_alignment_flags(monkeypatch, tmp_path):
+    """Process-level ASR chunking and alignment settings must reach the worker."""
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"fake-video")
+    output_dir = tmp_path / "out"
+    temp_root = tmp_path / "jobs"
+    ctx = make_job_context(
+        video_path,
+        output_dir,
+        temp_root,
+        skip_translation=True,
+    )
+    monkeypatch.setenv("ASR_ALIGNMENT_HEAD_PATH", "src/checkpoints/ctc_aligner.pt")
+    monkeypatch.setenv("ASR_CHUNK_MIN_PAUSE_S", "0.8")
+    monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
+
+    seen = {}
+
+    monkeypatch.setattr(main.asr_module, "get_backend_label", lambda: "mock_asr")
+    monkeypatch.setattr(main.aligned_cache_module, "try_load_aligned_segments", lambda *a, **k: None)
+
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"wav")
+
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+        **_run_kwargs,
+    ):
+        seen["head_path"] = env_overrides.get("ASR_ALIGNMENT_HEAD_PATH")
+        seen["min_pause"] = env_overrides.get("ASR_CHUNK_MIN_PAUSE_S")
+        assert device == "auto"
+        assert job_id
+        assert cancel_requested is not None
+        return (
+            [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+            ["mock asr"],
+            {"transcript_chunks": [], "stage_timings": {}},
+        )
+
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
+
+    main.run_asr_alignment(
+        str(video_path),
+        ctx=ctx,
+        job_id=ctx.job_id,
+    )
+
+    assert seen == {
+        "head_path": "src/checkpoints/ctc_aligner.pt",
+        "min_pause": "0.8",
+    }
+
+
+def test_chunk_root_reaches_transcribe_but_not_aligned_signature(
+    monkeypatch,
+    tmp_path,
+):
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"fake-video")
+    output_dir = tmp_path / "out"
+    temp_root = tmp_path / "jobs"
+    ctx = make_job_context(
+        video_path,
+        output_dir,
+        temp_root,
+        skip_translation=True,
+    )
+    monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks-a"))
+    monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(main.asr_module, "get_backend_label", lambda: "mock_asr")
+    monkeypatch.setattr(
+        main.asr_module,
+        "_get_asr_runtime_signature",
+        lambda last_boundary_signature=None: {"asr": "sig"},
+    )
+
+    seen = {}
+
+    def fake_try_load_aligned_segments(
+        _path,
+        _audio_key,
+        _expected_backend,
+        expected_signature=None,
+    ):
+        seen["cache_signature"] = expected_signature
+        return None
+
+    def fake_extract_audio(_video_path: str, out_path: str, **_kwargs) -> None:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"wav")
+
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+        **_run_kwargs,
+    ):
+        seen["transcribe_chunk_root"] = env_overrides.get("ASR_CHUNK_ROOT")
+        assert device == "auto"
+        assert job_id
+        assert cancel_requested is not None
+        return (
+            [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+            ["mock asr"],
+            {"transcript_chunks": [], "stage_timings": {}},
+        )
+
+    monkeypatch.setattr(
+        main.aligned_cache_module,
+        "try_load_aligned_segments",
+        fake_try_load_aligned_segments,
+    )
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
+
+    main.run_asr_alignment(str(video_path), ctx=ctx, job_id=ctx.job_id)
+
+    assert seen["transcribe_chunk_root"] == str(tmp_path / "chunks-a")
+    # Where the chunks are written does not change what they contain, so it
+    # must not invalidate the aligned-segment cache.
+    assert "ASR_CHUNK_ROOT" not in seen["cache_signature"]["asr_stage_config"]
+
+
+def test_an_empty_forwarded_knob_falls_back_instead_of_crashing(monkeypatch):
+    """`KEY=` means "use the default" everywhere else, and has to here too."""
+    from asr import pipeline as asr_pipeline
+
+    for value in ("", "   ", "not-a-number"):
+        monkeypatch.setenv("ASR_CHUNK_MAX_S", value)
+        monkeypatch.setenv("ASR_CHUNK_MIN_S", value)
+        monkeypatch.setenv("ASR_CHUNK_MIN_PAUSE_S", value)
+        monkeypatch.setenv("ASR_FEATURE_BATCH_SIZE", value)
+        monkeypatch.setenv("ASR_CHUNK_SPEECH_THRESHOLD", value)
+        assert asr_pipeline._chunking_config() == {
+            "max_chunk_s": 30.0,
+            "min_chunk_s": 2.0,
+            "min_blank_s": 0.6,
+            "pause_reading": "blank",
+            "speech_threshold": 0.5,
+        }
+        assert asr_pipeline.env_int("ASR_FEATURE_BATCH_SIZE", 4, minimum=1) == 4
+
+    # A real value still wins, or the fallback would be hiding the setting.
+    monkeypatch.setenv("ASR_CHUNK_MAX_S", "18.5")
+    assert asr_pipeline._chunking_config()["max_chunk_s"] == 18.5
+
+    # The pause reading does NOT fall back on a bad value.
+    monkeypatch.setenv("ASR_CHUNK_PAUSE_READING", "speach")
+    with pytest.raises(ValueError, match="ASR_CHUNK_PAUSE_READING"):
+        asr_pipeline._chunking_config()
+
+    monkeypatch.setenv("ASR_CHUNK_PAUSE_READING", "SPEECH")
+    assert asr_pipeline._chunking_config()["pause_reading"] == "speech"

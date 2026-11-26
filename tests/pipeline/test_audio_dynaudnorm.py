@@ -1,0 +1,66 @@
+from helpers import write_pcm_wav
+from pipeline import audio as pipeline_audio
+import pytest
+
+
+def _extract_filter_arg(command: list[str]) -> str:
+    assert "-af" in command
+    return command[command.index("-af") + 1]
+
+
+def _output_path(command: list[str]) -> str:
+    return command[command.index("-loglevel") - 1]
+
+
+def test_extract_audio_uses_dynaudnorm_by_default(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(command, *, check, timeout_s, **kwargs):
+        calls.append(command)
+        assert check is True
+        assert timeout_s == 30.0
+        write_pcm_wav(_output_path(command))
+
+    monkeypatch.delenv("AUDIO_DYNAUDNORM", raising=False)
+    monkeypatch.setenv("AUDIO_EXTRACT_TIMEOUT_S", "30")
+    monkeypatch.setattr(pipeline_audio, "run_cancellable", fake_run)
+
+    pipeline_audio.extract_audio("input.mp4", str(tmp_path / "out.wav"))
+
+    assert calls
+    filter_chain = _extract_filter_arg(calls[0])
+    assert filter_chain.startswith("aresample=16000:async=1000:first_pts=0,")
+    assert "agate=threshold=0.01" in filter_chain
+    assert "dynaudnorm=f=250:g=15" in filter_chain
+
+
+def test_extract_audio_can_disable_dynaudnorm(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(command, *, check, timeout_s, **kwargs):
+        calls.append(command)
+        assert check is True
+        assert timeout_s == 30.0
+        write_pcm_wav(_output_path(command))
+
+    monkeypatch.setenv("AUDIO_DYNAUDNORM", "0")
+    monkeypatch.setenv("AUDIO_EXTRACT_TIMEOUT_S", "30")
+    monkeypatch.setattr(pipeline_audio, "run_cancellable", fake_run)
+
+    pipeline_audio.extract_audio("input.mp4", str(tmp_path / "out.wav"))
+
+    assert calls
+    filter_chain = _extract_filter_arg(calls[0])
+    assert filter_chain.startswith("aresample=16000:async=1000:first_pts=0,")
+    assert "dynaudnorm" not in filter_chain
+
+
+def test_extract_audio_timeout_raises_clear_error(monkeypatch, tmp_path):
+    def fake_run(command, *, timeout_s, **kwargs):
+        raise pipeline_audio.subprocess.TimeoutExpired(command, timeout_s)
+
+    monkeypatch.setenv("AUDIO_EXTRACT_TIMEOUT_S", "30")
+    monkeypatch.setattr(pipeline_audio, "run_cancellable", fake_run)
+
+    with pytest.raises(TimeoutError, match="ffmpeg audio extraction timed out"):
+        pipeline_audio.extract_audio("input.mp4", str(tmp_path / "out.wav"))

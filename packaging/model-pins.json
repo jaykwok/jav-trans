@@ -1,0 +1,6 @@
+{
+  "schema": "release_model_pins_v1",
+  "models": {
+    "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf": "368788ce95dbd10fc47717442cd5bb63a0e00769"
+  }
+}

@@ -1,0 +1,2443 @@
+import os
+import logging
+import time
+import uuid
+import sys
+import hashlib
+import json
+import shutil
+from collections import Counter
+from contextlib import ExitStack
+from pathlib import Path
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
+from core import events
+from core.diagnostics import format_exception_chain
+from core import stage_errors
+from core.cancellation import PipelineCancelledError as _PipelineCancelledError
+from core.cancellation import cancel_requested as _cancel_requested_impl
+from core.cancellation import raise_if_cancelled as _raise_if_cancelled_impl
+from core.config import NETWORK_PROXY_ENV_KEYS, load_config
+from core.job_context import JobContext
+from asr import noise as asr_noise_module
+from pipeline import aligned_cache as aligned_cache_module
+from pipeline import audio as audio_module
+from pipeline import cleanup as cleanup_module
+from pipeline import gpu_worker as asr_stage_worker_module
+from pipeline import output as output_module
+from pipeline.execution_plan import (
+    TRANSLATION_BACKEND,
+    ExecutionPlan,
+)
+from pipeline import artifact_store
+from pipeline import stage_log as stage_log_module
+from pipeline.artifacts import AsrArtifacts
+from pipeline.ids import sanitize_job_id
+from utils.model_paths import PROJECT_ROOT
+
+
+load_config()
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+if os.getenv("HF_HOME"):
+    os.environ["HF_HOME"] = os.path.abspath(os.getenv("HF_HOME"))
+if os.getenv("TORCH_HOME"):
+    os.environ["TORCH_HOME"] = os.path.abspath(os.getenv("TORCH_HOME"))
+
+# Coverage note: atexit cleanup sweeps tmp/chunks, tmp/asr_timeouts, and
+# non-failed tmp/jobs/<id>/audio directories. Caches (cache/), logs (logs/),
+# outputs (outputs/), and private config (config/) live outside tmp/.
+
+class _LazyTorch:
+    _module = None
+
+    def _load(self):
+        if self._module is None:
+            import torch as torch_module
+
+            self._module = torch_module
+        return self._module
+
+    def __getattr__(self, name: str):
+        return getattr(self._load(), name)
+
+
+torch = _LazyTorch()
+
+from asr import pipeline as asr_module
+from asr.manifest import build_asr_manifest
+from subtitles import writer as subtitle_module
+from subtitles.options import BASE_FPS
+from llm import backends as llm_backends
+from llm import translator as translator_module
+
+from rich.console import Console
+from rich.progress import (
+    Progress,
+    TextColumn,
+    BarColumn,
+    TimeElapsedColumn,
+    MofNCompleteColumn,
+)
+
+console = Console(force_terminal=False, emoji=False)
+_ASR_PROGRESS_RE = stage_log_module._ASR_PROGRESS_RE
+
+
+# Prefixes whose settings reach the ASR stage worker. The boundary/CueQC
+# prefixes were dropped on 2026-07-31 with the chain they configured - a
+# forwarded setting for a stage that no longer runs is not neutral, because it
+# still participates in the stage's cache signature.
+_ASR_STAGE_ADVANCED_PREFIXES = (
+    "ASR_NATIVE_",
+    "ASR_CHUNK_",
+    "ASR_ALIGNMENT_",
+    # Decode budget and loop guard. Every one of them changes where a sequence
+    # stops, so they are all cache-relevant and none belongs in the neutral set.
+    "ASR_DECODE_",
+)
+_ASR_STAGE_ADVANCED_KEYS = {
+    "ASR_STAGE_WORKER_TIMEOUT_S",
+    "ASR_STAGE_WORKER_READY_TIMEOUT_S",
+    "ASR_STAGE_WORKER_KILL_GRACE_S",
+    "ASR_STAGE_WORKER_OOM_RETRY_LIMIT",
+    "ASR_STAGE_WORKER_VRAM_BUDGET_MB",
+    "ASR_STAGE_WORKER_VRAM_RATIO",
+    "ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO",
+    "ASR_STAGE_WORKER_RAM_RATIO",
+    "ASR_STAGE_WORKER_HEARTBEAT_S",
+    "ASR_LANGUAGE",
+    "ASR_FORCE_LANGUAGE",
+    "ASR_MODEL_PATH",
+    "ASR_MODEL_ID",
+    "ASR_DTYPE",
+    "ASR_ATTENTION",
+    "ASR_MAX_NEW_TOKENS",
+    "ASR_REPETITION_PENALTY",
+    "TRANSCRIPTION_TIMEOUT_S",
+    "ASR_BATCH_SIZE",
+    "ASR_CHUNK_ROOT",
+    "KEEP_ASR_CHUNKS",
+    # These two move segment end times, so they change the value the
+    # aligned-segments cache stores. `_asr_stage_config_signature_for_env` is
+    # built from this same predicate, so being absent from it meant absent from
+    # that signature too: changing either one replayed the old segments.
+    "ASR_INVALID_SEGMENT_DURATION",
+    "ASR_MIN_REPAIRED_SEGMENT_DURATION",
+    # Batch sizes for the two GPU passes that are not the text decode. Cost-only,
+    # like ASR_BATCH_SIZE, and the ones a user reaches for after an OOM.
+    "ASR_ALIGN_BATCH_SIZE",
+    "ASR_FEATURE_BATCH_SIZE",
+    # Operational siblings of the worker settings above; left out by oversight.
+    "ASR_STAGE_WORKER_MAX_IDLE_S",
+    "ASR_SHARED_VRAM_SPILL_TOLERANCE_MB",
+    # Already declared cache-neutral below, which only means anything if they can
+    # reach the stage in the first place.
+    "ASR_RESULT_CACHE_ENABLED",
+    "ASR_RESULT_CACHE_ROOT",
+}
+_ASR_STAGE_CACHE_NEUTRAL_KEYS = {
+    "ASR_BATCH_SIZE",
+    "ASR_STAGE_WORKER_KILL_GRACE_S",
+    "ASR_STAGE_WORKER_OOM_RETRY_LIMIT",
+    "ASR_STAGE_WORKER_READY_TIMEOUT_S",
+    "ASR_STAGE_WORKER_TIMEOUT_S",
+    "ASR_STAGE_WORKER_VRAM_BUDGET_MB",
+    "ASR_STAGE_WORKER_VRAM_RATIO",
+    "ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO",
+    "ASR_STAGE_WORKER_RAM_RATIO",
+    "ASR_STAGE_WORKER_HEARTBEAT_S",
+    "ASR_CHUNK_ROOT",
+    "KEEP_ASR_CHUNKS",
+    "ASR_RESULT_CACHE_ENABLED",
+    "ASR_RESULT_CACHE_ROOT",
+    "TRANSCRIPTION_TIMEOUT_S",
+    "ASR_ALIGN_BATCH_SIZE",
+    "ASR_FEATURE_BATCH_SIZE",
+    "ASR_STAGE_WORKER_MAX_IDLE_S",
+    "ASR_SHARED_VRAM_SPILL_TOLERANCE_MB",
+}
+
+
+def _is_asr_stage_advanced_key(name: str) -> bool:
+    return (
+        name in _ASR_STAGE_ADVANCED_KEYS
+        or any(name.startswith(prefix) for prefix in _ASR_STAGE_ADVANCED_PREFIXES)
+    )
+
+
+_ASR_STAGE_ENV_SNAPSHOT_KEYS = {
+    "ASR_BACKEND",
+    "HF_HOME",
+    "HF_ENDPOINT",
+    "HF_HUB_CACHE",
+    "HF_XET_CACHE",
+    "TORCH_HOME",
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "CUDA_VISIBLE_DEVICES",
+}
+
+
+def _asr_stage_env_snapshot_for_ctx(_ctx: JobContext | None = None) -> dict[str, str]:
+    names = {
+        name
+        for name in os.environ
+        if _is_asr_stage_advanced_key(name)
+        or name in _ASR_STAGE_ENV_SNAPSHOT_KEYS
+    }
+    # The GPU process is persistent. Empty values also have to travel so
+    # switching a proxy off clears the settings inherited at process start.
+    names.update(NETWORK_PROXY_ENV_KEYS)
+    return {
+        name: os.getenv(name, "")
+        for name in sorted(names)
+        if name in os.environ or name in NETWORK_PROXY_ENV_KEYS
+    }
+
+
+def _subtitle_options_for_ctx(_ctx: JobContext | None = None):
+    return subtitle_module.SubtitleOptions.from_env()
+
+
+def _asr_runtime_signature_for_env() -> dict:
+    try:
+        return dict(asr_module._get_asr_runtime_signature(last_boundary_signature={}))
+    except Exception:
+        return {}
+
+
+def _asr_stage_config_signature_for_env() -> dict:
+    names = {
+        name
+        for name in os.environ
+        if _is_asr_stage_advanced_key(name)
+        or name
+        in {
+            "ASR_BACKEND",
+        }
+    }
+    return {
+        name: os.getenv(name, "")
+        for name in sorted(names)
+        if name not in _ASR_STAGE_CACHE_NEUTRAL_KEYS
+    }
+
+
+def _aligned_cache_signature_for_ctx(
+    ctx: JobContext,
+    *,
+    backend_label: str,
+    subtitle_options=None,
+) -> dict:
+    options = subtitle_options or _subtitle_options_for_ctx(ctx)
+    asr_signature = _asr_runtime_signature_for_env()
+    subtitle_signature = dict(options.signature())
+    subtitle_signature["base_fps"] = BASE_FPS
+    subtitle_signature["frame_duration_s"] = options.frame_duration_s
+    subtitle_signature["frame_gap_s"] = options.frame_gap_s
+    subtitle_signature["frame_min_duration_s"] = options.frame_min_duration_s
+    # The head path reaches this through `asr_stage_config`, but only as the
+    # configured REFERENCE. The edge caps are source constants, so nothing here
+    # saw them at all until version 10 - retuning one left every job's cached
+    # aligned segments serving the previous boundaries.
+    from asr.alignment import CODA_EXTEND_MAX_S, ONSET_BACKOFF_MAX_S
+
+    # Version 11: `normalize_word_dicts` stopped dropping the zero-width spans an
+    # acoustic-only head gives punctuation, so the words - and the segment text
+    # rebuilt from them - now keep their commas. Same failure mode as the edge
+    # caps above: the change lives in source, not in anything the signature read,
+    # so without the bump a fixed pipeline keeps serving pre-fix segments. It was
+    # caught because the re-run came back byte-identical.
+    return {
+        "version": 11,
+        "backend_label": backend_label,
+        "asr": asr_signature,
+        "asr_stage_config": _asr_stage_config_signature_for_env(),
+        "subtitle": subtitle_signature,
+        "alignment_edge_caps": {
+            "onset_backoff_max_s": round(float(ONSET_BACKOFF_MAX_S), 6),
+            "coda_extend_max_s": round(float(CODA_EXTEND_MAX_S), 6),
+        },
+    }
+
+
+def aligned_cache_expectations_for_ctx(
+    ctx: JobContext,
+    *,
+    backend_label: str | None = None,
+) -> tuple[str, dict]:
+    resolved_backend_label = backend_label or asr_module.get_backend_label()
+    subtitle_options = _subtitle_options_for_ctx(ctx)
+    signature = _aligned_cache_signature_for_ctx(
+        ctx,
+        backend_label=resolved_backend_label,
+        subtitle_options=subtitle_options,
+    )
+    return resolved_backend_label, signature
+
+
+def _aligned_segments_payload(
+    *,
+    backend_label: str,
+    audio_path: str,
+    audio_cache_key: str,
+    segments: list[dict],
+    asr_details: dict,
+    asr_log: list[str],
+    cache_signature: dict | None,
+    subtitle_options,
+    cache_stage: str = "ready",
+) -> dict:
+    payload = {
+        "backend": backend_label,
+        "audio_path": audio_path,
+        "audio_cache_key": audio_cache_key,
+        "segments": segments,
+        "asr_details": _compact_asr_details_for_sidecar(asr_details),
+        "asr_log": asr_log,
+        "timeline_mode": subtitle_options.timeline_mode,
+        "cache_stage": cache_stage,
+    }
+    if cache_signature is not None:
+        payload["cache_signature"] = cache_signature
+    return payload
+
+
+_ASR_DETAILS_LARGE_SIDECAR_KEYS = {
+    "transcript_chunks",
+}
+
+
+def _compact_asr_details_for_sidecar(asr_details: dict | None) -> dict:
+    if not isinstance(asr_details, dict):
+        return {}
+    compact = {
+        key: value
+        for key, value in asr_details.items()
+        if key not in _ASR_DETAILS_LARGE_SIDECAR_KEYS
+    }
+    transcript_chunks = asr_details.get("transcript_chunks")
+    if isinstance(transcript_chunks, list):
+        compact["transcript_chunk_count"] = len(transcript_chunks)
+    return compact
+
+
+# Re-exported from core so stage modules below main (pipeline.audio, and the
+# media subprocess runner underneath it) can raise the same cancellation the
+# Web layer already reports as 取消 rather than as a failure.
+PipelineCancelledError = _PipelineCancelledError
+_cancel_requested = _cancel_requested_impl
+_raise_if_cancelled = _raise_if_cancelled_impl
+
+
+def _run_log_dir(ctx: JobContext) -> Path:
+    raw = (ctx.run_log_dir or "./logs/jobs").strip()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+def _run_log_component(value: str, *, max_chars: int) -> str:
+    safe = sanitize_job_id((value or "run").replace(" ", "_")) or "run"
+    if len(safe) <= max_chars:
+        return safe
+    digest = hashlib.sha1(safe.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    keep = max(1, max_chars - len(digest) - 1)
+    return f"{safe[:keep]}-{digest}"
+
+
+def _setup_run_logger(
+    job_id: str,
+    backend_label: str,
+    ctx: JobContext,
+) -> tuple[logging.Logger, Path]:
+    run_log_root = _run_log_dir(ctx)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    # Leave headroom below legacy Windows MAX_PATH. The root can itself be
+    # user-configured and deep, so fixed per-component limits are insufficient.
+    fixed_chars = len(str(run_log_root)) + 2 + len(stamp) + 1 + len(".run.log")
+    available_chars = max(24, 240 - fixed_chars)
+    job_chars = min(48, max(12, available_chars - 12))
+    backend_chars = min(40, max(12, available_chars - job_chars))
+    safe_job_id = _run_log_component(job_id, max_chars=job_chars)
+    safe_backend = _run_log_component(backend_label, max_chars=backend_chars)
+    # The parent directory already identifies the job. Repeating the job id in
+    # the filename can push packaged Windows runs past MAX_PATH even though
+    # each individual component is bounded.
+    candidate_roots: list[Path] = [run_log_root]
+    temp_dir_raw = str(getattr(ctx, "temp_dir", "") or "").strip()
+    if temp_dir_raw:
+        fallback_root = Path(temp_dir_raw) / "log"
+        if fallback_root != run_log_root:
+            candidate_roots.append(fallback_root)
+
+    logger_name = f"jav-sub.run.{job_id}.{stamp}"
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.handlers.clear()
+
+    log_path = run_log_root / safe_job_id / f"{stamp}_{safe_backend}.run.log"
+    last_error: OSError | None = None
+    for root in candidate_roots:
+        log_dir = root / safe_job_id
+        candidate_path = log_dir / f"{stamp}_{safe_backend}.run.log"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(candidate_path, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            logger.addHandler(handler)
+            return logger, candidate_path
+        except OSError as exc:
+            last_error = exc
+
+    logging.getLogger(__name__).warning(
+        "Could not open run log for job %s under %s: %s",
+        job_id,
+        run_log_root,
+        last_error,
+    )
+    logger.addHandler(logging.NullHandler())
+    return logger, log_path
+
+
+def _reopen_snapshot_run_logger(artifacts: "AsrArtifacts") -> None:
+    """Give a retried translation its run log back.
+
+    A translation retry rebuilds the artifacts from the on-disk snapshot, which
+    cannot carry a live FileHandler - so `logger` came back as None and every
+    stage line from the retry went nowhere. The run log then ended at the moment
+    the first attempt failed, which is exactly the run someone would go looking
+    for. The path survives the snapshot, so re-attach to it in append mode.
+    """
+    if isinstance(artifacts.logger, logging.Logger) or not artifacts.run_log_path:
+        return
+    log_path = Path(artifacts.run_log_path)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+    except OSError:
+        # Diagnostics are not worth failing a run that is otherwise fine.
+        return
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger = logging.getLogger(f"jav-sub.run.retry.{log_path.stem}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for existing in list(logger.handlers):
+        existing.close()
+        logger.removeHandler(existing)
+    logger.addHandler(handler)
+    artifacts.logger = logger
+    events._thread_local.run_logger = logger
+
+
+def _close_run_logger(logger: logging.Logger | None) -> None:
+    if logger is None:
+        return
+    for handler in list(logger.handlers):
+        handler.flush()
+        handler.close()
+        logger.removeHandler(handler)
+
+
+def _clear_thread_run_logger(logger: logging.Logger | None) -> None:
+    if logger is not None and getattr(events._thread_local, "run_logger", None) is logger:
+        try:
+            delattr(events._thread_local, "run_logger")
+        except AttributeError:
+            pass
+
+
+def _close_artifacts_logger(artifacts: "AsrArtifacts") -> None:
+    logger = artifacts.logger if isinstance(artifacts.logger, logging.Logger) else None
+    _close_run_logger(logger)
+    _clear_thread_run_logger(logger)
+    artifacts.logger = None
+
+
+def _persistent_timings_path(
+    timings_path: str,
+    run_log_path: Path | None,
+) -> Path | None:
+    if run_log_path is None:
+        return None
+    return Path(run_log_path).parent / Path(timings_path).name
+
+
+def _diagnostic_output_paths(
+    *,
+    timings_path: str,
+    run_log_path: Path | None,
+) -> dict[str, str | None]:
+    persistent_timings = _persistent_timings_path(timings_path, run_log_path)
+    return {
+        "run_log": str(run_log_path) if run_log_path else None,
+        "timings_log": str(persistent_timings) if persistent_timings else None,
+    }
+
+
+def _append_unique_output_path(output_paths: list[str], path: str | Path | None) -> None:
+    if path is None:
+        return
+    text = str(path)
+    if text and text not in output_paths:
+        output_paths.append(text)
+
+
+def _write_failure_timings_best_effort(
+    *,
+    video_path: str,
+    artifacts: "AsrArtifacts",
+    stage: str,
+    exc: BaseException,
+    run_id: str = "",
+) -> None:
+    """Persist diagnostic timings/retries even when translation or output fails.
+
+    Previously `timings.json` was written only on the happy path, so a failure
+    during translation discarded every accumulated API retry event, warmup
+    timing, and completed batch timing. When an existing snapshot on disk
+    belongs to the *same* `run_id` (e.g. output export/publish failed after
+    translation wrote timings), its completed request timings and retry events
+    are preserved; snapshots from an earlier retry's `run_id` are never inherited.
+    """
+    timings_path = getattr(artifacts, "timings_path", "")
+    if not timings_path:
+        return
+    raw_logger = getattr(artifacts, "logger", None)
+    logger = raw_logger if isinstance(raw_logger, logging.Logger) else None
+    run_log_path = getattr(artifacts, "run_log_path", None)
+    active_run_id = str(run_id or "").strip()
+    existing_payload: dict | None = None
+    if active_run_id:
+        try:
+            timings_file = Path(timings_path)
+            if timings_file.is_file():
+                loaded = json.loads(timings_file.read_text(encoding="utf-8"))
+                if (
+                    isinstance(loaded, dict)
+                    and str(loaded.get("run_id") or "").strip() == active_run_id
+                ):
+                    existing_payload = loaded
+        except Exception:  # noqa: BLE001 - best-effort preserve
+            existing_payload = None
+
+    diagnostics = getattr(exc, "_translation_diagnostics", None)
+    request_timings = (
+        list(diagnostics.get("translation_request_timings") or [])
+        if isinstance(diagnostics, dict)
+        else []
+    )
+    retry_events = (
+        list(diagnostics.get("translation_api_retry_events") or [])
+        if isinstance(diagnostics, dict)
+        else []
+    )
+    if existing_payload is not None:
+        if not request_timings and isinstance(
+            existing_payload.get("translation_request_timings"), list
+        ):
+            request_timings = list(existing_payload["translation_request_timings"])
+        if not retry_events and isinstance(
+            existing_payload.get("translation_api_retry_events"), list
+        ):
+            retry_events = list(existing_payload["translation_api_retry_events"])
+
+    stage_timings = dict(getattr(artifacts, "pipeline_timings", None) or {})
+    if existing_payload is not None and isinstance(existing_payload.get("stage_timings"), dict):
+        merged_stage_timings = dict(existing_payload["stage_timings"])
+        merged_stage_timings.update(stage_timings)
+        stage_timings = merged_stage_timings
+    started_at = getattr(artifacts, "pipeline_started", None)
+    if started_at:
+        stage_timings["pipeline_total_s"] = time.perf_counter() - float(started_at)
+    else:
+        stage_timings.setdefault("pipeline_total_s", 0.0)
+    asr_details = getattr(artifacts, "asr_details", None)
+    asr_details_dict = asr_details if isinstance(asr_details, dict) else {}
+    segments = getattr(artifacts, "segments", None) or []
+    base_payload = dict(existing_payload) if existing_payload is not None else {}
+    counts = dict(base_payload.get("counts")) if isinstance(base_payload.get("counts"), dict) else {}
+    counts.setdefault("transcript_chunks", len(asr_details_dict.get("transcript_chunks", [])))
+    counts.setdefault("segments", len(segments))
+    outputs_map = (
+        dict(base_payload.get("outputs"))
+        if isinstance(base_payload.get("outputs"), dict)
+        else {}
+    )
+    outputs_map.update(
+        {
+            "job_temp_dir": getattr(artifacts, "job_temp_dir", "") or outputs_map.get("job_temp_dir", ""),
+            "srt": getattr(artifacts, "srt_path", "") or outputs_map.get("srt", ""),
+            "asr_manifest": getattr(artifacts, "asr_manifest_path", "") or outputs_map.get("asr_manifest", ""),
+            "transcript_json": getattr(artifacts, "transcript_path", "") or outputs_map.get("transcript_json", ""),
+            "aligned_segments_json": getattr(artifacts, "aligned_segments_path", "") or outputs_map.get("aligned_segments_json", ""),
+            "bilingual_json": getattr(artifacts, "bilingual_json_path", "") or outputs_map.get("bilingual_json", ""),
+            **_diagnostic_output_paths(
+                timings_path=timings_path,
+                run_log_path=run_log_path,
+            ),
+        }
+    )
+    payload = {
+        **base_payload,
+        "status": "failed",
+        "failed_stage": stage,
+        "error": {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "chain": format_exception_chain(exc),
+        },
+        "video_path": video_path or base_payload.get("video_path", ""),
+        "audio_path": getattr(artifacts, "audio_path", "") or base_payload.get("audio_path", ""),
+        "audio_cached": bool(getattr(artifacts, "audio_cached", base_payload.get("audio_cached", False))),
+        "job_id": getattr(artifacts, "job_id", "") or base_payload.get("job_id", ""),
+        "run_id": active_run_id,
+        "job_temp_dir": getattr(artifacts, "job_temp_dir", "") or base_payload.get("job_temp_dir", ""),
+        "device": getattr(artifacts, "device", "") or base_payload.get("device", ""),
+        "backend": getattr(artifacts, "backend_label", "") or base_payload.get("backend", ""),
+        "counts": counts,
+        "stage_timings": stage_timings,
+        "asr_details": (
+            _compact_asr_details_for_sidecar(asr_details_dict)
+            if asr_details_dict
+            else base_payload.get("asr_details", {})
+        ),
+        "translation_request_timings": request_timings,
+        "translation_api_retry_events": retry_events,
+        "outputs": outputs_map,
+        "asr_log": list(getattr(artifacts, "asr_log", None) or base_payload.get("asr_log", []) or []),
+    }
+    try:
+        _write_timings_with_diagnostics(
+            timings_path=timings_path,
+            payload=payload,
+            run_log_path=run_log_path,
+            output_paths=[],
+            logger=logger,
+        )
+        _log_stage(
+            logger,
+            f"failure_timings_written path={_project_relative(timings_path)} retries={len(retry_events)}",
+        )
+    except Exception as write_exc:  # noqa: BLE001 - diagnostics must never mask original error
+        if logger is not None:
+            logger.warning("Failed to write failure timings snapshot: %r", write_exc)
+
+
+def _write_timings_with_diagnostics(
+    *,
+    timings_path: str,
+    payload: dict,
+    run_log_path: Path | None,
+    output_paths: list[str],
+    logger: logging.Logger | None,
+) -> None:
+    _write_json(timings_path, payload)
+    if run_log_path is None:
+        _append_unique_output_path(output_paths, timings_path)
+        return
+    _append_unique_output_path(output_paths, run_log_path)
+    persistent_timings = _persistent_timings_path(timings_path, run_log_path)
+    if persistent_timings is None:
+        _append_unique_output_path(output_paths, timings_path)
+        return
+    try:
+        if Path(timings_path).resolve() != persistent_timings.resolve():
+            persistent_timings.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(timings_path, persistent_timings)
+        _append_unique_output_path(output_paths, persistent_timings)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not fail jobs
+        _log_stage(logger, f"diagnostics_timings_copy_failed error={exc!r}")
+        _append_unique_output_path(output_paths, timings_path)
+
+
+_event_ts = stage_log_module._event_ts
+_coerce_event_value = stage_log_module._coerce_event_value
+_parse_stage_extra = stage_log_module._parse_stage_extra
+_emit_stage_event = stage_log_module._emit_stage_event
+_emit_stage_log_event = stage_log_module._emit_stage_log_event
+_parse_asr_stage_event = stage_log_module._parse_asr_stage_event
+_log_stage = stage_log_module._log_stage
+
+
+def _project_relative(path: str | Path | None) -> str | None:
+    return artifact_store.project_relative(path, project_root=PROJECT_ROOT)
+
+
+_log_timing_snapshot = stage_log_module._log_timing_snapshot
+
+
+def _pipeline_cuda_memory_snapshot(stage: str, *, elapsed_s: float | None = None) -> dict:
+    snapshot: dict[str, object] = {
+        "stage": stage,
+        "cuda_available": False,
+    }
+    if elapsed_s is not None:
+        snapshot["elapsed_s"] = round(float(elapsed_s), 3)
+    try:
+        snapshot["cuda_available"] = bool(torch.cuda.is_available())
+        if not torch.cuda.is_available():
+            return snapshot
+        device_index = torch.cuda.current_device()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+        scale = 1024 * 1024
+        snapshot.update(
+            {
+                "device_index": int(device_index),
+                "device_name": torch.cuda.get_device_name(device_index),
+                "allocated_mb": round(torch.cuda.memory_allocated(device_index) / scale, 1),
+                "reserved_mb": round(torch.cuda.memory_reserved(device_index) / scale, 1),
+                "max_allocated_mb": round(torch.cuda.max_memory_allocated(device_index) / scale, 1),
+                "max_reserved_mb": round(torch.cuda.max_memory_reserved(device_index) / scale, 1),
+                "free_mb": round(free_bytes / scale, 1),
+                "total_mb": round(total_bytes / scale, 1),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not break workflow
+        snapshot["error"] = f"{type(exc).__name__}: {exc}"
+    return snapshot
+
+
+def _record_pipeline_cuda_memory(
+    snapshots: list[dict],
+    stage: str,
+    *,
+    logger: logging.Logger | None = None,
+    elapsed_s: float | None = None,
+    skip_reason: str = "",
+) -> None:
+    if skip_reason:
+        snapshot: dict[str, object] = {
+            "stage": stage,
+            "cuda_available": False,
+            "skipped": True,
+            "reason": skip_reason,
+        }
+        if elapsed_s is not None:
+            snapshot["elapsed_s"] = round(float(elapsed_s), 3)
+        snapshots.append(snapshot)
+        _log_stage(logger, f"cuda_memory_skipped stage={stage} reason={skip_reason}")
+        return
+    snapshot = _pipeline_cuda_memory_snapshot(stage, elapsed_s=elapsed_s)
+    snapshots.append(snapshot)
+    if not snapshot.get("cuda_available"):
+        return
+    _log_stage(
+        logger,
+        "cuda_memory stage={stage} allocated={allocated}MB reserved={reserved}MB "
+        "max_reserved={max_reserved}MB free={free}MB total={total}MB".format(
+            stage=stage,
+            allocated=snapshot.get("allocated_mb"),
+            reserved=snapshot.get("reserved_mb"),
+            max_reserved=snapshot.get("max_reserved_mb"),
+            free=snapshot.get("free_mb"),
+            total=snapshot.get("total_mb"),
+        ),
+    )
+
+
+def _asr_details_cuda_skip_reason(asr_details: dict | None) -> str:
+    # The ASR stage always runs in the unified GPU worker; the main/web process
+    # must never initialize CUDA -- not even torch.cuda.is_available() -- or it
+    # re-splits the CUDA context this refactor exists to consolidate. Skip
+    # unconditionally, including for asr_details loaded from a stale cache that
+    # predates the stage_worker tag (otherwise such a cache hit would init CUDA
+    # in the main process during write_output).
+    return "asr_stage_worker_subprocess"
+
+
+def _resolve_job_temp_dir(job_id: str) -> str:
+    root = os.getenv("JOB_TEMP_DIR", "").strip()
+    if not root:
+        root = os.path.join("tmp", "jobs")
+    path = Path(root).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return str((path / sanitize_job_id(job_id)).resolve())
+
+
+def _materialize_cached_file(source: str | Path, destination: str | Path) -> bool:
+    """Bring a resumed job's cached file into this job's directory.
+
+    Published the same way an extraction is: hard link (already atomic) or copy
+    to a partial and replace, so an interrupted copy cannot leave a short file
+    under the name the cache reader trusts.
+    """
+    source_path = Path(source).resolve()
+    destination_path = Path(destination).resolve()
+    if source_path == destination_path:
+        return source_path.is_file()
+    if not source_path.is_file():
+        return False
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    if destination_path.exists():
+        return destination_path.is_file()
+    try:
+        os.link(source_path, destination_path)
+        return True
+    except OSError:
+        pass
+    staged = destination_path.with_name(
+        f"{destination_path.name}.{uuid.uuid4().hex[:8]}.partial"
+    )
+    try:
+        shutil.copy2(source_path, staged)
+        os.replace(staged, destination_path)
+    finally:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
+    return True
+
+
+def _materialize_usable_audio(source: str | Path, destination: str | Path) -> bool:
+    """Materialize a resumed job's audio, and only claim it if it is complete.
+
+    `_materialize_cached_file` answers "is there a file there now", which was
+    enough until a wav an older build left half-written could be the file it
+    finds - including the case where source and destination are the same path.
+    """
+    if not _materialize_cached_file(source, destination):
+        return False
+    return audio_module.audio_cache_is_usable(str(destination))
+
+
+def _resolve_project_runtime_path(raw_path: str | Path) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+def _cleanup_pipeline_temp(job_temp_dir: str, audio_path: str, translation_cache_path: str = "") -> None:
+    # ASR results live in the cross-job content-addressed cache
+    # (asr.result_cache) and deliberately survive job cleanup.
+    cleanup_module.cleanup_job_temp(
+        job_temp_dir,
+        translation_cache_path,
+    )
+    cleanup_module.cleanup_runtime_ephemeral_temp(
+        job_temp_root=os.getenv("JOB_TEMP_DIR", "tmp/jobs") or "tmp/jobs",
+        asr_chunk_root=asr_module.current_asr_chunk_root(),
+        project_root=PROJECT_ROOT,
+    )
+
+
+_format_asr_stage_label = stage_log_module._format_asr_stage_label
+
+
+def _write_json(path: str, payload: dict) -> None:
+    artifact_store.write_json(path, payload, project_root=PROJECT_ROOT)
+
+
+def _write_json_atomic(path: str | Path, payload: dict) -> None:
+    artifact_store.write_json_atomic(path, payload, project_root=PROJECT_ROOT)
+
+
+def output_target_for_ctx(video_path: str, ctx: JobContext) -> Path:
+    video = _resolve_project_runtime_path(video_path)
+    directory = _resolve_project_runtime_path(ctx.output_dir) if ctx.output_dir else video.parent
+    return directory / ExecutionPlan.for_asr(ctx).srt_filename(video.stem)
+
+
+def _output_lease(
+    video_path: str, ctx: JobContext, *, job_id: str, run_id: str,
+    target: str | Path | None = None,
+) -> artifact_store.OutputLease:
+    destination = Path(target).resolve() if target else output_target_for_ctx(video_path, ctx)
+    identity = run_id or ctx.output_run_id or uuid.uuid4().hex
+    if ctx.output_generation and ctx.output_run_id == identity:
+        if Path(ctx.output_target).resolve() != destination:
+            raise ValueError("运行的输出目标与已登记的目标不一致")
+        return artifact_store.OutputLease(
+            destination, PROJECT_ROOT, job_id, identity, ctx.output_generation,
+        )
+    lease = artifact_store.claim_output(
+        destination, project_root=PROJECT_ROOT, job_id=job_id, run_id=identity,
+    )
+    ctx.output_target = str(destination)
+    ctx.output_generation = lease.sequence
+    ctx.output_run_id = lease.run_id
+    return lease
+
+
+def _run_outputs(
+    *, ctx: JobContext, run_id: str, job_id: str, job_temp_dir: str, video_stem: str,
+) -> artifact_store.RunOutputs:
+    return artifact_store.RunOutputs(lease=artifact_store.OutputLease(
+        Path(ctx.output_target), PROJECT_ROOT, job_id,
+        run_id or ctx.output_run_id, ctx.output_generation,
+    ))
+
+
+def _publish_outputs(
+    outputs: artifact_store.RunOutputs, paths: list[str], artifacts: AsrArtifacts,
+    cancel_event, *, subtitle_cue_count: int,
+) -> list[str]:
+    run_logger = getattr(artifacts, "logger", None)
+    if isinstance(run_logger, logging.Logger):
+        for handler in list(run_logger.handlers):
+            try:
+                handler.flush()
+            except OSError:
+                pass
+    staged = {path.resolve() for path in outputs.targets()}
+    run_log_raw = getattr(artifacts, "run_log_path", None)
+    run_log_resolved = Path(run_log_raw).resolve() if run_log_raw else None
+    if run_log_resolved is not None and run_log_resolved not in staged and run_log_resolved.is_file():
+        outputs.stage_file(run_log_resolved, name="run_log")
+        staged.add(run_log_resolved)
+    for index, raw in enumerate(paths):
+        path = Path(raw).resolve()
+        if path not in staged and path.is_file():
+            outputs.stage_file(path, name=f"diagnostic_{index}")
+            staged.add(path)
+    manifest = outputs.publish(
+        still_current=lambda: cancel_event is None or not cancel_event.is_set(),
+        subtitle_cue_count=subtitle_cue_count,
+    )
+    resolved = {
+        str(Path(raw).resolve() if Path(raw).is_absolute() else (PROJECT_ROOT / raw).resolve()):
+            str(artifact_store.artifact_path(manifest["files"][name], PROJECT_ROOT))
+        for name, raw in manifest["targets"].items()
+    }
+    for name in ("transcript_path", "aligned_segments_path", "bilingual_json_path"):
+        value = getattr(artifacts, name, "")
+        if value and str(Path(value).resolve()) in resolved:
+            setattr(artifacts, name, resolved[str(Path(value).resolve())])
+    artifact_store.export_output(outputs.lease)
+    return artifact_store.manifest_paths(manifest, project_root=PROJECT_ROOT)
+
+
+def _build_japanese_srt_blocks(segments: list[dict]) -> list[dict]:
+    return [
+        {
+            "start": float(seg["start"]),
+            "end": float(seg["end"]),
+            "ja_text": str(seg.get("text", "")),
+            "zh_text": str(seg.get("text", "")),
+            "words": list(seg.get("words") or []),
+            "source_segment_ids": list(seg.get("source_segment_ids") or [idx]),
+            "acoustic_start": seg.get("acoustic_start", seg.get("start")),
+            "acoustic_end": seg.get("acoustic_end", seg.get("end")),
+            "acoustic_duration": seg.get("acoustic_duration"),
+            "chunk_acoustic_start": seg.get("chunk_acoustic_start"),
+            "chunk_acoustic_end": seg.get("chunk_acoustic_end"),
+            "chunk_acoustic_duration": seg.get("chunk_acoustic_duration"),
+            "primary_cut_candidates": list(seg.get("primary_cut_candidates") or []),
+            "weak_cut_candidates": list(seg.get("weak_cut_candidates") or []),
+            # The post-gate marks a chunk and `_annotate_segments_with_postgate`
+            # brings the mark down to the segment, but this key list is where it
+            # used to stop: a verdict nobody downstream can read is a detector
+            # running for nothing. Pieces inherit it through `dict(block)`.
+            "postgate_flags": list(seg.get("postgate_flags") or []),
+        }
+        for idx, seg in enumerate(segments)
+    ]
+
+
+def _frame_class_reader(asr_details: dict | None):
+    """A `(start_s, end_s) -> shares` callable, or None without a v2 head.
+
+    Built here because this is where the ASR stage and the subtitle stage meet.
+    Neither imports the other, and neither should: the arithmetic lives in
+    `asr.alignment`, the decision lives in `subtitles.vocalisation`, and the
+    integration is main.py's job.
+    """
+    if not isinstance(asr_details, dict):
+        return None
+    from asr.alignment import ENCODER_FRAME_S, span_class_shares
+    from asr.pipeline import decode_frame_class_track
+
+    decoded = decode_frame_class_track(asr_details.get("frame_class_track"))
+    if decoded is None:
+        return None
+    posteriors, frame_s = decoded
+    # `span_class_shares` takes an upsample factor and derives the frame width
+    # from the encoder rate; the track already knows its own width, so the
+    # factor is recovered rather than assumed - a head trained at a different
+    # upsample would otherwise silently index the wrong frames.
+    upsample = max(1, int(round(ENCODER_FRAME_S / frame_s))) if frame_s > 0 else 1
+
+    def shares(start_s: float, end_s: float) -> dict | None:
+        measured = span_class_shares(
+            posteriors, start_s, end_s, upsample=upsample
+        )
+        return measured if measured.get("frames") else None
+
+    return shares
+
+
+def _prepare_translation_cues(
+    segments: list[dict],
+    *,
+    subtitle_options,
+    on_stage=None,
+    asr_details: dict | None = None,
+) -> tuple[list[dict], dict]:
+    source_blocks = _build_japanese_srt_blocks(segments)
+    prepare_diagnostics: dict = {}
+    cues = subtitle_module.prepare_srt_blocks(
+        source_blocks,
+        options=subtitle_options,
+        on_stage=on_stage,
+        diagnostics=prepare_diagnostics,
+        acoustic_classes=_frame_class_reader(asr_details),
+    )
+    normalized: list[dict] = []
+    for cue_id, cue in enumerate(cues):
+        item = dict(cue)
+        ja_text = str(item.get("ja_text") or item.get("text") or "").strip()
+        item["cue_id"] = cue_id
+        item["text"] = ja_text
+        item["ja_text"] = ja_text
+        item["zh_text"] = str(item.get("zh_text") or ja_text)
+        item["words"] = list(item.get("words") or [])
+        # Normalized here rather than left absent so every cue answers the
+        # question, and the prompt layer can serialize a fact instead of an
+        # inference from a missing key.
+        item["continues_from_previous"] = bool(item.get("continues_from_previous"))
+        item["continues_into_next"] = bool(item.get("continues_into_next"))
+        if "source_segment_ids" not in item:
+            item["source_segment_ids"] = [cue_id]
+        normalized.append(item)
+    split_skipped = Counter(
+        str(cue.get("subtitle_layout_split_skipped") or "").strip()
+        for cue in normalized
+        if str(cue.get("subtitle_layout_split_skipped") or "").strip()
+    )
+    split_sources = Counter(
+        str(cue.get("subtitle_layout_split_source") or "").strip()
+        for cue in normalized
+        if str(cue.get("subtitle_layout_split_source") or "").strip()
+    )
+    # Which evidence ended each cue, and how much silence was actually there.
+    # This is the layout's cut-point decision, and the finished SRT keeps no
+    # trace of it: a cue ending at 。 and one ending in a 0.13s gap look the
+    # same afterwards, and only the second is a guess.
+    break_types = Counter(
+        str(cue.get("text_break_type") or "").strip()
+        for cue in normalized
+        if str(cue.get("text_break_type") or "").strip()
+    )
+    word_gap_widths = sorted(
+        float(cue.get("text_break_gap_s") or 0.0)
+        for cue in normalized
+        if str(cue.get("text_break_type") or "") == "word_gap"
+    )
+    # Counted here rather than at the ASR stage because the question worth
+    # answering is not how many chunks were flagged but how many flagged cues
+    # survived the layout and the vocalisation filter into the finished file.
+    postgate_flags = Counter(
+        flag
+        for cue in normalized
+        for flag in (cue.get("postgate_flags") or [])
+        if str(flag).strip()
+    )
+    postgate_flagged_cues = sum(
+        1 for cue in normalized if (cue.get("postgate_flags") or [])
+    )
+    return normalized, {
+        "schema": "subtitle_cue_summary_v2",
+        "cues_before": len(cues),
+        "cues_after": len(normalized),
+        "counts": {"keep": len(normalized)},
+        "layout_diagnostics": {
+            **prepare_diagnostics,
+            "subtitle_layout_split_skipped": dict(sorted(split_skipped.items())),
+            "subtitle_layout_split_source": dict(sorted(split_sources.items())),
+            "subtitle_layout_break_type": dict(sorted(break_types.items())),
+            "layout_word_gap_cut_count": len(word_gap_widths),
+            "layout_word_gap_cut_under_0p2s": sum(
+                1 for width in word_gap_widths if width < 0.2
+            ),
+            "layout_word_gap_median_s": (
+                round(word_gap_widths[len(word_gap_widths) // 2], 3)
+                if word_gap_widths
+                else None
+            ),
+            "display_clamped_to_max": sum(
+                bool(cue.get("display_clamped_to_max")) for cue in normalized
+            ),
+            "proportional_fallback_used": sum(
+                bool(cue.get("proportional_fallback_used")) for cue in normalized
+            ),
+            "duration_violation": sum(
+                bool(cue.get("duration_violation")) for cue in normalized
+            ),
+            "source_char_violation": sum(
+                bool(cue.get("source_char_violation")) for cue in normalized
+            ),
+            "duration_soft_cap_violation": sum(
+                bool(cue.get("duration_soft_cap_violation")) for cue in normalized
+            ),
+            "exact_measured_timeline": sum(
+                bool(cue.get("exact_measured_timeline")) for cue in normalized
+            ),
+            # What the translator is told about sentences the layout split. The
+            # counts belong next to `vocalisation_continuity_flags_cleared` from
+            # `prepare_diagnostics` above: that one says how many claims were
+            # withdrawn because the neighbour was dropped, and these say how many
+            # were made in the first place, which is the only way to read it.
+            "continues_from_previous": sum(
+                bool(cue.get("continues_from_previous")) for cue in normalized
+            ),
+            "continues_into_next": sum(
+                bool(cue.get("continues_into_next")) for cue in normalized
+            ),
+            "postgate_flagged_cues": postgate_flagged_cues,
+            "postgate_cue_flags": dict(sorted(postgate_flags.items())),
+        },
+    }
+
+
+def _subtitle_cue_plan_summary(
+    *,
+    segments_before: int,
+    mode: str,
+    cue_summary: dict,
+) -> dict:
+    return {
+        "schema": str(cue_summary.get("schema") or "subtitle_cue_summary_v2"),
+        "segments_before": segments_before,
+        "cues_before": int(cue_summary.get("cues_before", 0)),
+        "cues_after": int(cue_summary.get("cues_after", 0)),
+        "layout_diagnostics": dict(cue_summary.get("layout_diagnostics") or {}),
+        "mode": mode,
+        "stage": "pre_translation",
+    }
+
+
+def _log_subtitle_cue_diagnostics(logger, cue_summary: dict) -> None:
+    diagnostics = dict(cue_summary.get("layout_diagnostics") or {})
+    _log_stage(
+        logger,
+        "subtitle_cue_plan_diagnostics "
+        + json.dumps(diagnostics, ensure_ascii=False, sort_keys=True),
+    )
+
+
+def _print_timing_summary(stage_timings: dict, asr_details: dict) -> None:
+    stage_log_module._print_timing_summary(console, stage_timings, asr_details)
+
+
+def run_asr_alignment(
+    video_path: str,
+    *,
+    ctx: JobContext,
+    job_id: str = "",
+    run_id: str = "",
+    cache_job_id: str = "",
+    cancel_event=None,
+) -> AsrArtifacts:
+    # Reset per-run logger tracking so the finally below can tell whether THIS
+    # call created a run logger. On the success path ownership of the run
+    # logger's FileHandler transfers to the returned artifacts (and is released
+    # by run_translation_and_write); only the exception path leaks a handle.
+    events._thread_local.run_logger = None
+    artifacts: AsrArtifacts | None = None
+    try:
+        artifacts = _run_asr_alignment_impl(
+            video_path,
+            ctx=ctx,
+            job_id=job_id,
+            run_id=run_id,
+            cache_job_id=cache_job_id,
+            cancel_event=cancel_event,
+        )
+        return artifacts
+    except Exception as exc:
+        run_logger = getattr(events._thread_local, "run_logger", None)
+        if isinstance(run_logger, logging.Logger):
+            if isinstance(exc, PipelineCancelledError):
+                _log_stage(run_logger, "run_cancelled stage=asr_alignment")
+            else:
+                _log_stage(
+                    run_logger,
+                    f"run_failed stage=asr_alignment error={format_exception_chain(exc)!r}",
+                )
+                run_logger.exception("asr_alignment_stage_failed")
+        raise
+    finally:
+        if artifacts is None:
+            # ASR re-raise / OOM / cancellation: artifacts was never built, so
+            # close the run logger FileHandler here to avoid accumulating
+            # Windows file locks. _close_artifacts_logger cannot be used because
+            # no artifacts instance exists on this path; these two helpers are
+            # exactly what it calls internally, and both are idempotent.
+            run_logger = getattr(events._thread_local, "run_logger", None)
+            if isinstance(run_logger, logging.Logger):
+                _close_run_logger(run_logger)
+                _clear_thread_run_logger(run_logger)
+
+
+def _run_asr_alignment_impl(
+    video_path: str,
+    *,
+    ctx: JobContext,
+    job_id: str = "",
+    run_id: str = "",
+    cache_job_id: str = "",
+    cancel_event=None,
+) -> AsrArtifacts:
+    logger: logging.Logger | None = None
+    run_log_path: Path | None = None
+    pipeline_started = time.perf_counter()
+    pipeline_timings: dict[str, float] = {}
+    pipeline_cuda_memory: list[dict] = []
+
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    video_filename = video_name
+    job_id = sanitize_job_id(job_id or ctx.job_id or video_name)
+    cache_job_id = sanitize_job_id(cache_job_id or job_id)
+    effective_ctx = ctx
+    with events.scoped_run_identity(job_id, run_id, video=os.path.basename(video_path)):
+        backend_label = asr_module.get_backend_label()
+        if effective_ctx.run_log_enabled:
+            logger, run_log_path = _setup_run_logger(job_id, backend_label, effective_ctx)
+            events._thread_local.run_logger = logger
+
+        _log_stage(logger, f"run_start video={_project_relative(video_path)}")
+        _log_stage(logger, f"backend={backend_label}")
+        _raise_if_cancelled(cancel_event)
+        # Ahead of ffprobe/ffmpeg, which would report a moved file as a non-zero
+        # exit code and get described as a damaged or silent video.
+        if not os.path.isfile(video_path):
+            raise RuntimeError(f"{stage_errors.VIDEO_FILE_MISSING}\n{video_path}")
+        lease = _output_lease(video_path, ctx, job_id=job_id, run_id=run_id or uuid.uuid4().hex)
+        run_id = lease.run_id
+        events.set_current_run(job_id, run_id)
+        video_duration_s = audio_module.probe_video_duration_s(
+            video_path,
+            cancel_event=cancel_event,
+        )
+        _log_stage(logger, "asr_stage_worker=unified_gpu_worker")
+        _log_stage(
+            logger,
+            f"skip_translation={effective_ctx.skip_translation}",
+        )
+        cuda_skip_reason = "asr_stage_worker_subprocess"
+        _log_stage(logger, "cuda_diagnostics=worker_process")
+        _record_pipeline_cuda_memory(
+            pipeline_cuda_memory,
+            "run_start",
+            logger=logger,
+            elapsed_s=time.perf_counter() - pipeline_started,
+            skip_reason=cuda_skip_reason,
+        )
+        if run_log_path is not None:
+            console.print(f"[dim]运行日志：{_project_relative(run_log_path)}[/dim]")
+
+        subtitle_options = _subtitle_options_for_ctx(effective_ctx)
+        _log_stage(
+            logger,
+            "subtitle_frame_gap_s="
+            f"{subtitle_options.frame_gap_s:.6f}",
+        )
+        if effective_ctx.job_temp_dir:
+            job_temp_dir = str(Path(effective_ctx.job_temp_dir).expanduser().resolve())
+        else:
+            job_temp_dir = _resolve_job_temp_dir(job_id)
+        cache_temp_dir = (
+            str((Path(job_temp_dir).parent / cache_job_id).resolve())
+            if cache_job_id != job_id
+            else job_temp_dir
+        )
+        os.makedirs(job_temp_dir, exist_ok=True)
+        _log_stage(logger, f"job_temp_dir={_project_relative(job_temp_dir)}")
+        if cache_job_id != job_id:
+            _log_stage(
+                logger,
+                "resume_from_job_id="
+                f"{cache_job_id} cache_temp_dir={_project_relative(cache_temp_dir)}",
+            )
+        aligned_cache_signature = _aligned_cache_signature_for_ctx(
+            effective_ctx,
+            backend_label=backend_label,
+            subtitle_options=subtitle_options
+        )
+        audio_dir = os.path.join(job_temp_dir, "audio")
+        os.makedirs(audio_dir, exist_ok=True)
+        audio_cache_key = audio_module.get_audio_cache_key(video_path)
+        audio_path = os.path.join(audio_dir, f"{video_name}.{audio_cache_key}.wav")
+        cache_audio_path = os.path.join(
+            cache_temp_dir,
+            "audio",
+            f"{video_name}.{audio_cache_key}.wav",
+        )
+        aligned_segments_path = os.path.join(
+            job_temp_dir, f"{video_filename}.aligned_segments.json"
+        )
+        cache_aligned_segments_path = os.path.join(
+            cache_temp_dir,
+            f"{video_filename}.aligned_segments.json",
+        )
+        aligned_cache = aligned_cache_module.try_load_aligned_segments(
+            cache_aligned_segments_path,
+            audio_cache_key,
+            backend_label,
+            aligned_cache_signature,
+        )
+        segments: list[dict] = []
+        asr_log: list[str] = []
+        asr_details: dict = {}
+
+        # 1. Extract audio (skipped if cached)
+        audio_prepare_started = time.perf_counter()
+        # Not os.path.exists: a wav that ffmpeg started and never finished is
+        # not a cache hit. Since 2026-09-05 extraction publishes atomically, so
+        # this only has to answer for files an older build left behind.
+        audio_cached = audio_module.audio_cache_is_usable(audio_path)
+        _log_stage(logger, "stage_start audio_prepare")
+        _raise_if_cancelled(cancel_event)
+        if aligned_cache is not None:
+            segments = aligned_cache["segments"]
+            asr_log = [str(item) for item in aligned_cache.get("asr_log", [])]
+            asr_details = dict(aligned_cache.get("asr_details", {}))
+            if cache_job_id != job_id:
+                audio_cached = audio_cached or _materialize_usable_audio(
+                    cache_audio_path,
+                    audio_path,
+                )
+                if not audio_cached:
+                    audio_module.extract_audio(
+                        video_path,
+                        audio_path,
+                        cancel_event=cancel_event,
+                    )
+                    audio_cached = False
+            else:
+                audio_cached = True
+            if cache_aligned_segments_path != aligned_segments_path:
+                _write_json(
+                    aligned_segments_path,
+                    _aligned_segments_payload(
+                        backend_label=backend_label,
+                        audio_path=audio_path,
+                        audio_cache_key=audio_cache_key,
+                        segments=segments,
+                        asr_details=asr_details,
+                        asr_log=asr_log,
+                        cache_signature=aligned_cache_signature,
+                        subtitle_options=subtitle_options,
+                        cache_stage="resume_materialized",
+                    ),
+                )
+            _log_stage(
+                logger,
+                "aligned_cache_hit source="
+                f"{_project_relative(cache_aligned_segments_path)} "
+                f"materialized={_project_relative(aligned_segments_path)}",
+            )
+            console.print(
+                f"[green]命中 aligned_segments cache，跳过音频提取与 ASR：{_project_relative(aligned_segments_path)}[/green]"
+            )
+        elif audio_module.audio_cache_is_usable(audio_path) or _materialize_usable_audio(
+            cache_audio_path,
+            audio_path,
+        ):
+            audio_cached = True
+            _log_stage(logger, f"audio_cache_hit path={_project_relative(audio_path)}")
+            console.print(f"[dim]跳过提取：使用已缓存音频 {_project_relative(audio_path)}[/dim]")
+        else:
+            _log_stage(
+                logger,
+                f"extract_audio_start output={_project_relative(audio_path)}",
+            )
+            with console.status("[cyan]提取音频中...[/cyan]"):
+                _raise_if_cancelled(cancel_event)
+                audio_module.extract_audio(
+                    video_path,
+                    audio_path,
+                    cancel_event=cancel_event,
+                )
+                _raise_if_cancelled(cancel_event)
+            _log_stage(logger, f"extract_audio_done output={_project_relative(audio_path)}")
+        pipeline_timings["audio_prepare_s"] = time.perf_counter() - audio_prepare_started
+        pipeline_timings["audio_extract_s"] = (
+            0.0 if audio_cached else pipeline_timings["audio_prepare_s"]
+        )
+        _log_stage(
+            logger,
+            f"stage_done audio_prepare elapsed={pipeline_timings['audio_prepare_s']:.2f}s cached={audio_cached}",
+        )
+        _record_pipeline_cuda_memory(
+            pipeline_cuda_memory,
+            "audio_prepare_done",
+            logger=logger,
+            elapsed_s=time.perf_counter() - pipeline_started,
+            skip_reason=cuda_skip_reason,
+        )
+
+        # 2. ASR text-only transcription, model unload, then Boundary subtitle timing.
+        device = "auto"
+        _log_stage(logger, f"device={device}")
+        _raise_if_cancelled(cancel_event)
+
+        if aligned_cache is None:
+            asr_start = time.time()
+            asr_pipeline_started = time.perf_counter()
+            _log_stage(logger, "stage_start asr_alignment")
+            asr_event_started: set[str] = set()
+            asr_event_done: set[str] = set()
+            asr_event_last: dict[str, dict] = {}
+
+            with Progress(
+                TextColumn("{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            ) as asr_progress:
+                asr_task_id = asr_progress.add_task(
+                    "[magenta]ASR 初始化中...[/magenta]", total=None
+                )
+                asr_state = {"label": None, "total": None}
+
+                def _on_stage(msg: str):
+                    _raise_if_cancelled(cancel_event)
+                    elapsed = time.time() - asr_start
+                    _log_stage(logger, f"asr_stage elapsed={elapsed:.1f}s message={msg}")
+                    if msg.startswith(stage_log_module.ASR_WORKER_DIAGNOSTIC_PREFIX):
+                        return
+                    is_heartbeat = msg.startswith(
+                        stage_log_module.ASR_STAGE_HEARTBEAT_PREFIX
+                    )
+                    parsed_event = None if is_heartbeat else _parse_asr_stage_event(msg)
+                    if parsed_event is not None:
+                        event_stage, event_extra = parsed_event
+                        event_extra["elapsed_s"] = round(elapsed, 1)
+                        asr_event_last[event_stage] = dict(event_extra)
+                        if event_stage not in asr_event_started:
+                            _emit_stage_event(
+                                video_path,
+                                event_stage,
+                                "start",
+                                event_extra,
+                            )
+                            asr_event_started.add(event_stage)
+                        _emit_stage_event(
+                            video_path,
+                            event_stage,
+                            "progress",
+                            event_extra,
+                        )
+                        if (
+                            int(event_extra.get("total") or 0) > 0
+                            and int(event_extra.get("current") or 0)
+                            >= int(event_extra["total"])
+                            and event_stage not in asr_event_done
+                        ):
+                            _emit_stage_event(
+                                video_path,
+                                event_stage,
+                                "done",
+                                event_extra,
+                            )
+                            asr_event_done.add(event_stage)
+                    match = None if is_heartbeat else _ASR_PROGRESS_RE.search(msg)
+                    if match:
+                        raw_label = match.group("label")
+                        label = _format_asr_stage_label(raw_label)
+                        current = int(match.group("current"))
+                        total = int(match.group("total"))
+                        description = (
+                            f"[magenta]{label}[/magenta] [dim]{elapsed:.0f}s[/dim]"
+                        )
+                        if asr_state["label"] != label or asr_state["total"] != total:
+                            asr_progress.reset(
+                                asr_task_id,
+                                total=total,
+                                completed=current,
+                                description=description,
+                            )
+                            asr_state["label"] = label
+                            asr_state["total"] = total
+                        else:
+                            asr_progress.update(
+                                asr_task_id,
+                                completed=current,
+                                total=total,
+                                description=description,
+                            )
+                        return
+
+                    asr_progress.update(
+                        asr_task_id,
+                        description=f"[magenta]{msg}[/magenta] [dim]{elapsed:.0f}s[/dim]",
+                    )
+
+                try:
+                    segments, asr_log, asr_details = (
+                        asr_stage_worker_module.transcribe_and_align(
+                            audio_path,
+                            device=device,
+                            env_overrides=_asr_stage_env_snapshot_for_ctx(
+                                effective_ctx
+                            ),
+                            job_id=job_id,
+                            run_id=run_id,
+                            on_stage=_on_stage,
+                            cancel_requested=lambda: _cancel_requested(cancel_event),
+                        )
+                    )
+                    device = str(asr_details.get("device") or device)
+                    _log_stage(logger, f"stage_worker_device={device}")
+                except Exception as exc:
+                    _log_stage(logger, f"stage_blocked asr_alignment error={exc!r}")
+                    if logger is not None:
+                        logger.exception("asr_alignment_failed")
+                    raise
+                _raise_if_cancelled(cancel_event)
+                for event_stage in tuple(asr_event_started):
+                    if event_stage in asr_event_started and event_stage not in asr_event_done:
+                        _emit_stage_event(
+                            video_path,
+                            event_stage,
+                            "done",
+                            asr_event_last.get(event_stage, {}),
+                        )
+                        asr_event_done.add(event_stage)
+                if asr_state["total"]:
+                    asr_progress.update(asr_task_id, completed=asr_state["total"])
+            pipeline_timings["asr_alignment_total_s"] = (
+                time.perf_counter() - asr_pipeline_started
+            )
+            _log_stage(
+                logger,
+                f"stage_done asr_alignment elapsed={pipeline_timings['asr_alignment_total_s']:.2f}s segments={len(segments)}",
+            )
+            _record_pipeline_cuda_memory(
+                pipeline_cuda_memory,
+                "asr_alignment_done",
+                logger=logger,
+                elapsed_s=time.perf_counter() - pipeline_started,
+                skip_reason=cuda_skip_reason,
+            )
+            _write_json(
+                aligned_segments_path,
+                _aligned_segments_payload(
+                    backend_label=backend_label,
+                    audio_path=audio_path,
+                    audio_cache_key=audio_cache_key,
+                    segments=segments,
+                    asr_details=asr_details,
+                    asr_log=asr_log,
+                    cache_signature=aligned_cache_signature,
+                    subtitle_options=subtitle_options,
+                    cache_stage="asr_alignment",
+                ),
+            )
+            _log_stage(
+                logger,
+                f"aligned_segments_written path={_project_relative(aligned_segments_path)}",
+            )
+        else:
+            pipeline_timings["asr_alignment_total_s"] = 0.0
+            _log_stage(logger, "stage_skip asr_alignment reason=aligned_cache")
+            _record_pipeline_cuda_memory(
+                pipeline_cuda_memory,
+                "asr_alignment_skipped",
+                logger=logger,
+                elapsed_s=time.perf_counter() - pipeline_started,
+                skip_reason=cuda_skip_reason,
+            )
+            if device == "auto":
+                device = str(asr_details.get("device") or "cache")
+
+    _raise_if_cancelled(cancel_event)
+    asr_details.setdefault("pipeline_cuda_memory", pipeline_cuda_memory)
+    console.print(f"[dim]ASR backend: {backend_label}[/dim]")
+    for line in asr_log:
+        console.print(f"[cyan]{line}[/cyan]")
+        _log_stage(logger, f"asr_log {line}")
+    console.print(f"[green]识别完成，共 {len(segments)} 个片段。[/green]")
+    _log_stage(logger, f"segments_count={len(segments)}")
+
+    # One statement of what this run is: whether it translates, how its output
+    # is spelled, and what each of its stages will take from the machine.
+    plan = ExecutionPlan.for_asr(effective_ctx).after_asr(segment_count=len(segments))
+    bilingual = plan.bilingual
+
+    output_dir = output_module.resolve_output_dir_for_ctx(
+        video_path,
+        effective_ctx,
+        project_root=PROJECT_ROOT,
+    )
+    srt_path = os.path.join(output_dir, plan.srt_filename(video_filename))
+    transcript_path = os.path.join(job_temp_dir, f"{video_filename}.transcript.json")
+    asr_manifest_path = os.path.join(job_temp_dir, f"{video_filename}.asr_manifest.json")
+    bilingual_json_path = os.path.join(
+        job_temp_dir, f"{video_filename}.bilingual.json"
+    )
+    timings_path = os.path.join(job_temp_dir, f"{video_filename}.timings.json")
+    translation_cache_path = effective_ctx.translation_cache_path.strip()
+    if not translation_cache_path:
+        translation_cache_path = os.path.join(job_temp_dir, "translation_cache.jsonl")
+    _log_stage(logger, f"output_dir={_project_relative(output_dir)}")
+    _log_stage(logger, f"srt_path={_project_relative(srt_path)}")
+    _log_stage(
+        logger,
+        f"translation_cache_path={_project_relative(translation_cache_path)}",
+    )
+    _raise_if_cancelled(cancel_event)
+
+    return AsrArtifacts(
+        segments=segments,
+        audio_path=audio_path,
+        job_temp_dir=job_temp_dir,
+        asr_details=asr_details,
+        aligned_segments_path=aligned_segments_path,
+        transcript_path=transcript_path,
+        asr_manifest_path=asr_manifest_path,
+        pipeline_timings=pipeline_timings,
+        logger=logger,
+        run_log_path=run_log_path,
+        audio_cache_key=audio_cache_key,
+        video_stem=video_filename,
+        output_dir=output_dir,
+        srt_path=srt_path,
+        bilingual_json_path=bilingual_json_path,
+        bilingual=bilingual,
+        timings_path=timings_path,
+        translation_cache_path=translation_cache_path,
+        asr_log=asr_log,
+        audio_cached=audio_cached,
+        device=device,
+        backend_label=backend_label,
+        video_duration_s=video_duration_s,
+        pipeline_started=pipeline_started,
+        job_id=job_id,
+        aligned_cache_signature=aligned_cache_signature,
+    )
+
+
+def _run_plan(artifacts: AsrArtifacts, ctx: JobContext) -> ExecutionPlan:
+    """What this run will do, decided before it starts doing it.
+
+    Built *before* the lease, because a lease is a wait: a Japanese-only run and
+    a run with nothing to translate would otherwise queue behind a local server
+    that is retiring, and fail on the timeout of a resource they never use.
+    """
+    return ExecutionPlan.for_run(ctx, has_segments=bool(artifacts.segments))
+
+
+def run_translation_and_write(
+    video_path: str,
+    artifacts: AsrArtifacts,
+    *,
+    ctx: JobContext,
+    job_id: str = "",
+    run_id: str = "",
+    cancel_event=None,
+) -> list[str]:
+    _reopen_snapshot_run_logger(artifacts)
+    prev_job_id = getattr(events._thread_local, "job_id", "")
+    prev_run_id = getattr(events._thread_local, "run_id", "")
+    prev_video = getattr(events._thread_local, "video", "")
+    effective_run_id = run_id
+    try:
+        _raise_if_cancelled(cancel_event)
+        job_id = sanitize_job_id(job_id or ctx.job_id or artifacts.job_id)
+        lease = _output_lease(video_path, ctx, job_id=job_id, run_id=run_id, target=artifacts.srt_path)
+        effective_run_id = lease.run_id
+        existing = artifact_store.resume_output(lease)
+        if existing is not None:
+            if artifacts.job_temp_dir:
+                _cleanup_pipeline_temp(
+                    artifacts.job_temp_dir, artifacts.audio_path, artifacts.translation_cache_path,
+                )
+            return artifact_store.manifest_paths(existing, project_root=PROJECT_ROOT)
+        plan = _run_plan(artifacts, ctx)
+        with ExitStack() as stack:
+            if plan.needs(TRANSLATION_BACKEND):
+                # A local model is task-scoped, not Web-session-scoped, but the
+                # instance is process-wide: closing it outright at the end of
+                # *this* task would pull the server out from under a parallel
+                # video still translating through it. The lease closes it when
+                # the last task lets go, which for a single job is the same
+                # moment as before, and it covers cancellation, translation
+                # failure, output-write failure, empty-ASR and retry alike.
+                #
+                # Resolved once, here: the settings panel may change while a job
+                # runs, and the lease has to name the instance this task will
+                # actually use. Leasing "llamacpp" unconditionally meant an API
+                # job could sit out a local server's retirement for a resource
+                # it was never going to touch.
+                backend_name = llm_backends.selected_backend_name()
+                stack.enter_context(
+                    llm_backends.backend_lease(backend_name, cancel_event)
+                )
+            return _run_translation_and_write_impl(
+                video_path,
+                artifacts,
+                ctx=ctx,
+                plan=plan,
+                job_id=job_id,
+                run_id=lease.run_id,
+                cancel_event=cancel_event,
+            )
+    except Exception as exc:
+        raw_logger = getattr(artifacts, "logger", None)
+        run_logger = (
+            raw_logger
+            if isinstance(raw_logger, logging.Logger)
+            else None
+        )
+        if isinstance(exc, (PipelineCancelledError, artifact_store.OutputsSupersededError)):
+            _log_stage(run_logger, "run_cancelled stage=translation_and_write")
+        else:
+            _log_stage(
+                run_logger,
+                f"run_failed stage=translation_and_write error={format_exception_chain(exc)!r}",
+            )
+            if run_logger is not None:
+                run_logger.exception("translation_and_write_failed")
+            _write_failure_timings_best_effort(
+                video_path=video_path,
+                artifacts=artifacts,
+                stage="translation_and_write",
+                exc=exc,
+                run_id=effective_run_id,
+            )
+        raise
+    finally:
+        events._thread_local.job_id = prev_job_id
+        events._thread_local.run_id = prev_run_id
+        events._thread_local.video = prev_video
+        _close_artifacts_logger(artifacts)
+
+
+def _run_translation_and_write_impl(
+    video_path: str,
+    artifacts: AsrArtifacts,
+    *,
+    ctx: JobContext,
+    plan: ExecutionPlan | None = None,
+    job_id: str = "",
+    run_id: str = "",
+    cancel_event=None,
+) -> list[str]:
+    output_paths: list[str] = []
+    events._thread_local.video = os.path.basename(video_path)
+    _raise_if_cancelled(cancel_event)
+
+    segments = artifacts.segments
+    audio_path = artifacts.audio_path
+    audio_cache_key = artifacts.audio_cache_key
+    audio_cached = artifacts.audio_cached
+    asr_details = artifacts.asr_details
+    asr_log = artifacts.asr_log
+    backend_label = artifacts.backend_label or asr_module.get_backend_label()
+    device = artifacts.device
+    job_id = sanitize_job_id(job_id or ctx.job_id or artifacts.job_id)
+    lease = _output_lease(video_path, ctx, job_id=job_id, run_id=run_id, target=artifacts.srt_path)
+    run_id = lease.run_id
+    if job_id:
+        events.set_current_run(job_id, run_id)
+    job_temp_dir = artifacts.job_temp_dir
+    os.makedirs(job_temp_dir, exist_ok=True)
+    pipeline_started = artifacts.pipeline_started
+    pipeline_timings = artifacts.pipeline_timings
+    video_filename = artifacts.video_stem
+    aligned_segments_path = artifacts.aligned_segments_path
+    logger = artifacts.logger
+    run_log_path = artifacts.run_log_path
+    srt_path = artifacts.srt_path
+    transcript_path = artifacts.transcript_path
+    asr_manifest_path = artifacts.asr_manifest_path
+    bilingual_json_path = artifacts.bilingual_json_path
+    timings_path = artifacts.timings_path
+    translation_cache_path = artifacts.translation_cache_path
+    bilingual = artifacts.bilingual
+    if plan is None:
+        plan = _run_plan(artifacts, ctx)
+    skip_translation = plan.subtitle_language == "ja"
+    subtitle_options = _subtitle_options_for_ctx(ctx)
+    aligned_cache_signature = artifacts.aligned_cache_signature
+    if aligned_cache_signature is None:
+        _, aligned_cache_signature = aligned_cache_expectations_for_ctx(
+            ctx,
+            backend_label=backend_label,
+        )
+    _raise_if_cancelled(cancel_event)
+
+    _write_json(
+        asr_manifest_path,
+        {
+            "backend": backend_label,
+            "audio_path": audio_path,
+            "job_id": job_id,
+            "job_temp_dir": job_temp_dir,
+            "manifest": build_asr_manifest(segments),
+        },
+    )
+    output_paths.append(asr_manifest_path)
+    artifacts.asr_manifest_path = asr_manifest_path
+    _raise_if_cancelled(cancel_event)
+
+    if segments:
+        asr_noise_items = asr_noise_module.find_asr_noise_segments(segments)
+        if asr_noise_items:
+            asr_details["asr_noise_diagnostics"] = {
+                "count": len(asr_noise_items),
+                "items": asr_noise_items,
+                "policy": "diagnostic_only",
+            }
+            _log_stage(
+                logger,
+                f"asr_noise_diagnostics count={len(asr_noise_items)} policy=diagnostic_only",
+            )
+            artifacts.asr_details = asr_details
+
+    if not segments:
+        _log_stage(logger, "stage_skip translation reason=no_segments")
+        pipeline_timings["translation_context_s"] = 0.0
+        pipeline_timings["translation_s"] = 0.0
+        write_started = time.perf_counter()
+        _log_stage(logger, "stage_start write_output")
+        _raise_if_cancelled(cancel_event)
+        outputs = _run_outputs(
+            ctx=ctx,
+            run_id=run_id,
+            job_id=job_id,
+            job_temp_dir=job_temp_dir,
+            video_stem=video_filename,
+        )
+        if bilingual:
+            srt_blocks = outputs.stage(
+                srt_path,
+                name="srt",
+                write=lambda staged: subtitle_module.write_bilingual_srt(
+                    [],
+                    str(staged),
+                    options=subtitle_options,
+                ),
+            )
+        else:
+            srt_blocks = outputs.stage(
+                srt_path,
+                name="srt",
+                write=lambda staged: subtitle_module.write_srt(
+                    [],
+                    str(staged),
+                    options=subtitle_options,
+                    language=plan.subtitle_language,
+                ),
+            )
+        outputs.stage_json(
+            transcript_path,
+            {
+                "backend": backend_label,
+                "audio_path": audio_path,
+                "chunks": asr_details.get("transcript_chunks", []),
+            },
+            name="transcript",
+        )
+        outputs.stage_json(
+            aligned_segments_path,
+            _aligned_segments_payload(
+                backend_label=backend_label,
+                audio_path=audio_path,
+                audio_cache_key=audio_cache_key,
+                segments=[],
+                asr_details=asr_details,
+                asr_log=asr_log,
+                cache_signature=aligned_cache_signature,
+                subtitle_options=subtitle_options,
+            ),
+            name="aligned_segments",
+        )
+        outputs.stage_json(
+            bilingual_json_path,
+            {
+                "blocks": srt_blocks,
+                "timeline_mode": subtitle_options.timeline_mode,
+            },
+            name="bilingual_json",
+        )
+        _raise_if_cancelled(cancel_event)
+        output_paths.extend(
+            [srt_path, transcript_path, aligned_segments_path, bilingual_json_path]
+        )
+        pipeline_timings["write_output_s"] = time.perf_counter() - write_started
+        pipeline_timings["pipeline_total_s"] = time.perf_counter() - pipeline_started
+        _log_stage(
+            logger,
+            f"stage_done write_output elapsed={pipeline_timings['write_output_s']:.2f}s",
+        )
+
+        _record_pipeline_cuda_memory(
+            asr_details.setdefault("pipeline_cuda_memory", []),
+            "write_output_done",
+            logger=logger,
+            elapsed_s=time.perf_counter() - pipeline_started,
+            skip_reason=_asr_details_cuda_skip_reason(asr_details),
+        )
+
+        _log_timing_snapshot(logger, pipeline_timings, asr_details)
+        timings_payload = {
+            "video_path": video_path,
+            "audio_path": audio_path,
+            "audio_cached": audio_cached,
+            "job_id": job_id,
+            "run_id": run_id,
+            "job_temp_dir": job_temp_dir,
+            "device": device,
+            "backend": backend_label,
+            "counts": {"segments": 0, "blocks": 0},
+            "stage_timings": pipeline_timings,
+            "asr_details": _compact_asr_details_for_sidecar(asr_details),
+            "translation_request_timings": [],
+            "outputs": {
+                "job_temp_dir": job_temp_dir,
+                "srt": srt_path,
+                "asr_manifest": asr_manifest_path,
+                "transcript_json": transcript_path,
+                "aligned_segments_json": aligned_segments_path,
+                "bilingual_json": bilingual_json_path,
+                **_diagnostic_output_paths(
+                    timings_path=timings_path,
+                    run_log_path=run_log_path,
+                ),
+            },
+            "asr_log": asr_log,
+        }
+        _write_timings_with_diagnostics(
+            timings_path=timings_path,
+            payload=timings_payload,
+            run_log_path=run_log_path,
+            output_paths=output_paths,
+            logger=logger,
+        )
+        _print_timing_summary(pipeline_timings, asr_details)
+        output_paths = _publish_outputs(
+            outputs, output_paths, artifacts, cancel_event, subtitle_cue_count=len(srt_blocks),
+        )
+        console.print(
+            f"\n[bold yellow]未识别到可翻译字幕。[/bold yellow] 已生成空文件：{_project_relative(srt_path)}"
+        )
+        _cleanup_pipeline_temp(job_temp_dir, audio_path, translation_cache_path)
+        return output_paths
+
+    if skip_translation:
+        console.print("[yellow]SKIP_TRANSLATION=1，跳过翻译并输出日文 SRT。[/yellow]")
+        _log_stage(logger, "stage_skip translation reason=SKIP_TRANSLATION")
+        pipeline_timings["translation_context_s"] = 0.0
+        pipeline_timings["translation_s"] = 0.0
+        translation_request_timings: list[dict] = []
+        cue_plan_started = time.perf_counter()
+        _log_stage(
+            logger,
+            f"stage_start subtitle_cue_plan segments={len(segments)}",
+        )
+        srt_blocks, cue_summary = _prepare_translation_cues(
+            segments,
+            subtitle_options=subtitle_options,
+            on_stage=lambda stage, current, total: _log_stage(
+                logger,
+                f"subtitle_cue_plan stage={stage} {current}/{total}",
+            ),
+            asr_details=asr_details,
+        )
+        pipeline_timings["subtitle_cue_plan_s"] = (
+            time.perf_counter() - cue_plan_started
+        )
+        _log_stage(
+            logger,
+            "stage_done subtitle_cue_plan "
+            f"elapsed={pipeline_timings['subtitle_cue_plan_s']:.2f}s "
+            f"cues={len(srt_blocks)}",
+        )
+        asr_details["subtitle_cue_plan"] = _subtitle_cue_plan_summary(
+            segments_before=len(segments),
+            mode="srt",
+            cue_summary=cue_summary,
+        )
+        _log_subtitle_cue_diagnostics(logger, cue_summary)
+
+        write_started = time.perf_counter()
+        _log_stage(logger, "stage_start write_output")
+        _raise_if_cancelled(cancel_event)
+        outputs = _run_outputs(
+            ctx=ctx,
+            run_id=run_id,
+            job_id=job_id,
+            job_temp_dir=job_temp_dir,
+            video_stem=video_filename,
+        )
+        # Japanese-only output: the cues carry Japanese in `zh_text`, so the
+        # writer has to be told which style guide applies.
+        srt_blocks = outputs.stage(
+            srt_path,
+            name="srt",
+            write=lambda staged: subtitle_module.write_srt(
+                srt_blocks,
+                str(staged),
+                options=subtitle_options,
+                language="ja",
+            ),
+        )
+        outputs.stage_json(
+            transcript_path,
+            {
+                "backend": backend_label,
+                "audio_path": audio_path,
+                "chunks": asr_details.get("transcript_chunks", []),
+            },
+            name="transcript",
+        )
+        outputs.stage_json(
+            aligned_segments_path,
+            _aligned_segments_payload(
+                backend_label=backend_label,
+                audio_path=audio_path,
+                audio_cache_key=audio_cache_key,
+                segments=segments,
+                asr_details=asr_details,
+                asr_log=asr_log,
+                cache_signature=aligned_cache_signature,
+                subtitle_options=subtitle_options,
+            ),
+            name="aligned_segments",
+        )
+        outputs.stage_json(
+            bilingual_json_path,
+            {
+                "backend": backend_label,
+                "timeline_mode": subtitle_options.timeline_mode,
+                "blocks": srt_blocks,
+                "translation_skipped": True,
+                "translation_request_timings": translation_request_timings,
+                "translation_api_retry_events": [],
+            },
+            name="bilingual_json",
+        )
+        _raise_if_cancelled(cancel_event)
+        output_paths.extend(
+            [srt_path, transcript_path, aligned_segments_path, bilingual_json_path]
+        )
+        pipeline_timings["write_output_s"] = time.perf_counter() - write_started
+        pipeline_timings["pipeline_total_s"] = time.perf_counter() - pipeline_started
+        _log_stage(
+            logger,
+            f"stage_done write_output elapsed={pipeline_timings['write_output_s']:.2f}s blocks={len(srt_blocks)}",
+        )
+
+        _record_pipeline_cuda_memory(
+            asr_details.setdefault("pipeline_cuda_memory", []),
+            "write_output_done",
+            logger=logger,
+            elapsed_s=time.perf_counter() - pipeline_started,
+            skip_reason=_asr_details_cuda_skip_reason(asr_details),
+        )
+
+        timings_payload = {
+            "video_path": video_path,
+            "audio_path": audio_path,
+            "audio_cached": audio_cached,
+            "job_id": job_id,
+            "run_id": run_id,
+            "job_temp_dir": job_temp_dir,
+            "device": device,
+            "backend": backend_label,
+            "counts": {
+                "transcript_chunks": len(asr_details.get("transcript_chunks", [])),
+                "segments": len(segments),
+                "translation_cues": len(srt_blocks),
+                "blocks": len(srt_blocks),
+            },
+            "stage_timings": pipeline_timings,
+            "asr_details": _compact_asr_details_for_sidecar(asr_details),
+            "translation_request_timings": translation_request_timings,
+            "translation_api_retry_events": [],
+            "translation_skipped": True,
+            "outputs": {
+                "job_temp_dir": job_temp_dir,
+                "srt": srt_path,
+                "asr_manifest": asr_manifest_path,
+                "transcript_json": transcript_path,
+                "aligned_segments_json": aligned_segments_path,
+                "bilingual_json": bilingual_json_path,
+                **_diagnostic_output_paths(
+                    timings_path=timings_path,
+                    run_log_path=run_log_path,
+                ),
+            },
+            "asr_log": asr_log,
+        }
+        _write_timings_with_diagnostics(
+            timings_path=timings_path,
+            payload=timings_payload,
+            run_log_path=run_log_path,
+            output_paths=output_paths,
+            logger=logger,
+        )
+        _log_timing_snapshot(logger, pipeline_timings, asr_details)
+        _log_stage(
+            logger,
+            f"run_done srt={_project_relative(srt_path)} timings={_project_relative(timings_path)}",
+        )
+        _print_timing_summary(pipeline_timings, asr_details)
+        output_paths = _publish_outputs(
+            outputs, output_paths, artifacts, cancel_event, subtitle_cue_count=len(srt_blocks),
+        )
+        console.print(f"\n[bold green]完成！[/bold green] 已保存至：{_project_relative(srt_path)}")
+        console.print(f"[dim]详细耗时：{_project_relative(timings_path)}[/dim]")
+        _cleanup_pipeline_temp(job_temp_dir, audio_path, translation_cache_path)
+        return output_paths
+
+    # 4. Global context for LLM
+    cue_plan_started = time.perf_counter()
+    _log_stage(
+        logger,
+        f"stage_start subtitle_cue_plan segments={len(segments)}",
+    )
+    translation_segments, cue_summary = _prepare_translation_cues(
+        segments,
+        subtitle_options=subtitle_options,
+        on_stage=lambda stage, current, total: _log_stage(
+            logger,
+            f"subtitle_cue_plan stage={stage} {current}/{total}",
+        ),
+        asr_details=asr_details,
+    )
+    pipeline_timings["subtitle_cue_plan_s"] = (
+        time.perf_counter() - cue_plan_started
+    )
+    _log_stage(
+        logger,
+        "stage_done subtitle_cue_plan "
+        f"elapsed={pipeline_timings['subtitle_cue_plan_s']:.2f}s "
+        f"cues={len(translation_segments)}",
+    )
+    asr_details["subtitle_cue_plan"] = _subtitle_cue_plan_summary(
+        segments_before=len(segments),
+        mode="bilingual" if bilingual else "srt",
+        cue_summary=cue_summary,
+    )
+    _log_subtitle_cue_diagnostics(logger, cue_summary)
+    _log_stage(
+        logger,
+        "subtitle_cue_plan "
+        f"segments_before={len(segments)} "
+        f"cues_before={cue_summary.get('cues_before', 0)} "
+        f"cues_after={len(translation_segments)} "
+        f"mode={'bilingual' if bilingual else 'srt'} "
+    )
+    artifacts.asr_details = asr_details
+    _raise_if_cancelled(cancel_event)
+
+    context_started = time.perf_counter()
+    _log_stage(logger, "stage_start translation_context")
+    _raise_if_cancelled(cancel_event)
+    global_context = translator_module.generate_global_context(translation_segments)
+    _raise_if_cancelled(cancel_event)
+    pipeline_timings["translation_context_s"] = time.perf_counter() - context_started
+    _log_stage(
+        logger,
+        f"stage_done translation_context elapsed={pipeline_timings['translation_context_s']:.2f}s chars={len(global_context)}",
+    )
+
+    # 5. Batch-concurrent translation with full-film context
+    translation_started = time.perf_counter()
+    _log_stage(logger, f"stage_start translation cues={len(translation_segments)}")
+    # The job runs with the settings it was queued (or retried) with, not with
+    # whatever the panel shows now. Record them, so "why is it still thinking?"
+    # is answerable from the log instead of by guessing.
+    _log_stage(
+        logger,
+        "translation_settings "
+        f"backend={llm_backends.selected_backend_name()} "
+        f"model={os.getenv('LLM_MODEL_NAME', '').strip() or '-'} "
+        f"reasoning_effort={ctx.llm_reasoning_effort} "
+        f"target_lang={ctx.target_lang} "
+        f"workers={ctx.translation_max_workers}",
+    )
+    _raise_if_cancelled(cancel_event)
+
+    with Progress(
+        TextColumn("{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task_id = progress.add_task("[yellow]翻译中...", total=len(translation_segments))
+        completed_segments = 0
+
+        def _on_translation_done(_timing: dict) -> None:
+            nonlocal completed_segments
+            _raise_if_cancelled(cancel_event)
+            completed_segments = min(
+                len(translation_segments),
+                completed_segments + int(_timing.get("segment_count", 0) or 0),
+            )
+            progress.update(task_id, completed=completed_segments)
+            _log_stage(logger, f"translation_batch_done timing={_timing}")
+
+        def _on_translation_progress(evt: dict) -> None:
+            _raise_if_cancelled(cancel_event)
+            _log_stage(logger, f"translation_progress {evt}")
+            _emit_stage_event(video_path, "translation", "progress", dict(evt))
+            phase = evt.get("phase")
+            if phase == "reset":
+                progress.reset(task_id, completed=0)
+                progress.update(
+                    task_id,
+                    description=f"[blue]翻译: 重试 #{int(evt.get('attempt', 0)) + 1} 思考中...",
+                )
+            elif phase == "thinking":
+                progress.update(
+                    task_id,
+                    description=f"[blue]翻译: 思考中 ({int(evt.get('reasoning_chars', 0))} chars)...",
+                )
+            elif phase == "translating":
+                progress.update(
+                    task_id,
+                    description="[yellow]翻译: 输出中",
+                    completed=int(evt.get("translated", 0)),
+                )
+            elif phase == "done":
+                progress.update(
+                    task_id,
+                    description="[green]翻译完成",
+                    completed=int(evt.get("expected", len(translation_segments))),
+                )
+
+        (
+            zh_texts,
+            translation_request_timings,
+            translation_api_retry_events,
+        ) = translator_module.translate_segments(
+            translation_segments,
+            global_context=global_context,
+            target_lang=ctx.target_lang,
+            glossary=ctx.translation_glossary,
+            character_reference="",
+            max_workers=ctx.translation_max_workers,
+            reasoning_effort=ctx.llm_reasoning_effort,
+            cache_path=translation_cache_path,
+            on_batch_done=_on_translation_done,
+            on_progress=_on_translation_progress,
+            cancel_event=cancel_event,
+        )
+        _raise_if_cancelled(cancel_event)
+
+    # Lines that finished but should get a human look (for now: passed only
+    # under the kana-free retry grammar). Carried per cue like postgate_flags.
+    translation_review_by_id = {
+        int(entry["id"]): {key: value for key, value in entry.items() if key != "id"}
+        for timing in translation_request_timings
+        for entry in (timing.get("translation_review") or [])
+        if isinstance(entry, dict) and isinstance(entry.get("id"), int)
+    }
+    srt_blocks = [
+        {
+            "start": seg["start"],
+            "end": seg["end"],
+            "zh_text": zh_text,
+            "ja_text": seg.get("ja_text") or seg.get("text", ""),
+            "words": list(seg.get("words") or []),
+            "cue_id": seg.get("cue_id"),
+            "source_segment_ids": list(seg.get("source_segment_ids") or []),
+            "acoustic_start": seg.get("acoustic_start", seg.get("start")),
+            "acoustic_end": seg.get("acoustic_end", seg.get("end")),
+            "acoustic_duration": seg.get("acoustic_duration"),
+            "display_start": seg.get("display_start", seg.get("start")),
+            "display_end": seg.get("display_end", seg.get("end")),
+            "display_duration": seg.get("display_duration"),
+            "raw_text": seg.get("raw_text", seg.get("ja_text") or seg.get("text", "")),
+            "display_decision": seg.get("display_decision", "keep"),
+            "raw_texts": list(seg.get("raw_texts") or []),
+            "primary_cut_candidates": list(seg.get("primary_cut_candidates") or []),
+            "weak_cut_candidates": list(seg.get("weak_cut_candidates") or []),
+            # Only on the cues that carry one, so the sidecar stays quiet and a
+            # grep for the key lands on exactly the flagged cues. The quality
+            # report says how many survived into the finished file; without this
+            # there is no way to go from that count to the lines themselves.
+            **(
+                {"postgate_flags": list(seg["postgate_flags"])}
+                if seg.get("postgate_flags")
+                else {}
+            ),
+            **(
+                {"translation_review": dict(translation_review_by_id[index])}
+                if index in translation_review_by_id
+                else {}
+            ),
+            **{
+                key: seg[key]
+                for key in (
+                    "subtitle_layout_split",
+                    "subtitle_layout_split_source",
+                    "subtitle_layout_split_skipped",
+                    "display_clamped_to_max",
+                    "proportional_fallback_used",
+                    "duration_violation",
+                    "source_char_count",
+                    "source_char_violation",
+                    "duration_soft_cap_violation",
+                    "exact_measured_timeline",
+                    # Kept but marked by the acoustic verdict: the cue a human
+                    # should listen to. Only present on marked cues.
+                    "vocalisation_verdict",
+                )
+                if key in seg
+            },
+        }
+        for index, (seg, zh_text) in enumerate(zip(translation_segments, zh_texts))
+    ]
+    pipeline_timings["translation_s"] = time.perf_counter() - translation_started
+    _log_stage(
+        logger,
+        f"stage_done translation elapsed={pipeline_timings['translation_s']:.2f}s blocks={len(srt_blocks)}",
+    )
+
+    # 6. Write SRT and detailed sidecar outputs
+    write_started = time.perf_counter()
+    _log_stage(logger, "stage_start write_output")
+    _raise_if_cancelled(cancel_event)
+    outputs = _run_outputs(
+        ctx=ctx,
+        run_id=run_id,
+        job_id=job_id,
+        job_temp_dir=job_temp_dir,
+        video_stem=video_filename,
+    )
+    if bilingual:
+        srt_blocks = outputs.stage(
+            srt_path,
+            name="srt",
+            write=lambda staged: subtitle_module.write_bilingual_srt(
+                srt_blocks,
+                str(staged),
+                options=subtitle_options,
+            ),
+        )
+    else:
+        srt_blocks = outputs.stage(
+            srt_path,
+            name="srt",
+            write=lambda staged: subtitle_module.write_srt(
+                srt_blocks,
+                str(staged),
+                options=subtitle_options,
+            ),
+        )
+
+    outputs.stage_json(
+        transcript_path,
+        {
+            "backend": backend_label,
+            "audio_path": audio_path,
+            "chunks": asr_details.get("transcript_chunks", []),
+        },
+        name="transcript",
+    )
+    outputs.stage_json(
+        aligned_segments_path,
+        _aligned_segments_payload(
+            backend_label=backend_label,
+            audio_path=audio_path,
+            audio_cache_key=audio_cache_key,
+            segments=segments,
+            asr_details=asr_details,
+            asr_log=asr_log,
+            cache_signature=aligned_cache_signature,
+            subtitle_options=subtitle_options,
+        ),
+        name="aligned_segments",
+    )
+    outputs.stage_json(
+        bilingual_json_path,
+        {
+            "backend": backend_label,
+            "timeline_mode": subtitle_options.timeline_mode,
+            "blocks": srt_blocks,
+            "translation_request_timings": translation_request_timings,
+            "translation_api_retry_events": translation_api_retry_events,
+        },
+        name="bilingual_json",
+    )
+    _raise_if_cancelled(cancel_event)
+    output_paths.extend(
+        [srt_path, transcript_path, aligned_segments_path, bilingual_json_path]
+    )
+    pipeline_timings["write_output_s"] = time.perf_counter() - write_started
+    pipeline_timings["pipeline_total_s"] = time.perf_counter() - pipeline_started
+    _log_stage(
+        logger,
+        f"stage_done write_output elapsed={pipeline_timings['write_output_s']:.2f}s",
+    )
+    _record_pipeline_cuda_memory(
+        asr_details.setdefault("pipeline_cuda_memory", []),
+        "write_output_done",
+        logger=logger,
+        elapsed_s=time.perf_counter() - pipeline_started,
+        skip_reason=_asr_details_cuda_skip_reason(asr_details),
+    )
+
+    timings_payload = {
+        "video_path": video_path,
+        "audio_path": audio_path,
+        "audio_cached": audio_cached,
+        "job_id": job_id,
+        "run_id": run_id,
+        "job_temp_dir": job_temp_dir,
+        "device": device,
+        "backend": backend_label,
+        "counts": {
+            "transcript_chunks": len(asr_details.get("transcript_chunks", [])),
+            "segments": len(segments),
+            "translation_cues": len(translation_segments),
+            "blocks": len(srt_blocks),
+        },
+        "stage_timings": pipeline_timings,
+        "asr_details": _compact_asr_details_for_sidecar(asr_details),
+        "translation_request_timings": translation_request_timings,
+        "translation_api_retry_events": translation_api_retry_events,
+        "outputs": {
+            "job_temp_dir": job_temp_dir,
+            "srt": srt_path,
+            "asr_manifest": asr_manifest_path,
+            "transcript_json": transcript_path,
+            "aligned_segments_json": aligned_segments_path,
+            "bilingual_json": bilingual_json_path,
+            **_diagnostic_output_paths(
+                timings_path=timings_path,
+                run_log_path=run_log_path,
+            ),
+        },
+        "asr_log": asr_log,
+    }
+    _write_timings_with_diagnostics(
+        timings_path=timings_path,
+        payload=timings_payload,
+        run_log_path=run_log_path,
+        output_paths=output_paths,
+        logger=logger,
+    )
+    _log_timing_snapshot(logger, pipeline_timings, asr_details)
+    _log_stage(
+        logger,
+        f"run_done srt={_project_relative(srt_path)} timings={_project_relative(timings_path)}",
+    )
+    _print_timing_summary(pipeline_timings, asr_details)
+    output_paths = _publish_outputs(
+        outputs, output_paths, artifacts, cancel_event, subtitle_cue_count=len(srt_blocks),
+    )
+    console.print(f"\n[bold green]完成！[/bold green] 已保存至：{_project_relative(srt_path)}")
+    console.print(f"[dim]详细耗时：{_project_relative(timings_path)}[/dim]")
+    _cleanup_pipeline_temp(job_temp_dir, audio_path, translation_cache_path)
+    return output_paths

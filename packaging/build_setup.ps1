@@ -1,0 +1,192 @@
+param(
+    [switch]$Clean,
+    [switch]$SkipArchive,
+    [switch]$BundleUv,
+    [string]$UvExe = "",
+    [string]$FfmpegExe = "",
+    [string]$FfprobeExe = "",
+    [string]$SpecPath = "packaging/jav-sub-setup.spec",
+    [string]$OutputDir = "dist/release-assets",
+    [string]$ArchiveName = "jav-sub-windows-x64.zip"
+)
+
+# Assemble the lightweight release: the entry-point executable, FFmpeg, and
+# the source it syncs against. Everything else - PyTorch, the ASR weights, the
+# CTC head - is fetched on the user's machine at first run, which is what takes
+# the release from ~6 GB to ~150 MB.
+#
+# The exe is jav-sub.exe, not jav-sub-setup.exe: installing is only what the
+# first run does, and it is the launcher every time after that.
+
+$ErrorActionPreference = "Stop"
+$env:PYTHONIOENCODING = "utf-8"
+$Root = Resolve-Path (Join-Path $PSScriptRoot "..")
+Set-Location $Root
+
+# Staged one level down so the in-zip folder can be named jav-sub without
+# colliding with the full bundle's onedir output at dist/jav-sub.
+$PayloadRoot = Join-Path $Root "dist/setup-payload"
+$Payload = Join-Path $PayloadRoot "jav-sub"
+# Not shared with the full bundle: both specs build a target named jav-sub, and
+# one PyInstaller cache for two different Analysis inputs is a stale-build trap.
+$WorkPath = Join-Path $Root "build/jav-sub-setup"
+
+function Move-BuildArtifactToRm {
+    param(
+        [string]$Path,
+        [string]$Label
+    )
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+    $Resolved = (Resolve-Path -LiteralPath $Path).Path
+    $RootPrefix = $Root.Path.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if (-not $Resolved.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Build artifacts must be inside the project directory."
+    }
+    $RmRoot = Join-Path $Root "dev/rm"
+    $Stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $ArchiveRoot = Join-Path $RmRoot "$($Stamp)_$Label-$([Guid]::NewGuid().ToString('N'))"
+    $Destination = [IO.Path]::GetFullPath((Join-Path $ArchiveRoot $Resolved.Substring($RootPrefix.Length)))
+    if (-not $Destination.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Build archive must be inside the project directory."
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
+    Move-Item -LiteralPath $Resolved -Destination $Destination
+    Write-Host "Moved old build artifact to $Destination"
+}
+
+function Resolve-Tool {
+    param(
+        [string]$Override,
+        [string]$Name,
+        [string]$Hint
+    )
+    if ($Override) {
+        return (Resolve-Path $Override).Path
+    }
+    $Found = Get-Command $Name -ErrorAction SilentlyContinue
+    if (-not $Found) {
+        throw "$Name not found. $Hint"
+    }
+    return $Found.Source
+}
+
+# uv is not bundled by default. It would add 50-80 MB to buy nothing: the
+# installer fetches it from PyPI, and the very next thing it does is install
+# dependencies from that same host, so a machine that cannot reach PyPI cannot
+# be installed on either way. -BundleUv is there for building a release for a
+# network where PyPI itself is unreachable and only the archive travels.
+$UvSource = ""
+if ($BundleUv) {
+    $UvSource = Resolve-Tool -Override $UvExe -Name "uv.exe" `
+        -Hint "Install uv or pass -UvExe with the full path."
+}
+
+# torchcodec loads the FFmpeg shared DLLs at import time and uv cannot install
+# them, so they have to travel with the release exactly as the full bundle
+# ships them.
+$FfmpegSource = Resolve-Tool -Override $FfmpegExe -Name "ffmpeg.exe" `
+    -Hint "Install Gyan.FFmpeg.Shared or pass -FfmpegExe."
+$FfprobeSource = Resolve-Tool -Override $FfprobeExe -Name "ffprobe.exe" `
+    -Hint "Install Gyan.FFmpeg.Shared or pass -FfprobeExe."
+$FfmpegDir = Split-Path -Parent $FfmpegSource
+foreach ($Pattern in @("avcodec-*.dll", "avformat-*.dll", "avutil-*.dll")) {
+    if (-not (Get-ChildItem -Path $FfmpegDir -Filter $Pattern -ErrorAction SilentlyContinue)) {
+        throw "FFmpeg Shared build required: $FfmpegDir has no $Pattern. Install Gyan.FFmpeg.Shared and remove the static-only Gyan.FFmpeg package."
+    }
+}
+
+if ($Clean) {
+    & uv run --no-sync python -m PyInstaller --noconfirm --clean --workpath $WorkPath $SpecPath
+} else {
+    & uv run --no-sync python -m PyInstaller --noconfirm --workpath $WorkPath $SpecPath
+}
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+$EntryExe = Join-Path $Root "dist/jav-sub.exe"
+if (-not (Test-Path $EntryExe)) {
+    throw "Build finished but the executable was not found: $EntryExe"
+}
+
+# Always assemble a fresh payload: a non-clean build must not ship obsolete
+# modules, FFmpeg DLLs, or a uv.exe from an earlier -BundleUv build.
+Move-BuildArtifactToRm $Payload "dist-jav-sub-setup-payload"
+New-Item -ItemType Directory -Force -Path $Payload | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $Payload "bin") | Out-Null
+
+Move-Item -LiteralPath $EntryExe -Destination (Join-Path $Payload "jav-sub.exe") -Force
+if ($UvSource) {
+    Copy-Item -LiteralPath $UvSource -Destination (Join-Path $Payload "uv.exe") -Force
+}
+
+Copy-Item -LiteralPath $FfmpegSource -Destination (Join-Path $Payload "bin") -Force
+Copy-Item -LiteralPath $FfprobeSource -Destination (Join-Path $Payload "bin") -Force
+Get-ChildItem -Path $FfmpegDir -Filter "*.dll" | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Payload "bin") -Force
+}
+
+# What uv syncs against, plus what launcher.py runs. Kept as plain source: the
+# installed .venv imports it directly, so there is nothing to compile.
+# uv.lock is required, not optional: without it every user resolves their own
+# dependency versions and a release stops being one artifact.
+foreach ($Item in @("launcher.py", "pyproject.toml", "uv.lock")) {
+    $Source = Join-Path $Root $Item
+    if (-not (Test-Path -LiteralPath $Source)) {
+        throw "Missing $Item. Run 'uv sync' in the repository root before building."
+    }
+    Copy-Item -LiteralPath $Source -Destination $Payload -Force
+}
+# Named in ASCII on purpose: Windows PowerShell 5.1 reads a BOM-less .ps1 as the
+# system code page, so a Chinese literal here would ship as a mojibake filename.
+Copy-Item -LiteralPath (Join-Path $Root "packaging/setup-readme.txt") `
+    -Destination (Join-Path $Payload "README.txt") -Force
+
+$SrcDestination = Join-Path $Payload "src"
+$SrcRoot = (Resolve-Path -LiteralPath (Join-Path $Root "src")).Path
+Get-ChildItem -LiteralPath $SrcRoot -File -Recurse -Force | Where-Object {
+    $_.FullName -notmatch '[\\/]__pycache__[\\/]' -and $_.Extension -notin @('.pyc', '.pyo')
+} | ForEach-Object {
+    $Relative = $_.FullName.Substring($SrcRoot.Length + 1)
+    $Destination = Join-Path $SrcDestination $Relative
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
+    Copy-Item -LiteralPath $_.FullName -Destination $Destination
+}
+
+# The file index lets the launcher move files an older release left behind, so
+# extracting this archive over an existing install is a complete upgrade. Written
+# before hashing, so the manifest covers it like any other payload file.
+& uv run --no-sync python "packaging/write_release_index.py" --payload $Payload
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+$SizeMb = [math]::Round(
+    ((Get-ChildItem -Path $Payload -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB), 1)
+Write-Host "Payload: $Payload ($SizeMb MB)"
+
+# Freeze and hash every file, including this setup build's plain Python source.
+# Models downloaded on the user's machine are outside this archive's inventory.
+$ManifestPath = Join-Path $OutputDir "setup-manifest.json"
+& uv run --no-sync python "packaging/record_release_manifest.py" `
+    --dist $Payload --output $ManifestPath --skip-models
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+if ($SkipArchive) {
+    Write-Host "DONE (archive skipped)"
+    exit 0
+}
+
+# zip rather than the .7z the full bundle uses: this archive is small enough
+# that the compression ratio does not matter, and Windows opens zip without
+# installing anything.
+& uv run --no-sync python "packaging/archive_release.py" `
+    --source $Payload --output $OutputDir --manifest $ManifestPath --name $ArchiveName
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+Write-Host "DONE: verified release generation saved under $OutputDir"
