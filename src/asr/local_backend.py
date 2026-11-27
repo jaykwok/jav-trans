@@ -651,7 +651,55 @@ class LocalAsrBackend:
                     }
                     for path in normalized_paths
                 ]
-            asr_results = future.result()
+            try:
+                asr_results = future.result()
+            except Exception as exc:
+                if is_fatal_cuda_error(exc):
+                    raise
+                detail = f"{type(exc).__name__}: {exc}"
+                if len(normalized_paths) > 1:
+                    logger.warning(
+                        "ASR batch transcribe failed on %d chunks (%s); retrying chunk-by-chunk",
+                        len(normalized_paths),
+                        detail,
+                        exc_info=True,
+                    )
+                    _notify(
+                        on_stage,
+                        f"[WARN] ASR 批次转写异常（{detail[:160]}），改为逐块隔离重试",
+                    )
+                    recovered: list[dict] = []
+                    for single_path in normalized_paths:
+                        recovered.extend(
+                            self.transcribe_texts([single_path], on_stage=on_stage)
+                        )
+                    return recovered
+                logger.warning(
+                    "ASR chunk transcribe failed for %s (%s); skipping chunk",
+                    Path(normalized_paths[0]).name,
+                    detail,
+                    exc_info=True,
+                )
+                _notify(
+                    on_stage,
+                    f"[WARN] ASR 单块转写异常，已跳过该块（未写入缓存）：{detail[:160]}",
+                )
+                dur = _get_wav_duration_or_zero(normalized_paths[0])
+                return [
+                    {
+                        "text": "",
+                        "raw_text": "",
+                        "duration": dur,
+                        "language": language_hint or "Japanese",
+                        "normalized_path": normalized_paths[0],
+                        "asr_generation": _qwen_generation_metadata(
+                            error_kind="chunk_error",
+                            error_detail=detail,
+                            duration_s=dur,
+                        ),
+                        "log": [f"[WARN] ASR chunk skipped after error: {detail}"],
+                    }
+                ]
 
             payloads: list[dict] = []
             for normalized_path, asr_result in zip(normalized_paths, asr_results):

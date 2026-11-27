@@ -79,6 +79,14 @@ def _is_quarantined_result(result: dict) -> bool:
     )
 
 
+def _is_failed_result(result: dict) -> bool:
+    """True for timed-out, quarantined, or error-skipped chunks that must not be cached."""
+    if _is_timed_out_result(result) or _is_quarantined_result(result):
+        return True
+    generation = result.get("asr_generation")
+    return isinstance(generation, dict) and bool(generation.get("error_kind"))
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -293,7 +301,7 @@ def store(
 ) -> None:
     if not result_cache_enabled():
         return
-    if _is_timed_out_result(text_result) or _is_quarantined_result(text_result):
+    if _is_failed_result(text_result):
         return
     try:
         resolved_signature = signature if signature is not None else model_signature()

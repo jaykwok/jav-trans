@@ -745,6 +745,11 @@ def _chat_responses(
                 _redact_exception_in_place(exc)
                 if reason is not None:
                     raise reason from exc
+                if _is_retryable_api_error(exc):
+                    raise RetryableTranslationFormatError(
+                        "OpenAI Responses API transient request error: "
+                        f"{type(exc).__name__}: {_sanitize_error_text(str(exc))}"
+                    ) from exc
                 raise
 
             try:

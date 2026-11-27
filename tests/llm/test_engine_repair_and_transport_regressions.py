@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -242,7 +243,7 @@ def _repair_session(**overrides) -> TranslationSession:
     return TranslationSession(**fields)
 
 
-def test_repair_applies_zh_variant_and_preserves_echo_detection(monkeypatch):
+def test_repair_applies_zh_variant_and_preserves_echo_detection(monkeypatch, caplog):
     monkeypatch.setattr(llm_settings, "TRANSLATION_REPAIR_MAX_IDS", 100)
     monkeypatch.setattr(llm_settings, "TRANSLATION_BATCH_MAX_REQUESTS", 20)
     # Stub converter: turns 繁->简 (and simulates OpenCC converting 発->发 on echo!)
@@ -271,20 +272,34 @@ def test_repair_applies_zh_variant_and_preserves_echo_detection(monkeypatch):
         )
 
     persisted: list[tuple[list[str], set[int]]] = []
-    with pytest.raises(RuntimeError, match="still echoes the Japanese source"):
-        repair.apply_repair_pass(
+    with caplog.at_level(logging.WARNING, logger="llm.repair"):
+        repaired, timing = repair.apply_repair_pass(
             segments,
             originals,
             chat=_chat,
             session=_repair_session(batch_size=2),
-            cache_writer=lambda texts, ids: persisted.append((list(texts), set(ids))),
+            # Store the passed list reference directly to also verify blanking
+            # never mutates the cached batch snapshot in place.
+            cache_writer=lambda texts, ids: persisted.append((texts, set(ids))),
         )
 
-    # P0-5a: Already-repaired cue 0 was converted to Simplified Chinese AND persisted BEFORE raising!
+    # Already-repaired cue 0 was converted to Simplified Chinese AND persisted
+    # BEFORE blanking lingering echo cue 1 so cache stays valid.
     assert len(persisted) == 1
     saved_texts, saved_ids = persisted[0]
-    assert saved_texts[0] == "今天天气真好。"
+    assert saved_texts == ["今天天气真好。", "大きな発見があった。"]
     assert saved_ids == {0}
+    # Returned output blanks lingering echo cue 1 and logs a warning instead of raising.
+    assert repaired == ["今天天气真好。", ""]
+    assert timing is not None
+    assert timing["mode"] == "translation_repair_pass"
+    assert timing["lingering_echo_count"] == 1
+    assert timing["lingering_echo_ids"] == [1]
+    assert timing["blanked_echo_count"] == 1
+    assert timing["blanked_echo_ids"] == [1]
+    assert timing["lingering_kana_count"] == 0
+    assert timing["lingering_kana_ids"] == []
+    assert any("still echoes the Japanese source" in rec.message for rec in caplog.records)
 
 
 def test_repair_single_missing_cue_does_not_recurse_infinitely(monkeypatch):

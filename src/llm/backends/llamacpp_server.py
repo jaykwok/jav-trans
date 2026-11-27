@@ -1375,6 +1375,18 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             self._mark_draining_and_retiring(proc)
             if isinstance(exc, Exception):
                 error_chain = format_exception_chain(exc)
+                if transport_util._is_retryable_api_error(exc):
+                    logger.warning(
+                        "llama-server transient request error while process alive pid=%s port=%s error=%s log=%s",
+                        pid,
+                        port,
+                        error_chain,
+                        log_ref,
+                    )
+                    raise RetryableTranslationFormatError(
+                        f"本地翻译服务 llama-server（pid={pid}, port={port}）请求失败："
+                        f"{error_chain}；请查看日志 {log_ref} 后重试。"
+                    ) from exc
                 logger.error(
                     "llama-server request failed while process alive pid=%s port=%s error=%s log=%s",
                     pid,
@@ -1535,7 +1547,7 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             self._emit_usage(on_usage, usage_dict)
         choices = getattr(response, "choices", None) or []
         if not choices:
-            raise RuntimeError("llama-server 返回了空的 choices")
+            raise RetryableTranslationFormatError("llama-server 返回了空的 choices")
         if getattr(choices[0], "finish_reason", None) == "length":
             raise ResponseTruncatedError("llama-server exhausted the output token budget", limit=max_tokens)
         content = str(choices[0].message.content or "")

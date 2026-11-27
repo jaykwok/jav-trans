@@ -13,6 +13,7 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -27,6 +28,7 @@ from llm import zh_variant
 from llm.context import SourceContext, split_batches
 from llm.errors import (
     ContentPolicyRefusalError,
+    ResponseTruncatedError,
     RetryableTranslationFormatError,
     TranslationCancelledError,
 )
@@ -36,6 +38,12 @@ logger = logging.getLogger(__name__)
 _cancel_requested = transport_util._cancel_requested
 _raise_if_cancelled = transport_util._raise_if_cancelled
 _emit_progress = transport_util._emit_progress
+_CONTEXT_LIMIT_ERROR_RE = re.compile(
+    r"(?:exceed_context_size|exceeds?\s+(?:the\s+)?(?:available\s+)?context|"
+    r"context\s+size|n_ctx|prompt\s+is\s+too\s+long|input\s+is\s+too\s+long|"
+    r"request\s+exceeds)",
+    re.IGNORECASE,
+)
 
 
 def _split_into_batches(
@@ -390,6 +398,7 @@ class _BatchRunState:
         self.timings_by_batch: dict[int, dict] = {}
         self.review_lock = threading.Lock()
         self.review_by_index: dict[int, dict] = {}
+        self.blanked_empty_ids: set[int] = set()
         self.pending_by_index: dict[int, list[dict]] = {}
         self.worker_retry_events: list[dict] = []
         self.warmup_timing: dict | None = None
@@ -408,7 +417,12 @@ class _BatchRunState:
             _emit_progress(self.on_progress, payload)
 
     def profile_context(
-        self, *, batch_index: int = 0, warmup: bool = False
+        self,
+        *,
+        batch_index: int = 0,
+        warmup: bool = False,
+        focus_radius: int | None = None,
+        focus_context_chars: int | None = None,
     ) -> ProfileContext:
         return ProfileContext(
             target_lang=self.target_lang,
@@ -424,8 +438,12 @@ class _BatchRunState:
             batch_index=batch_index,
             warmup=warmup,
             source_context=self.source_context,
-            focus_radius=self.focus_radius,
-            focus_context_chars=self.focus_context_chars,
+            focus_radius=self.focus_radius if focus_radius is None else focus_radius,
+            focus_context_chars=(
+                self.focus_context_chars
+                if focus_context_chars is None
+                else focus_context_chars
+            ),
         )
 
     def to_variant(self, text: str) -> str:
@@ -466,6 +484,10 @@ class _BatchRunState:
         with self.review_lock:
             self.review_by_index[index] = entry
 
+    def record_blanked_empty(self, index: int) -> None:
+        with self.review_lock:
+            self.blanked_empty_ids.add(index)
+
     def batch_review(self, start: int, count: int) -> list[dict]:
         with self.review_lock:
             return [
@@ -496,6 +518,10 @@ class _BatchRunState:
                 for offset in range(len(segments))
                 if (start_index + offset) in self.review_by_index
             }
+            has_blanked_empty = any(
+                (start_index + offset) in self.blanked_empty_ids
+                for offset in range(len(segments))
+            )
         for offset in range(len(segments)):
             global_index = start_index + offset
             text = batch_results[global_index] or self.zh_texts[global_index] or ""
@@ -517,17 +543,18 @@ class _BatchRunState:
         if not self.cache_path:
             return
         batch_key = self.batch_key_for(batch_index, segments)
-        batch_review = [
-            {"offset": idx - start_index, **entry}
-            for idx, entry in sorted(review_snapshot.items())
-        ]
-        translation_cache._save_cache_entry(
-            self.cache_path,
-            batch_key,
-            local_texts,
-            self.cache_lock,
-            review=batch_review,
-        )
+        if not has_blanked_empty:
+            batch_review = [
+                {"offset": idx - start_index, **entry}
+                for idx, entry in sorted(review_snapshot.items())
+            ]
+            translation_cache._save_cache_entry(
+                self.cache_path,
+                batch_key,
+                local_texts,
+                self.cache_lock,
+                review=batch_review,
+            )
         if memory_entries:
             translation_cache._save_memory_entries(
                 self.cache_path,
@@ -535,7 +562,8 @@ class _BatchRunState:
                 self.cache_lock,
                 reviews=memory_review,
             )
-        print(f"[translation-cache] saved batch {batch_index} cache_key={batch_key}")
+        if not has_blanked_empty:
+            print(f"[translation-cache] saved batch {batch_index} cache_key={batch_key}")
 
 
 def _preload_cached_batches(
@@ -847,8 +875,12 @@ def _execute_single_batch(
 
     attempts_for_pending = 0
     retry_limit_for_pending = state.api_retries
-    last_retry_error: RetryableTranslationFormatError | None = None
+    last_retry_error: Exception | None = None
     request_span_limit = max(1, len(expected_ids))
+    effective_focus_radius = state.focus_radius
+    effective_focus_context_chars = state.focus_context_chars
+    blanked_empty_ids: list[int] = []
+    single_cue_parsed_empty_count = 0
     output_grammar: str | None = None
     constrained_after = ""
 
@@ -869,23 +901,46 @@ def _execute_single_batch(
                 }
             )
 
-    def narrow_request_span() -> None:
-        nonlocal request_span_limit
-        if request_span_limit <= 1:
-            return
-        previous = request_span_limit
-        request_span_limit = max(1, request_span_limit // 2)
-        state.emit_diagnostic(
-            {
-                "phase": "batch_span_narrowed",
-                **trace_base,
-                "from_span": previous,
-                "to_span": request_span_limit,
-                "pending_count": len(pending_ids),
-                "request_index": request_count,
-                "error": str(last_retry_error)[:300],
-            }
+    def narrow_request_span(
+        current_request_len: int | None = None,
+        *,
+        shrink_context: bool = False,
+    ) -> bool:
+        nonlocal request_span_limit, effective_focus_radius, effective_focus_context_chars
+        shrank = False
+        effective_current = (
+            min(request_span_limit, current_request_len)
+            if current_request_len is not None and current_request_len > 0
+            else request_span_limit
         )
+        if effective_current > 1:
+            previous = effective_current
+            request_span_limit = max(1, effective_current // 2)
+            shrank = True
+            state.emit_diagnostic(
+                {
+                    "phase": "batch_span_narrowed",
+                    **trace_base,
+                    "from_span": previous,
+                    "to_span": request_span_limit,
+                    "pending_count": len(pending_ids),
+                    "request_index": request_count,
+                    "error": str(last_retry_error)[:300],
+                }
+            )
+        else:
+            request_span_limit = 1
+        if shrink_context and (
+            effective_focus_context_chars > 0 or effective_focus_radius > 0
+        ):
+            if request_span_limit <= 1 or effective_focus_context_chars <= 250:
+                effective_focus_context_chars = 0
+                effective_focus_radius = 0
+            else:
+                effective_focus_context_chars = effective_focus_context_chars // 2
+                effective_focus_radius = max(1, effective_focus_radius // 2)
+            shrank = True
+        return shrank
 
     while True:
         _raise_if_cancelled(state.worker_cancel)
@@ -920,7 +975,11 @@ def _execute_single_batch(
                 request_messages = state.profile.build_messages(
                     request_segments,
                     ids=requested_ids,
-                    ctx=state.profile_context(batch_index=batch_index),
+                    ctx=state.profile_context(
+                        batch_index=batch_index,
+                        focus_radius=effective_focus_radius,
+                        focus_context_chars=effective_focus_context_chars,
+                    ),
                 )
             request_expected_count = len(request_segments)
             request_count += 1
@@ -990,18 +1049,44 @@ def _execute_single_batch(
                 # to the remaining ids without artificial backoff or retry logs.
                 attempts_for_pending = 0
                 retry_limit_for_pending = state.batch_repair_retries
+                single_cue_parsed_empty_count = 0
                 continue
             attempts_for_pending += 1
-            narrow_request_span()
+            if len(requested_ids) == 1:
+                single_cue_parsed_empty_count += 1
+            else:
+                shrank = narrow_request_span(len(requested_ids), shrink_context=False)
+                if shrank and attempts_for_pending >= retry_limit_for_pending:
+                    retry_limit_for_pending = max(
+                        retry_limit_for_pending, attempts_for_pending + 1
+                    )
         except ContentPolicyRefusalError as refusal:
             raise ContentPolicyRefusalError(
                 f"{refusal} (batch={batch_index}, start_index={start_index}, "
                 f"size={expected_count}, requested_ids={requested_ids[:50]})"
             ) from refusal
+        except ResponseTruncatedError as exc:
+            last_retry_error = exc
+            shrank = narrow_request_span(len(requested_ids), shrink_context=True)
+            if not shrank:
+                raise
+            attempts_for_pending += 1
+            # Let truncation descent halve down to span=1 + zero neighbour context
+            # (still strictly bounded by batch_max_requests).
+            retry_limit_for_pending = max(
+                retry_limit_for_pending, attempts_for_pending + 1
+            )
         except RetryableTranslationFormatError as exc:
             last_retry_error = exc
+            is_ctx_err = bool(_CONTEXT_LIMIT_ERROR_RE.search(str(exc)))
+            shrank = narrow_request_span(len(requested_ids), shrink_context=True)
             attempts_for_pending += 1
-            narrow_request_span()
+            if is_ctx_err and shrank:
+                # Let context-overflow descent reach span=1 + zero neighbour
+                # context (still strictly bounded by batch_max_requests).
+                retry_limit_for_pending = max(
+                    retry_limit_for_pending, attempts_for_pending + 1
+                )
             constrain_output(exc)
 
         if attempts_for_pending < retry_limit_for_pending:
@@ -1011,6 +1096,34 @@ def _execute_single_batch(
                 last_retry_error,
                 cancel_event=state.worker_cancel,
             )
+            continue
+
+        if len(requested_ids) == 1 and single_cue_parsed_empty_count > 0:
+            # Valid structured JSON was returned for this single cue on every
+            # retry, but its translation stayed empty (typically untranslatable
+            # vocalisation/onomatopoeia fragments). Blank it with a warning
+            # instead of throwing away the whole batch and film; the repair pass
+            # still gets one more chance to fill it before SRT export skips it.
+            empty_idx = requested_ids[0]
+            logger.warning(
+                "Translation batch %d cue %d returned empty translation after %d "
+                "parsed attempts; blanking cue instead of aborting the run",
+                batch_index,
+                empty_idx,
+                single_cue_parsed_empty_count,
+            )
+            batch_results[empty_idx] = ""
+            blanked_empty_ids.append(empty_idx)
+            state.record_blanked_empty(empty_idx)
+            missing_indexes = [
+                index for index in all_batch_ids if batch_results[index] is None
+            ]
+            if not missing_indexes:
+                break
+            pending_ids = list(missing_indexes)
+            attempts_for_pending = 0
+            retry_limit_for_pending = state.batch_repair_retries
+            single_cue_parsed_empty_count = 0
             continue
 
         raise RuntimeError(
@@ -1061,6 +1174,8 @@ def _execute_single_batch(
         **transport_util._merge_usage_metrics(request_usages),
         "missing_count": len(missing_indexes),
         "missing_indexes": missing_indexes,
+        "empty_translation_count": len(blanked_empty_ids),
+        "empty_translation_ids": blanked_empty_ids,
         "translation_memory_hit_count": expected_count - len(expected_ids),
         "cache_hit_type": "mixed" if len(expected_ids) < expected_count else "miss",
         **state.review_field(all_batch_ids),
@@ -1329,7 +1444,9 @@ def run_batched(
 
     _raise_if_cancelled(cancel_event)
     missing = [
-        idx for idx, value in enumerate(state.zh_texts) if value is None or value == ""
+        idx
+        for idx, value in enumerate(state.zh_texts)
+        if value is None or (value == "" and idx not in state.blanked_empty_ids)
     ]
     if missing:
         raise RuntimeError(

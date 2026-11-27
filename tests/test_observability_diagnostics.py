@@ -1031,8 +1031,9 @@ def test_completed_task_raising_timeout_error_does_not_poison_zombie_state(monke
     assert backend._zombie_executor is None
     assert backend.model is None
 
-    # 2. In transcribe_texts, a task-raised TimeoutError propagates cleanly and does not
-    #    block the next batch from calling _transcribe_native again.
+    # 2. In transcribe_texts, a task-raised TimeoutError is isolated as a chunk_error
+    #    (never registered as a zombie timeout) and does not block the next batch from
+    #    calling _transcribe_native again.
     wav = tmp_path / "c.wav"
     wav.write_bytes(b"RIFF")
     calls = 0
@@ -1050,8 +1051,10 @@ def test_completed_task_raising_timeout_error_does_not_poison_zombie_state(monke
     monkeypatch.setattr(backend2, "_transcribe_native", _native)
     monkeypatch.setattr(local_backend, "_get_wav_duration", lambda _p: 1.0)
 
-    with pytest.raises(TimeoutError, match="task internal timeout"):
-        backend2.transcribe_texts([str(wav)])
+    first = backend2.transcribe_texts([str(wav)])
+    assert first[0]["text"] == ""
+    assert first[0]["asr_generation"]["error_kind"] == "chunk_error"
+    assert "task internal timeout" in first[0]["asr_generation"]["error_detail"]
     assert backend2._zombie_future is None
 
     second = backend2.transcribe_texts([str(wav)])

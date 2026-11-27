@@ -1,20 +1,17 @@
 """What the repair pass returns when it only partly succeeded.
 
-Returning the Japanese source as the translation is the 10.1% untranslated-film
-regression, so the pass ends on a gate that refuses to hand back a lingering
-source echo. That gate was applied to the repaired array while the failure path
-returned the *original* one - two different arrays, so the check proved nothing
-about the value the caller got. A first request that fixed an echo, followed by
-any later request-level failure, put that echo straight back and threw away a
-repair that had already been generated and billed.
-
-Verification, return value and cache are one array now, and ids the detectors
-still flag are reported rather than hidden behind a rollback.
+Verification, return value and cache stay on one array so a repair that
+succeeded before a later request failure is never rolled back. Lingering source
+echoes and residual Japanese kana are reported via warnings and timing
+diagnostics instead of failing the run: clean repairs blank lingering full-cue
+echoes so SRT export skips untranslatable fragments, while request-level repair
+failures and partial residual kana preserve the existing text without fallback.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -180,11 +177,119 @@ class TestATerminalErrorIsNotARepairFailure:
         assert written and written[0][0] == _FIXED_FIRST
 
 
-def test_a_lingering_echo_still_fails_the_run_loudly():
-    # The other half of the contract: the gate is outside the handler on
-    # purpose, so a provider error cannot be a way past it.
+def test_lingering_echo_after_request_failure_warns_and_preserves_text(caplog):
     def chat(*_args, **_kwargs):
         raise RuntimeError("synthetic transport failure")
 
-    with pytest.raises(RuntimeError, match="still echoes the Japanese source"):
-        _run(chat, _ORIGINAL)
+    events: list[dict] = []
+    with caplog.at_level(logging.WARNING, logger="llm.repair"):
+        result, timing = repair.apply_repair_pass(
+            list(_SEGMENTS),
+            list(_ORIGINAL),
+            chat=chat,
+            session=_session(),
+            on_progress=events.append,
+        )
+
+    # Request failure must not raise on lingering echoes and must not blank text.
+    assert result == _ORIGINAL
+    assert timing is not None
+    assert timing["mode"] == "translation_repair_failed"
+    assert timing["missing_indexes"] == [0, 1]
+    assert timing["lingering_echo_count"] == 1
+    assert timing["lingering_echo_ids"] == [0]
+    assert timing["blanked_echo_count"] == 0
+    assert timing["blanked_echo_ids"] == []
+    assert timing["lingering_kana_count"] == 1
+    assert timing["lingering_kana_ids"] == [1]
+    assert any("still echoes the Japanese source" in rec.message for rec in caplog.records)
+    assert any("still contains Japanese kana" in rec.message for rec in caplog.records)
+    failed_events = [evt for evt in events if evt.get("phase") == "repair_failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0]["lingering_echo_count"] == 1
+    assert failed_events[0]["lingering_kana_count"] == 1
+
+
+def test_lingering_echo_after_clean_repair_warns_and_blanks_without_threshold(caplog):
+    segments = [
+        {"text": "んっ、あっ、あーっ...", "start": 0, "end": 2},
+        {"text": "はぁ、あんっ、あんっ...", "start": 2, "end": 4},
+    ]
+    originals = [seg["text"] for seg in segments]
+
+    def always_echo(*_args, **_kwargs):
+        return json.dumps(
+            {
+                "translations": [
+                    {"id": idx, "text": seg["text"]}
+                    for idx, seg in enumerate(segments)
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    events: list[dict] = []
+    with caplog.at_level(logging.WARNING, logger="llm.repair"):
+        result, timing = repair.apply_repair_pass(
+            segments,
+            originals,
+            chat=always_echo,
+            session=_session(batch_size=2),
+            on_progress=events.append,
+        )
+
+    # Even when 100% of cues still echo after clean repair, warn and blank
+    # instead of raising a threshold-gated RuntimeError.
+    assert result == ["", ""]
+    assert timing is not None
+    assert timing["mode"] == "translation_repair_pass"
+    assert timing["lingering_echo_count"] == 2
+    assert timing["lingering_echo_ids"] == [0, 1]
+    assert timing["blanked_echo_count"] == 2
+    assert timing["blanked_echo_ids"] == [0, 1]
+    assert timing["lingering_kana_count"] == 0
+    assert timing["lingering_kana_ids"] == []
+    assert any(
+        "still echoes the Japanese source" in rec.message and "blanking" in rec.message
+        for rec in caplog.records
+    )
+    done_events = [evt for evt in events if evt.get("phase") == "repair_done"]
+    assert len(done_events) == 1
+    assert done_events[0]["lingering_echo_count"] == 2
+    assert done_events[0]["blanked_echo_count"] == 2
+    assert done_events[0]["lingering_kana_count"] == 0
+
+
+def test_lingering_partial_kana_warns_and_preserves_text_without_fallback(caplog):
+    segments = [{"text": "明日は公園に行きます。", "start": 0, "end": 2}]
+    originals = ["明天去公园です。"]
+
+    def keep_kana(*_args, **_kwargs):
+        return json.dumps(
+            {"translations": [{"id": 0, "text": "明天去公园です。"}]},
+            ensure_ascii=False,
+        )
+
+    events: list[dict] = []
+    with caplog.at_level(logging.WARNING, logger="llm.repair"):
+        result, timing = repair.apply_repair_pass(
+            segments,
+            originals,
+            chat=keep_kana,
+            session=_session(batch_size=1),
+            on_progress=events.append,
+        )
+
+    assert result == originals
+    assert timing is not None
+    assert timing["mode"] == "translation_repair_pass"
+    assert timing["lingering_echo_count"] == 0
+    assert timing["lingering_echo_ids"] == []
+    assert timing["blanked_echo_count"] == 0
+    assert timing["blanked_echo_ids"] == []
+    assert timing["lingering_kana_count"] == 1
+    assert timing["lingering_kana_ids"] == [0]
+    assert any("still contains Japanese kana" in rec.message for rec in caplog.records)
+    done_events = [evt for evt in events if evt.get("phase") == "repair_done"]
+    assert len(done_events) == 1
+    assert done_events[0]["lingering_kana_count"] == 1

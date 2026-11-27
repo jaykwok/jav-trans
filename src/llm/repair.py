@@ -316,6 +316,16 @@ def apply_repair_pass(
             )
         ]
 
+    def lingering_kana(exclude: set[int]) -> list[int]:
+        return [
+            idx
+            for idx in range(len(segments))
+            if idx not in exclude
+            and _has_remaining_japanese_kana(
+                _repair_translation_text(segments[idx], repaired_texts, idx)
+            )
+        ]
+
     def recheck(candidates: list[int]) -> list[int]:
         """Ids the detector suite still flags after a repair attempt.
 
@@ -451,37 +461,43 @@ def apply_repair_pass(
             exc_info=True,
         )
 
-    # Outside the handler on purpose: a provider error must not be able to skip
-    # this gate. Returning the Japanese source as the translation is the known
-    # 10.1% untranslated-film regression, and the caller caches what it gets
-    # back, so it is worth failing the run over. Residual kana and glossary flags
-    # stay diagnostics - they are just as often proper names or deliberate
-    # subtitle compression.
+    # Lingering echoes and residual kana are reported as warnings rather than
+    # failing the whole run. When repair completed cleanly, full source echoes
+    # (typically untranslatable vocalisation/onomatopoeia fragments) are blanked
+    # so SRT export skips them instead of emitting raw Japanese; when repair
+    # hit a request error, existing texts are kept untouched. Partial residual
+    # kana is always kept as-is with a warning (no fallback/blanking).
     final_echoes = lingering_echoes()
-    if final_echoes:
-        persist_repairs(repaired_texts, repaired_ids)
-        detail = (
-            f" after {format_exception_chain(request_error)}"
-            if request_error is not None
-            else ""
-        )
-        raise RuntimeError(
-            f"translation still echoes the Japanese source for {len(final_echoes)} "
-            f"cues after repair at effort={escalated_effort}{detail}; "
-            f"ids={final_echoes[:50]}"
-        ) from request_error
+    final_kana = lingering_kana(set(final_echoes))
 
     if request_error is not None:
-        # `repaired_texts`, not `zh_texts`. The echo gate above was applied to
-        # the repaired array, so returning the original one would return
-        # something that was never checked - and specifically, would put back
-        # the Japanese source lines the earlier requests had already fixed and
-        # been billed for. Verification, return value and cache are the same
-        # array on every exit from this function; ids the detectors still flag
-        # are reported as unresolved rather than being hidden behind a rollback.
+        # `repaired_texts`, not `zh_texts`: verification, return value and cache
+        # stay on the same array so repairs generated before the error survive
+        # instead of rolling back. Lingering echoes are kept unchanged here
+        # because repair did not finish cleanly.
         still_flagged = recheck(repair_ids)
         persist_repairs(repaired_texts, repaired_ids)
         error_chain = format_exception_chain(request_error)
+        if final_echoes:
+            logger.warning(
+                "Translation still echoes the Japanese source for %d/%d cues after "
+                "repair failed at effort=%s (%s); keeping existing text unchanged: ids=%s",
+                len(final_echoes),
+                len(segments),
+                escalated_effort,
+                error_chain,
+                final_echoes[:50],
+            )
+        if final_kana:
+            logger.warning(
+                "Translation still contains Japanese kana for %d/%d cues after "
+                "repair failed at effort=%s (%s); keeping existing text unchanged: ids=%s",
+                len(final_kana),
+                len(segments),
+                escalated_effort,
+                error_chain,
+                final_kana[:50],
+            )
         logger.warning(
             "Translation repair failed (%s): %s",
             type(request_error).__name__,
@@ -494,6 +510,8 @@ def apply_repair_pass(
                 "repair_ids": repair_ids,
                 "repaired": len(repaired_ids),
                 "unresolved": len(still_flagged),
+                "lingering_echo_count": len(final_echoes),
+                "lingering_kana_count": len(final_kana),
                 "error_type": type(request_error).__name__,
                 "error": error_chain[:300],
             },
@@ -508,12 +526,46 @@ def apply_repair_pass(
             "candidate_count": len(repair_ids),
             "missing_count": len(still_flagged),
             "missing_indexes": still_flagged,
+            "lingering_echo_count": len(final_echoes),
+            "lingering_echo_ids": final_echoes,
+            "blanked_echo_count": 0,
+            "blanked_echo_ids": [],
+            "lingering_kana_count": len(final_kana),
+            "lingering_kana_ids": final_kana,
             "error_type": type(request_error).__name__,
             "error": error_chain[:1000],
             **transport_util._merge_usage_metrics(request_usages),
         }
 
+    # Persist genuinely repaired cues BEFORE blanking lingering echoes: writing
+    # "" into a shared batch cache entry would fail `valid_cached` on the next
+    # run and invalidate the whole batch.
     persist_repairs(repaired_texts, repaired_ids)
+
+    blanked_echoes: list[int] = []
+    if final_echoes:
+        repaired_texts = list(repaired_texts)
+        for idx in final_echoes:
+            repaired_texts[idx] = ""
+        blanked_echoes = list(final_echoes)
+        logger.warning(
+            "Translation still echoes the Japanese source for %d/%d cues after "
+            "repair at effort=%s; blanking them instead of failing the run: ids=%s",
+            len(final_echoes),
+            len(segments),
+            escalated_effort,
+            final_echoes[:50],
+        )
+    if final_kana:
+        logger.warning(
+            "Translation still contains Japanese kana for %d/%d cues after "
+            "repair at effort=%s; keeping existing text unchanged: ids=%s",
+            len(final_kana),
+            len(segments),
+            escalated_effort,
+            final_kana[:50],
+        )
+
     timing = {
         "mode": "translation_repair_pass",
         "start_index": min(repair_ids),
@@ -532,6 +584,12 @@ def apply_repair_pass(
         "format_split_count": format_split_count,
         "missing_count": len(set(unresolved)),
         "missing_indexes": sorted(set(unresolved)),
+        "lingering_echo_count": len(final_echoes),
+        "lingering_echo_ids": final_echoes,
+        "blanked_echo_count": len(blanked_echoes),
+        "blanked_echo_ids": blanked_echoes,
+        "lingering_kana_count": len(final_kana),
+        "lingering_kana_ids": final_kana,
         **transport_util._merge_usage_metrics(request_usages),
     }
     _emit_progress(
@@ -541,6 +599,9 @@ def apply_repair_pass(
             "repair_ids": repair_ids,
             "repaired": len(repaired_ids),
             "expected": len(repair_ids),
+            "lingering_echo_count": len(final_echoes),
+            "blanked_echo_count": len(blanked_echoes),
+            "lingering_kana_count": len(final_kana),
         },
     )
     return repaired_texts, timing

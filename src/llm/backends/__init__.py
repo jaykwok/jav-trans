@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from core.typed_config import FALL_BACK, env_float
 
+import os
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -118,9 +119,16 @@ def _validate_lifecycle(instance) -> None:
         raise TypeError(f"Managed backend lifecycle incomplete: {', '.join(missing)}")
 
 
+_DEFAULT_RETIRING_HOLDER_WAIT_TIMEOUT_S = 7200.0
+
+
 def _admission_timeout_s() -> float:
     # Read when a task starts, after application configuration has been loaded.
     return env_float("LOCAL_BACKEND_WAIT_TIMEOUT_S", 600.0, minimum=0.001, out_of_range=FALL_BACK)
+
+
+def _has_explicit_admission_timeout() -> bool:
+    return bool(str(os.getenv("LOCAL_BACKEND_WAIT_TIMEOUT_S", "") or "").strip())
 
 
 def get_backend(name: str | None = None) -> TranslationBackend:
@@ -313,7 +321,7 @@ def _claim_step_locked(normalized: str, cancel_event) -> tuple[str, TranslationB
         instance = None
     if instance is not None and _instance_retiring(instance):
         if _holders_locked(normalized, instance) > 0:
-            return ("wait", None)  # someone is still translating through it
+            return ("wait_retiring_holder", None)  # someone is still translating through it
         # Nobody holds it, so retire it instead of attaching to it. The close
         # itself happens outside this lock; until it commits, the name is marked
         # closing and nothing may take its place.
@@ -335,15 +343,28 @@ def _claim_backend(normalized: str, cancel_event=None):
 
     A deadline ends admission, not cleanup: ownership stays with the old
     instance, and a timed-out task neither joins nor replaces that generation.
+    When no explicit ``LOCAL_BACKEND_WAIT_TIMEOUT_S`` is configured, waiting on
+    a healthy sibling task that still holds a retiring generation gets a longer
+    budget than waiting on stuck shutdown cleanup so long videos are not killed.
     """
     warn_at = time.monotonic() + _RETIRE_WAIT_S
+    explicit_timeout = _has_explicit_admission_timeout()
     timeout_s = _admission_timeout_s()
-    deadline = time.monotonic() + timeout_s
+    holder_timeout_s = (
+        timeout_s
+        if explicit_timeout
+        else max(timeout_s, _DEFAULT_RETIRING_HOLDER_WAIT_TIMEOUT_S)
+    )
+    cleanup_deadline = time.monotonic() + timeout_s
+    holder_deadline = time.monotonic() + holder_timeout_s
+    waiting_on_holder = False
     while True:
         raise_if_cancelled(cancel_event)
-        if time.monotonic() >= deadline:
+        active_deadline = holder_deadline if waiting_on_holder else cleanup_deadline
+        active_timeout_s = holder_timeout_s if waiting_on_holder else timeout_s
+        if time.monotonic() >= active_deadline:
             raise BackendUnavailableError(
-                f"翻译后端 {normalized} 等待退役或清理超过 {timeout_s:g}s；"
+                f"翻译后端 {normalized} 等待退役或清理超过 {active_timeout_s:g}s；"
                 "本任务已停止等待，旧实例仍由清理流程持有。请点击「重试清理」或「重新检查」，待清理完成后重试。"
             )
         with _REGISTRY_LOCK:
@@ -351,11 +372,20 @@ def _claim_backend(normalized: str, cancel_event=None):
         if action == "granted":
             return instance
         if action == "retire":
+            waiting_on_holder = False
+            cleanup_deadline = time.monotonic() + timeout_s
             # Started, not awaited: the close blocks until a process exits, and
             # this thread has a cancel event to stay responsive to. It falls
             # through to the same `_CLOSING` wait every other claimer uses.
             _start_close(normalized, instance)
             continue
+        if action == "wait_retiring_holder":
+            waiting_on_holder = True
+            cleanup_deadline = time.monotonic() + timeout_s
+            active_deadline = holder_deadline
+        else:
+            waiting_on_holder = False
+            active_deadline = cleanup_deadline
         if time.monotonic() >= warn_at:
             print(
                 "[WARN] 本地翻译服务仍在退役中（上一个被取消的请求可能还在生成），"
@@ -363,7 +393,7 @@ def _claim_backend(normalized: str, cancel_event=None):
                 flush=True,
             )
             warn_at = time.monotonic() + _RETIRE_WAIT_S
-        _wait_briefly(cancel_event, min(0.25, max(0.0, deadline - time.monotonic())))
+        _wait_briefly(cancel_event, min(0.25, max(0.0, active_deadline - time.monotonic())))
 
 
 def _wait_briefly(cancel_event, timeout: float = 0.25) -> None:
