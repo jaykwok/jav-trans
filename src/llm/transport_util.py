@@ -7,13 +7,18 @@ the layer both backends and the orchestration engine stand on.
 
 from __future__ import annotations
 
+import email.utils
 import logging
+import math
+import random
 import re
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Callable
 
-from core.diagnostics import format_exception_chain
+from core.cancellation import PipelineCancelledError
+from core.diagnostics import format_exception_chain, redact_url_credentials
 from llm import settings
 from llm.errors import (
     RetryableTranslationFormatError,
@@ -21,6 +26,13 @@ from llm.errors import (
 )
 
 logger = logging.getLogger(__name__)
+_BEARER_TOKEN_RE = re.compile(r"(?i)\b(Bearer\s+)([^\s,;\"']+)")
+
+
+def _sanitize_error_text(text: str) -> str:
+    """Redact URL credentials and Bearer tokens from error strings."""
+    cleaned = redact_url_credentials(str(text or ""))
+    return _BEARER_TOKEN_RE.sub(r"\1***", cleaned)
 
 
 # --- cancellation -------------------------------------------------------------
@@ -238,15 +250,58 @@ def _is_stream_interrupted_error(exc: Exception) -> bool:
 def _stream_interrupted_format_error(exc: Exception) -> RetryableTranslationFormatError:
     return RetryableTranslationFormatError(
         "LLM stream interrupted before complete JSON content: "
-        f"{type(exc).__name__}: {exc}"
+        f"{type(exc).__name__}: {_sanitize_error_text(str(exc))}"
     )
 
 
-def _request_backoff_delay(attempt: int) -> float:
-    return min(
-        settings.TRANSLATION_API_BACKOFF_MAX_S,
-        settings.TRANSLATION_API_BACKOFF_BASE_S * (2**attempt),
+def _parse_retry_after_seconds(exc: Exception | None) -> float | None:
+    if exc is None:
+        return None
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
+    except ValueError:
+        pass
+    try:
+        dt = email.utils.parsedate_to_datetime(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = (dt - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, delta)
+    except Exception:
+        return None
+
+
+def _request_backoff_delay(
+    attempt: int,
+    exc: Exception | None = None,
+    *,
+    jitter: bool = True,
+) -> float:
+    max_delay = float(settings.TRANSLATION_API_BACKOFF_MAX_S)
+    retry_after = _parse_retry_after_seconds(exc)
+    if retry_after is not None:
+        return min(max(max_delay, 60.0), max(0.0, retry_after))
+    base = min(
+        max_delay,
+        float(settings.TRANSLATION_API_BACKOFF_BASE_S) * (2 ** max(0, int(attempt))),
     )
+    if not jitter:
+        return base
+    return base * random.uniform(0.5, 1.0)
 
 
 def _record_api_retry_event(
@@ -261,15 +316,17 @@ def _record_api_retry_event(
         response = getattr(exc, "response", None)
         status_code = getattr(response, "status_code", None)
 
+    safe_message = _sanitize_error_text(str(exc))
+    safe_chain = _sanitize_error_text(format_exception_chain(exc))
     event = {
         "attempt": attempt + 1,
         "delay_s": delay_s,
         "status_code": status_code,
         "error_type": type(exc).__name__,
-        "message": str(exc)[:500],
+        "message": safe_message[:500],
     }
     if exc.__cause__ is not None:
-        event["cause"] = format_exception_chain(exc)[:500]
+        event["cause"] = safe_chain[:500]
     if note:
         event["note"] = note
     logger.warning(
@@ -277,7 +334,7 @@ def _record_api_retry_event(
         attempt + 1,
         delay_s,
         status_code,
-        format_exception_chain(exc)[:300],
+        safe_chain[:300],
         f" note={note}" if note else "",
     )
     local_events = _current_retry_events()
@@ -290,6 +347,19 @@ def _interruptible_sleep(
     cancel_event: threading.Event | None = None,
 ) -> None:
     remaining = max(0.0, float(total_s))
+    if remaining <= 0:
+        return
+    if _cancel_requested(cancel_event):
+        return
+    wait = getattr(cancel_event, "wait", None)
+    if callable(wait):
+        deadline = time.perf_counter() + remaining
+        while True:
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                return
+            if wait(left) or _cancel_requested(cancel_event):
+                return
     while remaining > 0:
         if _cancel_requested(cancel_event):
             return
@@ -301,7 +371,7 @@ def _interruptible_sleep(
 def _request_backoff_sleep(
     attempt: int, exc: Exception, cancel_event: threading.Event | None = None
 ) -> None:
-    delay = _request_backoff_delay(attempt)
+    delay = _request_backoff_delay(attempt, exc)
     _record_api_retry_event(exc, attempt, delay)
     _interruptible_sleep(delay, cancel_event)
     _raise_if_cancelled(cancel_event)
@@ -318,11 +388,9 @@ def _emit_progress(
         return
     try:
         on_progress(payload)
-    except TranslationCancelledError:
+    except (TranslationCancelledError, PipelineCancelledError):
         raise
     except Exception as exc:
-        if type(exc).__name__ == "PipelineCancelledError":
-            raise
         logger.warning("Translation progress callback failed: %s", exc, exc_info=True)
 
 
@@ -332,14 +400,22 @@ def _count_translation_markers(
     id_scan_tail: str,
     id_marker: str,
 ) -> tuple[int, str]:
+    marker_len = len(id_marker)
+    if marker_len == 0:
+        return 0, ""
     scan_text = id_scan_tail + piece
     tail_len = len(id_scan_tail)
-    count = sum(
-        1
-        for match in re.finditer(re.escape(id_marker), scan_text)
-        if match.end() > tail_len
-    )
-    return count, scan_text[-(len(id_marker) - 1) :]
+    count = 0
+    pos = max(0, tail_len - marker_len + 1)
+    while True:
+        found = scan_text.find(id_marker, pos)
+        if found == -1:
+            break
+        if found + marker_len > tail_len:
+            count += 1
+        pos = found + marker_len
+    keep = marker_len - 1
+    return count, (scan_text[-keep:] if keep > 0 else "")
 
 
 def _emit_stream_content_progress(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import json
 import os
 import threading
@@ -948,6 +949,7 @@ async def _test_settings_env_file_quotes_multiline_values(tmp_path, monkeypatch)
     )
     monkeypatch.setattr(config_routes, "PROJECT_ROOT", tmp_path)
     monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.delenv("TRANSLATION_GLOSSARY", raising=False)
     malicious_value = "safe\nOPENAI_COMPATIBILITY_BASE_URL=https://evil.example"
 
     transport = httpx.ASGITransport(app=create_app())
@@ -955,16 +957,24 @@ async def _test_settings_env_file_quotes_multiline_values(tmp_path, monkeypatch)
         transport=transport,
         base_url="http://test",
     ) as client:
-        response = await client.post(
+        # API keys go into HTTP Authorization headers and must reject CR/LF.
+        bad_key_response = await client.post(
             "/api/settings",
             json={"api_key": malicious_value},
         )
+        # Multiline glossary values are stored safely as JSON strings without injecting keys.
+        response = await client.post(
+            "/api/settings",
+            json={"translation_glossary": malicious_value},
+        )
 
+    assert bad_key_response.status_code == 422
     assert response.status_code == 200
     values = json.loads(config_path.read_text(encoding="utf-8"))
-    assert values["API_KEY"] == malicious_value
+    assert values["API_KEY"] == "old"
+    assert values["TRANSLATION_GLOSSARY"] == malicious_value
     assert values.get("OPENAI_COMPATIBILITY_BASE_URL") is None
-    assert os.environ["API_KEY"] == malicious_value
+    assert os.environ["TRANSLATION_GLOSSARY"] == malicious_value
 
 
 async def _test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch):
@@ -1398,18 +1408,22 @@ async def _test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
     app = create_app()
 
     class DummyPopen:
-        def __init__(self, args):
-            opened.append(("popen", str(args[-1])))
+        def __init__(self, args, **_kwargs):
+            opened.append(("popen", args if isinstance(args, str) else list(args)))
 
+    monkeypatch.setattr(files_routes.subprocess, "Popen", DummyPopen)
     if os.name == "nt":
+        monkeypatch.setattr(
+            files_routes,
+            "_query_windows_associated_executable",
+            lambda _ext: None,
+        )
         monkeypatch.setattr(
             files_routes.os,
             "startfile",
             lambda path: opened.append(("startfile", str(path))),
             raising=False,
         )
-    else:
-        monkeypatch.setattr(files_routes.subprocess, "Popen", DummyPopen)
 
     try:
         jobs = await pm.create_job(
@@ -1462,10 +1476,18 @@ async def _test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
         assert allowed_artifact.status_code == 200
         assert blocked_artifact.status_code == 403
         assert blocked_folder.status_code == 403
-        open_kind = "startfile" if os.name == "nt" else "popen"
-        assert (open_kind, str(video_path.resolve())) in opened
-        assert (open_kind, str(artifact_path.resolve())) in opened
-        assert (open_kind, str(output_dir.resolve())) in opened
+        if os.name == "nt":
+            assert ("startfile", str(video_path.resolve())) in opened
+            assert ("startfile", str(artifact_path.resolve())) in opened
+            assert ("popen", f'explorer.exe /select,"{artifact_path.resolve()}"') in opened
+        elif sys.platform == "darwin":
+            assert ("popen", ["open", str(video_path.resolve())]) in opened
+            assert ("popen", ["open", str(artifact_path.resolve())]) in opened
+            assert ("popen", ["open", "-R", str(artifact_path.resolve())]) in opened
+        else:
+            assert ("popen", ["xdg-open", str(video_path.resolve())]) in opened
+            assert ("popen", ["xdg-open", str(artifact_path.resolve())]) in opened
+            assert ("popen", ["xdg-open", str(output_dir.resolve())]) in opened
     finally:
         await _reset_pm_state()
 
@@ -1489,18 +1511,17 @@ async def _test_open_folder_allows_default_video_directory(tmp_path, monkeypatch
     outside_artifact.write_text("secret\n", encoding="utf-8")
     opened: list[str] = []
 
+    monkeypatch.setattr(
+        files_routes.subprocess,
+        "Popen",
+        lambda args, **_kwargs: opened.append(args if isinstance(args, str) else list(args)),
+    )
     if os.name == "nt":
         monkeypatch.setattr(
             files_routes.os,
             "startfile",
             lambda path: opened.append(str(path)),
             raising=False,
-        )
-    else:
-        monkeypatch.setattr(
-            files_routes.subprocess,
-            "Popen",
-            lambda args: opened.append(str(args[-1])),
         )
 
     try:
@@ -1528,7 +1549,12 @@ async def _test_open_folder_allows_default_video_directory(tmp_path, monkeypatch
 
         assert allowed.status_code == 200
         assert blocked.status_code == 403
-        assert opened == [str(video_dir.resolve())]
+        if os.name == "nt":
+            assert opened == [f'explorer.exe /select,"{artifact_path.resolve()}"']
+        elif sys.platform == "darwin":
+            assert opened == [["open", "-R", str(artifact_path.resolve())]]
+        else:
+            assert opened == [["xdg-open", str(video_dir.resolve())]]
     finally:
         await _reset_pm_state()
 

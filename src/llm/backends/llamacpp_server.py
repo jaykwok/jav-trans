@@ -16,10 +16,11 @@ the pipeline stops this server again once a job's translation stage finishes.
 from __future__ import annotations
 
 import atexit
-import importlib.util
 import inspect
+import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -30,17 +31,20 @@ import urllib.request
 import weakref
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 from core import gpu_admission, resources
 from core.diagnostics import format_exception_chain, format_exit_code
 from core.typed_config import env_int
+from llm import request_config, transport_util
 from llm.async_transport import close_quietly, run_cancellable_request
+from llm.backends import llamacpp_env, llamacpp_vram
 from llm.backends.base import ManagedTranslationBackend
-from llm.backends import llamacpp_vram
 from llm.errors import (
     BackendLeaseInvalidatedError,
     LocalServerCrashedError,
     ResponseTruncatedError,
+    RetryableTranslationFormatError,
     TranslationCancelledError,
 )
 from utils.model_paths import PROJECT_ROOT
@@ -144,6 +148,14 @@ def resolve_adaptive_server_plan(
     )
 
 
+def _gpu_layers() -> int:
+    return env_int("LLAMACPP_N_GPU_LAYERS", 999, minimum=0, maximum=999)
+
+
+def _startup_timeout_s() -> int:
+    return env_int("LLAMACPP_STARTUP_TIMEOUT_S", 300, minimum=10, maximum=3600)
+
+
 def server_limits(
     *,
     model_path: str | Path | None = None,
@@ -157,16 +169,16 @@ def server_limits(
     )
     return {
         "ctx": plan.ctx_per_slot,
-        "gpu_layers": env_int("LLAMACPP_N_GPU_LAYERS", 999, minimum=0, maximum=999),
+        "gpu_layers": _gpu_layers(),
         "parallel": plan.parallel,
-        "startup_s": env_int("LLAMACPP_STARTUP_TIMEOUT_S", 300, minimum=10, maximum=3600),
+        "startup_s": _startup_timeout_s(),
     }
 
 
 def resolve_server_executable(
     *, download_enabled: bool = False, cancel_event=None
 ) -> str:
-    """Locate llama-server: explicit setting, managed runtime dir, PATH, then optional auto-download.
+    """Locate llama-server: explicit setting, managed CUDA runtime dir, auto-download, then PATH.
 
     Raises with an actionable message instead of guessing -- a wrong binary
     (CPU build, stale version) would fail later in a much less readable way.
@@ -190,12 +202,12 @@ def resolve_server_executable(
     managed = llamacpp_runtime.managed_server_executable()
     if managed is not None:
         return str(managed)
+    if download_enabled and llamacpp_runtime.auto_download_allowed():
+        return llamacpp_runtime.ensure_managed_llama_server(cancel_event=cancel_event)
     for name in _SERVER_EXE_NAMES:
         found = shutil.which(name)
         if found:
             return found
-    if download_enabled and llamacpp_runtime.auto_download_allowed():
-        return llamacpp_runtime.ensure_managed_llama_server(cancel_event=cancel_event)
     raise RuntimeError(
         "未找到 llama-server。留空路径运行本地翻译会自动下载匹配 CUDA 版本的 llama.cpp 到 "
         "models/runtime/llama-cpp/；如需手动安装，可执行 "
@@ -205,18 +217,22 @@ def resolve_server_executable(
     )
 
 
+def _snapshot_env(name: str, default: str = "") -> str:
+    return str(request_config.getenv(name, default) or "").strip()
+
+
 def resolve_gguf_model_path(
     *, download_enabled: bool = True, cancel_event=None
 ) -> str:
     """Explicit local GGUF path wins; otherwise download the configured repo
     file into the project Hugging Face cache (honours HF_HOME and proxy env)."""
-    explicit = _env("LLAMACPP_GGUF_PATH")
+    explicit = _snapshot_env("LLAMACPP_GGUF_PATH")
     if explicit:
         if Path(explicit).is_file():
             return explicit
         raise RuntimeError(f"LLAMACPP_GGUF_PATH 指向的 GGUF 文件不存在：{explicit}")
-    repo = _env("LLAMACPP_MODEL_REPO")
-    filename = _env("LLAMACPP_MODEL_FILE")
+    repo = _snapshot_env("LLAMACPP_MODEL_REPO")
+    filename = _snapshot_env("LLAMACPP_MODEL_FILE")
     if not repo or not filename:
         raise RuntimeError(
             "未配置 GGUF 模型：请在翻译设置里选择一个 GGUF 预设，"
@@ -242,93 +258,91 @@ def resolve_gguf_model_path(
         )
 
 
-def _torch_library_dir() -> Path | None:
-    """``torch/lib`` without importing torch (which costs seconds and VRAM)."""
-    try:
-        spec = importlib.util.find_spec("torch")
-    except (ImportError, ValueError):
-        return None
-    for location in getattr(spec, "submodule_search_locations", None) or []:
-        candidate = Path(location) / "lib"
-        if candidate.is_dir():
-            return candidate
-    return None
+# Re-exported from `llamacpp_env` for backwards compatibility with callers and
+# tests that import or monkeypatch these symbols on `llamacpp_server`.
+_torch_library_dir = llamacpp_env._torch_library_dir
+_ACCELERATOR_PREFIXES = llamacpp_env._ACCELERATOR_PREFIXES
 
 
 def cuda_library_dirs() -> tuple[str, ...]:
-    """Directories to put on the server's PATH so ``ggml-cuda.dll`` can load.
-
-    The CUDA llama.cpp zip links cuBLAS dynamically but ships no CUDA runtime;
-    its own release publishes that as a separate ~400MB `cudart-*` download.
-    Without `cublas64_*.dll` on the search path the CUDA backend fails to
-    register *silently* and the server runs on the CPU: measured 2026-08-04 on
-    Hy-MT2-1.8B-Q8_0, 90 tok/s prompt eval and ~4 tok/s generation, roughly 40x
-    off, with nothing in the log saying why.
-
-    torch already installs the matching CUDA libraries into the venv this app
-    runs from, so point the server at those instead of asking for a second
-    download of the same DLLs.
-    """
-    lib_dir = _torch_library_dir()
-    if lib_dir is None or not any(lib_dir.glob("cublas64_*.dll")):
-        return ()
-    return (str(lib_dir),)
+    return llamacpp_env.cuda_library_dirs(torch_lib_dir_fn=_torch_library_dir)
 
 
 def server_environment() -> dict[str, str]:
-    env = dict(os.environ)
-    # `--fit` (on by default in current builds) may only change arguments left
-    # unset, and `_build_command` sets them all. With the Q6_K default, less
-    # than fit's 1024 MiB margin stays free on an 8GB card, so fit logged
-    # "failed to fit params ... abort" on every start and then loaded exactly
-    # as asked. Off rather than tolerated: that line reads like the fault in a
-    # user's uploaded log. The env form is silently ignored by builds that
-    # predate the option, where `--fit off` would stop the server starting.
-    env["LLAMA_ARG_FIT"] = "off"
-    extra = cuda_library_dirs()
-    if extra:
-        env["PATH"] = os.pathsep.join([*extra, env.get("PATH", "")])
-    return env
+    return llamacpp_env.server_environment(cuda_dirs_fn=cuda_library_dirs)
 
 
-_ACCELERATOR_PREFIXES = ("cuda", "vulkan", "rocm", "hip", "sycl", "metal", "opencl")
+probe_compute_devices = llamacpp_env.probe_compute_devices
 
 
-def probe_compute_devices(exe: str, env: dict[str, str] | None = None) -> list[str]:
-    """Accelerators the server can actually see, via its own ``--list-devices``.
+def _wait_briefly(cancel_event, timeout: float = 0.5) -> None:
+    """Sleep up to ``timeout`` seconds, waking immediately when cancelled."""
+    wait = getattr(cancel_event, "wait", None)
+    if callable(wait):
+        if wait(timeout):
+            LlamaCppServerBackend._raise_if_cancelled(cancel_event)
+        return
+    time.sleep(timeout)
 
-    Cheap (no model load) and the only honest answer: whether ``-ngl`` does
-    anything depends on which ggml backend DLLs loaded, not on what the binary
-    was named or built for.
-    """
-    try:
-        result = subprocess.run(
-            [exe, "--list-devices"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=120,
-            env=env,
-            **no_window_subprocess_kwargs(),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.warning("llama-server --list-devices failed to run (%s): %s", exe, exc)
-        return []
-    returncode = getattr(result, "returncode", 0)
-    if returncode not in (0, None):
-        stderr_tail = (getattr(result, "stderr", "") or "").strip()[-400:]
-        logger.warning(
-            "llama-server --list-devices exited with %s: %s",
-            format_exit_code(returncode),
-            stderr_tail or "(no stderr)",
-        )
-    devices: list[str] = []
-    for line in (result.stdout or "").splitlines():
-        entry = line.strip()
-        if entry.split(":", 1)[0].lower().startswith(_ACCELERATOR_PREFIXES):
-            devices.append(entry)
-    return devices
+
+_CONTEXT_LIMIT_RE = re.compile(
+    r"(?:exceed_context_size|exceeds?\s+(?:the\s+)?(?:available\s+)?context|"
+    r"context\s+size|n_ctx|prompt\s+is\s+too\s+long|input\s+is\s+too\s+long|"
+    r"request\s+exceeds)",
+    re.IGNORECASE,
+)
+
+
+def _http_status_code(exc: BaseException) -> int | None:
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        resp = getattr(exc, "response", None)
+        code = getattr(resp, "status_code", None)
+    return int(code) if isinstance(code, int) and not isinstance(code, bool) else None
+
+
+def _is_context_limit_error(exc: BaseException) -> bool:
+    parts = [str(exc)]
+    body = getattr(exc, "body", None)
+    if body is not None:
+        parts.append(str(body))
+    return bool(_CONTEXT_LIMIT_RE.search(" ".join(parts)))
+
+
+def _usage_to_dict(usage) -> dict | None:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        data = {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+        }
+    else:
+        data = {
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+        }
+    return data if any(val is not None for val in data.values()) else None
+
+
+def _completion_from_json_payload(payload: dict) -> SimpleNamespace:
+    raw_choices = payload.get("choices") if isinstance(payload, dict) else None
+    choices: list[SimpleNamespace] = []
+    if isinstance(raw_choices, list):
+        for entry in raw_choices:
+            if not isinstance(entry, dict):
+                continue
+            message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
+            choices.append(
+                SimpleNamespace(
+                    message=SimpleNamespace(content=str(message.get("content") or "")),
+                    finish_reason=entry.get("finish_reason"),
+                )
+            )
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    return SimpleNamespace(choices=choices, usage=usage)
 
 
 def _pick_free_port() -> int:
@@ -421,7 +435,6 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         self._proc: subprocess.Popen | None = None
         self._job_handle = None
         self._port: int | None = None
-        self._model_path = ""
         self._active_plan: llamacpp_vram.LlamaAdaptivePlan | None = None
         self._log_path: Path | None = None
         self._log_start_offset: int = 0
@@ -474,7 +487,7 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         resolved_plan = plan or resolve_adaptive_server_plan(model_path=model_path)
         ctx = resolved_plan.ctx_per_slot
         parallel = resolved_plan.parallel
-        ngl = env_int("LLAMACPP_N_GPU_LAYERS", 999, minimum=0, maximum=999)
+        ngl = _gpu_layers()
         # -c is the total context; llama-server splits it across -np slots, so
         # the env var means "context per slot". `--kv-unified` shares the KV
         # buffer dynamically across slots (+6 MiB measured) so single-slot
@@ -500,7 +513,8 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
 
     def _health_ok(self, port: int) -> bool:
         try:
-            with urllib.request.urlopen(
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(
                 f"http://127.0.0.1:{port}/health", timeout=2.0
             ) as resp:
                 if resp.status == 200:
@@ -679,12 +693,11 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         if not supports_download:
             return str(resolve_server_executable())
 
-        # Fast path: explicit path, managed runtime dir, or PATH needs no thread.
-        try:
+        # Fast path: explicit path or already-installed managed CUDA runtime needs no thread.
+        if _env("LLAMACPP_SERVER_PATH") or llamacpp_runtime.managed_server_executable() is not None:
             return resolve_server_executable(download_enabled=False)
-        except RuntimeError:
-            if _env("LLAMACPP_SERVER_PATH") or not llamacpp_runtime.auto_download_allowed():
-                raise
+        if not llamacpp_runtime.auto_download_allowed():
+            return resolve_server_executable(download_enabled=False)
 
         identity = hf_progress.current_identity()
         resolved: list[str] = []
@@ -749,6 +762,15 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             # Asks the driver what it can see, so it belongs after the permit -
             # and outside the lock, where its 120s timeout cannot strand anyone.
             devices = probe_compute_devices(exe, env)
+            ngl = _gpu_layers()
+            if ngl > 0 and not devices:
+                raise RuntimeError(
+                    "llama-server 未检测到任何可用 GPU 设备（CUDA 后端未加载），"
+                    "已拒绝在 CPU 上静默运行以避免数十倍性能退化。"
+                    "请确认 NVIDIA 驱动满足 CUDA 要求、llama-server.exe 为 CUDA 构建，"
+                    "且同目录或 PyTorch 环境包含 cuBLAS 运行库；"
+                    "如确实需要纯 CPU 运行，请显式设置 LLAMACPP_N_GPU_LAYERS=0。"
+                )
             with self._lock:
                 self._raise_if_invalidated()
                 self._raise_if_cancelled(cancel_event)
@@ -768,15 +790,6 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
                 self._log_path = self._server_log_path()
                 self._rotate_log_if_oversized(self._log_path)
                 command = self._build_command(exe, model_path, port, plan=plan)
-                if not devices and server_limits()["gpu_layers"] > 0:
-                    # Not fatal - a CPU-only build is a legitimate choice - but
-                    # it is a 40x slowdown that otherwise shows up only as
-                    # "翻译很慢".
-                    logger.warning(
-                        "llama-server 看不到任何 GPU 设备，将以 CPU 运行（会慢几十倍）。"
-                        "CUDA 版还需要 cuBLAS 运行库：确认 llama-server.exe 是 CUDA 构建，"
-                        "或解压对应 release 的 cudart-llama-bin-win-cuda-*.zip 到同一目录。"
-                    )
                 plan_line = (
                     f"adaptive={plan.adaptive} ctx={plan.ctx_per_slot} parallel={plan.parallel} "
                     f"kv_unified={plan.kv_unified} focus_radius={plan.focus_radius} "
@@ -800,7 +813,7 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
                         ).encode("utf-8")
                     )
                     log_file.flush()
-                    self._proc = subprocess.Popen(
+                    started_proc = subprocess.Popen(
                         command,
                         stdout=log_file,
                         stderr=subprocess.STDOUT,
@@ -810,20 +823,23 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
                     )
                     logger.info(
                         "Started llama-server pid=%s port=%s log=%s",
-                        getattr(self._proc, "pid", None),
+                        getattr(started_proc, "pid", None),
                         port,
                         self._log_path,
                     )
-                self._server_generation += 1
-                self._retiring = False
-                self._job_handle = _bind_kill_on_close_job(self._proc)
+                job_handle = _bind_kill_on_close_job(started_proc)
+                with self._status_lock:
+                    self._proc = started_proc
+                    self._server_generation += 1
+                    self._retiring = False
+                    self._job_handle = job_handle
                 resources.register(
                     resource_id=self._resource_id(),
                     generation=self._server_generation,
                     kind=_LOCAL_KIND,
                     description="llama-server",
-                    process=self._proc,
-                    job_handle=self._job_handle,
+                    process=started_proc,
+                    job_handle=job_handle,
                     stopper=self._stop_server,
                     holds_gpu=True,
                 )
@@ -845,7 +861,7 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
                 # invisible to GPU admission or to the cleanup watchdog.
                 if self.is_invalidated():
                     resources.schedule_stop(self._resource_id(), self._server_generation)
-                proc = self._proc
+                proc = started_proc
                 generation = self._server_generation
         finally:
             # Only the paths that never got as far as registering: nothing
@@ -865,46 +881,50 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         is named by argument, so nothing here needs the lock except the short
         writes that publish the result.
         """
-        timeout_s = server_limits()["startup_s"]
+        timeout_s = _startup_timeout_s()
         deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            self._raise_if_cancelled(cancel_event)
-            with self._lock:
-                current = self._proc
-                current_generation = self._server_generation
-            if current is not proc or current_generation != generation:
-                # Closed or replaced while it was loading. Reporting that as a
-                # startup failure of *this* server would name the wrong process.
-                raise RuntimeError(
-                    "本地翻译服务器在启动过程中被关闭或替换；请重新运行该任务。"
-                )
-            exit_code = proc.poll()
-            if exit_code is not None:
-                pid = getattr(proc, "pid", None)
-                tail = self._log_tail()
-                log_ref = str(self._log_path) if self._log_path else "logs/llamacpp_server.log"
-                self._teardown_if_current(proc)
-                logger.error(
-                    "llama-server exited during startup pid=%s port=%s exit=%s log=%s tail=%s",
-                    pid,
-                    port,
-                    format_exit_code(exit_code),
-                    log_ref,
-                    tail,
-                )
-                raise LocalServerCrashedError(
-                    f"llama-server 启动即退出（pid={pid}, exit={format_exit_code(exit_code)}），"
-                    f"请查看日志 {log_ref}。日志尾部：{tail}"
-                )
-            if self._health_ok(port):
+        try:
+            while time.monotonic() < deadline:
+                self._raise_if_cancelled(cancel_event)
                 with self._lock:
-                    if self._proc is not proc:
-                        raise RuntimeError(
-                            "本地翻译服务器在启动过程中被关闭或替换；请重新运行该任务。"
-                        )
-                    self._port = port
-                return
-            time.sleep(0.5)
+                    current = self._proc
+                    current_generation = self._server_generation
+                if current is not proc or current_generation != generation:
+                    # Closed or replaced while it was loading. Reporting that as a
+                    # startup failure of *this* server would name the wrong process.
+                    raise RuntimeError(
+                        "本地翻译服务器在启动过程中被关闭或替换；请重新运行该任务。"
+                    )
+                exit_code = proc.poll()
+                if exit_code is not None:
+                    pid = getattr(proc, "pid", None)
+                    tail = self._log_tail()
+                    log_ref = str(self._log_path) if self._log_path else "logs/llamacpp_server.log"
+                    self._teardown_if_current(proc)
+                    logger.error(
+                        "llama-server exited during startup pid=%s port=%s exit=%s log=%s tail=%s",
+                        pid,
+                        port,
+                        format_exit_code(exit_code),
+                        log_ref,
+                        tail,
+                    )
+                    raise LocalServerCrashedError(
+                        f"llama-server 启动即退出（pid={pid}, exit={format_exit_code(exit_code)}），"
+                        f"请查看日志 {log_ref}。日志尾部：{tail}"
+                    )
+                if self._health_ok(port):
+                    with self._lock:
+                        if self._proc is not proc:
+                            raise RuntimeError(
+                                "本地翻译服务器在启动过程中被关闭或替换；请重新运行该任务。"
+                            )
+                        self._port = port
+                    return
+                _wait_briefly(cancel_event, 0.5)
+        except TranslationCancelledError:
+            self._teardown_if_current(proc)
+            raise
         pid = getattr(proc, "pid", None)
         tail = self._log_tail()
         log_ref = str(self._log_path) if self._log_path else "logs/llamacpp_server.log"
@@ -938,6 +958,7 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             raise RuntimeError(
                 "本地翻译服务器已停止或尚未就绪；请重新运行该任务。"
             )
+        import httpx
         from openai import AsyncOpenAI
 
         return AsyncOpenAI(
@@ -945,6 +966,7 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             api_key="local-llamacpp",
             timeout=600.0,
             max_retries=0,
+            http_client=httpx.AsyncClient(trust_env=False, timeout=600.0),
         )
 
     def _resource_id(self) -> str:
@@ -992,10 +1014,12 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         if state != "gone":
             detail = detail or f"llama-server is {state} after kill()"
             logger.warning("llama-server 未确认退出：%s", detail)
-        with self._status_lock:
-            self._job_handle = job_handle
-            if state == "gone" and self._proc is proc:
-                self._proc = None
+        with self._lock:
+            with self._status_lock:
+                if self._proc is proc:
+                    self._job_handle = job_handle
+                    if state == "gone":
+                        self._proc = None
         return resources.StopOutcome(
             process_state=state, job_handle=job_handle, detail=detail
         )
@@ -1011,8 +1035,10 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         # The port is dropped either way: whatever this process is doing,
         # nothing may be sent to it again.
         self._port = None
+        self._active_plan = None
         if proc is None:
-            self._retiring = False
+            with self._status_lock:
+                self._retiring = False
             return True
         if not resources.is_registered(self._resource_id(), generation):
             # A process adopted outside `_ensure_server` (tests, and any future
@@ -1029,7 +1055,8 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             )
         result = resources.request_stop(self._resource_id(), generation)
         if result.stopped:
-            self._retiring = False
+            with self._status_lock:
+                self._retiring = False
         return result.stopped
 
     def cleanup_status(self) -> dict:
@@ -1072,12 +1099,11 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             stopped = self._teardown_locked()
             if stopped:
                 self._active_plan = None
-        if stopped:
-            # Only now is the unknown resolved: the process that might still
-            # have been generating is gone, so nothing of that request outlives
-            # it. A teardown that did not confirm leaves the flag standing.
-            with self._status_lock:
-                self._draining_since = None
+                # Only now is the unknown resolved: the process that might still
+                # have been generating is gone, so nothing of that request outlives
+                # it. A teardown that did not confirm leaves the flag standing.
+                with self._status_lock:
+                    self._draining_since = None
         return stopped
 
     def invalidate(self) -> None:
@@ -1138,12 +1164,22 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             except Exception:
                 return None
 
-    def _request_completion(self, request: dict, cancel_event):
-        """One local completion, abortable while the model is still thinking.
+    def _mark_draining_and_retiring(self, proc: subprocess.Popen | None) -> None:
+        with self._lock:
+            with self._status_lock:
+                if proc is not None and self._proc is proc:
+                    self._draining_since = time.time()
+                    self._retiring = True
 
-        A local request is silent from the first byte to the last: no streaming,
-        one blocking read, up to the 600s client timeout. Without this, 取消 on a
-        local job was unreachable for as long as the model kept generating.
+    def _request_completion(
+        self,
+        request: dict,
+        cancel_event,
+        *,
+        on_progress: Callable[[dict], None] | None = None,
+        expected_count: int = 0,
+    ):
+        """One local completion, supporting SSE streaming and abortable mid-generation.
 
         Aborting the HTTP request is *not* proof that llama-server stopped
         generating - it only proves this process stopped waiting. The server is
@@ -1156,6 +1192,96 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
             proc = self._proc
             log_path = self._log_path
 
+        async def _consume_stream(stream):
+            last_emit = 0.0
+            debounce_s = 0.25
+            stream_state = {
+                "final_content": [],
+                "content_chars": 0,
+                "translated_count": 0,
+                "id_scan_tail": "",
+                "id_marker": '"id":',
+            }
+            finish_reason: str | None = None
+            usage = None
+            saw_choice = False
+
+            def maybe_emit(payload: dict, *, force: bool = False) -> None:
+                nonlocal last_emit
+                now = time.monotonic()
+                if not force and now - last_emit < debounce_s:
+                    return
+                last_emit = now
+                self._emit_progress(on_progress, payload)
+
+            def _handle_chunk(chunk) -> None:
+                nonlocal finish_reason, usage, saw_choice
+                chunk_usage = (
+                    chunk.get("usage")
+                    if isinstance(chunk, dict)
+                    else getattr(chunk, "usage", None)
+                )
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                chunk_choices = (
+                    chunk.get("choices")
+                    if isinstance(chunk, dict)
+                    else getattr(chunk, "choices", None)
+                ) or []
+                if not chunk_choices:
+                    return
+                saw_choice = True
+                choice = chunk_choices[0]
+                choice_finish = (
+                    choice.get("finish_reason")
+                    if isinstance(choice, dict)
+                    else getattr(choice, "finish_reason", None)
+                )
+                if choice_finish:
+                    finish_reason = str(choice_finish)
+                delta = (
+                    choice.get("delta")
+                    if isinstance(choice, dict)
+                    else getattr(choice, "delta", None)
+                )
+                if delta is None:
+                    return
+                piece = (
+                    delta.get("content")
+                    if isinstance(delta, dict)
+                    else getattr(delta, "content", None)
+                )
+                if isinstance(piece, str) and piece:
+                    transport_util._emit_stream_content_progress(
+                        piece=piece,
+                        state=stream_state,
+                        expected_count=expected_count,
+                        maybe_emit=maybe_emit,
+                    )
+
+            try:
+                if hasattr(stream, "__aiter__"):
+                    async for chunk in stream:
+                        _handle_chunk(chunk)
+                else:
+                    for chunk in stream:
+                        _handle_chunk(chunk)
+            finally:
+                await close_quietly(stream)
+
+            content = "".join(stream_state["final_content"])
+            choices = (
+                [
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=content),
+                        finish_reason=finish_reason,
+                    )
+                ]
+                if (saw_choice or content)
+                else []
+            )
+            return SimpleNamespace(choices=choices, usage=usage)
+
         async def operation():
             client = self._make_async_client(port)
             try:
@@ -1164,6 +1290,22 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
                 # transport itself is async.
                 if inspect.isawaitable(result):
                     result = await result
+                if getattr(result, "choices", None) is not None:
+                    return result
+                raw_resp = getattr(result, "response", None)
+                headers = getattr(raw_resp, "headers", None) if raw_resp is not None else None
+                content_type = str(headers.get("content-type") or "").lower() if headers is not None else ""
+                if "application/json" in content_type:
+                    try:
+                        raw_body = await raw_resp.aread()
+                        return _completion_from_json_payload(json.loads(raw_body))
+                    finally:
+                        await close_quietly(result)
+                if hasattr(result, "__aiter__") or (
+                    hasattr(result, "__iter__")
+                    and not isinstance(result, (str, bytes, dict))
+                ):
+                    return await _consume_stream(result)
                 return result
             finally:
                 await close_quietly(client)
@@ -1171,13 +1313,9 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         try:
             response = run_cancellable_request(operation, cancel_event=cancel_event)
         except (TranslationCancelledError, BackendLeaseInvalidatedError):
-            with self._status_lock:
-                if self._proc is not None:
-                    self._draining_since = time.time()
-                    # This generation is no longer trustworthy: it may still be
-                    # generating for a request nobody is reading. Existing users
-                    # keep it, new tasks get a fresh one once they let go.
-                    self._retiring = True
+            self._mark_draining_and_retiring(proc)
+            raise
+        except (ResponseTruncatedError, RetryableTranslationFormatError):
             raise
         except BaseException as exc:
             exit_code = self._poll_proc_exit_with_grace(proc)
@@ -1194,19 +1332,47 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
                     log_ref,
                     tail,
                 )
-                with self._status_lock:
-                    if self._proc is proc:
-                        self._retiring = True
+                with self._lock:
+                    with self._status_lock:
+                        if proc is not None and self._proc is proc:
+                            self._retiring = True
                 raise LocalServerCrashedError(
                     f"本地翻译服务 llama-server 在翻译过程中意外退出"
                     f"（pid={pid}, exit={format_exit_code(exit_code)}），"
                     f"请查看日志 {log_ref}。日志尾部：{tail}"
                 ) from exc
 
-            with self._status_lock:
-                if self._proc is not None:
-                    self._draining_since = time.time()
-                    self._retiring = True
+            status_code = _http_status_code(exc)
+            if status_code is not None and 400 <= status_code < 600:
+                # Server explicitly answered with an HTTP 4xx/5xx error: the slot is
+                # not stuck generating, so do NOT falsely retire the healthy server.
+                error_chain = format_exception_chain(exc)
+                if status_code in {500, 503} or _is_context_limit_error(exc):
+                    logger.warning(
+                        "llama-server returned retryable HTTP %s pid=%s port=%s error=%s",
+                        status_code,
+                        pid,
+                        port,
+                        error_chain,
+                    )
+                    raise RetryableTranslationFormatError(
+                        f"llama-server HTTP {status_code}: {error_chain}"
+                    ) from exc
+                logger.error(
+                    "llama-server returned HTTP %s pid=%s port=%s error=%s log=%s",
+                    status_code,
+                    pid,
+                    port,
+                    error_chain,
+                    log_ref,
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    f"本地翻译服务 llama-server（pid={pid}, port={port}）返回 HTTP {status_code}："
+                    f"{error_chain}；请查看日志 {log_ref} 后重试。"
+                ) from exc
+
+            self._mark_draining_and_retiring(proc)
             if isinstance(exc, Exception):
                 error_chain = format_exception_chain(exc)
                 logger.error(
@@ -1259,6 +1425,16 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
     def name(self) -> str:
         return "llamacpp"
 
+    def ensure_ready_and_plan(
+        self, cancel_event=None
+    ) -> llamacpp_vram.LlamaAdaptivePlan | None:
+        """Start the server if needed and return the real active sizing plan."""
+        self._raise_if_cancelled(cancel_event)
+        self._raise_if_invalidated()
+        self._ensure_server(cancel_event)
+        with self._lock:
+            return self._active_plan
+
     def _current_or_preview_plan(self) -> llamacpp_vram.LlamaAdaptivePlan:
         with self._lock:
             if self._active_plan is not None:
@@ -1282,11 +1458,11 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         return (plan.focus_radius, plan.focus_context_chars)
 
     def cache_identity(self) -> str:
-        explicit = _env("LLAMACPP_GGUF_PATH")
+        explicit = _snapshot_env("LLAMACPP_GGUF_PATH")
         if explicit:
             return f"llamacpp:{Path(explicit).name}"
-        repo = _env("LLAMACPP_MODEL_REPO")
-        filename = _env("LLAMACPP_MODEL_FILE")
+        repo = _snapshot_env("LLAMACPP_MODEL_REPO")
+        filename = _snapshot_env("LLAMACPP_MODEL_FILE")
         return f"llamacpp:{repo}/{filename}"
 
     def supports_json_schema(self) -> bool:
@@ -1324,13 +1500,14 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         self._raise_if_invalidated()
         self._ensure_server(cancel_event)
         self._raise_if_cancelled(cancel_event)
-        self._emit_progress(on_progress, {"phase": "translating", "expected": expected_count})
         request: dict = {
             "model": self.cache_identity(),
             "messages": messages,
             "temperature": temperature,
             "top_p": top_p,
             "max_tokens": max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
         # These are llama.cpp extensions, not OpenAI SDK keyword arguments.
         # The SDK merges extra_body into the JSON sent to the server.
@@ -1346,21 +1523,28 @@ class LlamaCppServerBackend(ManagedTranslationBackend):
         wrapped = _wrap_response_format(response_format)
         if wrapped is not None:
             request["response_format"] = wrapped
-        response = self._request_completion(request, cancel_event)
+        response = self._request_completion(
+            request,
+            cancel_event,
+            on_progress=on_progress,
+            expected_count=expected_count,
+        )
         self._raise_if_cancelled(cancel_event)
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            self._emit_usage(
-                on_usage,
-                {
-                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
-                    "completion_tokens": getattr(usage, "completion_tokens", None),
-                    "total_tokens": getattr(usage, "total_tokens", None),
-                },
-            )
+        usage_dict = _usage_to_dict(getattr(response, "usage", None))
+        if usage_dict is not None:
+            self._emit_usage(on_usage, usage_dict)
         choices = getattr(response, "choices", None) or []
         if not choices:
             raise RuntimeError("llama-server 返回了空的 choices")
         if getattr(choices[0], "finish_reason", None) == "length":
             raise ResponseTruncatedError("llama-server exhausted the output token budget", limit=max_tokens)
-        return str(choices[0].message.content or "")
+        content = str(choices[0].message.content or "")
+        self._emit_progress(
+            on_progress,
+            {
+                "phase": "done",
+                "translated": expected_count,
+                "expected": expected_count,
+            },
+        )
+        return content

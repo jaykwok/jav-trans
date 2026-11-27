@@ -21,7 +21,12 @@ import subprocess
 from pathlib import Path
 from typing import Any, Mapping
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from tools._common import (
+    PROJECT_ROOT,
+    read_json as read_json,
+    read_jsonl as _read_jsonl,
+    write_json as _write_json,
+)
 
 
 DEFAULT_API_KEY_ENV_CANDIDATES = (
@@ -123,28 +128,11 @@ def project_path(value: str | Path) -> Path:
 
 
 def write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-
-
-def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+    _write_json(path, payload, sort_keys=True)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8-sig") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            payload = json.loads(line)
-            if not isinstance(payload, Mapping):
-                raise ValueError(f"JSONL row must be an object: {path}:{line_number}")
-            rows.append(dict(payload))
-    return rows
+    return _read_jsonl(path, require_mapping=True)
 
 
 def _parse_env_value(raw: str) -> str:

@@ -23,14 +23,25 @@ def test_translation_settings_have_an_explicit_config_save_path() -> None:
     assert "config/config.json" in settings
 
 
-def test_custom_task_template_is_not_misrepresented_as_config_persistence() -> None:
+def test_presets_and_tuning_panel_are_removed_from_sidebar() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
-    presets = (STATIC / "js" / "presets.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    javascript = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((STATIC / "js").glob("*.js"))
+    )
 
-    assert "保存自定义任务模板" in html
-    assert "只保存在本机浏览器中，不写入" in html
-    assert "config/config.json" in html
-    assert "不会写入 config/config.json" in presets
+    for removed in (
+        "preset-chip",
+        "section-tuning",
+        "panel-tuning",
+        "btn-save-custom",
+        "r-skip-translation",
+    ):
+        assert removed not in html
+        assert removed not in css
+    assert "from './presets.js'" not in javascript
+    assert "保存自定义任务模板" not in html
 
 
 def test_every_browser_translation_setting_is_accepted_by_settings_api() -> None:
@@ -96,28 +107,35 @@ def test_frontend_defaults_match_backend_defaults_and_limits() -> None:
     assert f'max="{MAX_TRANSLATION_WORKERS}"' in html
 
 
-def test_standard_preset_matches_backend_job_defaults() -> None:
-    """"标准" is applied unconditionally on every load for non-custom users
-    (main.js's `applyPreset(state.activePreset)`), so a TUNING_FIELDS value
-    that drifts from JobSpec silently overrides whatever /api/config just
-    reported. translation_max_workers did exactly that once (shipped as 16
-    against a backend default of 4) - this pins every "标准" field against
-    the real JobSpec default so that class of bug fails the suite instead of
-    showing up in a user's job list."""
-    presets_js = (STATIC / "js" / "presets.js").read_text(encoding="utf-8")
-    tuning_block = presets_js[
-        presets_js.index("export const TUNING_FIELDS") :
-        presets_js.index("};", presets_js.index("export const TUNING_FIELDS"))
+def test_sidebar_subtitle_output_and_concurrency_match_backend_defaults() -> None:
+    """With presets/tuning removed, sidebar controls directly match JobSpec
+    defaults and are remembered automatically by formMemory.js."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    form_memory = (STATIC / "js" / "formMemory.js").read_text(encoding="utf-8")
+
+    # `#r-mode` lives in the video & subtitle panel with all 3 output modes.
+    video_panel = html[html.index("📁 视频与字幕") : html.index('id="panel-model-requirements"')]
+    assert 'id="r-mode"' in video_panel
+    assert 'id="f-output-dir"' in video_panel
+    mode_block = video_panel[video_panel.index('<select id="r-mode"') : video_panel.index("</select>", video_panel.index('<select id="r-mode"'))]
+    assert set(re.findall(r'value="([^"]+)"', mode_block)) == {"zh", "bilingual", "ja_only"}
+    assert f'<option value="{JobSpec.model_fields["subtitle_mode"].default}" selected>' in mode_block
+
+    # `#t-translation-max-workers` lives inside `#openai-backend-fields` only.
+    openai_block = html[
+        html.index('<div id="openai-backend-fields"') : html.index('<div id="llamacpp-backend-fields"')
     ]
+    assert 'id="t-translation-max-workers"' in openai_block
+    assert f'value="{JobSpec.model_fields["translation_max_workers"].default}"' in openai_block
+    assert f'max="{MAX_TRANSLATION_WORKERS}"' in openai_block
+    assert "并发请求数" in openai_block
 
-    def js_value(field_id: str) -> str:
-        match = re.search(rf"'{re.escape(field_id)}':\s*([^,\n]+),", tuning_block)
-        assert match, f"{field_id} missing from presets.js TUNING_FIELDS"
-        return match.group(1).strip()
-
-    assert js_value("r-mode") == f"'{JobSpec.model_fields['subtitle_mode'].default}'"
-    assert js_value("r-skip-translation") == str(JobSpec.model_fields["skip_translation"].default).lower()
-    assert js_value("t-translation-max-workers") == f"'{JobSpec.model_fields['translation_max_workers'].default}'"
+    # Per-job sidebar controls must NOT be excluded from browser form memory.
+    excluded_block = form_memory[
+        form_memory.index("const FORM_MEMORY_EXCLUDED") : form_memory.index("]);", form_memory.index("const FORM_MEMORY_EXCLUDED"))
+    ]
+    for remembered_id in ("r-mode", "f-output-dir", "t-translation-max-workers"):
+        assert f"'{remembered_id}'" not in excluded_block
 
 
 def test_retired_diagnostic_controls_are_removed_from_ui() -> None:
@@ -157,18 +175,66 @@ def test_every_js_module_import_resolves_to_an_existing_file_and_export() -> Non
         assert (STATIC / script_src).is_file(), f"Missing script in index.html: {script_src}"
 
     files = sorted(js_dir.glob("*.js"))
-    exports_by_file = {
-        path.name: set(
+    sources = {path.name: path.read_text(encoding="utf-8") for path in files}
+    direct_exports: dict[str, set[str]] = {}
+    reexports: dict[str, list[tuple[str, str, str]]] = {}
+    for name, text in sources.items():
+        exported = set(
             re.findall(
                 r"\bexport\s+(?:async\s+)?(?:function|const|let|var|class)\s+([A-Za-z0-9_$]+)",
-                path.read_text(encoding="utf-8"),
+                text,
             )
         )
-        for path in files
+        # Support `export { a, b as c };` (without `from`).
+        for block in re.findall(r"\bexport\s+\{([^}]+)\}\s*(?!from\b)", text):
+            for raw_item in block.split(","):
+                item = raw_item.strip()
+                if not item:
+                    continue
+                parts = [p.strip() for p in item.split(" as ")]
+                exported.add(parts[-1])
+        direct_exports[name] = exported
+
+        reexport_entries: list[tuple[str, str, str]] = []
+        for block, target in re.findall(
+            r"""\bexport\s+\{([^}]+)\}\s+from\s+['"]\./([^'"]+)['"]""",
+            text,
+        ):
+            for raw_item in block.split(","):
+                item = raw_item.strip()
+                if not item:
+                    continue
+                parts = [p.strip() for p in item.split(" as ")]
+                orig_name = parts[0]
+                alias_name = parts[-1]
+                reexport_entries.append((orig_name, alias_name, target))
+        reexports[name] = reexport_entries
+
+    exports_by_file: dict[str, set[str]] = {
+        name: set(names) for name, names in direct_exports.items()
     }
     broken: list[str] = []
+    # Resolve re-exports (supports transitive chains).
+    for _ in range(len(files) + 1):
+        changed = False
+        for name, entries in reexports.items():
+            for orig_name, alias_name, target in entries:
+                if target in exports_by_file and orig_name in exports_by_file[target]:
+                    if alias_name not in exports_by_file[name]:
+                        exports_by_file[name].add(alias_name)
+                        changed = True
+        if not changed:
+            break
+
+    for name, entries in reexports.items():
+        for orig_name, _alias_name, target in entries:
+            if target not in exports_by_file:
+                broken.append(f"{name}: missing re-export module ./{target}")
+            elif orig_name not in exports_by_file[target]:
+                broken.append(f"{name}: re-exported {orig_name} is not exported by ./{target}")
+
     for path in files:
-        text = path.read_text(encoding="utf-8")
+        text = sources[path.name]
         for target in re.findall(r"""\bfrom\s+['"]\./([^'"]+)['"]""", text):
             if target not in exports_by_file:
                 broken.append(f"{path.name}: missing module ./{target}")

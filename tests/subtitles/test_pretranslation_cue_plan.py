@@ -11,6 +11,11 @@ from pipeline.artifacts import AsrArtifacts
 from subtitles.options import SubtitleOptions
 
 
+@pytest.fixture(autouse=True)
+def _isolate_project_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+
+
 def _artifacts(tmp_path: Path, segments: list[dict], *, bilingual: bool = False) -> AsrArtifacts:
     job_temp_dir = tmp_path / "jobs" / "clip"
     output_dir = tmp_path / "out"

@@ -225,3 +225,64 @@ def test_current_identity_reads_through_to_events_thread_local():
         assert hf_progress.current_identity()[0] == "job-99"
     finally:
         events.set_current_job_id("")
+
+
+def test_cancellable_progress_bar_aborts_in_init_when_already_cancelled(monkeypatch):
+    captured = _events_sink(monkeypatch)
+    cancel = threading.Event()
+    cancel.set()
+
+    with pytest.raises(hf_progress.DownloadCancelled):
+        hf_progress.tqdm_class(cancel)(
+            total=1000,
+            initial=0,
+            unit="B",
+            unit_scale=True,
+            desc="model.gguf",
+            name="huggingface_hub.http_get",
+            disable=True,
+        )
+    assert captured == []
+
+
+def test_concurrent_progress_updates_never_regress_or_emit_after_done(monkeypatch):
+    captured: list[dict] = []
+    cap_lock = threading.Lock()
+    monkeypatch.setattr(
+        events,
+        "emit",
+        lambda event: (cap_lock.acquire(), captured.append(event), cap_lock.release()),
+    )
+    monkeypatch.setattr(hf_progress, "_current_job_id", lambda: "job-conc")
+
+    bar = hf_progress.HfDownloadProgressTqdm(
+        total=1000,
+        initial=0,
+        unit="B",
+        unit_scale=True,
+        desc="concurrent.gguf",
+        name="huggingface_hub.http_get",
+        disable=True,
+    )
+
+    def worker():
+        for _ in range(50):
+            bar.update(5)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+    bar.close()
+    # Any late update after close must not emit progress after done.
+    bar.update(1)
+    bar.close()
+
+    phases = [e["phase"] for e in captured]
+    assert phases[0] == "start"
+    assert phases.count("done") == 1
+    assert phases[-1] == "done"
+
+    pcts = [e["extra"]["pct"] for e in captured if e["phase"] == "progress" and "pct" in e["extra"]]
+    assert pcts == sorted(pcts)

@@ -75,7 +75,7 @@ def test_qwen_finalize_uses_boundary_chunk_timeline(monkeypatch):
                 "normalized_path": "missing.wav",
                 "alignment_window_start_s": 2.0,
                 "alignment_window_end_s": 8.0,
-                "alignment_window_source": "speech_core",
+                "alignment_window_source": "chunk",
                 "log": [],
             }
         ]
@@ -86,4 +86,3 @@ def test_qwen_finalize_uses_boundary_chunk_timeline(monkeypatch):
     assert chunk_result["alignment_mode"] == "boundary_proportional"
     assert calls == [("テスト", 2.0, 8.0)]
     assert any("Subtitle timing: boundary_chunk_timeline" in entry for entry in chunk_log)
-    assert any("Subtitle timing window: speech_core" in entry for entry in chunk_log)

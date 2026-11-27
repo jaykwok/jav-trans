@@ -166,7 +166,7 @@ def test_write_bilingual_srt_does_not_normalize_unprepared_blocks(tmp_path):
     written = subtitle.write_bilingual_srt(blocks, str(path), options=SubtitleOptions())
 
     assert written[0]["end"] == pytest.approx(1.2)
-    assert "00:00:00,000 --> 00:00:01,199" in path.read_text(encoding="utf-8")
+    assert "00:00:00,000 --> 00:00:01,200" in path.read_text(encoding="utf-8")
 
 
 def test_write_srt_returned_blocks_match_min_written_duration(tmp_path):
@@ -188,7 +188,7 @@ def test_write_bilingual_srt_returned_blocks_match_min_written_duration(tmp_path
     )
 
     assert written[0]["end"] == pytest.approx(2.05)
-    assert "00:00:02,000 --> 00:00:02,049" in path.read_text(encoding="utf-8")
+    assert "00:00:02,000 --> 00:00:02,050" in path.read_text(encoding="utf-8")
 
 
 def test_ja_wrap_uses_hiragana_kanji_boundary():
@@ -1188,3 +1188,90 @@ def test_a_comma_and_an_unrelated_gap_do_not_establish_a_completed_clause():
     assert len(prepared) == 1
     assert prepared[0]["text_break_type"] == "end"
     assert prepared[0]["ja_text"] == text
+
+
+@pytest.mark.parametrize(
+    "seconds,expected",
+    [
+        (1.14, "00:00:01,140"),
+        (1.2, "00:00:01,200"),
+        (2.05, "00:00:02,050"),
+        (59.9999, "00:00:59,999"),
+        (3661.999, "01:01:01,999"),
+        (0.0, "00:00:00,000"),
+        (-1.25, "00:00:00,000"),
+        (float("nan"), "00:00:00,000"),
+        (float("inf"), "00:00:00,000"),
+    ],
+)
+def test_format_timestamp_avoids_float_truncation_drift(seconds, expected):
+    assert subtitle.format_timestamp(seconds) == expected
+
+
+def test_write_srt_guards_submillisecond_measured_exact_cues(tmp_path):
+    single_path = tmp_path / "exact_single.srt"
+    bilingual_path = tmp_path / "exact_bilingual.srt"
+    blocks = [
+        {
+            "start": 1.0,
+            "end": 1.0,
+            "ja_text": "私",
+            "zh_text": "我",
+            "exact_measured_timeline": True,
+        },
+        {
+            "start": 2.0002,
+            "end": 2.0005,
+            "ja_text": "君",
+            "zh_text": "你",
+            "exact_measured_timeline": True,
+        },
+    ]
+
+    kept_single = subtitle.write_srt(blocks, str(single_path))
+    kept_bi = subtitle.write_bilingual_srt(blocks, str(bilingual_path))
+
+    for kept, path in ((kept_single, single_path), (kept_bi, bilingual_path)):
+        assert len(kept) == 2
+        assert kept[0]["end"] == pytest.approx(1.001)
+        assert kept[1]["end"] == pytest.approx(2.0012)
+        content = path.read_text(encoding="utf-8-sig")
+        assert "00:00:01,000 --> 00:00:01,001" in content
+        assert "00:00:02,000 --> 00:00:02,001" in content
+        assert "00:00:01,000 --> 00:00:01,000" not in content
+        assert "00:00:02,000 --> 00:00:02,000" not in content
+
+
+def test_write_srt_is_atomic_and_cleans_up_temp_files_on_failure(tmp_path, monkeypatch):
+    path = tmp_path / "atomic.srt"
+    subtitle.write_srt([{"start": 0.0, "end": 1.0, "zh_text": "原始内容"}], str(path))
+    before = path.read_text(encoding="utf-8-sig")
+    assert list(tmp_path.glob("*.tmp")) == []
+
+    def boom(_text, *, options):
+        raise RuntimeError("render boom")
+
+    monkeypatch.setattr(subtitle, "_render_zh_subtitle_text", boom)
+    with pytest.raises(RuntimeError, match="render boom"):
+        subtitle.write_srt([{"start": 0.0, "end": 1.0, "zh_text": "新内容"}], str(path))
+
+    assert path.read_text(encoding="utf-8-sig") == before
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_prepare_subtitle_blocks_sorts_only_at_entry_and_after_split(monkeypatch):
+    calls = 0
+    real_copy_sorted = subtitle._copy_sorted_blocks
+
+    def counting_copy_sorted(blocks):
+        nonlocal calls
+        calls += 1
+        return real_copy_sorted(blocks)
+
+    monkeypatch.setattr(subtitle, "_copy_sorted_blocks", counting_copy_sorted)
+    blocks = [
+        {"start": 0.0, "end": 1.0, "ja_text": "私", "zh_text": "我"},
+        {"start": 2.0, "end": 3.0, "ja_text": "君", "zh_text": "你"},
+    ]
+    subtitle.prepare_srt_blocks(blocks, options=SubtitleOptions())
+    assert calls == 2

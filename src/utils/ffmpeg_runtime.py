@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 from utils.runtime_paths import prepend_to_path, resource_root, runtime_root
 
-
+_RUNTIME_LOCK = threading.Lock()
 _DLL_DIRECTORY_HANDLES: list[object] = []
 _CONFIGURED_DIRECTORIES: tuple[str, ...] | None = None
 
@@ -55,29 +56,35 @@ def _candidate_directories() -> list[Path]:
 def configure_ffmpeg_shared_runtime() -> tuple[str, ...]:
     """Register FFmpeg shared DLL directories for TorchCodec on Windows."""
     global _CONFIGURED_DIRECTORIES
-    if _CONFIGURED_DIRECTORIES is not None:
-        return _CONFIGURED_DIRECTORIES
+    with _RUNTIME_LOCK:
+        if _CONFIGURED_DIRECTORIES is not None:
+            return _CONFIGURED_DIRECTORIES
 
-    configured: list[str] = []
-    seen: set[str] = set()
-    for candidate in _candidate_directories():
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            continue
-        key = os.path.normcase(str(resolved))
-        if key in seen or not _is_shared_ffmpeg_directory(resolved):
-            continue
-        seen.add(key)
-        prepend_to_path(resolved)
-        if os.name == "nt" and hasattr(os, "add_dll_directory"):
+        configured_paths: list[Path] = []
+        seen: set[str] = set()
+        for candidate in _candidate_directories():
             try:
-                # The returned handle must stay alive for the registration to
-                # remain active, including while TorchCodec loads dependencies.
-                _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(resolved)))
+                resolved = candidate.resolve()
             except OSError:
                 continue
-        configured.append(str(resolved))
+            key = os.path.normcase(os.path.normpath(str(resolved)))
+            if key in seen or not _is_shared_ffmpeg_directory(resolved):
+                continue
+            seen.add(key)
+            if os.name == "nt" and hasattr(os, "add_dll_directory"):
+                try:
+                    # The returned handle must stay alive for the registration to
+                    # remain active, including while TorchCodec loads dependencies.
+                    handle = os.add_dll_directory(str(resolved))
+                except OSError:
+                    continue
+                _DLL_DIRECTORY_HANDLES.append(handle)
+            configured_paths.append(resolved)
 
-    _CONFIGURED_DIRECTORIES = tuple(configured)
-    return _CONFIGURED_DIRECTORIES
+        # Prepend in reverse priority order so the highest-priority directory
+        # (env override or bundled bin/) ends up first on PATH.
+        for resolved in reversed(configured_paths):
+            prepend_to_path(resolved)
+
+        _CONFIGURED_DIRECTORIES = tuple(str(path) for path in configured_paths)
+        return _CONFIGURED_DIRECTORIES

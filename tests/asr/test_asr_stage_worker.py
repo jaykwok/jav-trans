@@ -9,6 +9,11 @@ from pipeline import audio as pipeline_audio
 from pipeline import gpu_worker
 
 
+@pytest.fixture(autouse=True)
+def _isolate_project_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+
+
 def test_asr_details_cuda_skip_reason_always_skips_in_main():
     # The main/web process must never own CUDA -- not even is_available() --
     # including for asr_details loaded from a stale cache that lacks the
@@ -79,6 +84,39 @@ def test_shared_vram_spill_tolerance_env_override(monkeypatch):
                 "max_allocated_mb": 4800.0,
             }
         )
+
+
+def test_enforce_vram_budget_fails_fast_on_shared_vram_spill(monkeypatch):
+    from types import SimpleNamespace
+    from asr import transcribe
+    from pipeline import memory_safety
+
+    monkeypatch.setenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "7778")
+    monkeypatch.setenv("ASR_SHARED_VRAM_SPILL_TOLERANCE_MB", "64")
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            max_memory_allocated=lambda _idx: 5600 * 1024 * 1024,
+            memory_allocated=lambda _idx: 3910 * 1024 * 1024,
+            max_memory_reserved=lambda _idx: 6400 * 1024 * 1024,
+            memory_reserved=lambda _idx: 4200 * 1024 * 1024,
+        )
+    )
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+    monkeypatch.setattr(
+        memory_safety,
+        "runtime_memory_snapshot",
+        lambda **_kwargs: {
+            "shared_vram_mb": 86.0,
+            "shared_vram_raw_mb": 162.0,
+            "shared_vram_baseline_mb": 76.0,
+        },
+    )
+    warnings: list[str] = []
+    with pytest.raises(RuntimeError, match="GPU shared VRAM spill detected"):
+        transcribe._enforce_vram_budget("ASR 文本转写_batch_1", warnings.append)
+    assert any("shared VRAM spill" in msg for msg in warnings)
 
 
 def test_stage_worker_emits_heartbeat_while_provider_is_silent(monkeypatch, tmp_path):
@@ -591,7 +629,8 @@ def test_adaptive_runtime_tuning_accounts_for_live_free_and_resident_vram():
         "ASR_BATCH_SIZE": "auto",
         "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "auto",
     }
-    # Fresh worker with 6800 MiB free -> picks batch 7..8.
+    # Fresh worker with 6800 MiB free -> picks batch 5..6 (leaves CUDA/cuDNN
+    # workspace + WDDM headroom so it does not spill to shared VRAM).
     with gpu_worker._temporary_env(env):
         fresh = gpu_worker._adaptive_runtime_tuning(_Torch(), env)
     # Resident worker holding 4868 MiB of its own weights -> free drops to 1932 MiB,
@@ -601,7 +640,7 @@ def test_adaptive_runtime_tuning_accounts_for_live_free_and_resident_vram():
     with gpu_worker._temporary_env(env):
         resident = gpu_worker._adaptive_runtime_tuning(_Torch(), env)
     assert resident["asr_batch_size"] == fresh["asr_batch_size"]
-    assert fresh["asr_batch_size"] >= 7
+    assert 5 <= fresh["asr_batch_size"] <= 7
 
     # Heavy external desktop load (only 5400 MiB free, 0 own reserved) -> steps down safely.
     _Cuda.free_mb = 5400

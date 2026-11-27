@@ -1,9 +1,13 @@
 # Translation backend base classes
 
 from abc import ABC, abstractmethod
+import logging
 from typing import Callable
 
+from core.cancellation import PipelineCancelledError
 from llm.errors import TranslationCancelledError
+
+logger = logging.getLogger(__name__)
 
 
 class BaseTranslationBackend(ABC):
@@ -60,8 +64,10 @@ class BaseTranslationBackend(ABC):
             return
         try:
             on_progress(payload)
-        except Exception:
-            pass
+        except (TranslationCancelledError, PipelineCancelledError):
+            raise
+        except Exception as exc:
+            logger.warning("Backend progress callback failed: %s", exc, exc_info=True)
 
     def _emit_usage(
         self,
@@ -73,8 +79,8 @@ class BaseTranslationBackend(ABC):
             return
         try:
             on_usage(usage_data)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Backend usage callback failed: %s", exc, exc_info=True)
 
     @staticmethod
     def _raise_if_cancelled(cancel_event) -> None:

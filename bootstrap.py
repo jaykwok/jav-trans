@@ -24,8 +24,12 @@ would actually take, and lets the user decide from that number.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import html
+import html.parser
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -42,6 +46,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -55,7 +60,9 @@ LOCK_PATH = ROOT / "uv.lock"
 STAMP_PATH = VENV_PATH / ".jav-sub-install-stamp"
 # Touched by launcher.py once its server answers and its window is up. That is
 # the first moment at which hiding the console cannot swallow a startup failure.
-READY_PATH = ROOT / "tmp" / ".app-ready"
+# Default launches isolate this path per PID; READY_PATH stays as a test hook.
+_DEFAULT_READY_PATH = ROOT / "tmp" / ".app-ready"
+READY_PATH = _DEFAULT_READY_PATH
 
 # Import roots that have to exist on disk for the app to start, mapped to the
 # distribution that provides each. A tripwire, not a manifest: what breaks an
@@ -113,13 +120,43 @@ _PROTECTED_UPDATE_TOP_DIRS = frozenset(
         ".git",
     }
 )
+_REQUIRED_PAYLOAD_ENTRIES = (
+    "jav-sub.exe",
+    "launcher.py",
+    "pyproject.toml",
+    "uv.lock",
+    RELEASE_INDEX_NAME,
+)
+_MAX_ARCHIVE_MEMBERS = 10_000
+_MAX_ARCHIVE_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_GITHUB_ALLOWED_REDIRECT_SUFFIXES = (
+    "github.com",
+    "githubusercontent.com",
+    "githubassets.com",
+)
+_WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{idx}" for idx in range(1, 10)),
+        *(f"LPT{idx}" for idx in range(1, 10)),
+    }
+)
+_LAUNCHER_INSTANCE_DIR_NAME = "launcher"
+_WORKSPACE_GATE_NAME = "workspace.gate"
+_REQUIRED_FFMPEG_DLL_PATTERNS = ("avcodec-*.dll", "avformat-*.dll", "avutil-*.dll")
 
-# Must match core.config._PROXY_ENV_KEYS. Both cases are set because parts of
-# the stack read only the lowercase names.
+# Must match core.config._PROXY_ENV_KEYS / _NO_PROXY_ENV_KEYS. Both cases are
+# set because parts of the stack read only the lowercase names.
 PROXY_ENV_KEYS = (
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
     "http_proxy", "https_proxy", "all_proxy",
 )
+NO_PROXY_ENV_KEYS = ("NO_PROXY", "no_proxy")
+_LOOPBACK_NO_PROXY = ("127.0.0.1", "localhost", "::1")
 SUPPORTED_PROXY_PROTOCOLS = ("http", "https", "socks5")
 DEFAULT_PROXY_PORT = "7890"
 
@@ -137,9 +174,7 @@ _WHEEL_URL = re.compile(r'"(https?://[^"]+\.whl)"')
 # source than its GitHub release for this audience: PyPI is the one host the
 # install already depends on, and it is mirrored where GitHub is not.
 UV_PYPI_INDEX = "https://pypi.org/simple/uv/"
-_UV_WHEEL = re.compile(
-    r'href="([^"#]*uv-([0-9][^"#/]*?)-py3-none-win_amd64\.whl)(?:#[^"]*)?"'
-)
+_UV_WHEEL_FILENAME_RE = re.compile(r"^uv-([0-9]+(?:\.[0-9]+)*)-py3-none-win_amd64\.whl$")
 
 
 _BOOTSTRAP_LOG_ENABLED = False
@@ -360,6 +395,44 @@ def read_config_file(path: Path | None = None) -> dict[str, str]:
         return {}
 
 
+def _replace_atomically(
+    src: Path,
+    dst: Path,
+    *,
+    retries: int = 6,
+    base_delay_s: float = 0.02,
+) -> None:
+    """Replace `dst` with `src`, retrying transient Windows `PermissionError`."""
+    attempts = max(1, int(retries))
+    delay = max(0.0, float(base_delay_s))
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(delay * (2**attempt))
+
+
+def _write_json_atomic(target: Path, payload: object) -> None:
+    """Atomically write JSON to `target` via a same-directory uuid temp file + fsync."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _replace_atomically(temporary, target)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def update_config_file(updates: dict[str, str], path: Path | None = None) -> None:
     """Merge keys into `config/config.json`, preserving all existing settings.
 
@@ -369,48 +442,52 @@ def update_config_file(updates: dict[str, str], path: Path | None = None) -> Non
     discarding it.
     """
     target = path or CONFIG_PATH
-    existing: dict[str, object] = {}
-    if target.exists():
-        try:
-            text = target.read_text(encoding="utf-8-sig")
-        except UnicodeDecodeError as exc:
-            raise ValueError(
-                "config/config.json 不是有效的 UTF-8 编码，已拒绝覆盖以保护现有配置。"
-            ) from exc
-        if not text.strip():
-            raise ValueError(
-                "config/config.json 内容为空（可能已被截断），已拒绝覆盖以保护现有配置。"
-            )
-        try:
-            loaded = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"config/config.json 格式损坏（{exc}），已拒绝覆盖以保护现有配置。"
-            ) from exc
-        if not isinstance(loaded, dict):
-            raise ValueError(
-                "config/config.json 顶层不是 JSON 对象，已拒绝覆盖以保护现有配置。"
-            )
-        existing = loaded
+    try:
+        existing = _read_config_file_strict(target)
+    except ValueError as exc:
+        raise ValueError(f"{exc}，已拒绝覆盖以保护现有配置。") from exc
 
-    merged = dict(existing)
+    merged: dict[str, str] = dict(existing)
     for key, value in updates.items():
         merged[str(key)] = "" if value is None else str(value)
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f"{target.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(merged, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, target)
+    _write_json_atomic(target, merged)
+
+
+def _no_proxy_value_with_loopback(existing: str) -> str:
+    """Merge loopback hosts into a NO_PROXY list, preserving user entries."""
+    entries = [item.strip() for item in str(existing or "").split(",")]
+    entries = [item for item in entries if item]
+    if "*" in entries:
+        return ",".join(entries)
+    lowered = {item.lower() for item in entries}
+    for host in _LOOPBACK_NO_PROXY:
+        if host not in lowered:
+            entries.append(host)
+            lowered.add(host)
+    return ",".join(entries)
+
+
+def _format_proxy_host(raw_host: str) -> str:
+    """Wrap a bare IPv6 literal in brackets while keeping other hosts intact."""
+    host = raw_host.strip()
+    if not host or "://" in host:
+        return host
+    userinfo, sep, host_part = host.rpartition("@")
+    if ":" in host_part and not (host_part.startswith("[") and host_part.endswith("]")):
+        try:
+            ipaddress.IPv6Address(host_part)
+        except ValueError:
+            return host
+        host_part = f"[{host_part}]"
+    return f"{userinfo}@{host_part}" if sep else host_part
 
 
 def proxy_url_from(values: dict[str, str]) -> str:
     """Same rule as core.config.network_proxy_url_from_env, restated here
     because importing src/ would mean importing its dependencies."""
     protocol = (values.get("PROXY_PROTOCOL") or "http").strip().lower() or "http"
-    host = (values.get("PROXY_HOST") or "").strip()
+    host = _format_proxy_host(values.get("PROXY_HOST") or "")
     port = (values.get("PROXY_PORT") or "").strip()
     if not host or not port:
         return ""
@@ -419,38 +496,136 @@ def proxy_url_from(values: dict[str, str]) -> str:
     return f"{protocol}://{host}:{port}"
 
 
-def apply_proxy(proxy_url: str) -> None:
+def _validate_proxy_url(proxy_url: str) -> tuple[dict[str, str], str]:
+    raw = str(proxy_url or "").strip()
+    if any(ch.isspace() or ch in "\\\x00" for ch in raw):
+        raise ValueError("代理 URL 不能包含空白或非法字符")
+    parsed = urllib.parse.urlsplit(raw)
+    if (
+        parsed.scheme not in SUPPORTED_PROXY_PROTOCOLS
+        or not parsed.hostname
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("代理 URL 必须是 http://、https:// 或 socks5://地址:端口")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("代理端口必须是 1-65535 的数字") from exc
+    if port is not None:
+        host = parsed.netloc.rsplit(":", 1)[0]
+    else:
+        if parsed.netloc.endswith(":"):
+            raise ValueError("代理端口必须是 1-65535 的数字")
+        host = parsed.netloc
+        port = {"http": 80, "https": 443, "socks5": 1080}[parsed.scheme]
+    if not host or "://" in host or any(ch in host for ch in ("/", "?", "#", "\\", "\x00")):
+        raise ValueError("代理地址格式无效")
+    if not 1 <= port <= 65535:
+        raise ValueError("代理端口必须是 1-65535 的数字")
+    settings = {
+        "PROXY_PROTOCOL": parsed.scheme,
+        "PROXY_HOST": host,
+        "PROXY_PORT": str(port),
+    }
+    return settings, proxy_url_from(settings)
+
+
+def _parse_proxy_host_entry(raw: str) -> tuple[str, str, str]:
+    """Parse user input at the proxy host prompt.
+
+    Accepts plain host, bare/bracketed IPv6, `host:port`, or full
+    `scheme://host[:port]` URLs and rejects whitespace/path/invalid port.
+    Returns ``(detected_protocol, normalized_host, detected_port)``.
+    """
+    text = raw.strip()
+    if not text:
+        return "", "", ""
+    if any(ch.isspace() or ch in "?#\\\x00" for ch in text):
+        raise ValueError("代理地址不能包含空白、?、# 或反斜杠")
+    if "://" in text:
+        parsed = urllib.parse.urlsplit(text)
+        scheme = parsed.scheme.lower()
+        if scheme not in SUPPORTED_PROXY_PROTOCOLS:
+            raise ValueError(f"不支持的代理协议 {parsed.scheme!r}，仅支持 http、https、socks5")
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment or not parsed.hostname:
+            raise ValueError("代理地址不能包含路径或无效主机")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("代理端口必须是 1-65535 的数字") from exc
+        if port is not None:
+            if not 1 <= port <= 65535:
+                raise ValueError("代理端口必须是 1-65535 的数字")
+            host = parsed.netloc.rsplit(":", 1)[0]
+            port_str = str(port)
+        else:
+            if parsed.netloc.endswith(":"):
+                raise ValueError("代理端口必须是 1-65535 的数字")
+            host = parsed.netloc
+            port_str = ""
+        if not host:
+            raise ValueError("代理地址无效")
+        return scheme, host, port_str
+
+    if "/" in text:
+        raise ValueError("代理地址不能包含路径字符 '/'")
+
+    userinfo, sep, host_part = text.rpartition("@")
+    if host_part and ":" in host_part and not host_part.startswith("["):
+        try:
+            ipaddress.IPv6Address(host_part)
+        except ValueError:
+            pass
+        else:
+            formatted = f"{userinfo}@[{host_part}]" if sep else f"[{host_part}]"
+            return "", formatted, ""
+
+    parsed = urllib.parse.urlsplit(f"http://{text}")
+    if not parsed.hostname or parsed.path or parsed.query or parsed.fragment:
+        raise ValueError("代理地址格式无效")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("代理端口必须是 1-65535 的数字") from exc
+    if port is not None:
+        if not 1 <= port <= 65535:
+            raise ValueError("代理端口必须是 1-65535 的数字")
+        host = parsed.netloc.rsplit(":", 1)[0]
+        return "", host, str(port)
+    if parsed.netloc.endswith(":"):
+        raise ValueError("代理端口必须是 1-65535 的数字")
+    return "", parsed.netloc, ""
+
+
+def apply_proxy(proxy_url: str, *, clear_existing: bool = False) -> None:
     """Export the proxy to this process and everything it spawns.
 
     uv and huggingface_hub both read these, so setting them here is what makes
     one console answer cover dependency install and model download alike.
+    Matches `core.config.apply_network_proxy_environment`: preserves external
+    shell proxy env vars when `proxy_url` is empty unless `clear_existing=True`,
+    and merges loopback addresses into `NO_PROXY`/`no_proxy` when setting a proxy.
     """
-    proxy_url = proxy_url.strip()
-    settings = {"PROXY_PROTOCOL": "http", "PROXY_HOST": "", "PROXY_PORT": ""}
-    if proxy_url:
-        parsed = urllib.parse.urlsplit(proxy_url)
-        if (
-            parsed.scheme not in SUPPORTED_PROXY_PROTOCOLS
-            or not parsed.hostname
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError("代理 URL 必须是 http://、https:// 或 socks5://地址:端口")
-        port = parsed.port
-        host = parsed.netloc.rsplit(":", 1)[0] if port is not None else parsed.netloc
-        port = port if port is not None else {"http": 80, "https": 443, "socks5": 1080}[parsed.scheme]
-        if not 1 <= port <= 65535:
-            raise ValueError("代理端口必须是 1-65535 的数字")
-        settings = {"PROXY_PROTOCOL": parsed.scheme, "PROXY_HOST": host, "PROXY_PORT": str(port)}
-        proxy_url = proxy_url_from(settings)
-    # Export the app's keys too: load_config protects process values from config/config.json.
-    # In particular, an explicit --proxy must survive the hand-off to launcher.
-    os.environ.update(settings)
-    for key in PROXY_ENV_KEYS:
-        if proxy_url:
-            os.environ[key] = proxy_url
-        else:
+    raw = str(proxy_url or "").strip()
+    if raw:
+        settings, normalized_url = _validate_proxy_url(raw)
+        # Export the app's keys too: load_config protects process values from config/config.json.
+        # In particular, an explicit --proxy must survive the hand-off to launcher.
+        os.environ.update(settings)
+        for key in PROXY_ENV_KEYS:
+            os.environ[key] = normalized_url
+        existing_no_proxy = ""
+        for key in NO_PROXY_ENV_KEYS:
+            existing_no_proxy = os.environ.get(key) or existing_no_proxy
+        merged_no_proxy = _no_proxy_value_with_loopback(existing_no_proxy)
+        for key in NO_PROXY_ENV_KEYS:
+            os.environ[key] = merged_no_proxy
+        return
+    if clear_existing:
+        os.environ.update({"PROXY_PROTOCOL": "http", "PROXY_HOST": "", "PROXY_PORT": ""})
+        for key in PROXY_ENV_KEYS:
             os.environ.pop(key, None)
 
 
@@ -566,19 +741,30 @@ class _BootstrapProxyHandler(urllib.request.ProxyHandler):
         return urllib.request.HTTPHandler().do_open(connection, req)
 
 
+def _build_proxy_handler() -> _BootstrapProxyHandler:
+    all_proxy = os.environ.get("ALL_PROXY") or os.environ.get("all_proxy") or ""
+    proxies: dict[str, str] = {}
+    for scheme in ("http", "https"):
+        value = (
+            os.environ.get(f"{scheme.upper()}_PROXY")
+            or os.environ.get(f"{scheme}_proxy")
+            or all_proxy
+        )
+        if value:
+            proxies[scheme] = value
+    return _BootstrapProxyHandler(proxies) if proxies else _BootstrapProxyHandler()
+
+
 def _opener() -> urllib.request.OpenerDirector:
     """Build a fresh opener per probe.
 
     urllib caches the default opener - and with it the proxy settings that were
     in the environment the first time it was used - so re-testing after the user
     enters a proxy would silently re-measure the direct connection.
+    When no proxy environment variables are set, omit the explicit `{}` mapping
+    so urllib keeps its OS/system proxy fallback.
     """
-    proxies = {}
-    for scheme in ("http", "https"):
-        value = os.environ.get(f"{scheme.upper()}_PROXY") or os.environ.get(f"{scheme}_proxy")
-        if value:
-            proxies[scheme] = value
-    return urllib.request.build_opener(_BootstrapProxyHandler(proxies))
+    return urllib.request.build_opener(_build_proxy_handler())
 
 
 def measure_download(url: str = "") -> tuple[float, int] | None:
@@ -658,19 +844,88 @@ def find_uv() -> Path | None:
 
 
 def _version_key(version: str) -> tuple[int, ...]:
-    return tuple(int(part) for part in re.findall(r"\d+", version)[:4])
+    return tuple(int(part) for part in version.split("."))
 
 
-def latest_uv_wheel_url(index_html: str) -> str:
-    """Newest Windows uv wheel from a PyPI simple index page.
+class _SimpleIndexLinkParser(html.parser.HTMLParser):
+    """Extract `<a href=...>` links and `data-yanked` flags from PEP 503 HTML."""
 
-    Sorted by version rather than taking the last link: the index is ordered by
-    upload time, and a yanked-then-rebuilt patch would otherwise win.
-    """
-    matches = _UV_WHEEL.findall(index_html)
-    if not matches:
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, bool]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        attr_map = {name.lower(): value for name, value in attrs}
+        href = attr_map.get("href")
+        if not href:
+            return
+        yanked = "data-yanked" in attr_map
+        self.links.append((html.unescape(href.strip()), yanked))
+
+
+def _extract_fragment_sha256(fragment: str) -> str:
+    raw = str(fragment or "").strip()
+    if not raw:
         return ""
-    url, _version = max(matches, key=lambda item: _version_key(item[1]))
+    for item in raw.split("&"):
+        key, sep, value = item.partition("=")
+        if sep and key.strip().lower() == "sha256":
+            return value.strip().lower()
+    return ""
+
+
+def _latest_uv_wheel(
+    index_html: str,
+    *,
+    base_url: str = UV_PYPI_INDEX,
+) -> tuple[str, str]:
+    """Return ``(url, sha256)`` for the newest non-yanked stable Windows uv wheel.
+
+    Skips links carrying `data-yanked` and prerelease/non-numeric versions,
+    unescapes and resolves relative URLs against `base_url`, strips any
+    `#sha256=...` fragment from the returned URL, and returns the digest.
+    """
+    parser = _SimpleIndexLinkParser()
+    parser.feed(index_html)
+    parser.close()
+
+    candidates: list[tuple[tuple[int, ...], str, str]] = []
+    for href, yanked in parser.links:
+        if yanked or not href:
+            continue
+        resolved = urllib.parse.urljoin(base_url, href)
+        try:
+            parsed = urllib.parse.urlsplit(resolved)
+        except ValueError:
+            continue
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        filename = PurePosixPath(urllib.parse.unquote(parsed.path)).name
+        match = _UV_WHEEL_FILENAME_RE.fullmatch(filename)
+        if not match:
+            continue
+        version = match.group(1)
+        clean_url = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, parsed.query, "")
+        )
+        sha256 = _extract_fragment_sha256(parsed.fragment)
+        candidates.append((_version_key(version), clean_url, sha256))
+
+    if not candidates:
+        return "", ""
+    _ver_key, best_url, best_sha = max(candidates, key=lambda item: item[0])
+    return best_url, best_sha
+
+
+def latest_uv_wheel_url(index_html: str, *, base_url: str = UV_PYPI_INDEX) -> str:
+    """Newest Windows uv wheel URL from a PyPI simple index page.
+
+    Sorted by numeric version rather than taking the last link: the index is
+    ordered by upload time, and yanked/prerelease builds are skipped.
+    """
+    url, _sha256 = _latest_uv_wheel(index_html, base_url=base_url)
     return url
 
 
@@ -683,8 +938,9 @@ def download_uv() -> Path | None:
     """
     target = ROOT / "bin" / ("uv.exe" if os.name == "nt" else "uv")
     log("\n未找到 uv，正在从 PyPI 下载（约 20MB）...")
+    opener = _opener()
     try:
-        with _opener().open(
+        with opener.open(
             urllib.request.Request(
                 UV_PYPI_INDEX,
                 headers={
@@ -695,19 +951,29 @@ def download_uv() -> Path | None:
             timeout=PROBE_TIMEOUT_S,
         ) as response:
             index_html = response.read().decode("utf-8", "replace")
+            base_url = (
+                response.geturl()
+                if hasattr(response, "geturl") and callable(response.geturl)
+                else UV_PYPI_INDEX
+            ) or UV_PYPI_INDEX
     except (urllib.error.URLError, OSError, ValueError) as error:
         log(f"  无法读取 PyPI 索引: {error}")
         return None
 
-    url = latest_uv_wheel_url(index_html)
+    url, expected_sha = _latest_uv_wheel(index_html, base_url=base_url)
     if not url:
         log("  PyPI 索引里没有 Windows 版 uv。")
         return None
 
     with tempfile.TemporaryDirectory() as work:
         wheel = Path(work) / "uv.whl"
+        tmp_target: Path | None = None
         try:
-            _download_with_progress(url, wheel)
+            actual_sha = _download_with_progress(url, wheel, opener=opener)
+            if expected_sha:
+                if not _UPDATE_SHA256_RE.fullmatch(expected_sha) or actual_sha != expected_sha:
+                    log("  下载的 uv 校验失败（SHA-256 不匹配）。")
+                    return None
             with zipfile.ZipFile(wheel) as archive:
                 names = [
                     name for name in archive.namelist()
@@ -717,31 +983,58 @@ def download_uv() -> Path | None:
                     log("  下载的 uv 包里没有可执行文件。")
                     return None
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(names[0]) as source, open(target, "wb") as sink:
+                tmp_target = target.with_name(
+                    f".{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+                )
+                with archive.open(names[0]) as source, tmp_target.open("wb") as sink:
                     shutil.copyfileobj(source, sink)
+                    sink.flush()
+                    os.fsync(sink.fileno())
+                tmp_target.chmod(0o755)
+                _replace_atomically(tmp_target, target)
         except (urllib.error.URLError, OSError, ValueError, zipfile.BadZipFile) as error:
             log(f"  下载失败: {error}")
             return None
+        finally:
+            if tmp_target is not None:
+                try:
+                    tmp_target.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-    target.chmod(0o755)
     log(f"  已安装 uv: {target}")
     return target
 
 
-def _download_with_progress(url: str, destination: Path) -> None:
-    request = urllib.request.Request(url, headers={"User-Agent": "jav-sub-setup"})
-    with _opener().open(request, timeout=PROBE_TIMEOUT_S) as response:
-        length = response.headers.get("Content-Length", "")
-        total = int(length) if length.strip().isdigit() else 0
+def _download_with_progress(
+    url: str,
+    destination: Path,
+    *,
+    opener=None,
+    headers: dict[str, str] | None = None,
+    timeout: float = PROBE_TIMEOUT_S,
+) -> str:
+    req_headers = {"User-Agent": "jav-sub-setup"}
+    if headers:
+        req_headers.update(headers)
+    request = urllib.request.Request(url, headers=req_headers)
+    active_opener = opener if opener is not None else _opener()
+    digest = hashlib.sha256()
+    with active_opener.open(request, timeout=timeout) as response:
+        resp_headers = getattr(response, "headers", None)
+        length = resp_headers.get("Content-Length", "") if resp_headers is not None else ""
+        total = int(length) if str(length).strip().isdigit() else 0
         read = 0
         with open(destination, "wb") as sink:
             while chunk := response.read(262144):
                 sink.write(chunk)
+                digest.update(chunk)
                 read += len(chunk)
                 if total:
                     print(f"\r  {read * 100 // total}%", end="", flush=True)
     if total:
         print("\r  100%", flush=True)
+    return digest.hexdigest()
 
 
 def ensure_uv() -> Path | None:
@@ -1074,15 +1367,36 @@ def probe_imports(names: tuple[str, ...] = ()) -> list[tuple[str, str]]:
 
     The ground truth, and the only check that catches a half-deleted package: a
     dist-info left behind by a deleted `torch/lib` still satisfies `uv sync`,
-    which audits metadata rather than files. Returns [(import name, reason)] for
-    everything that failed, so the repair can name the packages to reinstall.
+    which audits metadata rather than files. Injects `ROOT/bin` into PATH and
+    Windows DLL search paths so bundled FFmpeg shared DLLs are visible, and
+    exercises `torchcodec._core.get_ffmpeg_library_versions()` to verify real
+    DLL loading. Returns [(import name, reason)] for everything that failed.
     """
     targets = list(names) or sorted(CRITICAL_IMPORT_ROOTS)
+    bin_dir = ROOT / "bin"
+    env = os.environ.copy()
+    if bin_dir.is_dir():
+        bin_str = str(bin_dir)
+        current_path = env.get("PATH", "")
+        if bin_str not in current_path.split(os.pathsep):
+            env["PATH"] = bin_str + (os.pathsep + current_path if current_path else "")
     script = (
-        "import importlib\n"
+        "import importlib, os\n"
+        f"bin_dir = {str(bin_dir)!r}\n"
+        "_dll_handles = []\n"
+        "if os.name == 'nt' and os.path.isdir(bin_dir) and hasattr(os, 'add_dll_directory'):\n"
+        "    try:\n"
+        "        _dll_handles.append(os.add_dll_directory(bin_dir))\n"
+        "    except OSError:\n"
+        "        pass\n"
         f"for name in {targets!r}:\n"
         "    try:\n"
         "        importlib.import_module(name)\n"
+        "        if name == 'torchcodec':\n"
+        "            from torchcodec._core import get_ffmpeg_library_versions\n"
+        "            versions = get_ffmpeg_library_versions()\n"
+        "            if not isinstance(versions, dict) or not versions:\n"
+        "                raise RuntimeError('torchcodec failed to load FFmpeg shared libraries')\n"
         "    except BaseException as exc:\n"
         f"        print('{_PROBE_PREFIX}' + name + ': '"
         " + type(exc).__name__ + ': ' + str(exc).replace(chr(10), ' '), flush=True)\n"
@@ -1090,7 +1404,7 @@ def probe_imports(names: tuple[str, ...] = ()) -> list[tuple[str, str]]:
     try:
         completed = subprocess.run(
             [str(venv_python()), "-c", script],
-            cwd=str(ROOT), capture_output=True, timeout=600,
+            cwd=str(ROOT), capture_output=True, env=env, timeout=600,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         return [(name, f"无法运行 .venv 里的 python: {error}") for name in targets]
@@ -1554,8 +1868,21 @@ def _validate_update_relpath(raw: str) -> PurePosixPath:
     normalized = raw.replace("\\", "/")
     if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
         raise ValueError(f"更新包包含绝对路径：{raw}")
-    pure = PurePosixPath(normalized)
-    if any(part in {"..", ""} for part in pure.parts):
+    raw_trimmed = normalized[:-1] if normalized.endswith("/") else normalized
+    if not raw_trimmed:
+        raise ValueError(f"更新包包含空路径或越界路径：{raw}")
+    for part in raw_trimmed.split("/"):
+        if part in {".", "..", ""}:
+            raise ValueError(f"更新包包含越界路径：{raw}")
+        if ":" in part:
+            raise ValueError(f"更新包路径包含非法字符 ':'：{raw}")
+        if part.endswith(" ") or part.endswith("."):
+            raise ValueError(f"更新包路径段末尾包含非法空格或点号：{raw}")
+        stem = part.split(".", 1)[0].rstrip(" ").upper()
+        if stem in _WINDOWS_RESERVED_DEVICE_NAMES:
+            raise ValueError(f"更新包包含 Windows 保留设备名路径：{raw}")
+    pure = PurePosixPath(raw_trimmed)
+    if not pure.parts or any(part in {".", "..", ""} for part in pure.parts):
         raise ValueError(f"更新包包含越界路径：{raw}")
     return pure
 
@@ -1585,11 +1912,63 @@ def _allowed_update_url(url: str) -> bool:
         parsed = urllib.parse.urlsplit(url.strip())
     except ValueError:
         return False
-    if parsed.scheme == "https" and bool(parsed.netloc):
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https" and bool(host):
         return True
-    if parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost"}:
+    if parsed.scheme == "http" and host in _LOOPBACK_HOSTS:
         return True
     return False
+
+
+def _is_host_in_suffixes(host: str, suffixes: tuple[str, ...]) -> bool:
+    normalized = host.rstrip(".").lower()
+    for suffix in suffixes:
+        if normalized == suffix or normalized.endswith(f".{suffix}"):
+            return True
+    return False
+
+
+def _is_allowed_update_redirect(origin_url: str, target_url: str) -> bool:
+    if not _allowed_update_url(target_url):
+        return False
+    try:
+        origin = urllib.parse.urlsplit(origin_url.strip())
+        target = urllib.parse.urlsplit(target_url.strip())
+    except ValueError:
+        return False
+    if origin.scheme == "https" and target.scheme != "https":
+        return False
+    origin_host = (origin.hostname or "").rstrip(".").lower()
+    target_host = (target.hostname or "").rstrip(".").lower()
+    if not target_host:
+        return False
+    if target_host == origin_host or (
+        origin_host and target_host.endswith(f".{origin_host}")
+    ):
+        return True
+    if _is_host_in_suffixes(target_host, _GITHUB_ALLOWED_REDIRECT_SUFFIXES):
+        return True
+    return False
+
+
+class _SafeUpdateRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject HTTPS downgrades and untrusted redirect targets during self-update."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        origin_url = req.full_url
+        target_url = urllib.parse.urljoin(origin_url, str(newurl).strip())
+        if not _is_allowed_update_redirect(origin_url, target_url):
+            raise ValueError(
+                f"更新下载重定向目标不受信任或试图协议降级（{target_url}），已拒绝。"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, target_url)
+
+
+def _update_opener():
+    opener = _opener()
+    if not isinstance(opener, urllib.request.OpenerDirector):
+        return opener
+    return urllib.request.build_opener(_build_proxy_handler(), _SafeUpdateRedirectHandler())
 
 
 def _update_api_url() -> str:
@@ -1598,6 +1977,87 @@ def _update_api_url() -> str:
         return explicit
     repo = os.environ.get("JAV_SUB_UPDATE_REPO", DEFAULT_UPDATE_REPO).strip().strip("/")
     return f"https://api.github.com/repos/{repo or DEFAULT_UPDATE_REPO}/releases/latest"
+
+
+def _try_lock_file(handle) -> bool:
+    """Non-blocking exclusive OS lock compatible with `launcher.py` & `core.atomic_io`."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock_and_close(handle) -> None:
+    if handle is None:
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+@contextlib.contextmanager
+def _workspace_gate(root: Path, *, wait_s: float = 5.0, poll_s: float = 0.05):
+    """Acquire the shared OS mutex `tmp/launcher/workspace.gate`.
+
+    Yields `True` while the lock is held, or `False` if busy past `wait_s`.
+    Matches `launcher.py` and `core/atomic_io.py` so self-update never races
+    instance registration or exit temp sweeps.
+    """
+    try:
+        directory = root / "tmp" / _LAUNCHER_INSTANCE_DIR_NAME
+        directory.mkdir(parents=True, exist_ok=True)
+        handle = (directory / _WORKSPACE_GATE_NAME).open("a+", encoding="utf-8")
+    except OSError:
+        yield False
+        return
+
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    sleep_s = max(0.005, float(poll_s))
+    acquired = False
+    while True:
+        if _try_lock_file(handle):
+            acquired = True
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(sleep_s, remaining))
+
+    if not acquired:
+        try:
+            handle.close()
+        except OSError:
+            pass
+        yield False
+        return
+
+    try:
+        yield True
+    finally:
+        _unlock_and_close(handle)
 
 
 def _launcher_slot_is_held(path: Path) -> bool:
@@ -1626,22 +2086,47 @@ def _launcher_slot_is_held(path: Path) -> bool:
     return False
 
 
+def _scan_launcher_slots_held(root: Path) -> bool:
+    instance_dir = root / "tmp" / _LAUNCHER_INSTANCE_DIR_NAME
+    if not instance_dir.is_dir():
+        return False
+    try:
+        slots = sorted(instance_dir.glob("instance-*.lock"))
+    except OSError:
+        return True
+    return any(_launcher_slot_is_held(slot) for slot in slots)
+
+
 def _other_launcher_instances_active(root: Path, *, wait_s: float = 10.0) -> bool:
-    instance_dir = root / "tmp" / "launcher"
+    instance_dir = root / "tmp" / _LAUNCHER_INSTANCE_DIR_NAME
     if not instance_dir.is_dir():
         return False
     deadline = time.monotonic() + max(0.0, wait_s)
     while True:
-        try:
-            slots = sorted(instance_dir.glob("instance-*.lock"))
-        except OSError:
-            return True
-        held = any(_launcher_slot_is_held(slot) for slot in slots)
-        if not held:
-            return False
+        remaining = max(0.0, deadline - time.monotonic())
+        gate_wait = min(remaining, 0.2) if remaining > 0 else 0.0
+        with _workspace_gate(root, wait_s=gate_wait) as acquired:
+            if acquired and not _scan_launcher_slots_held(root):
+                return False
         if time.monotonic() >= deadline:
             return True
-        time.sleep(0.2)
+        time.sleep(min(0.2, max(0.01, deadline - time.monotonic())))
+
+
+def _unlink_with_retry(path: Path, *, attempts: int = 8) -> bool:
+    for attempt in range(max(1, attempts)):
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            if attempt >= attempts - 1:
+                return False
+            time.sleep(0.05 * (attempt + 1))
+        except OSError:
+            return False
+    return not path.exists()
 
 
 def _copy_file_atomic(source: Path, destination: Path, *, attempts: int = 8) -> None:
@@ -1801,6 +2286,26 @@ def _read_and_validate_staged_update(
         shutil.rmtree(updates_root, ignore_errors=True)
         return "invalid", None, None, []
 
+    for required in _REQUIRED_PAYLOAD_ENTRIES:
+        req_path = staged_dir / required
+        try:
+            st = req_path.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            log(f"  待应用更新目录缺少必需文件 {required}，已清理。")
+            shutil.rmtree(updates_root, ignore_errors=True)
+            return "invalid", None, None, []
+        except OSError as exc:
+            log(f"  暂时无法检查暂存包文件 {required}（文件可能正被占用），已保留暂存更新包并停止本次启动：{exc}")
+            return "failed", descriptor, None, []
+        if not stat.S_ISREG(st.st_mode):
+            log(f"  待应用更新目录缺少必需文件 {required}，已清理。")
+            shutil.rmtree(updates_root, ignore_errors=True)
+            return "invalid", None, None, []
+    if not (staged_dir / "src").is_dir():
+        log("  待应用更新目录缺少 src/ 目录，已清理。")
+        shutil.rmtree(updates_root, ignore_errors=True)
+        return "invalid", None, None, []
+
     pyproject_path = staged_dir / "pyproject.toml"
     try:
         pyproject_raw = pyproject_path.read_bytes()
@@ -1824,11 +2329,16 @@ def _read_and_validate_staged_update(
         return "invalid", None, None, []
 
     validated_files: list[str] = []
+    seen_cf: set[str] = set()
     for rel in sorted(shipped):
         try:
             pure = _validate_update_relpath(rel)
             if pure.parts[0].casefold() in _PROTECTED_UPDATE_TOP_DIRS:
                 raise ValueError(f"包含受保护目录：{rel}")
+            rel_cf = pure.as_posix().casefold()
+            if rel_cf in seen_cf:
+                raise ValueError(f"包含重复或大小写冲突路径：{rel}")
+            seen_cf.add(rel_cf)
             src = (staged_dir / Path(*pure.parts)).resolve()
             src.relative_to(staged_dir)
             try:
@@ -1881,55 +2391,105 @@ def apply_pending_update(
         log("请关闭全部 jav-sub 窗口后重新启动，将自动继续完成升级。")
         return "deferred", target_version
 
-    log(f"\n=== 正在应用在线升级 -> v{target_version} ===")
-    exe_rel = ""
-    try:
-        for rel in validated_files:
-            if rel.casefold() == "jav-sub.exe":
-                exe_rel = rel
-                continue
-            pure = _validate_update_relpath(rel)
-            src = staged_dir / Path(*pure.parts)
-            dst = base_root / Path(*pure.parts)
-            _copy_file_atomic(src, dst)
+    with _workspace_gate(base_root, wait_s=wait_instances_s) as gate_acquired:
+        if not gate_acquired or _scan_launcher_slots_held(base_root):
+            log("\n检测到同目录还有其他 jav-sub 窗口正在运行，已暂缓覆盖升级。")
+            log("请关闭全部 jav-sub 窗口后重新启动，将自动继续完成升级。")
+            return "deferred", target_version
 
-        # Publish the new release-files.json once all non-exe files are in place.
-        _copy_file_atomic(staged_dir / RELEASE_INDEX_NAME, base_root / RELEASE_INDEX_NAME)
+        log(f"\n=== 正在应用在线升级 -> v{target_version} ===")
+        exe_rel = ""
+        try:
+            for rel in validated_files:
+                if rel.casefold() == "jav-sub.exe":
+                    exe_rel = rel
+                    continue
+                pure = _validate_update_relpath(rel)
+                src = staged_dir / Path(*pure.parts)
+                dst = base_root / Path(*pure.parts)
+                _copy_file_atomic(src, dst)
 
-        # Replace jav-sub.exe last via rename-aside on Windows.
-        if exe_rel:
-            _replace_running_exe(staged_dir / exe_rel, base_root / "jav-sub.exe")
-    except OSError as exc:
-        log(f"覆盖升级失败（文件可能正被占用）：{exc}")
-        log("为避免新旧版本文件混用，已保留暂存更新包并停止本次启动。")
-        log("请关闭占用程序目录的窗口或安全软件后，重新双击 jav-sub.exe 自动继续完成升级。")
-        return "failed", target_version
+            # Publish the new release-files.json once all non-exe files are in place.
+            _copy_file_atomic(staged_dir / RELEASE_INDEX_NAME, base_root / RELEASE_INDEX_NAME)
 
-    shutil.rmtree(base_root / UPDATES_DIR, ignore_errors=True)
+            # Replace jav-sub.exe last via rename-aside on Windows.
+            if exe_rel:
+                _replace_running_exe(staged_dir / exe_rel, base_root / "jav-sub.exe")
+        except OSError as exc:
+            log(f"覆盖升级失败（文件可能正被占用）：{exc}")
+            log("为避免新旧版本文件混用，已保留暂存更新包并停止本次启动。")
+            log("请关闭占用程序目录的窗口或安全软件后，重新双击 jav-sub.exe 自动继续完成升级。")
+            return "failed", target_version
+
+        pending_path = base_root / UPDATES_DIR / PENDING_UPDATE_FILE_NAME
+        if not _unlink_with_retry(pending_path):
+            log(f"[WARN] 已完成覆盖更新，但暂时无法删除 {pending_path.name}，请稍后手动清理 tmp\\updates\\。")
+        shutil.rmtree(base_root / UPDATES_DIR, ignore_errors=True)
     log(f"已成功覆盖更新至 v{target_version}，并清理升级临时缓存。")
     return "applied", target_version
 
 
-def _safe_extract_update_zip(archive_path: Path, dest_dir: Path) -> Path:
+def _safe_extract_update_zip(
+    archive_path: Path,
+    dest_dir: Path,
+    *,
+    max_members: int = _MAX_ARCHIVE_MEMBERS,
+    max_total_bytes: int = _MAX_ARCHIVE_UNCOMPRESSED_BYTES,
+) -> Path:
     extract_root = dest_dir.resolve()
     extract_root.mkdir(parents=True, exist_ok=True)
+    member_limit = max(1, int(max_members))
+    byte_limit = max(1, int(max_total_bytes))
+    seen_files_cf: dict[str, str] = {}
+    seen_dirs_cf: dict[str, str] = {}
+    total_extracted_bytes = 0
     with zipfile.ZipFile(archive_path, "r") as zf:
         infos = zf.infolist()
         if not infos:
             raise ValueError("安装包为空")
+        if len(infos) > member_limit:
+            raise ValueError(f"安装包成员数量超过安全上限（{len(infos)} > {member_limit}）")
         for info in infos:
             mode = (info.external_attr >> 16) & 0o170000
             if mode == 0o120000:
                 raise ValueError(f"安装包包含符号链接：{info.filename}")
             pure = _validate_update_relpath(info.filename)
+            posix_path = pure.as_posix()
+            path_cf = posix_path.casefold()
+
+            parent_end = len(pure.parts) if info.is_dir() else len(pure.parts) - 1
+            for depth in range(1, parent_end + 1):
+                dir_posix = "/".join(pure.parts[:depth])
+                dir_cf = dir_posix.casefold()
+                if dir_cf in seen_files_cf:
+                    raise ValueError(f"安装包包含文件与目录大小写冲突：{info.filename}")
+                prev_dir = seen_dirs_cf.get(dir_cf)
+                if prev_dir is not None and prev_dir != dir_posix:
+                    raise ValueError(f"安装包包含目录大小写冲突：{prev_dir} 与 {dir_posix}")
+                seen_dirs_cf[dir_cf] = dir_posix
+
+            if not info.is_dir():
+                if path_cf in seen_files_cf or path_cf in seen_dirs_cf:
+                    raise ValueError(f"安装包包含重复或大小写冲突路径：{info.filename}")
+                seen_files_cf[path_cf] = posix_path
+
             target = (extract_root / Path(*pure.parts)).resolve()
             target.relative_to(extract_root)
             if info.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
+            if info.file_size > byte_limit or total_extracted_bytes + info.file_size > byte_limit:
+                raise ValueError("安装包解压体积超过安全上限")
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info, "r") as src, target.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total_extracted_bytes += len(chunk)
+                    if total_extracted_bytes > byte_limit:
+                        raise ValueError("安装包解压体积超过安全上限")
+                    dst.write(chunk)
     if (extract_root / RELEASE_INDEX_NAME).is_file():
         return extract_root
     children = [p for p in extract_root.iterdir() if p.name != "__MACOSX"]
@@ -1941,27 +2501,43 @@ def _safe_extract_update_zip(archive_path: Path, dest_dir: Path) -> Path:
 def _verify_manifest_payload(staged_dir: Path, manifest_payload: dict) -> None:
     if not isinstance(manifest_payload, dict) or manifest_payload.get("schema") != RELEASE_MANIFEST_SCHEMA:
         raise ValueError("release-manifest.json schema 无效")
+    git_meta = manifest_payload.get("git")
+    if isinstance(git_meta, dict) and git_meta.get("dirty") is True:
+        raise ValueError("发行清单标记为未提交的脏构建（git.dirty=true），已拒绝安装")
     files = manifest_payload.get("files")
     if not isinstance(files, list) or not files:
         raise ValueError("release-manifest.json 缺少文件列表")
     checked = 0
     recorded_dist: set[str] = set()
+    recorded_dist_cf: set[str] = set()
     for entry in files:
         if not isinstance(entry, dict) or entry.get("root") != "dist":
             continue
         rel = str(entry.get("path") or "")
         expected_hash = str(entry.get("sha256") or "").lower()
         expected_size = entry.get("bytes")
-        if not rel or not _UPDATE_SHA256_RE.fullmatch(expected_hash) or type(expected_size) is not int:
+        if (
+            not rel
+            or not _UPDATE_SHA256_RE.fullmatch(expected_hash)
+            or type(expected_size) is not int
+            or expected_size < 0
+        ):
             raise ValueError(f"发行清单条目无效：{rel!r}")
         pure = _validate_update_relpath(rel)
+        if pure.parts[0].casefold() in _PROTECTED_UPDATE_TOP_DIRS:
+            raise ValueError(f"发行清单试图写入受保护目录：{rel}")
+        posix_rel = pure.as_posix()
+        rel_cf = posix_rel.casefold()
+        if posix_rel in recorded_dist or rel_cf in recorded_dist_cf:
+            raise ValueError(f"发行清单包含重复或大小写冲突路径：{rel}")
         target = (staged_dir / Path(*pure.parts)).resolve()
         target.relative_to(staged_dir)
         if not target.is_file() or target.stat().st_size != expected_size:
             raise ValueError(f"文件缺失或大小不匹配：{rel}")
         if _sha256_file(target) != expected_hash:
             raise ValueError(f"文件 SHA-256 校验失败：{rel}")
-        recorded_dist.add(pure.as_posix())
+        recorded_dist.add(posix_rel)
+        recorded_dist_cf.add(rel_cf)
         checked += 1
     if checked == 0:
         raise ValueError("发行清单不含有效载荷条目")
@@ -1988,12 +2564,19 @@ def stage_online_update_cli(
     if (base_root / ".git").exists():
         log("检测到这是 git 工作副本，请直接使用 git pull 更新。")
         return "error", ""
+    if _other_launcher_instances_active(base_root, wait_s=0.0):
+        log("检测到同目录还有其他 jav-sub 窗口正在运行，请先关闭全部窗口后再执行升级。")
+        return "error", ""
 
     local_ver_str = current_project_version(base_root)
     local_tuple = parse_semver(local_ver_str) or (0, 0, 0)
     api_url = _update_api_url()
+    if not _allowed_update_url(api_url):
+        log(f"更新接口地址不受信任（{api_url}），已拒绝。")
+        return "error", ""
     log(f"当前版本：v{local_ver_str}")
     log("正在检查最新稳定版 ...")
+    opener = _update_opener()
     req = urllib.request.Request(
         api_url,
         headers={
@@ -2002,7 +2585,7 @@ def stage_online_update_cli(
         },
     )
     try:
-        with _opener().open(req, timeout=20.0) as resp:
+        with opener.open(req, timeout=20.0) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log(f"检查更新失败：{exc}")
@@ -2059,16 +2642,16 @@ def stage_online_update_cli(
         log("已取消升级。")
         return "cancelled", remote_ver_str
 
-    version_dir = base_root / UPDATES_DIR / f"v{remote_ver_str}-{os.getpid()}"
+    version_dir = base_root / UPDATES_DIR / f"v{remote_ver_str}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     archive_part = version_dir / f"{UPDATE_ARCHIVE_NAME}.part"
     archive_path = version_dir / UPDATE_ARCHIVE_NAME
     extract_dir = version_dir / "extract"
     staged_dir = version_dir / "staged"
     try:
         version_dir.mkdir(parents=True, exist_ok=True)
-        opener = _opener()
+        ua_headers = {"User-Agent": f"jav-sub-setup/{local_ver_str}"}
         if sha_url and _allowed_update_url(sha_url):
-            sha_req = urllib.request.Request(sha_url, headers={"User-Agent": f"jav-sub-setup/{local_ver_str}"})
+            sha_req = urllib.request.Request(sha_url, headers=ua_headers)
             with opener.open(sha_req, timeout=20.0) as resp:
                 sidecar_sha = _parse_sha256_sidecar(resp.read().decode("utf-8", "replace"))
             if not sidecar_sha:
@@ -2079,24 +2662,21 @@ def stage_online_update_cli(
         if not _UPDATE_SHA256_RE.fullmatch(expected_sha):
             raise ValueError("缺少有效的 64 位 SHA-256 摘要")
 
-        m_req = urllib.request.Request(manifest_url, headers={"User-Agent": f"jav-sub-setup/{local_ver_str}"})
+        m_req = urllib.request.Request(manifest_url, headers=ua_headers)
         with opener.open(m_req, timeout=20.0) as resp:
             manifest_payload = json.loads(resp.read().decode("utf-8"))
 
         log(f"正在下载 {UPDATE_ARCHIVE_NAME} ...")
-        dl_req = urllib.request.Request(archive_url, headers={"User-Agent": f"jav-sub-setup/{local_ver_str}"})
-        digest = hashlib.sha256()
-        with opener.open(dl_req, timeout=60.0) as resp, archive_part.open("wb") as out:
-            while True:
-                chunk = resp.read(256 * 1024)
-                if not chunk:
-                    break
-                out.write(chunk)
-                digest.update(chunk)
-        actual_sha = digest.hexdigest()
+        actual_sha = _download_with_progress(
+            archive_url,
+            archive_part,
+            opener=opener,
+            headers=ua_headers,
+            timeout=60.0,
+        )
         if actual_sha != expected_sha:
             raise ValueError("安装包 SHA-256 校验失败")
-        os.replace(archive_part, archive_path)
+        _replace_atomically(archive_part, archive_path)
 
         log("正在解压并核验发行清单 ...")
         extracted = _safe_extract_update_zip(archive_path, extract_dir)
@@ -2104,6 +2684,11 @@ def stage_online_update_cli(
             shutil.move(str(extracted), str(staged_dir))
         if extract_dir.exists():
             shutil.rmtree(extract_dir, ignore_errors=True)
+        for required in _REQUIRED_PAYLOAD_ENTRIES:
+            if not (staged_dir / required).is_file():
+                raise ValueError(f"更新包缺少必需文件：{required}")
+        if not (staged_dir / "src").is_dir():
+            raise ValueError("更新包缺少 src/ 目录")
         if read_release_index(staged_dir) is None:
             raise ValueError("更新包缺少有效的 release-files.json")
         if parse_semver(current_project_version(staged_dir)) != remote_tuple:
@@ -2112,7 +2697,6 @@ def stage_online_update_cli(
         archive_path.unlink(missing_ok=True)
 
         pending_path = base_root / UPDATES_DIR / PENDING_UPDATE_FILE_NAME
-        pending_tmp = pending_path.with_name(f"{pending_path.name}.{os.getpid()}.tmp")
         descriptor = {
             "schema": PENDING_UPDATE_SCHEMA,
             "from_version": local_ver_str,
@@ -2123,8 +2707,7 @@ def stage_online_update_cli(
             "manifest_verified": True,
             "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
-        pending_tmp.write_text(json.dumps(descriptor, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(pending_tmp, pending_path)
+        _write_json_atomic(pending_path, descriptor)
         return "staged", remote_ver_str
     except (urllib.error.URLError, OSError, ValueError, zipfile.BadZipFile) as exc:
         log(f"在线升级准备失败：{exc}")
@@ -2153,8 +2736,16 @@ def _relaunch_updated_exe(passthrough: list[str], *, keep_console: bool = False)
         return False
 
 
+def _missing_ffmpeg_dll_patterns(directory: Path) -> list[str]:
+    return [
+        pattern
+        for pattern in _REQUIRED_FFMPEG_DLL_PATTERNS
+        if not any(directory.glob(pattern))
+    ]
+
+
 def ffmpeg_problem() -> str:
-    """"" when ffmpeg is usable, else what is wrong with it.
+    """Empty string when ffmpeg is usable, else what is wrong with it.
 
     Never repaired from here: FFmpeg ships inside the archive, so the only fix is
     to put those files back.
@@ -2164,10 +2755,28 @@ def ffmpeg_problem() -> str:
     if all((bin_dir / f"{name}{suffix}").is_file() for name in ("ffmpeg", "ffprobe")):
         # torchcodec loads the shared libraries rather than the executables, so
         # an ffmpeg.exe whose av*.dll were deleted is still a broken install.
-        if os.name == "nt" and not any(bin_dir.glob("avcodec-*.dll")):
-            return "bin\\ 里缺少 FFmpeg 的 av*.dll（torchcodec 需要 Shared 版）"
+        if os.name == "nt":
+            missing = _missing_ffmpeg_dll_patterns(bin_dir)
+            if missing:
+                return f"bin\\ 里缺少 FFmpeg 的 av*.dll（缺少 {', '.join(missing)}；torchcodec 需要 Shared 版）"
         return ""
-    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+    ffmpeg_found = shutil.which("ffmpeg")
+    ffprobe_found = shutil.which("ffprobe")
+    if ffmpeg_found and ffprobe_found:
+        if os.name == "nt":
+            candidate_dirs: list[Path] = []
+            for exe_path in (ffmpeg_found, ffprobe_found):
+                parent = Path(exe_path).parent
+                if parent not in candidate_dirs:
+                    candidate_dirs.append(parent)
+            if not any(
+                directory.is_dir() and not _missing_ffmpeg_dll_patterns(directory)
+                for directory in candidate_dirs
+            ):
+                return (
+                    "系统 PATH 中的 FFmpeg 缺少 av*.dll"
+                    "（需同时具备 avcodec/avformat/avutil；torchcodec 需要 Shared 版）"
+                )
         return ""
     return "找不到 ffmpeg / ffprobe"
 
@@ -2229,20 +2838,37 @@ def prompt_proxy() -> dict[str, str] | None:
     log()
     log("填写本地代理（Clash / v2ray 等）的监听地址；直接回车则放弃设置。")
     try:
-        host = input("  代理地址 [留空跳过]: ").strip()
-        if not host:
+        raw_host = input("  代理地址 [留空跳过]: ").strip()
+        if not raw_host:
             return None
-        port = input(f"  代理端口 [{DEFAULT_PROXY_PORT}]: ").strip() or DEFAULT_PROXY_PORT
-        protocol = input("  协议 http/https/socks5 [http]: ").strip().lower() or "http"
+        try:
+            detected_protocol, host, detected_port = _parse_proxy_host_entry(raw_host)
+        except ValueError as exc:
+            log(f"  {exc}，跳过代理设置。")
+            return None
+        if detected_port:
+            port = detected_port
+        else:
+            port = input(f"  代理端口 [{DEFAULT_PROXY_PORT}]: ").strip() or DEFAULT_PROXY_PORT
+        if detected_protocol:
+            protocol = detected_protocol
+        else:
+            protocol = input("  协议 http/https/socks5 [http]: ").strip().lower() or "http"
     except (EOFError, KeyboardInterrupt):
         return None
-    if not port.isdigit():
-        log(f"  端口 {port!r} 不是数字，跳过代理设置。")
+    if not (port.isascii() and port.isdigit()) or not 1 <= int(port) <= 65535:
+        log(f"  端口 {port!r} 无效（必须是 1-65535 的数字），跳过代理设置。")
         return None
     if protocol not in SUPPORTED_PROXY_PROTOCOLS:
         log(f"  不支持的协议 {protocol!r}，按 http 处理。")
         protocol = "http"
-    return {"PROXY_PROTOCOL": protocol, "PROXY_HOST": host, "PROXY_PORT": port}
+    settings = {"PROXY_PROTOCOL": protocol, "PROXY_HOST": host, "PROXY_PORT": str(int(port))}
+    try:
+        validated_settings, _ = _validate_proxy_url(proxy_url_from(settings))
+    except ValueError as exc:
+        log(f"  代理配置无效（{exc}），跳过代理设置。")
+        return None
+    return validated_settings
 
 
 def ask_yes(question: str, *, default: bool = False) -> bool:
@@ -2260,9 +2886,13 @@ def ensure_proxy_configured(*, assume_yes: bool) -> None:
     """Settle the proxy question before anything large is downloaded."""
     proxy_url = proxy_url_from(read_config_file())
     if proxy_url:
-        log("使用 config/config.json 中已配置的代理")
-        apply_proxy(proxy_url)
-        return
+        try:
+            apply_proxy(proxy_url)
+        except ValueError as exc:
+            log(f"\n[WARN] config/config.json 中的代理配置无效（{exc}），已忽略。")
+        else:
+            log("使用 config/config.json 中已配置的代理")
+            return
     if assume_yes or not interactive():
         return
 
@@ -2271,16 +2901,24 @@ def ensure_proxy_configured(*, assume_yes: bool) -> None:
 
     if not ask_yes("需要设置代理吗？"):
         return
-    settings = prompt_proxy()
-    if not settings:
-        return
-    proxy_url = proxy_url_from(settings)
+    while True:
+        settings = prompt_proxy()
+        if not settings:
+            return
+        proxy_url = proxy_url_from(settings)
+        try:
+            apply_proxy(proxy_url)
+        except ValueError as exc:
+            log(f"  代理配置无效（{exc}）。")
+            if ask_yes("重新填写代理吗？", default=True):
+                continue
+            return
+        break
     try:
         update_config_file(settings)
         log("代理设置已写入 config/config.json")
     except (ValueError, OSError) as exc:
         log(f"[WARN] {exc}；本次启动仍使用所填代理，请修复 config/config.json 后重新保存。")
-    apply_proxy(proxy_url)
     log("正在用代理复测 ...")
     log(f"  {describe_speed(measure_download())}")
 
@@ -2432,35 +3070,60 @@ def doctor(*, assume_yes: bool, deep: bool = False, allow_repair: bool = True) -
     return repaired and not report["ffmpeg"], repaired
 
 
-def _watch_for_ready(stop: threading.Event) -> None:
+def _effective_ready_path(ready_path: Path | None = None) -> Path:
+    """Return a PID-isolated ready file path unless explicitly overridden."""
+    if ready_path is not None:
+        return Path(ready_path)
+    if READY_PATH != _DEFAULT_READY_PATH:
+        return READY_PATH
+    return ROOT / "tmp" / f".app-ready-{os.getpid()}"
+
+
+def _watch_for_ready(stop: threading.Event, ready_path: Path | None = None) -> None:
+    target = _effective_ready_path(ready_path)
     while not stop.wait(0.2):
-        if READY_PATH.exists():
-            READY_PATH.unlink(missing_ok=True)
+        if target.exists():
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
             set_console_visible(False)
             return
 
 
-def launch(extra_args: list[str], *, hide_when_ready: bool = True) -> int:
+def launch(
+    extra_args: list[str],
+    *,
+    hide_when_ready: bool = True,
+    ready_path: Path | None = None,
+) -> int:
     log("\n=== 启动 jav-sub ===")
     stop = threading.Event()
+    target_ready = _effective_ready_path(ready_path)
     if hide_when_ready:
         try:
-            READY_PATH.parent.mkdir(parents=True, exist_ok=True)
-            READY_PATH.unlink(missing_ok=True)
-            os.environ["JAV_SUB_READY_FILE"] = str(READY_PATH)
+            target_ready.parent.mkdir(parents=True, exist_ok=True)
+            target_ready.unlink(missing_ok=True)
+            os.environ["JAV_SUB_READY_FILE"] = str(target_ready)
         except OSError:
             os.environ.pop("JAV_SUB_READY_FILE", None)
-        threading.Thread(target=_watch_for_ready, args=(stop,), daemon=True).start()
+        else:
+            threading.Thread(
+                target=_watch_for_ready,
+                args=(stop, target_ready),
+                daemon=True,
+            ).start()
     else:
         os.environ.pop("JAV_SUB_READY_FILE", None)
     try:
         code = run_streaming([venv_python(), "launcher.py", *extra_args])
     finally:
         stop.set()
-        try:
-            READY_PATH.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if hide_when_ready:
+            try:
+                target_ready.unlink(missing_ok=True)
+            except OSError:
+                pass
     if code != 0:
         # Whatever went wrong has to be readable, so give the window back.
         set_console_visible(True)
@@ -2476,7 +3139,7 @@ def launch_with_recovery(
     allow_repair: bool = True,
 ) -> int:
     code = launch(extra_args, hide_when_ready=hide_when_ready)
-    if code == 0 or code == UPDATE_EXIT_CODE:
+    if code in (0, UPDATE_EXIT_CODE):
         return code
 
     log(f"\n程序退出，退出码 {_format_exit_code(code)}。")
@@ -2495,7 +3158,7 @@ def launch_with_recovery(
 
     log("\n重新启动一次 ...")
     code = launch(extra_args, hide_when_ready=hide_when_ready)
-    if code != 0:
+    if code not in (0, UPDATE_EXIT_CODE):
         log(f"\n重试后仍退出，退出码 {_format_exit_code(code)}。")
         _log_launch_failure_hints()
     return code
@@ -2521,8 +3184,7 @@ def _finish_after_launch(
         if apply_status != "applied":
             return 1
         log(f"正在重启已升级的 jav-sub v{updated_ver} ...")
-        _relaunch_updated_exe(passthrough, keep_console=keep_console)
-        return 0
+        return 0 if _relaunch_updated_exe(passthrough, keep_console=keep_console) else 1
     return exit_code
 
 
@@ -2578,8 +3240,8 @@ def main(argv: list[str] | None = None) -> int:
         apply_status, updated_ver = apply_pending_update()
         if apply_status == "applied":
             log(f"已应用待完成更新 v{updated_ver}，正在重启 jav-sub ...")
-            if _FROZEN and _relaunch_updated_exe(passthrough, keep_console=args.keep_console):
-                return 0
+            if _FROZEN:
+                return 0 if _relaunch_updated_exe(passthrough, keep_console=args.keep_console) else 1
         elif apply_status in {"failed", "deferred"}:
             return 1
 
@@ -2606,8 +3268,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.install_only:
             return 0
         log(f"正在重启已升级的 jav-sub v{updated_ver} ...")
-        _relaunch_updated_exe(passthrough, keep_console=args.keep_console)
-        return 0
+        return 0 if _relaunch_updated_exe(passthrough, keep_console=args.keep_console) else 1
 
     # Before anything reads src/: an upgrade extracted over the old folder is
     # only finished once what the old release left behind is out of the way.

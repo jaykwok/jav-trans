@@ -10,7 +10,7 @@ $ErrorActionPreference = "Stop"
 $rootDir = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONPATH = $(if ($env:PYTHONPATH) { $env:PYTHONPATH } else { "src" })
-$env:UV_CACHE_DIR = $(if ($env:UV_CACHE_DIR) { $env:UV_CACHE_DIR } else { "dev/temp/uv-cache" })
+$env:UV_CACHE_DIR = $(if ($env:UV_CACHE_DIR) { $env:UV_CACHE_DIR } else { "cache/uv" })
 $arguments = @(
     "run"
     "python"

@@ -1,6 +1,8 @@
 param(
     [switch]$Clean,
     [switch]$SkipArchive,
+    [switch]$SkipSmoke,
+    [switch]$RequireClean,
     [switch]$BundleUv,
     [string]$UvExe = "",
     [string]$FfmpegExe = "",
@@ -69,8 +71,14 @@ function Resolve-Tool {
     if (-not $Found) {
         throw "$Name not found. $Hint"
     }
-    return $Found.Source
+    if ($Found.Source) {
+        return $Found.Source
+    }
+    return $Found.Name
 }
+
+[void](Resolve-Tool -Override "" -Name "uv" `
+    -Hint "Install uv, then run 'uv sync --frozen' in the repository root.")
 
 # uv is not bundled by default. It would add 50-80 MB to buy nothing: the
 # installer fetches it from PyPI, and the very next thing it does is install
@@ -124,8 +132,20 @@ if ($UvSource) {
 
 Copy-Item -LiteralPath $FfmpegSource -Destination (Join-Path $Payload "bin") -Force
 Copy-Item -LiteralPath $FfprobeSource -Destination (Join-Path $Payload "bin") -Force
-Get-ChildItem -Path $FfmpegDir -Filter "*.dll" | ForEach-Object {
-    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Payload "bin") -Force
+$FfmpegDllPatterns = @(
+    "avcodec-*.dll",
+    "avdevice-*.dll",
+    "avfilter-*.dll",
+    "avformat-*.dll",
+    "avutil-*.dll",
+    "postproc-*.dll",
+    "swresample-*.dll",
+    "swscale-*.dll"
+)
+foreach ($Pattern in $FfmpegDllPatterns) {
+    Get-ChildItem -Path $FfmpegDir -Filter $Pattern -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Payload "bin") -Force
+    }
 }
 
 # What uv syncs against, plus what launcher.py runs. Kept as plain source: the
@@ -155,6 +175,13 @@ Get-ChildItem -LiteralPath $SrcRoot -File -Recurse -Force | Where-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $Destination
 }
 
+if (-not $SkipSmoke) {
+    & (Join-Path $Payload "jav-sub.exe") --help | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Built executable failed --help smoke check (exit code $LASTEXITCODE)."
+    }
+}
+
 # The file index lets the launcher move files an older release left behind, so
 # extracting this archive over an existing install is a complete upgrade. Written
 # before hashing, so the manifest covers it like any other payload file.
@@ -169,24 +196,41 @@ Write-Host "Payload: $Payload ($SizeMb MB)"
 
 # Freeze and hash every file, including this setup build's plain Python source.
 # Models downloaded on the user's machine are outside this archive's inventory.
-$ManifestPath = Join-Path $OutputDir "setup-manifest.json"
-& uv run --no-sync python "packaging/record_release_manifest.py" `
-    --dist $Payload --output $ManifestPath --skip-models
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
-}
-
+$TempManifestDir = ""
 if ($SkipArchive) {
-    Write-Host "DONE (archive skipped)"
-    exit 0
+    $ManifestPath = Join-Path $OutputDir "setup-manifest.json"
+} else {
+    $TempManifestDir = Join-Path ([IO.Path]::GetTempPath()) ("jav-sub-setup-manifest-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $TempManifestDir | Out-Null
+    $ManifestPath = Join-Path $TempManifestDir "setup-manifest.json"
 }
 
-# zip rather than the .7z the full bundle uses: this archive is small enough
-# that the compression ratio does not matter, and Windows opens zip without
-# installing anything.
-& uv run --no-sync python "packaging/archive_release.py" `
-    --source $Payload --output $OutputDir --manifest $ManifestPath --name $ArchiveName
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
+try {
+    $ManifestArgs = @("--dist", $Payload, "--output", $ManifestPath, "--skip-models")
+    if ($RequireClean) {
+        $ManifestArgs += "--require-clean"
+    }
+    & uv run --no-sync python "packaging/record_release_manifest.py" @ManifestArgs
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
+    if ($SkipArchive) {
+        Write-Host "DONE (archive skipped)"
+        exit 0
+    }
+
+    # zip rather than the .7z the full bundle uses: this archive is small enough
+    # that the compression ratio does not matter, and Windows opens zip without
+    # installing anything.
+    & uv run --no-sync python "packaging/archive_release.py" `
+        --source $Payload --output $OutputDir --manifest $ManifestPath --name $ArchiveName
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+} finally {
+    if ($TempManifestDir -and (Test-Path -LiteralPath $TempManifestDir)) {
+        Remove-Item -LiteralPath $TempManifestDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 Write-Host "DONE: verified release generation saved under $OutputDir"

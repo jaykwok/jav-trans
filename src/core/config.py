@@ -1,17 +1,24 @@
+import ipaddress
 import json
 import logging
 import os
 import re
 import threading
-import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
+from core.atomic_io import write_json_atomic
+from core.typed_config import (
+    clear_configuration_problem,
+    record_configuration_problem,
+)
 from utils.runtime_paths import is_frozen, runtime_root
 
 logger = logging.getLogger(__name__)
 _CONFIG_LOAD_ERROR = ""
-_CONFIG_FILE_LOCK = threading.Lock()
+_LAST_REPORTED_CONFIG_LOAD_ERROR = ""
+_CONFIG_FILE_LOCK = threading.RLock()
 _CONFIG_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 PROJECT_ROOT = runtime_root()
@@ -408,15 +415,105 @@ def _no_proxy_value_with_loopback(existing: str) -> str:
     return ",".join(entries)
 
 
+def _redact_proxy_host_for_log(raw_host: str) -> str:
+    if "@" not in raw_host:
+        return raw_host
+    _, _, host_part = raw_host.rpartition("@")
+    return f"***@{host_part}"
+
+
+def _normalize_proxy_host(raw_host: str) -> str | None:
+    if (
+        "://" in raw_host
+        or any(ch.isspace() for ch in raw_host)
+        or any(ch in raw_host for ch in ("/", "?", "#", "\\", "\x00"))
+    ):
+        return None
+    userinfo, sep, host_part = raw_host.rpartition("@")
+    if not host_part:
+        return None
+    if host_part.startswith("[") or host_part.endswith("]"):
+        if not (host_part.startswith("[") and host_part.endswith("]")):
+            return None
+        try:
+            ipaddress.IPv6Address(host_part[1:-1])
+        except ValueError:
+            return None
+        formatted_host = host_part
+    elif ":" in host_part:
+        try:
+            ipaddress.IPv6Address(host_part)
+        except ValueError:
+            return None
+        formatted_host = f"[{host_part}]"
+    else:
+        formatted_host = host_part
+    return f"{userinfo}@{formatted_host}" if sep else formatted_host
+
+
 def network_proxy_url_from_env() -> str:
-    protocol = os.getenv("PROXY_PROTOCOL", "http").strip().lower() or "http"
-    host = os.getenv("PROXY_HOST", "").strip()
-    port = os.getenv("PROXY_PORT", "").strip()
-    if not host or not port:
-        return ""
+    raw_protocol = os.getenv("PROXY_PROTOCOL", "").strip().lower()
+    protocol = raw_protocol or "http"
     if protocol not in _SUPPORTED_PROXY_PROTOCOLS:
+        record_configuration_problem(
+            "PROXY_PROTOCOL",
+            raw_protocol,
+            "不是支持的代理协议（http、https、socks5），已按 'http' 处理",
+        )
         protocol = "http"
-    return f"{protocol}://{host}:{port}"
+    else:
+        clear_configuration_problem("PROXY_PROTOCOL")
+
+    raw_host = os.getenv("PROXY_HOST", "").strip()
+    raw_port = os.getenv("PROXY_PORT", "").strip()
+
+    normalized_host: str | None = None
+    if raw_host:
+        normalized_host = _normalize_proxy_host(raw_host)
+        if normalized_host is None:
+            record_configuration_problem(
+                "PROXY_HOST",
+                _redact_proxy_host_for_log(raw_host),
+                "代理主机格式无效（不能包含协议头、空白、/、?、# 或无效端口），已忽略代理配置",
+            )
+        else:
+            clear_configuration_problem("PROXY_HOST")
+    else:
+        clear_configuration_problem("PROXY_HOST")
+
+    port_num: int | None = None
+    if raw_port:
+        if raw_port.isascii() and raw_port.isdigit():
+            candidate_port = int(raw_port)
+            if 1 <= candidate_port <= 65535:
+                port_num = candidate_port
+        if port_num is None:
+            record_configuration_problem(
+                "PROXY_PORT",
+                raw_port,
+                "代理端口必须是 1~65535 之间的整数，已忽略代理配置",
+            )
+        else:
+            clear_configuration_problem("PROXY_PORT")
+    else:
+        clear_configuration_problem("PROXY_PORT")
+
+    if normalized_host is None or port_num is None:
+        return ""
+
+    proxy_url = f"{protocol}://{normalized_host}:{port_num}"
+    try:
+        parsed = urlsplit(proxy_url)
+        if not parsed.hostname or parsed.port != port_num:
+            raise ValueError("invalid proxy authority")
+    except ValueError:
+        record_configuration_problem(
+            "PROXY_HOST",
+            _redact_proxy_host_for_log(raw_host),
+            "代理主机无法构成合法 URL，已忽略代理配置",
+        )
+        return ""
+    return proxy_url
 
 
 def apply_network_proxy_environment(
@@ -448,7 +545,23 @@ def sync_network_proxy_environment(*, clear_existing: bool = False) -> str:
 
 def config_load_error() -> str:
     """Return the last config/config.json decode/read problem encountered during load_config, if any."""
-    return _CONFIG_LOAD_ERROR
+    with _CONFIG_FILE_LOCK:
+        return _CONFIG_LOAD_ERROR
+
+
+def _set_config_load_error(message: str) -> None:
+    """Record a config load error under lock and deduplicate repeated warnings."""
+    global _CONFIG_LOAD_ERROR, _LAST_REPORTED_CONFIG_LOAD_ERROR
+    with _CONFIG_FILE_LOCK:
+        _CONFIG_LOAD_ERROR = message
+        if not message:
+            _LAST_REPORTED_CONFIG_LOAD_ERROR = ""
+            return
+        if message == _LAST_REPORTED_CONFIG_LOAD_ERROR:
+            return
+        _LAST_REPORTED_CONFIG_LOAD_ERROR = message
+    logger.warning("%s", message)
+    print(f"[WARN] {message}", flush=True)
 
 
 def _stringify_config_value(key: str, value: Any) -> str | None:
@@ -481,13 +594,14 @@ def _parse_config_mapping(path: Path) -> dict[str, Any]:
 def read_config_file(path: Path | None = None) -> dict[str, str]:
     """Read key-value overrides from config/config.json leniently."""
     target = Path(path) if path is not None else CONFIG_PATH
-    if not target.exists():
-        return {}
-    try:
-        raw = _parse_config_mapping(target)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        logger.warning("Skipping unreadable config at %s: %s", target, exc)
-        return {}
+    with _CONFIG_FILE_LOCK:
+        if not target.exists():
+            return {}
+        try:
+            raw = _parse_config_mapping(target)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Skipping unreadable config at %s: %s", target, exc)
+            return {}
 
     values: dict[str, str] = {}
     for key, value in raw.items():
@@ -504,9 +618,16 @@ def update_config_file(
     path: Path | None = None,
 ) -> None:
     """Atomically merge updates into config/config.json while preserving existing keys."""
-    for key in updates:
+    coerced_updates: dict[str, str] = {}
+    for key, value in updates.items():
         if not isinstance(key, str) or not _CONFIG_KEY_RE.fullmatch(key):
             raise ValueError(f"Invalid config key: {key!r}")
+        coerced = _stringify_config_value(key, value)
+        if coerced is None:
+            raise ValueError(
+                f"Invalid non-scalar config value for {key!r}: {type(value).__name__}"
+            )
+        coerced_updates[key] = coerced
 
     target = Path(path) if path is not None else CONFIG_PATH
     with _CONFIG_FILE_LOCK:
@@ -523,69 +644,52 @@ def update_config_file(
                     f"config/config.json 不是有效的 JSON 对象（{exc}），请修正或删除后再保存设置。"
                 ) from exc
         merged = dict(existing)
-        for key, value in updates.items():
-            merged[key] = "" if value is None else str(value)
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = target.parent / f"{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
-        try:
-            tmp_path.write_text(
-                json.dumps(merged, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            os.replace(tmp_path, target)
-        finally:
-            if tmp_path.exists():
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
+        merged.update(coerced_updates)
+        write_json_atomic(target, merged, indent=2, ensure_ascii=False)
 
 
 def _load_private_config(path: Path, protected_keys: set[str]) -> None:
     """Load config/config.json without clobbering protected process environment keys."""
-    global _CONFIG_LOAD_ERROR
-    _CONFIG_LOAD_ERROR = ""
+    with _CONFIG_FILE_LOCK:
+        if not path.exists():
+            _set_config_load_error("")
+            return
 
-    if not path.exists():
-        return
+        try:
+            raw = _parse_config_mapping(path)
+        except UnicodeDecodeError as exc:
+            _set_config_load_error(
+                f"配置文件（{path}）不是有效的 UTF-8 编码（{exc}），已跳过加载并使用默认配置；"
+                "请先将其转换为 UTF-8 编码后重启，或在设置页重新保存。"
+            )
+            return
+        except (json.JSONDecodeError, ValueError) as exc:
+            _set_config_load_error(
+                f"配置文件（{path}）不是有效的 JSON 对象（{exc}），已跳过加载并使用默认配置；"
+                "请修正格式后重启，或删除后在设置页重新保存。"
+            )
+            return
+        except OSError as exc:
+            _set_config_load_error(
+                f"读取配置文件（{path}）失败（{exc}），已使用默认配置。"
+            )
+            return
 
-    try:
-        raw = _parse_config_mapping(path)
-    except UnicodeDecodeError as exc:
-        _CONFIG_LOAD_ERROR = (
-            f"配置文件（{path}）不是有效的 UTF-8 编码（{exc}），已跳过加载并使用默认配置；"
-            "请先将其转换为 UTF-8 编码后重启，或在设置页重新保存。"
-        )
-        logger.warning("%s", _CONFIG_LOAD_ERROR)
-        print(f"[WARN] {_CONFIG_LOAD_ERROR}", flush=True)
-        return
-    except (json.JSONDecodeError, ValueError) as exc:
-        _CONFIG_LOAD_ERROR = (
-            f"配置文件（{path}）不是有效的 JSON 对象（{exc}），已跳过加载并使用默认配置；"
-            "请修正格式后重启，或删除后在设置页重新保存。"
-        )
-        logger.warning("%s", _CONFIG_LOAD_ERROR)
-        print(f"[WARN] {_CONFIG_LOAD_ERROR}", flush=True)
-        return
-    except OSError as exc:
-        _CONFIG_LOAD_ERROR = f"读取配置文件（{path}）失败（{exc}），已使用默认配置。"
-        logger.warning("%s", _CONFIG_LOAD_ERROR)
-        print(f"[WARN] {_CONFIG_LOAD_ERROR}", flush=True)
-        return
+        _set_config_load_error("")
 
-    for key, value in raw.items():
-        if not isinstance(key, str) or not _CONFIG_KEY_RE.fullmatch(key):
-            continue
-        if key in protected_keys:
-            continue
-        coerced = _stringify_config_value(key, value)
-        if coerced is None:
-            continue
-        if key == "HF_ENDPOINT" and not coerced.strip():
-            os.environ.pop(key, None)
-            continue
-        os.environ[key] = coerced
+        for key, value in raw.items():
+            if not isinstance(key, str) or not _CONFIG_KEY_RE.fullmatch(key):
+                continue
+            if key in protected_keys:
+                continue
+            coerced = _stringify_config_value(key, value)
+            if coerced is None:
+                continue
+            coerced = _coerce_default_value(key, coerced)
+            if key == "HF_ENDPOINT" and not coerced.strip():
+                os.environ.pop(key, None)
+                continue
+            os.environ[key] = coerced
 
 
 def load_config(*, override_existing_env: bool = False) -> None:
@@ -595,8 +699,8 @@ def load_config(*, override_existing_env: bool = False) -> None:
     That keeps test/process overrides intact while still letting config/config.json
     override shared defaults from this file.
     """
-
-    protected_keys = set() if override_existing_env else set(os.environ)
-    _apply_values(DEFAULT_SETTINGS, protected_keys)
-    _load_private_config(CONFIG_PATH, protected_keys)
-    sync_network_proxy_environment(clear_existing=False)
+    with _CONFIG_FILE_LOCK:
+        protected_keys = set() if override_existing_env else set(list(os.environ))
+        _apply_values(DEFAULT_SETTINGS, protected_keys)
+        _load_private_config(CONFIG_PATH, protected_keys)
+        sync_network_proxy_environment(clear_existing=False)

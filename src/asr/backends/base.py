@@ -9,10 +9,13 @@ class BaseAsrBackend(Protocol):
 
     is_subprocess: bool
     request_batch_size: int
+    cumulative_load_s: float
 
     def load(self, on_stage: Callable[[str], None] | None = None) -> None: ...
 
     def unload_model(self, on_stage: Callable[[str], None] | None = None) -> None: ...
+
+    def close(self) -> None: ...
 
     def transcribe_texts(
         self,

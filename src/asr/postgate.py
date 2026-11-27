@@ -161,7 +161,7 @@ def review_all(
     alignment_scores: list[float | None] | None = None,
     config: PostGateConfig | None = None,
 ) -> list[dict[str, Any]]:
-    scores = alignment_scores or [None] * len(candidates)
+    scores = [None] * len(candidates) if alignment_scores is None else alignment_scores
     if len(scores) != len(candidates):
         raise ValueError("alignment_scores must line up with candidates")
     return [

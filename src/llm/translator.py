@@ -1,7 +1,6 @@
 import json
 import contextlib
 import os
-import re
 import threading
 from typing import Callable
 
@@ -15,7 +14,6 @@ from llm import request_config
 from llm.run_context import RunContext
 from llm.session import TranslationSession
 from llm.profiles import json_v3
-from llm.profiles.base import ProfileContext
 from llm.context import SourceContext
 from llm import settings as llm_settings
 from llm import token_budget
@@ -40,7 +38,6 @@ from llm.errors import (
 
 load_config()
 
-_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 # Shared threading.local instance — tests and worker code set attributes on the
 # object, never rebind the name, so aliasing keeps one recording scope.
 _RETRY_CONTEXT = transport_util._RETRY_CONTEXT
@@ -56,8 +53,6 @@ _cancel_requested = transport_util._cancel_requested
 _raise_if_cancelled = transport_util._raise_if_cancelled
 
 
-OPENAI_COMPATIBILITY_BASE_URL = llm_settings.OPENAI_COMPATIBILITY_BASE_URL
-API_KEY = llm_settings.API_KEY
 LLM_MODEL_NAME = llm_settings.LLM_MODEL_NAME
 LLM_REASONING_EFFORT = llm_settings.LLM_REASONING_EFFORT
 
@@ -180,9 +175,15 @@ def _compute_prompt_signature(
     glossary: str = "",
     target_lang: str = "简体中文",
     character_reference: str = "",
+    compact_system_prompt: bool | None = None,
     reasoning_effort: str | None = None,
     prefix_mode: str = "",
 ) -> str:
+    effective_compact = (
+        COMPACT_SYSTEM_PROMPT
+        if compact_system_prompt is None
+        else bool(compact_system_prompt)
+    )
     return translation_cache._compute_prompt_signature(
         extra_glossary,
         glossary=glossary,
@@ -190,7 +191,7 @@ def _compute_prompt_signature(
         character_reference=character_reference,
         prompt_version=_effective_prompt_version(),
         model_name=_translation_model_identity(),
-        compact_system_prompt=COMPACT_SYSTEM_PROMPT,
+        compact_system_prompt=effective_compact,
         reasoning_effort=_effective_reasoning_effort(reasoning_effort),
         prefix_mode=prefix_mode,
     )
@@ -204,10 +205,16 @@ def _translation_cache_key(
     glossary: str = "",
     target_lang: str = "简体中文",
     character_reference: str = "",
+    compact_system_prompt: bool | None = None,
     reasoning_effort: str | None = None,
     prefix_mode: str = "",
     context_signature: str = "",
 ) -> str:
+    effective_compact = (
+        COMPACT_SYSTEM_PROMPT
+        if compact_system_prompt is None
+        else bool(compact_system_prompt)
+    )
     return translation_cache._translation_cache_key(
         batch_index,
         batch_segments,
@@ -217,7 +224,7 @@ def _translation_cache_key(
         character_reference=character_reference,
         prompt_version=_effective_prompt_version(),
         model_name=_translation_model_identity(),
-        compact_system_prompt=COMPACT_SYSTEM_PROMPT,
+        compact_system_prompt=effective_compact,
         reasoning_effort=_effective_reasoning_effort(reasoning_effort),
         prefix_mode=prefix_mode,
         context_signature=context_signature,
@@ -313,9 +320,11 @@ def translate_segments(
     if not segments:
         return [], [], []
 
-    effective_max_workers = max(1, int(max_workers))
+    caller_max_workers = max(1, int(max_workers))
+    effective_max_workers = caller_max_workers
     backend_name = task_backend_name()
     is_local = backend_name == "llamacpp"
+    backend_obj = None
     focus_radius = 2
     focus_context_chars = 3000
     if is_local:
@@ -351,15 +360,18 @@ def translate_segments(
     profile_batch_cap = profile.max_batch_size()
     if profile_batch_cap is not None:
         effective_batch_size = min(effective_batch_size, max(1, int(profile_batch_cap)))
+    batches = (
+        _split_into_batches(
+            segments,
+            effective_batch_size,
+            max_source_chars=effective_max_source_chars,
+        )
+        if effective_batch_size > 0
+        else []
+    )
     if effective_batch_size > 0:
         effective_max_workers = _auto_translation_workers(
-            len(
-                _split_into_batches(
-                    segments,
-                    effective_batch_size,
-                    max_source_chars=effective_max_source_chars,
-                )
-            ),
+            len(batches),
             effective_max_workers,
         )
     effective_cache_path = cache_path or ""
@@ -379,11 +391,6 @@ def translate_segments(
         glossary=effective_glossary,
         character_reference=effective_character_reference,
         reasoning_effort=_effective_reasoning_effort(reasoning_effort),
-    )
-    _warn_about_inert_context(
-        profile,
-        glossary=effective_glossary,
-        character_reference=effective_character_reference,
     )
     previous_retry_events = getattr(_RETRY_CONTEXT, "events", None)
     retry_events: list[dict] = []
@@ -409,13 +416,16 @@ def translate_segments(
                 use_full_json_prefix = False
                 effective_compact_system = True
             else:
+                default_global_context = generate_global_context(segments)
                 full_context = (
                     global_context
                     if global_context is not None
-                    else generate_global_context(segments)
+                    else default_global_context
                 )
                 external_context = (
-                    full_context if global_context is not None and full_context != generate_global_context(segments) else ""
+                    full_context
+                    if global_context is not None and full_context != default_global_context
+                    else ""
                 )
                 source_context = SourceContext.build(segments, external_context=external_context)
                 model_identity = _translation_model_identity()
@@ -447,6 +457,23 @@ def translate_segments(
                     "" if is_local else reasoning_effort,
                 )
                 return _chat_with_reasoning(messages, **chat_kwargs)
+
+            prepare_backend = None
+            if (
+                is_local
+                and backend_obj is not None
+                and _chat is _DEFAULT_CHAT
+                and _chat_with_reasoning is _DEFAULT_CHAT_WITH_REASONING
+            ):
+                ensure_plan_fn = getattr(backend_obj, "ensure_ready_and_plan", None)
+                if callable(ensure_plan_fn):
+                    prepare_backend = ensure_plan_fn
+
+            worker_cap = (
+                _auto_translation_workers(len(batches), caller_max_workers)
+                if batches
+                else caller_max_workers
+            )
 
             zh_texts, timings, worker_retry_events = engine_module.run_batched(
                 segments,
@@ -485,15 +512,36 @@ def translate_segments(
                 max_source_chars=effective_max_source_chars,
                 focus_radius=focus_radius,
                 focus_context_chars=focus_context_chars,
+                prepare_backend=prepare_backend,
+                max_workers_cap=worker_cap,
+                batches=batches,
             )
             retry_events.extend(worker_retry_events)
             _raise_if_cancelled(cancel_event)
 
-            def _persist_repaired_translation_cache(repaired_texts: list[str]) -> None:
-                # Write repaired texts back under the same batch_key entries the
-                # translation phase used, so subsequent runs reuse the repair.
+            def _persist_repaired_translation_cache(
+                repaired_texts: list[str],
+                repaired_ids: set[int] | None = None,
+            ) -> None:
+                # Incrementally write only affected batches and repaired memory
+                # entries under the exact keys the engine used, preserving
+                # existing review records on untouched batches and cues.
                 if not effective_cache_path or not segments:
                     return
+                if repaired_ids is not None and not repaired_ids:
+                    return
+                affected_ids = (
+                    set(range(len(segments)))
+                    if repaired_ids is None
+                    else set(repaired_ids)
+                )
+                effective_prefix_mode = engine_module.prefix_mode_label(
+                    use_full_json_prefix,
+                    windowed=(
+                        not use_full_json_prefix
+                        and not (full_context or "").strip()
+                    ),
+                )
                 cache_kwargs = {
                     # The base pass always ran with no settled rendering (there was
                     # none to give it yet), so its cache keys carry "" here too -
@@ -503,47 +551,69 @@ def translate_segments(
                     "glossary": effective_glossary,
                     "target_lang": effective_target_lang,
                     "character_reference": effective_character_reference,
-                    # Same two inputs the engine keyed on, or the repaired text is
-                    # written under a key nothing ever reads again.
-                    "reasoning_effort": reasoning_effort,
-                    "prefix_mode": engine_module.prefix_mode_label(
-                        use_full_json_prefix,
-                        windowed=not use_full_json_prefix and not full_context,
-                    ),
+                    # Match engine.py's exact key ingredients: compact system
+                    # prompt, resolved session reasoning effort, and prefix mode.
+                    "compact_system_prompt": effective_compact_system,
+                    "reasoning_effort": session.reasoning_effort,
+                    "prefix_mode": effective_prefix_mode,
                     "context_signature": context_signature,
                 }
+                existing_reviews: dict[str, list] = {}
+                _load_translation_cache(effective_cache_path, existing_reviews)
                 start = 0
                 memory_entries: list[tuple[str, str]] = []
-                for b_index, b_segments in enumerate(
-                    _split_into_batches(
-                        segments,
-                        effective_batch_size,
-                        max_source_chars=effective_max_source_chars,
+                for b_index, b_segments in enumerate(batches):
+                    batch_len = len(b_segments)
+                    batch_affected = any(
+                        (start + off) in affected_ids for off in range(batch_len)
                     )
-                ):
+                    if not batch_affected:
+                        start += batch_len
+                        continue
                     local_texts = [
                         repaired_texts[start + off]
                         if start + off < len(repaired_texts)
                         else ""
-                        for off in range(len(b_segments))
+                        for off in range(batch_len)
                     ]
                     batch_key = _translation_cache_key(b_index, b_segments, **cache_kwargs)
+                    prior_review = existing_reviews.get(batch_key)
+                    preserved_review: list[dict] = []
+                    if isinstance(prior_review, list):
+                        for item in prior_review:
+                            if not isinstance(item, dict):
+                                continue
+                            offset = item.get("offset")
+                            if (
+                                isinstance(offset, int)
+                                and not isinstance(offset, bool)
+                                and (start + offset) in affected_ids
+                            ):
+                                continue
+                            preserved_review.append(item)
                     _save_cache_entry(
-                        effective_cache_path, batch_key, local_texts, _cache_lock
+                        effective_cache_path,
+                        batch_key,
+                        local_texts,
+                        _cache_lock,
+                        review=preserved_review or None,
                     )
                     for offset, (segment, text) in enumerate(zip(b_segments, local_texts)):
+                        if (start + offset) not in affected_ids:
+                            continue
                         source = str(segment.get("text", ""))
                         if text and _translation_memory_source_is_cacheable(source):
                             key = _translation_memory_key(
-                                source, glossary=effective_glossary,
+                                source,
+                                glossary=effective_glossary,
                                 target_lang=effective_target_lang,
                                 character_reference=effective_character_reference,
-                                reasoning_effort=reasoning_effort,
+                                reasoning_effort=session.reasoning_effort,
                                 context_signature=context_signature,
                                 occurrence_id=start + offset,
                             )
                             memory_entries.append((key, text))
-                    start += len(b_segments)
+                    start += batch_len
                 if memory_entries:
                     _save_memory_entries(effective_cache_path, memory_entries, _cache_lock)
 
@@ -557,6 +627,7 @@ def translate_segments(
                     on_progress=on_progress,
                     cancel_event=cancel_event,
                     cache_writer=_persist_repaired_translation_cache,
+                    source_context=source_context,
                 )
                 _raise_if_cancelled(cancel_event)
                 if repair_timing is not None:
@@ -800,26 +871,6 @@ _emit_progress = transport_util._emit_progress
 _make_aggregated_progress_callback = engine_module._make_aggregated_progress_callback
 
 
-def _warn_about_inert_context(profile, *, glossary: str, character_reference: str) -> None:
-    """Say so when the chosen contract cannot carry a setting the user filled in.
-
-    The local contract supports matching user terms and nearby source context.
-    Character references still cannot be carried by its native template.
-    """
-    reporter = getattr(profile, "warn_about_inert_context", None)
-    if reporter is None:
-        return
-    inert = reporter(
-        ProfileContext(glossary=glossary, character_reference=character_reference)
-    )
-    if inert:
-        print(
-            f"[translation] 本地逐句翻译不使用：{'、'.join(inert)}"
-            "（这些设置只在 OpenAI 兼容 API 后端生效）",
-            flush=True,
-        )
-
-
 # Below this a budget is too small to translate a batch with, so a further
 # halving would trade one useless request for another.
 _MIN_MAX_TOKENS_RETRY = 4096
@@ -895,48 +946,54 @@ def _chat(
     effective_max_tokens = capability.budget(max_tokens, warn=True)
 
     def _dispatch(budget: int) -> str:
-        # Resolved through the lease: re-reading the selected name here meant a
-        # task could hold a claim on one instance and send its requests to
-        # another, which the holder of *that* one was then free to close.
-        if task_backend_name() != "openai":
-            backend = task_backend()
-            profile = request_config.current_profile()
-            sampling = profile.sampling_parameters() if profile is not None and task_backend_name() == "llamacpp" else {}
-            model_options = {}
-            if task_backend_name() == "llamacpp" and sampling:
-                model_options["sampling_parameters"] = sampling
-            if task_backend_name() == "llamacpp" and output_grammar is not None:
-                model_options["grammar"] = output_grammar
-            return backend.chat_completion(
+        # Always resolve through the lease so every backend (including openai)
+        # validates its task lease and dispatches via `chat_completion`.
+        backend_name = task_backend_name()
+        backend = task_backend()
+        if backend_name == "openai" and _chat_responses is not _DEFAULT_CHAT_RESPONSES:
+            return _chat_responses(
                 messages,
-                temperature=float(sampling.get("temperature", TRANSLATION_TEMPERATURE)),
-                top_p=float(sampling.get("top_p", TRANSLATION_TOP_P)),
-                max_tokens=budget,
-                # Local-only, and deliberately not passed to the OpenAI
-                # transports below: their strict structured-output mode
-                # validates against a fixed keyword allowlist that has no
-                # `maxLength` for strings, so sending it is a 400 at request
-                # time rather than a tighter grammar. Nothing is lost - the
-                # repetition loop this bounds was only ever measured on local
-                # GGUF models, never on an API one.
-                response_format=bounded_response_schema or response_schema,
-                reasoning_effort=reasoning_effort,
                 expected_count=expected_count,
-                cancel_event=cancel_event,
                 on_progress=on_progress,
+                reasoning_effort=reasoning_effort,
                 on_usage=on_usage,
-                **model_options,
+                cancel_event=cancel_event,
+                response_schema=response_schema,
+                response_schema_name=response_schema_name,
+                max_tokens=budget,
             )
-        return _chat_responses(
+        profile = request_config.current_profile()
+        sampling = (
+            profile.sampling_parameters()
+            if profile is not None and backend_name == "llamacpp"
+            else {}
+        )
+        model_options: dict = {}
+        if backend_name == "llamacpp" and sampling:
+            model_options["sampling_parameters"] = sampling
+        if backend_name == "llamacpp" and output_grammar is not None:
+            model_options["grammar"] = output_grammar
+        if isinstance(backend, openai_transport.OpenAICompatBackend):
+            model_options["response_schema_name"] = response_schema_name
+        return backend.chat_completion(
             messages,
-            expected_count=expected_count,
-            on_progress=on_progress,
-            reasoning_effort=reasoning_effort,
-            on_usage=on_usage,
-            cancel_event=cancel_event,
-            response_schema=response_schema,
-            response_schema_name=response_schema_name,
+            temperature=float(sampling.get("temperature", TRANSLATION_TEMPERATURE)),
+            top_p=float(sampling.get("top_p", TRANSLATION_TOP_P)),
             max_tokens=budget,
+            # Local-only `bounded_response_schema` (`maxLength`) is never sent to
+            # OpenAI Responses endpoints, whose strict structured-output mode
+            # validates against a fixed keyword allowlist without `maxLength`.
+            response_format=(
+                response_schema
+                if backend_name == "openai"
+                else (bounded_response_schema or response_schema)
+            ),
+            reasoning_effort=reasoning_effort,
+            expected_count=expected_count,
+            cancel_event=cancel_event,
+            on_progress=on_progress,
+            on_usage=on_usage,
+            **model_options,
         )
 
     # Retry state for the whole call, not for one trip down the ladder. The
@@ -1125,7 +1182,10 @@ def _chat(
             ) from again
 
 
-_chat_responses = openai_transport._chat_responses
+_DEFAULT_CHAT = _chat
+_DEFAULT_CHAT_WITH_REASONING = _chat_with_reasoning
+_DEFAULT_CHAT_RESPONSES = openai_transport._chat_responses
+_chat_responses = _DEFAULT_CHAT_RESPONSES
 
 
 # JSON-contract parsing lives in llm.profiles.json_v3; these aliases keep the

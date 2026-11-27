@@ -1,7 +1,6 @@
 import concurrent.futures
 import gc
 import logging
-import os
 import sys
 import time
 import wave
@@ -16,7 +15,7 @@ from asr.backends.qwen import (
     active_qwen_asr_model_path,
     current_qwen_asr_backend,
 )
-from asr import alignment
+from asr import alignment, audio_encoder
 from asr.alignment import AlignmentHead
 from asr.decode_guard import (
     DEFAULT_BUDGET_SECONDS,
@@ -28,13 +27,14 @@ from asr.subtitle_timing import (
     build_aligned_word_timestamps,
     build_boundary_word_timestamps,
 )
-from asr.text_normalize import normalize_display_text, strip_text_punctuation
+from asr.text_normalize import normalize_display_text
 from core.diagnostics import is_fatal_cuda_error
 from core.typed_config import env_bool, env_float, env_int, env_text
 
 logger = logging.getLogger(__name__)
 
-ASR_LANGUAGE = env_text("ASR_LANGUAGE", "Japanese")
+_DEFAULT_ASR_LANGUAGE = "Japanese"
+_DEFAULT_TRANSCRIPTION_TIMEOUT_S = 180.0
 
 
 def _resolve_asr_batch_size() -> int:
@@ -45,30 +45,6 @@ def _resolve_asr_batch_size() -> int:
         return fallback
     return env_int("ASR_BATCH_SIZE", fallback, minimum=1)
 
-
-TRANSCRIPTION_TIMEOUT_S = env_float("TRANSCRIPTION_TIMEOUT_S", 180.0, minimum=1.0)
-# --- Windows Job Object: delegated to `utils.subprocess_tools` so all Windows
-# child-management sites share one 64-bit-HANDLE-safe implementation. ---
-if os.name == "nt":
-    from utils.subprocess_tools import (
-        assign_handle_to_job as _assign_handle_to_job,
-        create_kill_on_close_job as _create_kill_on_close_job,
-    )
-
-    def _create_kill_on_close_job_object():
-        return _create_kill_on_close_job()
-
-    def _assign_process_to_job_object(job, process) -> None:
-        # multiprocessing spawn Process keeps the Win32 process handle on its
-        # Popen object (process._popen._handle).
-        handle = getattr(getattr(process, "_popen", None), "_handle", None)
-        if not handle:
-            raise RuntimeError("subprocess has no win32 handle to assign")
-        _assign_handle_to_job(job, int(handle))
-
-
-def _is_fatal_cuda_oom(exc: BaseException) -> bool:
-    return is_fatal_cuda_error(exc)
 
 def _get_wav_duration(audio_path: str) -> float:
     with wave.open(audio_path, "rb") as wav_file:
@@ -106,40 +82,15 @@ def _clear_cuda_cache(device: str, *, propagate_fatal: bool = True) -> None:
 
 
 def _detect_dtype(device: str):
-    import torch
-
-    dtype = os.getenv("ASR_DTYPE", "auto").strip().lower()
-    if dtype == "float32":
-        return torch.float32
-    if dtype == "float16":
-        return torch.float16
-    if dtype in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    if device.startswith("cuda"):
-        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    return torch.float32
+    return audio_encoder.detect_asr_dtype(device)
 
 
 def _detect_attention(device: str) -> str:
-    attention = os.getenv("ASR_ATTENTION", "auto").strip().lower()
-    if attention != "auto":
-        return attention
-    if not device.startswith("cuda"):
-        return "sdpa"
-    try:
-        import flash_attn  # noqa: F401
-
-        return "flash_attention_2"
-    except Exception:
-        return "sdpa"
+    return audio_encoder.detect_asr_attention(device)
 
 
 def _clean_master_text(text: str) -> str:
     return normalize_display_text(text)
-
-
-def _strip_punctuation(text: str) -> str:
-    return strip_text_punctuation(text)
 
 
 def _first_token_id(value) -> int | None:
@@ -241,25 +192,32 @@ def _rows_truncated_at_cap(suffix, model, caps: Sequence[int] | int) -> list[boo
     budgets = [int(caps)] * rows if isinstance(caps, int) else [int(c) for c in caps]
     if len(budgets) != rows:
         return [False] * rows
-    stopped = torch.isin(
-        suffix, torch.tensor(stop_ids, device=suffix.device)
-    ).any(dim=1)
+    budget_tensor = torch.tensor(budgets, dtype=torch.long, device=suffix.device)
+    positions = torch.arange(length, dtype=torch.long, device=suffix.device)
+    within_budget = positions[None, :] < budget_tensor[:, None]
+    stop_tensor = torch.tensor(stop_ids, dtype=suffix.dtype, device=suffix.device)
+    stopped = (torch.isin(suffix, stop_tensor) & within_budget).any(dim=1)
     if pad_id is None or int(pad_id) in stop_ids:
-        # Padding is indistinguishable from a stop token, so fall back to the
-        # full row length. `stopped` already excludes every padded row.
-        emitted = torch.full((rows,), length, device=suffix.device)
+        # Padding is indistinguishable from a stop token, so inspect only each
+        # row's [:budget_i] prefix: trailing pad_id tokens past budget_i must
+        # not mask a short chunk that hit its own cap.
+        reached = (budget_tensor > 0) & (budget_tensor <= length)
     else:
-        emitted = (suffix != int(pad_id)).sum(dim=1)
-    reached = emitted >= torch.tensor(budgets, device=suffix.device)
+        emitted = ((suffix != int(pad_id)) & within_budget).sum(dim=1)
+        reached = (budget_tensor > 0) & (emitted >= budget_tensor)
     return [bool(value) for value in ((~stopped) & reached).tolist()]
 
 
 def _transcription_timeout_s() -> float:
-    return env_float("TRANSCRIPTION_TIMEOUT_S", TRANSCRIPTION_TIMEOUT_S, minimum=1.0)
+    return env_float(
+        "TRANSCRIPTION_TIMEOUT_S",
+        _DEFAULT_TRANSCRIPTION_TIMEOUT_S,
+        minimum=1.0,
+    )
 
 
 def _asr_language() -> str:
-    return env_text("ASR_LANGUAGE", ASR_LANGUAGE)
+    return env_text("ASR_LANGUAGE", _DEFAULT_ASR_LANGUAGE)
 
 
 def _asr_force_language() -> bool:
@@ -375,6 +333,7 @@ class LocalAsrBackend:
         self._zombie_future = None
         self._zombie_executor = None
         self._zombie_timed_out_future = None
+        self._executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._last_align_error = ""
         # Loaded lazily on first use and only when ASR_ALIGNMENT_HEAD_PATH is
         # set. `False` means "not looked at yet"; `None` means "looked, absent",
@@ -387,8 +346,6 @@ class LocalAsrBackend:
         self.cumulative_load_s = 0.0
 
     def load(self, on_stage: Callable[[str], None] | None = None) -> None:
-        from transformers import AutoModelForMultimodalLM, AutoProcessor
-
         if self.model is not None:
             return
         load_started = time.perf_counter()
@@ -399,20 +356,12 @@ class LocalAsrBackend:
             active_qwen_asr_model_id(),
             download=True,
         )
-        model_kwargs = {
-            "dtype": self.dtype,
-            "device_map": self.device,
-        }
-
-        if self.attention and self.attention != "sdpa":
-            model_kwargs["attn_implementation"] = self.attention
-
-        self.processor = AutoProcessor.from_pretrained(model_spec)
-        self.model = AutoModelForMultimodalLM.from_pretrained(
-            model_spec,
-            **model_kwargs,
+        self.model, self.processor = audio_encoder.load_qwen_asr_model(
+            model_spec=model_spec,
+            device=self.device,
+            dtype=self.dtype,
+            attention=self.attention,
         )
-        self.model.eval()
         _apply_generation_safety(self.model)
         self.cumulative_load_s += time.perf_counter() - load_started
 
@@ -426,19 +375,30 @@ class LocalAsrBackend:
                 "[WARN] ASR generate 僵尸线程未结束，跳过卸载以防两模型同驻 OOM",
             )
             return
-        if self.model is None:
+        has_head = self._alignment_head not in (False, None)
+        if self.model is None and not has_head:
             return
-        _notify(on_stage, "卸载 ASR 文本模型...")
-        try:
-            del self.model
-        except Exception:
-            pass
-        self.model = None
-        self.processor = None
+        if self.model is not None:
+            _notify(on_stage, "卸载 ASR 文本模型...")
+            try:
+                del self.model
+            except Exception:
+                pass
+            self.model = None
+            self.processor = None
+        if has_head:
+            self._alignment_head = False
         _clear_cuda_cache(self.device)
 
     def close(self) -> None:
         self.unload_model()
+        executor = self._executor
+        self._executor = None
+        if executor is not None:
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
 
     def _join_zombie_worker(
         self,
@@ -614,8 +574,11 @@ class LocalAsrBackend:
         asr_results = None
         executor = None
         timed_out = False
+        zombie_active = False
         try:
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            if self._executor is None:
+                self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            executor = self._executor
             future = executor.submit(
                 self._transcribe_native,
                 normalized_paths,
@@ -625,6 +588,8 @@ class LocalAsrBackend:
             done, _ = concurrent.futures.wait((future,), timeout=timeout_s)
             if future not in done:
                 timed_out = True
+                # Detach this pool so the next batch creates a clean worker.
+                self._executor = None
                 cancelled = future.cancel()
                 if cancelled:
                     # The worker never began executing `_transcribe_native`, so
@@ -655,6 +620,7 @@ class LocalAsrBackend:
                     # before reusing/reloading -- never drop self.model here, or
                     # load() would allocate a second model while the zombie still
                     # holds the old one (VRAM OOM).
+                    zombie_active = True
                     self._zombie_future = future
                     self._zombie_executor = executor
                     logger.warning(
@@ -672,7 +638,7 @@ class LocalAsrBackend:
                     {
                         "text": "",
                         "raw_text": "",
-                        "duration": _get_wav_duration(path),
+                        "duration": _get_wav_duration_or_zero(path),
                         "language": language_hint or "Japanese",
                         "normalized_path": path,
                         "asr_generation": _qwen_generation_metadata(
@@ -702,14 +668,15 @@ class LocalAsrBackend:
                 payload["log"] = payload_log
                 payloads.append(payload)
         finally:
-            if executor is not None:
-                executor.shutdown(wait=not timed_out, cancel_futures=True)
+            if timed_out and executor is not None and not zombie_active:
+                executor.shutdown(wait=False, cancel_futures=True)
             if asr_results is not None:
                 try:
                     del asr_results
                 except Exception:
                     pass
-            _clear_cuda_cache(self.device)
+            if timed_out and not zombie_active:
+                _clear_cuda_cache(self.device)
         return payloads
 
     def _transcribe_native(
@@ -771,14 +738,19 @@ class LocalAsrBackend:
             parsed = self.processor.parse_output(decoded)
             if isinstance(parsed, dict):
                 parsed = [parsed]
-            for offset, item in enumerate(parsed):
+            if len(parsed) != len(paths):
+                raise RuntimeError(
+                    "ASR parse_output count mismatch: "
+                    f"expected={len(paths)} actual={len(parsed)}"
+                )
+            if len(truncated) != len(paths):
+                truncated = [False] * len(paths)
+            for item, was_truncated in zip(parsed, truncated, strict=True):
                 results.append(
                     NativeAsrTranscription(
                         language=str(item.get("language") or "").strip() or language_hint,
                         text=str(item.get("transcription") or ""),
-                        truncated_at_cap=bool(
-                            truncated[offset] if offset < len(truncated) else False
-                        ),
+                        truncated_at_cap=bool(was_truncated),
                     )
                 )
         return results
@@ -796,12 +768,17 @@ class LocalAsrBackend:
         timing_window_source: str,
         log: list[str],
         cached_features: Any = None,
+        cached_log_probs: Any = None,
     ) -> tuple[dict, list[str]]:
         log.append("Subtitle timing: boundary_chunk_timeline")
         text = master_text or raw_master_text
         self._last_align_error = ""
         aligned = self._align_characters(
-            normalized_path, text, log, cached_features=cached_features
+            normalized_path,
+            text,
+            log,
+            cached_features=cached_features,
+            cached_log_probs=cached_log_probs,
         )
         align_error = self._last_align_error
         if aligned is not None:
@@ -854,6 +831,7 @@ class LocalAsrBackend:
         log: list[str],
         *,
         cached_features: Any = None,
+        cached_log_probs: Any = None,
     ) -> tuple[list, tuple[float, float]] | None:
         """Character times for `text`, measured off this chunk's own audio.
 
@@ -872,21 +850,15 @@ class LocalAsrBackend:
         if head is None or not (text or "").strip():
             return None
         try:
-            import numpy as np
-            import torch
-
-            from asr.qwen_native import (
-                move_processor_inputs,
-                prepare_transcription_inputs,
-            )
             from audio.loading import load_audio_16k_mono
-            from asr.encoder_features import qwen3_asr_audio_output_lengths
 
             if self.model is None or self.processor is None:
                 return None
-            if cached_features is not None:
-                # Already encoded with this chunk's siblings in one forward pass.
-                chunk_features = cached_features
+            if cached_log_probs is not None:
+                aligned = head.align_extent_from_log_probs(cached_log_probs, text)
+            elif cached_features is not None:
+                # Caller provided pre-extracted CPU/GPU features directly.
+                aligned = head.align_extent(cached_features, text)
             else:
                 if not self._join_zombie_worker():
                     detail = "zombie ASR generate worker still active; skipping encoder pass"
@@ -897,26 +869,29 @@ class LocalAsrBackend:
                 audio, rate = load_audio_16k_mono(normalized_path)
                 if rate != 16000:
                     return None
-                inputs = prepare_transcription_inputs(
+                features, lengths = audio_encoder.encode_audio_features_batch(
+                    self.model,
                     self.processor,
-                    audio=[np.asarray(audio, dtype=np.float32)],
-                    language=ASR_LANGUAGE,
+                    [audio],
+                    device=self.device,
+                    dtype=self.dtype,
+                    language=_asr_language(),
+                    stage_label="alignment",
                 )
-                moved = move_processor_inputs(
-                    inputs, device=self.device, dtype=self.dtype
-                )
-                with torch.inference_mode():
-                    features = self.model.get_audio_features(
-                        input_features=moved["input_features"],
-                        input_features_mask=moved["input_features_mask"],
-                    ).pooler_output
-                frames = int(
-                    qwen3_asr_audio_output_lengths(
-                        moved["input_features_mask"].sum(dim=1)
-                    )[0]
-                )
-                chunk_features = features[:frames].detach().float().cpu().numpy()
-            aligned = head.align_extent(chunk_features, text)
+                if hasattr(head, "forward_batch_from_gpu_features"):
+                    ctc_list, _ = head.forward_batch_from_gpu_features(
+                        features,
+                        lengths,
+                        need_ctc_log_probs=True,
+                        argmax_only=False,
+                        need_frames=False,
+                    )
+                    aligned = head.align_extent_from_log_probs(ctc_list[0], text)
+                else:
+                    hidden_list = audio_encoder.split_encoded_features_numpy(
+                        features, lengths
+                    )
+                    aligned = head.align_extent(hidden_list[0], text)
             if not aligned:
                 log.append("Subtitle timing: alignment declined, using proportional")
                 return None
@@ -966,11 +941,10 @@ class LocalAsrBackend:
         timing_meta: dict | None = None,
         timing_window_source: str = "",
     ) -> tuple[dict, list[str]]:
+        del timing_window_source
         log.append(f"Subtitle timing word count: {len(word_dicts)}")
         if align_error:
             log.append(f"Subtitle timing error: {align_error}")
-        if timing_window_source == "speech_core":
-            log.append("Subtitle timing window: speech_core")
         if timing_meta is not None and timing_meta.get("timing_source"):
             source = timing_meta["timing_source"]
             head = self._alignment_head if self._alignment_head else None
@@ -996,25 +970,17 @@ class LocalAsrBackend:
             "timing_meta": dict(timing_meta or {}),
         }, log
 
-    def _encode_chunk_features(self, paths: list[str]) -> dict[str, Any]:
-        """Encoder frames for several chunks in one forward pass.
-
-        The alignment pass used to encode one chunk at a time, re-reading the wav
-        and recomputing mel on the CPU for each - 37.76s over 384 chunks on a
-        2h09m file. The encoder is compute-bound, so the per-call overhead was
-        most of that. Returns `{path: frames}` and simply omits anything that
-        failed to load, because the caller already degrades to proportional
-        timing when a chunk has no features.
-        """
+    def _load_alignment_audios(self, paths: list[str]) -> list[tuple[str, Any]]:
         import numpy as np
-        import torch
 
-        from asr.qwen_native import move_processor_inputs, prepare_transcription_inputs
         from audio.loading import load_audio_16k_mono
-        from asr.encoder_features import qwen3_asr_audio_output_lengths
 
         loaded: list[tuple[str, Any]] = []
+        seen: set[str] = set()
         for path in paths:
+            if path in seen:
+                continue
+            seen.add(path)
             try:
                 audio, rate = load_audio_16k_mono(path)
             except Exception as error:  # noqa: BLE001
@@ -1023,6 +989,11 @@ class LocalAsrBackend:
             if rate != 16000:
                 continue
             loaded.append((path, np.asarray(audio, dtype=np.float32)))
+        return loaded
+
+    def _encode_chunk_features(self, paths: list[str]) -> dict[str, Any]:
+        """Encoder frames for several chunks in one forward pass."""
+        loaded = self._load_alignment_audios(paths)
         if not loaded:
             return {}
         if not self._join_zombie_worker():
@@ -1031,38 +1002,54 @@ class LocalAsrBackend:
             )
             return {}
 
-        inputs = prepare_transcription_inputs(
+        features, lengths = audio_encoder.encode_audio_features_batch(
+            self.model,
             self.processor,
-            audio=[audio for _, audio in loaded],
-            language=ASR_LANGUAGE,
+            [audio for _, audio in loaded],
+            device=self.device,
+            dtype=self.dtype,
+            language=_asr_language(),
+            stage_label="alignment",
         )
-        moved = move_processor_inputs(inputs, device=self.device, dtype=self.dtype)
-        with torch.inference_mode():
-            features = self.model.get_audio_features(
-                input_features=moved["input_features"],
-                input_features_mask=moved["input_features_mask"],
-            ).pooler_output
-        lengths = [
-            int(value)
-            for value in qwen3_asr_audio_output_lengths(
-                moved["input_features_mask"].sum(dim=1)
+        hidden_list = audio_encoder.split_encoded_features_numpy(features, lengths)
+        return {
+            path: hidden
+            for (path, _), hidden in zip(loaded, hidden_list, strict=True)
+        }
+
+    def _compute_chunk_log_probs(
+        self, paths: list[str], head: AlignmentHead
+    ) -> dict[str, Any]:
+        """Batched GPU encoder + alignment head forward pass (zero CPU roundtrip)."""
+        loaded = self._load_alignment_audios(paths)
+        if not loaded:
+            return {}
+        if not self._join_zombie_worker():
+            logger.warning(
+                "Skipping batched alignment encode: zombie ASR generate worker is still active"
             )
-        ]
-        # `pooler_output` concatenates the batch along the frame axis, matching
-        # `encoder_features.Qwen3AsrEncoder.encode_batch`.
-        hidden = features.detach().float().cpu().numpy()
-        expected_total_frames = sum(lengths)
-        if expected_total_frames != int(hidden.shape[0]):
-            raise RuntimeError(
-                "ASR encoder output length mismatch during alignment: "
-                f"expected_frames={expected_total_frames} actual_frames={int(hidden.shape[0])}"
-            )
-        encoded: dict[str, Any] = {}
-        offset = 0
-        for (path, _), length in zip(loaded, lengths):
-            encoded[path] = hidden[offset : offset + length]
-            offset += length
-        return encoded
+            return {}
+
+        features, lengths = audio_encoder.encode_audio_features_batch(
+            self.model,
+            self.processor,
+            [audio for _, audio in loaded],
+            device=self.device,
+            dtype=self.dtype,
+            language=_asr_language(),
+            stage_label="alignment",
+        )
+        ctc_list, _ = head.forward_batch_from_gpu_features(
+            features,
+            lengths,
+            need_ctc_log_probs=True,
+            argmax_only=False,
+            need_frames=False,
+        )
+        return {
+            path: log_probs
+            for (path, _), log_probs in zip(loaded, ctc_list, strict=True)
+        }
 
     def finalize_text_results(
         self,
@@ -1091,9 +1078,13 @@ class LocalAsrBackend:
                 "Skipping alignment encoder passes for %d chunks: zombie ASR generate worker is still active",
                 total_results,
             )
+        use_gpu_head_batch = head_available and hasattr(
+            primary_head, "forward_batch_from_gpu_features"
+        )
         for group_start in range(0, total_results, batch_size):
             group = text_results[group_start : group_start + batch_size]
             feature_cache: dict[str, Any] = {}
+            log_probs_cache: dict[str, Any] = {}
             if head_available and not zombie_active:
                 alignable = [
                     str(item["normalized_path"])
@@ -1102,7 +1093,12 @@ class LocalAsrBackend:
                 ]
                 if alignable:
                     try:
-                        feature_cache = self._encode_chunk_features(alignable)
+                        if use_gpu_head_batch:
+                            log_probs_cache = self._compute_chunk_log_probs(
+                                alignable, primary_head
+                            )
+                        else:
+                            feature_cache = self._encode_chunk_features(alignable)
                     except Exception as error:  # noqa: BLE001
                         if is_fatal_cuda_error(error):
                             raise
@@ -1113,7 +1109,10 @@ class LocalAsrBackend:
                             "batched chunk encode failed: %s", error, exc_info=True
                         )
                         feature_cache = {}
-            group_finalized = self._finalize_group(group, feature_cache)
+                        log_probs_cache = {}
+            group_finalized = self._finalize_group(
+                group, feature_cache, log_probs_cache=log_probs_cache
+            )
             if head_notes and group_start == 0 and group_finalized:
                 group_finalized[0][1].extend(head_notes)
             finalized.extend(group_finalized)
@@ -1125,8 +1124,11 @@ class LocalAsrBackend:
         self,
         text_results: list[dict],
         feature_cache: dict[str, Any],
+        *,
+        log_probs_cache: dict[str, Any] | None = None,
     ) -> list[tuple[dict, list[str]]]:
         finalized: list[tuple[dict, list[str]]] = []
+        resolved_log_probs = log_probs_cache or {}
         for text_result in text_results:
             log: list[str] = list(text_result.get("log", []))
             normalized_path = str(text_result["normalized_path"])
@@ -1164,6 +1166,7 @@ class LocalAsrBackend:
                     timing_window_source=window_source,
                     log=log,
                     cached_features=feature_cache.get(normalized_path),
+                    cached_log_probs=resolved_log_probs.get(normalized_path),
                 )
             )
         return finalized

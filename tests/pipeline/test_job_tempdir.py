@@ -1,9 +1,16 @@
 import json
 from pathlib import Path
 
+import pytest
+
 import main
 from pipeline import audio as pipeline_audio
 from helpers import make_job_context, run_pipeline
+
+
+@pytest.fixture(autouse=True)
+def _isolate_project_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
 
 
 def _assert_no_project_absolute_path(text: str) -> None:
@@ -228,8 +235,11 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
         ctx=ctx,
         job_id=ctx.job_id,
     )
-    logger = artifacts.logger
-    assert logger is not None
+    # ASR stage always closes its run log FileHandler before returning so a
+    # cancel between ASR and translation never leaks an open Windows handle.
+    assert artifacts.logger is None
+    assert artifacts.run_log_path is not None
+    assert Path(artifacts.run_log_path).is_file()
     output_paths = main.run_translation_and_write(
         str(video_path),
         artifacts,
@@ -237,8 +247,7 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
         job_id=ctx.job_id,
     )
     assert artifacts.logger is None
-    assert not logger.handlers
-    assert getattr(main.events._thread_local, "run_logger", None) is not logger
+    assert getattr(main.events._thread_local, "run_logger", None) is None
 
     published = {Path(path).name: Path(path) for path in output_paths}
     timings = json.loads(published["sample.timings.json"].read_text(encoding="utf-8"))

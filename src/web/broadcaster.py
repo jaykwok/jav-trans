@@ -7,15 +7,26 @@ import logging
 
 log = logging.getLogger(__name__)
 _TCP_STREAM_LIMIT_BYTES = 4 * 1024 * 1024
-
+MAX_SUBSCRIBERS = 64
+MAX_TCP_CLIENTS = 64
+RESYNC_EVENT_LINE = '{"type": "resync"}'
+_CRITICAL_PHASES = frozenset({"done", "error", "blocked"})
+_CONTROL_TYPES = frozenset({"connected", "resync"})
 
 _subscribers: list[asyncio.Queue[str]] = []
-# Strong refs for fire-and-forget progress tasks so they aren't GC'd before
-# completing (loop.create_task drops the ref otherwise).
+_active_tcp_clients = 0
+# Strong refs for background progress persistence tasks so they aren't GC'd
+# before completing and can be cancelled cleanly on shutdown.
 _pending_progress_tasks: set[asyncio.Task[None]] = set()
 
 
+class SubscriberLimitError(RuntimeError):
+    """Raised when the SSE subscriber cap has been reached."""
+
+
 async def subscribe() -> asyncio.Queue[str]:
+    if len(_subscribers) >= MAX_SUBSCRIBERS:
+        raise SubscriberLimitError(f"SSE subscriber limit ({MAX_SUBSCRIBERS}) reached")
     queue: asyncio.Queue[str] = asyncio.Queue(maxsize=200)
     _subscribers.append(queue)
     await queue.put('{"type": "connected"}')
@@ -31,9 +42,9 @@ def _is_stale_run(event: dict) -> bool:
     """Did a previous execution of this job send this?
 
     Both defences are needed: dropping it here keeps the browser from showing a
-    cancelled run's progress under the retry, and `update_job_progress` makes
-    the same check inside the state lock so the stored job cannot be rewritten
-    by it either. An event without a run id cannot be judged and is kept.
+    cancelled run's progress under the retry, and `apply_job_progress_memory`
+    enforces the same check on the stored job. An event without a run id cannot
+    be judged and is kept.
     """
     job_id = str(event.get("job_id", "") or "")
     run_id = str(event.get("run_id", "") or "")
@@ -55,11 +66,94 @@ def _on_progress_task_done(task: asyncio.Task[None]) -> None:
         return
     exc = task.exception()
     if exc is not None:
-        log.error("Background job progress update failed", exc_info=exc)
+        log.error("Background job progress persistence failed", exc_info=exc)
+
+
+def _is_critical_event(event: dict | None) -> bool:
+    if not isinstance(event, dict):
+        return False
+    if event.get("type") in _CONTROL_TYPES:
+        return True
+    if event.get("stage") == "timing_summary":
+        return True
+    return event.get("phase") in _CRITICAL_PHASES
+
+
+def _classify_queued_line(line: str) -> tuple[bool, bool]:
+    """Return ``(is_progress, is_critical)`` for a queued SSE line."""
+    try:
+        parsed = json.loads(line)
+    except json.JSONDecodeError:
+        return False, False
+    if not isinstance(parsed, dict):
+        return False, False
+    return parsed.get("phase") == "progress", _is_critical_event(parsed)
+
+
+def _enqueue_with_backpressure(
+    queue: asyncio.Queue[str],
+    line: str,
+    *,
+    is_critical: bool,
+) -> None:
+    """Enqueue ``line``, shedding oldest progress events rather than terminal ones."""
+    try:
+        queue.put_nowait(line)
+        return
+    except asyncio.QueueFull:
+        pass
+    except RuntimeError:
+        return
+
+    items: list[str] = []
+    while True:
+        try:
+            items.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    maxsize = queue.maxsize if queue.maxsize > 0 else len(items) + 2
+    has_resync = RESYNC_EVENT_LINE in items
+
+    def _drop_one(*, allow_non_progress: bool) -> bool:
+        for idx, queued_line in enumerate(items):
+            is_progress, queued_critical = _classify_queued_line(queued_line)
+            if is_progress:
+                items.pop(idx)
+                return True
+            if allow_non_progress and not queued_critical:
+                items.pop(idx)
+                return True
+        if allow_non_progress:
+            for idx, queued_line in enumerate(items):
+                if queued_line not in {'{"type": "connected"}', RESYNC_EVENT_LINE}:
+                    items.pop(idx)
+                    return True
+        return False
+
+    dropped = _drop_one(allow_non_progress=is_critical)
+    if not dropped and not is_critical:
+        # Every queued item is critical; prefer preserving critical events and
+        # signal a resync only if space already exists.
+        if not has_resync and len(items) < maxsize:
+            items.append(RESYNC_EVENT_LINE)
+    else:
+        if dropped and not has_resync and maxsize >= 2:
+            if len(items) + 2 > maxsize:
+                _drop_one(allow_non_progress=is_critical)
+            if len(items) + 2 <= maxsize:
+                items.append(RESYNC_EVENT_LINE)
+                has_resync = True
+        if len(items) < maxsize:
+            items.append(line)
+
+    for queued_line in items:
+        with contextlib.suppress(asyncio.QueueFull, RuntimeError):
+            queue.put_nowait(queued_line)
 
 
 def publish(event_line: str) -> None:
-    line = str(event_line).strip()
+    line = str(event_line).replace("\r", " ").replace("\n", " ").strip()
     if not line:
         return
     try:
@@ -92,40 +186,61 @@ def publish(event_line: str) -> None:
             ):
                 if key in extra:
                     progress[key] = extra[key]
-            try:
-                from web import pipeline_manager
+            from web import pipeline_manager
 
-                loop = asyncio.get_running_loop()
-                task = loop.create_task(
-                    pipeline_manager.update_job_progress(
-                        job_id,
-                        progress,
-                        run_id=str(event.get("run_id", "") or ""),
-                    )
+            updated, stage_changed = pipeline_manager.apply_job_progress_memory(
+                job_id,
+                progress,
+                run_id=str(event.get("run_id", "") or ""),
+            )
+            if updated:
+                task = pipeline_manager.schedule_progress_persist(
+                    job_id,
+                    immediate=stage_changed,
                 )
-                _pending_progress_tasks.add(task)
-                task.add_done_callback(_on_progress_task_done)
-            except RuntimeError:
-                pass
+                if task is not None and task not in _pending_progress_tasks:
+                    _pending_progress_tasks.add(task)
+                    task.add_done_callback(_on_progress_task_done)
+
+    is_critical = _is_critical_event(event if isinstance(event, dict) else None)
     for queue in list(_subscribers):
-        try:
-            queue.put_nowait(line)
-        except asyncio.QueueFull:
-            continue
-        except RuntimeError:
-            continue
+        _enqueue_with_backpressure(queue, line, is_critical=is_critical)
+
+
+async def cancel_pending_progress_tasks() -> None:
+    """Cancel and await any pending progress persistence tasks during shutdown."""
+    tasks = list(_pending_progress_tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _handle_tcp_client(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
 ) -> None:
+    global _active_tcp_clients
+    if _active_tcp_clients >= MAX_TCP_CLIENTS:
+        log.warning(
+            "Event TCP client rejected: active client limit (%d) reached",
+            MAX_TCP_CLIENTS,
+        )
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+        return
+    _active_tcp_clients += 1
     try:
         while True:
             try:
                 raw_line = await reader.readline()
             except ValueError as exc:
-                log.warning("Event TCP stream line exceeded %d bytes: %s", _TCP_STREAM_LIMIT_BYTES, exc)
+                log.warning(
+                    "Event TCP stream line exceeded %d bytes: %s",
+                    _TCP_STREAM_LIMIT_BYTES,
+                    exc,
+                )
                 break
             if not raw_line:
                 break
@@ -140,6 +255,7 @@ async def _handle_tcp_client(
     except Exception:
         log.exception("Unhandled error in event TCP client handler")
     finally:
+        _active_tcp_clients = max(0, _active_tcp_clients - 1)
         writer.close()
         with contextlib.suppress(Exception):
             await writer.wait_closed()
@@ -165,19 +281,3 @@ async def start_tcp_listener(host: str, port: int) -> tuple[asyncio.Server, asyn
 
     task = asyncio.create_task(_serve(), name=f"sse-tcp-listener-{port}")
     return server, task
-
-
-async def tcp_listener(host: str, port: int) -> None:
-    server = await asyncio.start_server(
-        _handle_tcp_client,
-        host,
-        port,
-        limit=_TCP_STREAM_LIMIT_BYTES,
-    )
-    try:
-        async with server:
-            await server.serve_forever()
-    except asyncio.CancelledError:
-        server.close()
-        await server.wait_closed()
-        raise

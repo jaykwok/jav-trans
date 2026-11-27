@@ -28,7 +28,7 @@ def test_start_only_removes_the_pending_entries_that_were_sent() -> None:
     assert "btnSubmit.textContent = '开始任务';" in files_js
 
 
-def test_completed_job_opens_srt_and_forces_full_progress() -> None:
+def test_completed_job_renders_minimal_actions_and_forces_full_progress() -> None:
     jobs_js = (STATIC / "js" / "jobsRender.js").read_text(encoding="utf-8")
 
     assert "job.status === 'done'" in jobs_js
@@ -37,5 +37,11 @@ def test_completed_job_opens_srt_and_forces_full_progress() -> None:
     assert "const activeStage = savingStage || terminalStage || job.progress?.stage" in jobs_js
     assert "done:                '已完成'" in jobs_js
     assert "const progressInfo = terminalStage" in jobs_js
-    assert "data-open-artifact" in jobs_js
-    assert "/api/open-artifact?job_id=" in jobs_js
+    # Minimalist card actions: play, folder reveal, remove (no SRT open/download buttons).
+    assert "data-play=" in jobs_js
+    assert "data-folder=" in jobs_js
+    assert "data-remove=" in jobs_js
+    assert "data-open-artifact" not in jobs_js
+    assert "btn-open-artifact" not in jobs_js
+    assert "data-dl" not in jobs_js
+    assert "下载 SRT" not in jobs_js

@@ -1,4 +1,13 @@
-import { state } from './state.js';
+import {
+  state,
+  CLEARABLE_STATUSES,
+  ERROR_STATUSES,
+  DELIVERY_FAILURE_STATUSES,
+  RETRYABLE_STATUSES,
+  CANCELLABLE_STATUSES,
+  SAVING_OR_DELIVERY_STATUSES,
+  TRANSLATION_RETRY_STAGES,
+} from './state.js';
 import { escHtml, readErrorDetail } from './util.js';
 import { jobArea, jobAreaHeader, emptyState, btnClearDone } from './dom.js';
 import { addLog } from './log.js';
@@ -42,8 +51,6 @@ const PROGRESS_PCT = {
   saving: 99, save_failed: 99, publish_failed: 98, export_failed: 99,
   done: 100, failed: 100, cancelled: 0, cancelling: 0,
 };
-// Rebalanced on 2026-07-31: the five boundary stages that used to fill 3->38%
-// no longer run, and chunking now costs one encoder pass instead of five models.
 const STAGE_PCT = {
   audio_prepare: 3,
   audio_chunking: 8,
@@ -57,8 +64,6 @@ const STAGE_PCT = {
 
 const STAGE_ORDER = Object.keys(STAGE_PCT);
 
-// How much of the bar a stage owns: the gap to whatever comes next, minus a
-// point so an in-progress stage never reaches its successor's mark.
 function stageSpan(stage) {
   const index = STAGE_ORDER.indexOf(stage);
   if (index < 0) return 0;
@@ -72,12 +77,8 @@ function clampPct(value) {
   return Math.min(100, Math.max(0, n));
 }
 
-export const CLEARABLE = new Set(['done', 'failed', 'cancelled', 'publish_failed', 'export_failed']);
+export const CLEARABLE = CLEARABLE_STATUSES;
 
-// Our own messages name the missing setting and the panel that fills it in, so
-// they are shown whole (wrapped, never ellipsised). Only a payload long enough
-// to bury the card - a provider traceback, say - still gets folded away, and
-// even then the first line stays visible.
 const MAX_INLINE_ERROR_CHARS = 260;
 
 function renderJobError(error) {
@@ -102,8 +103,35 @@ function jobTitle(job) {
   return p.split(/[\\/]/).pop() || job.id;
 }
 
+function setTextIfChanged(el, text) {
+  if (el && el.textContent !== text) el.textContent = text;
+}
+
+function syncCardHtml(card, html) {
+  if (card._html === html) return;
+  const wasErrorOpen = Boolean(card.querySelector('.job-error-wrap')?.open);
+  card.innerHTML = html;
+  card._html = html;
+  if (wasErrorOpen) {
+    const details = card.querySelector('.job-error-wrap');
+    if (details) details.open = true;
+  }
+  card._refs = {
+    fill: card.querySelector('.progress-fill'),
+    dlFill: card.querySelector('.dl-bar-fill'),
+    stageEl: card.querySelector('.job-stage'),
+    dlLabelEl: card.querySelector('.dl-label'),
+    dlInfoEl: card.querySelector('.dl-info'),
+  };
+}
+
 export function renderJobs() {
-  const ids = Object.keys(state.jobs);
+  const ids = Object.keys(state.jobs).sort((a, b) => {
+    const ca = String(state.jobs[a]?.created_at || '');
+    const cb = String(state.jobs[b]?.created_at || '');
+    if (ca !== cb) return ca < cb ? -1 : 1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
   const pendingFiles = state.files;
   emptyState.style.display = ids.length || pendingFiles.length ? 'none' : 'flex';
 
@@ -114,14 +142,16 @@ export function renderJobs() {
     ...ids,
     ...pendingFiles.map(file => file.pendingId),
   ]);
-  [...jobArea.querySelectorAll('.job-card')].forEach(el => {
-    if (!visibleIds.has(el.dataset.id)) el.remove();
-  });
+  const existingCards = new Map();
+  for (const el of jobArea.querySelectorAll('.job-card')) {
+    const cardId = el.dataset.id;
+    if (!visibleIds.has(cardId)) {
+      el.remove();
+    } else {
+      existingCards.set(cardId, el);
+    }
+  }
 
-  // Re-appending an already-attached card restarts all of its CSS animations
-  // (card-in entrance, progress flow/sheen), which showed up as a whole-card
-  // blink on every poll. Cards are only (re)inserted when their order actually
-  // changes, and innerHTML is only rewritten when the content differs.
   let prevCard = null;
   const placeCard = card => {
     const misplaced =
@@ -138,7 +168,7 @@ export function renderJobs() {
 
   ids.forEach(id => {
     const job = state.jobs[id];
-    let card = jobArea.querySelector(`.job-card[data-id="${id}"]`);
+    let card = existingCards.get(id);
     if (!card) {
       card = document.createElement('div');
       card.className = 'job-card';
@@ -149,7 +179,7 @@ export function renderJobs() {
     const current = job.progress?.current ?? job.progress?.extra?.current;
     const total = job.progress?.total ?? job.progress?.extra?.total;
     const terminalStage = CLEARABLE.has(job.status) ? job.status : null;
-    const savingStage = ['saving', 'save_failed', 'publish_failed', 'export_failed'].includes(job.status) ? job.status : null;
+    const savingStage = SAVING_OR_DELIVERY_STATUSES.has(job.status) ? job.status : null;
     const activeStage = savingStage || terminalStage || job.progress?.stage || job.current_stage || job.status;
     const translatedRatio = translated != null && expected
       ? Math.min(1, Math.max(0, translated / expected))
@@ -161,32 +191,36 @@ export function renderJobs() {
     if (job.status === 'done') {
       pct = 100;
     } else {
-      // Interpolate within the stage's own share of the bar, read from the
-      // table rather than repeated as literals - the old code hardcoded the
-      // 43..63 and 76..95 spans, so re-weighting a stage silently desynced them.
       const ratio = activeStage === 'translation' ? translatedRatio : itemRatio;
       if (ratio != null && STAGE_PCT[activeStage] != null) {
         pct = Math.round(STAGE_PCT[activeStage] + ratio * stageSpan(activeStage));
       }
     }
     pct = clampPct(pct);
-    const fillClass = job.status === 'done' ? ' done' : ['failed', 'save_failed', 'publish_failed', 'export_failed'].includes(job.status) ? ' error' : '';
-    const stage = STAGE_LABEL[activeStage] ?? STAGE_LABEL[job.status] ?? activeStage;
+    const fillClass = job.status === 'done' ? ' done' : ERROR_STATUSES.has(job.status) ? ' error' : '';
+    const skipTranslation = Boolean(job.spec?.skip_translation);
+    const effectiveStageKey = skipTranslation
+      && (activeStage === 'translation' || activeStage === 'translating' || activeStage === 'translation_context')
+      ? 'write_output'
+      : activeStage;
+    const stage = STAGE_LABEL[effectiveStageKey] ?? STAGE_LABEL[job.status] ?? effectiveStageKey;
     const progressInfo = terminalStage
       ? ''
       : translated != null
       ? ` ${translated}/${expected ?? '?'}`
       : current != null ? ` ${current}/${total ?? '?'}` : '';
+    const stageText = `${stage}${progressInfo}`;
 
     const isDone = job.status === 'done';
+    const effectiveStatusKey = skipTranslation && job.status === 'translating' ? 'writing' : job.status;
     const statusLabel = isDone && job.subtitle_cue_count === 0
-      ? '完成（无字幕）' : (STATUS_LABEL[job.status] ?? job.status);
+      ? '完成（无字幕）' : (STATUS_LABEL[effectiveStatusKey] ?? effectiveStatusKey);
     const readable = isDone || job.status === 'export_failed' || (job.status === 'save_failed' && ['done', 'export_failed'].includes(job.pending_status));
-    const deliveryRetry = ['save_failed', 'publish_failed', 'export_failed'].includes(job.status);
-    const isRetryable = ['failed', 'cancelled', 'save_failed', 'publish_failed', 'export_failed'].includes(job.status);
-    const isCancellable = ['queued', 'asr', 'translating', 'writing'].includes(job.status);
+    const deliveryRetry = DELIVERY_FAILURE_STATUSES.has(job.status);
+    const isRetryable = RETRYABLE_STATUSES.has(job.status);
+    const isCancellable = CANCELLABLE_STATUSES.has(job.status);
     const retryStage = job.progress?.stage || job.current_stage || '';
-    const translationRetry = ['translation_context', 'translation', 'write_output'].includes(retryStage);
+    const translationRetry = TRANSLATION_RETRY_STAGES.has(retryStage);
     const retryBtn = isRetryable
       ? `<button class="btn-sm btn-retry" data-retry="${escHtml(id)}" title="${
           deliveryRetry ? '使用已保存的计算结果重试，不重新翻译' : translationRetry
@@ -195,77 +229,76 @@ export function renderJobs() {
         }">↺ ${job.status === 'save_failed' ? '重试保存' : job.status === 'publish_failed' ? '重试提交' : job.status === 'export_failed' ? '重试导出' : translationRetry ? '重试翻译' : '重试'}</button>`
       : '';
 
-    const srtArtifacts = readable ? job.artifacts.filter(p => /\.srt$/i.test(p)) : [];
-
-    const srtBtns = srtArtifacts.map(p => {
-      const name = p.split(/[\\/]/).pop() || '';
-      return `<button class="btn-sm btn-open-artifact" data-open-artifact="${escHtml(id)}" data-file="${escHtml(name)}" title="用系统默认程序打开 ${escHtml(name)}">↗ ${escHtml(name)}</button>
-        <button class="btn-sm btn-dl" data-dl="${escHtml(id)}" data-file="${escHtml(name)}" title="下载 ${escHtml(name)}">⬇ 下载 SRT</button>`;
-    }).join('');
+    const srtArtifacts = readable ? (job.artifacts || []).filter(p => /\.srt$/i.test(p)) : [];
 
     const playBtn = isDone
-      ? `<button class="btn-sm btn-play" data-play="${id}" title="用系统播放器打开视频">▶ 播放</button>`
+      ? `<button class="btn-sm btn-play" data-play="${escHtml(id)}" title="用系统播放器打开视频并自动挂字幕">▶ 播放</button>`
       : '';
 
     const folderPath = readable
-      ? (job.output_target || srtArtifacts[0] || job.artifacts[0] || job.spec?.video_paths?.[0] || '')
+      ? (job.output_target || srtArtifacts[0] || job.artifacts?.[0] || job.spec?.video_paths?.[0] || '')
       : '';
     const openFolderBtn = folderPath
-      ? `<button class="btn-sm btn-folder" data-folder="${escHtml(folderPath)}" title="打开输出文件夹">📂 文件夹</button>`
+      ? `<button class="btn-sm btn-folder" data-folder="${escHtml(folderPath)}" title="在文件夹中定位字幕文件">📂 文件夹</button>`
       : '';
 
-    const errorMsg = renderJobError(job.storage_error || (['failed', 'publish_failed', 'export_failed'].includes(job.status) ? job.error : ''));
+    const errorMsg = renderJobError(
+      job.storage_error || (['failed', 'publish_failed', 'export_failed'].includes(job.status) ? job.error : ''),
+    );
 
     const dl = job._download;
     const dlPct = dl ? clampPct(dl.pct ?? 0) : 0;
+    let dlLabelText = '';
+    let dlInfoText = '';
     let progressSection = `<div class="progress-bar"><div class="progress-fill${fillClass}"></div></div>`;
     if (dl) {
       const fname = dl.file ? dl.file.split(/[\\/]/).pop().replace(/\.(safetensors|bin|pt|gguf)$/, '') : '模型';
       const downloadedMb = dl.sizeMb ? Math.round(dlPct / 100 * dl.sizeMb) : null;
       const sizeStr = downloadedMb != null && dl.sizeMb ? `${downloadedMb}/${dl.sizeMb}MB` : '';
       const speedStr = dl.speedMb != null ? `${dl.speedMb.toFixed(1)}MB/s` : '';
-      const info = [sizeStr, speedStr].filter(Boolean).join(' · ');
+      dlLabelText = `↓ ${fname}`;
+      dlInfoText = [sizeStr, speedStr].filter(Boolean).join(' · ');
       progressSection = `
         <div class="dl-row">
-          <span class="dl-label">↓ ${escHtml(fname)}</span>
-          <span class="dl-info">${escHtml(info)}</span>
+          <span class="dl-label"></span>
+          <span class="dl-info"></span>
         </div>
         <div class="dl-bar"><div class="dl-bar-fill"></div></div>`;
     }
     const title = jobTitle(job);
 
+    // Dynamic progress text (.job-stage, .dl-label, .dl-info) is populated via
+    // textContent below so progress ticks never rewrite innerHTML.
     const html = `
       <div class="job-header">
         <span class="job-title" title="${escHtml(title)}">${escHtml(title)}</span>
-        <span class="badge badge-${escHtml(job.status)}">${escHtml(statusLabel)}</span>
+        <span class="badge badge-${escHtml(effectiveStatusKey)}">${escHtml(statusLabel)}</span>
       </div>
       ${progressSection}
       <div class="job-footer">
-        <span class="job-stage">${escHtml(stage)}${escHtml(progressInfo)}</span>
+        <span class="job-stage"></span>
         ${playBtn}
         ${openFolderBtn}
-        ${srtBtns}
         ${retryBtn}
         ${isCancellable ? `<button class="btn-sm btn-del" data-cancel="${escHtml(id)}">取消</button>` : ''}
-        ${CLEARABLE.has(job.status) ? `<button class="btn-sm btn-remove" data-remove="${escHtml(id)}" title="从列表删除">✕ 删除</button>` : ''}
+        ${CLEARABLE.has(job.status) ? `<button class="btn-sm btn-remove" data-remove="${escHtml(id)}" title="从列表删除">✕</button>` : ''}
       </div>
       ${errorMsg}`;
-    if (card._html !== html) {
-      card.innerHTML = html;
-      card._html = html;
+    syncCardHtml(card, html);
+
+    const refs = card._refs || {};
+    setTextIfChanged(refs.stageEl, stageText);
+    if (dl) {
+      setTextIfChanged(refs.dlLabelEl, dlLabelText);
+      setTextIfChanged(refs.dlInfoEl, dlInfoText);
     }
-    // Bar widths go through style so a pct-only change never rewrites the DOM
-    // (rewriting restarts the flow/sheen animations mid-loop).
-    const fill = card.querySelector('.progress-fill');
-    if (fill) fill.style.width = `${pct}%`;
-    const dlFill = card.querySelector('.dl-bar-fill');
-    if (dlFill) dlFill.style.width = `${dlPct}%`;
-    // Keep the visual order aligned with the API's FIFO job order.
+    if (refs.fill) refs.fill.style.width = `${pct}%`;
+    if (refs.dlFill) refs.dlFill.style.width = `${dlPct}%`;
     placeCard(card);
   });
 
   pendingFiles.forEach(file => {
-    let card = jobArea.querySelector(`.job-card[data-id="${file.pendingId}"]`);
+    let card = existingCards.get(file.pendingId);
     if (!card) {
       card = document.createElement('div');
       card.className = 'job-card job-card-pending';
@@ -282,12 +315,19 @@ export function renderJobs() {
         <span class="job-stage">等待点击“开始任务”</span>
         <button class="btn-sm btn-remove" data-remove-pending="${escHtml(file.pendingId)}" title="移出待开始列表">✕ 删除</button>
       </div>`;
-    if (card._html !== html) {
-      card.innerHTML = html;
-      card._html = html;
-    }
+    syncCardHtml(card, html);
     placeCard(card);
   });
+}
+
+async function withButtonLock(btn, action) {
+  if (!btn || btn.disabled) return;
+  btn.disabled = true;
+  try {
+    await action();
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // fetchAllJobs and syncSettings are injected from main.js to avoid circular
@@ -301,42 +341,24 @@ export function installJobAreaHandlers(fetchAllJobs, syncSettings = null) {
       window.dispatchEvent(new Event('pending-files-changed'));
       return;
     }
-    const openArtifact = e.target.closest('[data-open-artifact]');
-    if (openArtifact) {
-      try {
-        const r = await fetch(
-          `/api/open-artifact?job_id=${encodeURIComponent(openArtifact.dataset.openArtifact)}&path=${encodeURIComponent(openArtifact.dataset.file)}`,
-          { method: 'POST' },
-        );
-        if (!r.ok) alert('打开字幕失败：' + await readErrorDetail(r));
-      } catch (error) {
-        alert('打开字幕失败：' + error.message);
-      }
-      return;
-    }
-    const dl = e.target.closest('[data-dl]');
-    if (dl) {
-      const url = `/api/output/${encodeURIComponent(dl.dataset.dl)}/${encodeURIComponent(dl.dataset.file)}`;
-      const a = document.createElement('a');
-      a.href = url; a.download = dl.dataset.file; a.click();
-      return;
-    }
     const play = e.target.closest('[data-play]');
     if (play) {
       const job = state.jobs[play.dataset.play];
       const videoPath = job?.spec?.video_paths?.[0];
       if (videoPath) {
-        try {
-          const r = await fetch(`/api/open-video?job_id=${encodeURIComponent(play.dataset.play)}&path=${encodeURIComponent(videoPath)}`, { method: 'POST' });
-          if (!r.ok) {
-            const detail = await readErrorDetail(r);
-            addLog(`打开视频失败：${detail}`, 'stage-error');
-            alert('打开视频失败：' + detail);
+        await withButtonLock(play, async () => {
+          try {
+            const r = await fetch(`/api/open-video?job_id=${encodeURIComponent(play.dataset.play)}&path=${encodeURIComponent(videoPath)}`, { method: 'POST' });
+            if (!r.ok) {
+              const detail = await readErrorDetail(r);
+              addLog(`打开视频失败：${detail}`, 'stage-error');
+              alert('打开视频失败：' + detail);
+            }
+          } catch (error) {
+            addLog(`打开视频出错：${error.message}`, 'stage-error');
+            alert('打开视频出错：' + error.message);
           }
-        } catch (error) {
-          addLog(`打开视频出错：${error.message}`, 'stage-error');
-          alert('打开视频出错：' + error.message);
-        }
+        });
       }
       return;
     }
@@ -344,81 +366,92 @@ export function installJobAreaHandlers(fetchAllJobs, syncSettings = null) {
     if (folder) {
       const card = folder.closest('.job-card');
       const jobId = card?.dataset?.id || '';
-      try {
-        const r = await fetch(`/api/open-folder?job_id=${encodeURIComponent(jobId)}&path=${encodeURIComponent(folder.dataset.folder)}`, { method: 'POST' });
-        if (!r.ok) alert('打开文件夹失败：' + await readErrorDetail(r));
-      } catch (error) {
-        alert('打开文件夹失败：' + error.message);
-      }
+      await withButtonLock(folder, async () => {
+        try {
+          const r = await fetch(`/api/open-folder?job_id=${encodeURIComponent(jobId)}&path=${encodeURIComponent(folder.dataset.folder)}`, { method: 'POST' });
+          if (!r.ok) alert('打开文件夹失败：' + await readErrorDetail(r));
+        } catch (error) {
+          alert('打开文件夹失败：' + error.message);
+        }
+      });
       return;
     }
     const retry = e.target.closest('[data-retry]');
     if (retry) {
       const job = state.jobs[retry.dataset.retry];
       if (job?.spec) {
-        try {
-          const deliveryRetry = ['save_failed', 'publish_failed', 'export_failed'].includes(job.status);
-          if (syncSettings && !deliveryRetry) await syncSettings();
-          const r = await fetch(`/api/jobs/${retry.dataset.retry}/retry`, { method: 'POST' });
-          if (r.ok) {
-            const retried = await r.json();
-            addLog(`重试任务：${retried.id}`, 'stage-start');
-            await fetchAllJobs();
-          } else {
-            alert('重试失败：\n' + await readErrorDetail(r));
+        await withButtonLock(retry, async () => {
+          try {
+            const deliveryRetry = DELIVERY_FAILURE_STATUSES.has(job.status);
+            if (syncSettings && !deliveryRetry) await syncSettings();
+            const r = await fetch(`/api/jobs/${encodeURIComponent(retry.dataset.retry)}/retry`, { method: 'POST' });
+            if (r.ok) {
+              const retried = await r.json();
+              addLog(`重试任务：${retried.id}`, 'stage-start');
+              await fetchAllJobs();
+            } else {
+              alert('重试失败：\n' + await readErrorDetail(r));
+            }
+          } catch (err) {
+            alert('重试出错：' + err.message);
           }
-        } catch (e) {
-          alert('重试出错：' + e.message);
-        }
+        });
       }
       return;
     }
     const cancel = e.target.closest('[data-cancel]');
     if (cancel) {
-      try {
-        const r = await fetch(`/api/jobs/${encodeURIComponent(cancel.dataset.cancel)}`, { method: 'DELETE' });
-        if (!r.ok) {
-          const detail = await readErrorDetail(r);
-          addLog(`取消任务失败：${detail}`, 'stage-error');
-          alert('取消任务失败：' + detail);
+      await withButtonLock(cancel, async () => {
+        try {
+          const r = await fetch(`/api/jobs/${encodeURIComponent(cancel.dataset.cancel)}`, { method: 'DELETE' });
+          if (!r.ok) {
+            const detail = await readErrorDetail(r);
+            addLog(`取消任务失败：${detail}`, 'stage-error');
+            alert('取消任务失败：' + detail);
+          }
+        } catch (error) {
+          addLog(`取消任务出错：${error.message}`, 'stage-error');
+          alert('取消任务出错：' + error.message);
         }
-      } catch (error) {
-        addLog(`取消任务出错：${error.message}`, 'stage-error');
-        alert('取消任务出错：' + error.message);
-      }
-      await fetchAllJobs();
+        await fetchAllJobs();
+      });
       return;
     }
     const remove = e.target.closest('[data-remove]');
     if (remove) {
-      try {
-        const r = await fetch(`/api/jobs/${encodeURIComponent(remove.dataset.remove)}`, { method: 'DELETE' });
-        if (!r.ok) {
-          const detail = await readErrorDetail(r);
-          addLog(`删除任务失败：${detail}`, 'stage-error');
-          alert('删除任务失败：' + detail);
+      await withButtonLock(remove, async () => {
+        try {
+          const r = await fetch(`/api/jobs/${encodeURIComponent(remove.dataset.remove)}`, { method: 'DELETE' });
+          if (!r.ok) {
+            const detail = await readErrorDetail(r);
+            addLog(`删除任务失败：${detail}`, 'stage-error');
+            alert('删除任务失败：' + detail);
+          }
+        } catch (error) {
+          addLog(`删除任务出错：${error.message}`, 'stage-error');
+          alert('删除任务出错：' + error.message);
         }
-      } catch (error) {
-        addLog(`删除任务出错：${error.message}`, 'stage-error');
-        alert('删除任务出错：' + error.message);
-      }
-      await fetchAllJobs();
+        await fetchAllJobs();
+      });
     }
   });
 
   btnClearDone.addEventListener('click', async () => {
+    if (btnClearDone.disabled) return;
     if (!confirm('确定清空所有已完成 / 失败 / 已取消的任务？')) return;
-    try {
-      const r = await fetch('/api/jobs', { method: 'DELETE' });
-      if (!r.ok) {
-        const detail = await readErrorDetail(r);
-        addLog(`清空任务失败：${detail}`, 'stage-error');
-        alert('清空任务失败：' + detail);
+    await withButtonLock(btnClearDone, async () => {
+      try {
+        const r = await fetch('/api/jobs', { method: 'DELETE' });
+        if (!r.ok) {
+          const detail = await readErrorDetail(r);
+          addLog(`清空任务失败：${detail}`, 'stage-error');
+          alert('清空任务失败：' + detail);
+        }
+      } catch (error) {
+        addLog(`清空任务出错：${error.message}`, 'stage-error');
+        alert('清空任务出错：' + error.message);
       }
-    } catch (error) {
-      addLog(`清空任务出错：${error.message}`, 'stage-error');
-      alert('清空任务出错：' + error.message);
-    }
-    await fetchAllJobs();
+      await fetchAllJobs();
+    });
   });
 }

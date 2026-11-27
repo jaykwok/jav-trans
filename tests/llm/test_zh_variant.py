@@ -187,12 +187,12 @@ class TestItReachesTranslatedOutput:
         from llm import translator
 
         monkeypatch.setattr(translator, "_chat", self._reply_with('"'))
-        with pytest.raises(Exception):
+        monkeypatch.setattr(translator, "TRANSLATION_API_RETRIES", 0)
+        with pytest.raises(RuntimeError):
             translator.translate_segments(
                 self._segments(2),
                 max_workers=1,
                 cache_path="",
                 target_lang="简体中文",
                 glossary="",
-                api_retries=0,
             )

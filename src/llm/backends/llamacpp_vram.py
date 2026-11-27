@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
 import re
 import struct
@@ -282,30 +283,72 @@ def estimate_server_vram_mib(
 
 
 def parse_device_vram_mb(devices: Sequence[str]) -> tuple[int, int | None] | None:
-    """Extract ``(total_mib, free_mib)`` from ``llama-server --list-devices`` lines."""
-    best: tuple[int, int | None] | None = None
+    """Extract ``(total_mib, free_mib)`` for the primary device from ``--list-devices``.
+
+    ``llama-server --list-devices`` respects ``CUDA_VISIBLE_DEVICES`` and lists
+    the primary CUDA device first (``CUDA0``). Picking the first CUDA device
+    (or first valid accelerator if no CUDA entry exists) avoids over-sizing
+    against a secondary GPU that ``llama-server`` will not place layers on.
+    """
+    first_valid: tuple[int, int | None] | None = None
     for entry in devices or ():
-        match = _DEVICE_VRAM_RE.search(str(entry or ""))
+        text = str(entry or "").strip()
+        match = _DEVICE_VRAM_RE.search(text)
         if not match:
             continue
         total = int(match.group(1))
         free = int(match.group(2)) if match.group(2) is not None else None
         if total <= 0:
             continue
-        if best is None or total > best[0]:
-            best = (total, free)
-    return best
+        pair = (total, free)
+        if text.lower().startswith("cuda"):
+            return pair
+        if first_valid is None:
+            first_valid = pair
+    return first_valid
+
+
+def _first_cuda_visible_device() -> str | None:
+    """First device token from ``CUDA_VISIBLE_DEVICES``, or ``None`` if unset.
+
+    Returns ``""`` when CUDA visibility is explicitly disabled (e.g. ``-1`` or
+    ``NoDevFiles``).
+    """
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if not stripped:
+        return ""
+    tokens = [tok.strip() for tok in stripped.split(",") if tok.strip()]
+    if not tokens:
+        return ""
+    first = tokens[0]
+    if first.lower() in {"-1", "none", "nodevfiles"}:
+        return ""
+    return first
 
 
 def query_nvidia_smi_vram_mb(*, timeout_s: float = 5.0) -> tuple[int, int] | None:
-    """Fast, torch-free ``(total_mib, free_mib)`` probe via ``nvidia-smi``."""
+    """Fast, torch-free ``(total_mib, free_mib)`` probe via ``nvidia-smi``.
+
+    Honours the first entry of ``CUDA_VISIBLE_DEVICES`` (index or UUID) when
+    set, and otherwise selects physical GPU 0 rather than blindly picking the
+    largest card in a multi-GPU host.
+    """
+    selected = _first_cuda_visible_device()
+    if selected == "":
+        return None
+    command = [
+        "nvidia-smi",
+        "--query-gpu=memory.total,memory.free",
+        "--format=csv,noheader,nounits",
+    ]
+    if selected is not None:
+        command.extend(["-i", selected])
     try:
         result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.total,memory.free",
-                "--format=csv,noheader,nounits",
-            ],
+            command,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -317,7 +360,7 @@ def query_nvidia_smi_vram_mb(*, timeout_s: float = 5.0) -> tuple[int, int] | Non
         return None
     if getattr(result, "returncode", 1) != 0:
         return None
-    best: tuple[int, int] | None = None
+    rows: list[tuple[int, int]] = []
     for line in (result.stdout or "").splitlines():
         parts = [part.strip() for part in line.split(",")]
         if len(parts) < 2:
@@ -329,9 +372,14 @@ def query_nvidia_smi_vram_mb(*, timeout_s: float = 5.0) -> tuple[int, int] | Non
             continue
         if total <= 0 or free < 0:
             continue
-        if best is None or total > best[0]:
-            best = (total, free)
-    return best
+        rows.append((total, free))
+    if not rows:
+        return None
+    if selected is not None and selected.isdigit() and len(rows) > 1:
+        idx = int(selected)
+        if 0 <= idx < len(rows):
+            return rows[idx]
+    return rows[0]
 
 
 def focus_window_for_ctx(ctx_per_slot: int) -> tuple[int, int]:

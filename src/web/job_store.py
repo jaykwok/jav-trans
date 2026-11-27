@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import threading
 import time
@@ -14,6 +15,10 @@ from typing import Callable
 from web.models import JobState
 
 log = logging.getLogger(__name__)
+
+_CACHEABLE_TERMINAL_STATUSES = frozenset(
+    {"done", "failed", "cancelled", "publish_failed", "export_failed"}
+)
 
 
 class JobPersistenceError(RuntimeError):
@@ -27,6 +32,10 @@ class _CommitGate:
         self._lock = threading.Lock()
         self._cancelled = False
         self._started = False
+
+    def is_cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
 
     def cancel(self) -> bool:
         with self._lock:
@@ -52,10 +61,37 @@ class _Receipt(Future):
 @dataclass
 class _Write:
     sequence: int
-    snapshot: list[JobState]
+    snapshot: list[JobState] | Callable[[], list[JobState]]
     barrier: bool
     write: Callable[[list[JobState]], None]
+    gate: _CommitGate | None = None
     receipts: list[_Receipt] = field(default_factory=list)
+
+
+def _job_cache_key(job: JobState) -> tuple:
+    return (
+        job.revision,
+        job.run_id,
+        job.status,
+        job.current_stage,
+        job.output_target,
+        job.output_generation,
+        job.error,
+        job.storage_error,
+        job.pending_status,
+        job.subtitle_cue_count,
+        tuple(job.artifacts),
+    )
+
+
+def _copy_job_lightweight(job: JobState) -> JobState:
+    """Snapshot a job without deep-copying immutable ``spec`` payloads."""
+    return job.model_copy(
+        update={
+            "progress": copy.deepcopy(job.progress) if job.progress else {},
+            "artifacts": list(job.artifacts),
+        }
+    )
 
 
 class JobStoreWriter:
@@ -71,21 +107,62 @@ class JobStoreWriter:
         self._last_write = 0.0
         self._thread: threading.Thread | None = None
         self._latest: Future | None = None
+        self._frozen_cache: dict[str, tuple[tuple, JobState]] = {}
+
+    def _freeze_snapshot(self, snapshot: list[JobState]) -> list[JobState]:
+        """Freeze caller-owned models while reusing cached immutable terminal records."""
+        frozen: list[JobState] = []
+        live_ids: set[str] = set()
+        for job in snapshot:
+            live_ids.add(job.id)
+            if job.revision > 0 and job.status in _CACHEABLE_TERMINAL_STATUSES:
+                key = _job_cache_key(job)
+                cached = self._frozen_cache.get(job.id)
+                if cached is not None and cached[0] == key:
+                    frozen.append(cached[1])
+                    continue
+                copied = _copy_job_lightweight(job)
+                self._frozen_cache[job.id] = (key, copied)
+                frozen.append(copied)
+            else:
+                self._frozen_cache.pop(job.id, None)
+                frozen.append(_copy_job_lightweight(job))
+        if len(self._frozen_cache) > len(live_ids):
+            for stale_id in list(self._frozen_cache):
+                if stale_id not in live_ids:
+                    self._frozen_cache.pop(stale_id, None)
+        return frozen
 
     def enqueue(
-        self, snapshot: list[JobState], *, confirm: bool,
+        self,
+        snapshot: list[JobState] | Callable[[], list[JobState]],
+        *,
+        confirm: bool,
         write: Callable[[list[JobState]], None] | None = None,
         guarded_write: Callable[[list[JobState], Callable], None] | None = None,
     ) -> Future:
-        # Caller-owned models must not change a snapshot while it is queued.
-        frozen = [job.model_copy(deep=True) for job in snapshot]
         gate = _CommitGate() if guarded_write is not None else None
         receipt = _Receipt(gate)
         if guarded_write is not None:
-            write = lambda frozen: guarded_write(frozen, gate.commit)
+            assert gate is not None
+            effective_write: Callable[[list[JobState]], None] = (
+                lambda frozen, _gw=guarded_write, _commit=gate.commit: _gw(frozen, _commit)
+            )
+        else:
+            effective_write = write or self._write
         with self._ready:
+            frozen: list[JobState] | Callable[[], list[JobState]] = (
+                snapshot if callable(snapshot) else self._freeze_snapshot(snapshot)
+            )
             self._submitted += 1
-            operation = _Write(self._submitted, frozen, confirm, write or self._write, [receipt])
+            operation = _Write(
+                self._submitted,
+                frozen,
+                confirm,
+                effective_write,
+                gate=gate,
+                receipts=[receipt],
+            )
             # A barrier may absorb preceding progress, but can never itself be
             # replaced by progress or another barrier.
             if self._queue and not self._queue[-1].barrier:
@@ -97,7 +174,9 @@ class JobStoreWriter:
             self._latest = receipt
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(
-                    target=self._run, name="job-store-writer", daemon=True,
+                    target=self._run,
+                    name="job-store-writer",
+                    daemon=True,
                 )
                 self._thread.start()
             self._ready.notify_all()
@@ -152,7 +231,9 @@ class JobStoreWriter:
                     return
                 # The abandoned writer may still be preparing its temp file.
                 # Consume its eventual rejection; no late exception is lost.
-                wrapped.add_done_callback(lambda result: None if result.cancelled() else result.exception())
+                wrapped.add_done_callback(
+                    lambda result: None if result.cancelled() else result.exception()
+                )
                 if isinstance(exc, asyncio.CancelledError):
                     raise
                 raise JobPersistenceError("保存任务状态超时；尚未确认保存，请重试保存。") from exc
@@ -184,7 +265,14 @@ class JobStoreWriter:
                         continue
                 operation = self._queue.popleft()
             try:
-                operation.write(operation.snapshot)
+                if operation.gate is not None and operation.gate.is_cancelled():
+                    raise JobPersistenceError("保存请求已超时或取消，未提交这次任务变更。")
+                snapshot = (
+                    operation.snapshot()
+                    if callable(operation.snapshot)
+                    else operation.snapshot
+                )
+                operation.write(snapshot)
             except Exception as exc:
                 log.exception("Failed to persist job state")
                 for receipt in operation.receipts:

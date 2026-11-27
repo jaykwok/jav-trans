@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 
-from testset_quality_eval import (
+from pathlib import Path
+
+from tools.audits.testset_quality_eval import (
+    PROJECT_ROOT,
     DatasetCase,
     SubtitleSegment,
     clean_subtitle_text,
@@ -15,6 +18,11 @@ from testset_quality_eval import (
     parse_srt_segments,
     write_index,
 )
+
+
+def test_testset_quality_eval_resolves_repository_root():
+    assert PROJECT_ROOT == Path(__file__).resolve().parents[2]
+    assert (PROJECT_ROOT / "src").is_dir()
 
 
 def test_clean_subtitle_text_strips_tags_and_newlines():

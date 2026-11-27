@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
 import re
 import statistics
+import unicodedata
 
 from asr import alignment
 from asr.alignment import normalize_text
@@ -94,11 +96,15 @@ def _alignment_tokens(tokens: list[str]) -> list[str]:
     the per-character timing the alignment was built to produce. Latin runs stay
     grouped, because there a whitespace token really is a word and splitting it
     per letter would report letter times as word times.
+
+    Each token is NFKC-normalised before splitting so NFD combining sequences
+    (e.g. ``か\\u3099``) stay composed in sync with ``normalize_text``.
     """
     out: list[str] = []
     for token in tokens:
+        normalized_token = unicodedata.normalize("NFKC", token)
         buffer = ""
-        for char in token:
+        for char in normalized_token:
             if char.isascii() and char.isalnum():
                 buffer += char
                 continue
@@ -194,11 +200,20 @@ def build_aligned_word_timestamps(
         )
 
     # The seam outlier is a property of the segment's edge, not of any one
-    # token, so the trusted extent is decided once over every character and each
-    # token is then clamped into it. Deciding per token would be a no-op here:
-    # most tokens are a single character and have no gap distribution to judge.
+    # token, so the trusted extent is decided once over acoustic characters and
+    # every token (including zero-width punctuation) is then clamped into it.
+    # Filtering out zero-width non-acoustic spans prevents adjacent punctuation
+    # anchors (with 0 s gaps) from collapsing the median gap or masking a
+    # dragged leading/trailing spoken character.
+    acoustic_spans = [
+        span
+        for span in char_spans
+        if span.end_frame > span.start_frame or alignment.is_acoustic_char(span.char)
+    ]
+    bound_spans = acoustic_spans or char_spans
     segment_start, segment_end, trimmed = _robust_bounds(
-        [span.start_s for span in char_spans], [span.end_s for span in char_spans]
+        [span.start_s for span in bound_spans],
+        [span.end_s for span in bound_spans],
     )
 
     # This chunk's own audio is the hard bound on every time below. The aligner
@@ -248,15 +263,21 @@ def build_aligned_word_timestamps(
             continue
         start = min(max(spans[0].start_s, segment_start), segment_end)
         end = min(max(spans[-1].end_s, start), segment_end)
+        finite_word_scores = [
+            float(span.score) for span in spans if math.isfinite(span.score)
+        ]
+        word_score = (
+            round(sum(finite_word_scores) / len(finite_word_scores), 4)
+            if finite_word_scores
+            else None
+        )
         words.append(
             {
                 "start": start,
                 "end": end,
                 "word": token,
                 "timestamp_kind": ALIGNED_TIMESTAMP_KIND,
-                "alignment_score": round(
-                    sum(span.score for span in spans) / len(spans), 4
-                ),
+                "alignment_score": word_score,
             }
         )
 
@@ -267,6 +288,9 @@ def build_aligned_word_timestamps(
         words[0]["start"] = min(words[0]["start"], segment_start)
         words[-1]["end"] = max(words[-1]["end"], segment_end)
 
+    finite_char_scores = [
+        float(span.score) for span in char_spans if math.isfinite(span.score)
+    ]
     return (
         words,
         "ctc_forced_alignment",
@@ -276,12 +300,12 @@ def build_aligned_word_timestamps(
             "aligned_characters": len(char_spans),
             "boundary_trimmed": bool(trimmed),
             "boundary_edged": bool(words and edged),
-            # Mean over tokens of the mean per-character score. The post-gate
-            # reads this: text the acoustics do not support aligns badly.
+            # Mean per-character finite alignment score. The post-gate reads
+            # this: text the acoustics do not support aligns badly.
             "alignment_score": round(
-                sum(word["alignment_score"] for word in words) / len(words), 4
+                sum(finite_char_scores) / len(finite_char_scores), 4
             )
-            if words
+            if words and finite_char_scores
             else None,
         },
     )

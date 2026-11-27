@@ -13,15 +13,55 @@ import shutil
 import threading
 import time
 import uuid
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Iterable, TypeVar
+from typing import Literal, TypeVar
+
+from core import atomic_io
 
 log = logging.getLogger(__name__)
 
 MANIFEST_SCHEMA = "run_outputs_v2"
 OWNER_SCHEMA = "output_owner_v1"
+
+_STALE_STAGING_MAX_AGE_S = 3600.0
+_WINDOWS_SAFE_PATH_CHARS = 240
+_COMPOUND_ARTIFACT_SUFFIXES = (
+    ".aligned_segments.json",
+    ".asr_manifest.json",
+    ".transcript.json",
+    ".bilingual.json",
+    ".timings.json",
+    ".ja.srt",
+    ".run.log",
+)
+
+# Payload fields whose values are subtitle prose, word lists, hashes, or binary
+# encodings (e.g. 2 MB Base64 frame_class_track). Skipping them during path
+# relativization prevents both multi-second Path() overhead and accidental
+# backslash rewriting inside dialogue/kaomoji text.
+_NON_PATH_CONTENT_KEYS = frozenset(
+    {
+        "frame_class_track",
+        "words",
+        "text",
+        "ja_text",
+        "zh_text",
+        "raw_text",
+        "raw_texts",
+        "sha256",
+        "sizes",
+        "fingerprint",
+        "classes",
+        "data_b64",
+        "schema",
+        "translation_review",
+        "translation_request_timings",
+        "translation_api_retry_events",
+    }
+)
 
 T = TypeVar("T")
 
@@ -59,7 +99,7 @@ def project_relative(path: str | Path | None, *, project_root: Path) -> str | No
     if path is None:
         return None
     raw = str(path)
-    if not raw:
+    if not raw or len(raw) > 4096:
         return raw
     if "/" not in raw and "\\" not in raw:
         # Not a path, so neither branch below can change it: the root pattern
@@ -90,7 +130,11 @@ def project_relative(path: str | Path | None, *, project_root: Path) -> str | No
 def relativize_payload_paths(value, *, project_root: Path):
     if isinstance(value, dict):
         return {
-            key: relativize_payload_paths(item, project_root=project_root)
+            key: (
+                item
+                if key in _NON_PATH_CONTENT_KEYS
+                else relativize_payload_paths(item, project_root=project_root)
+            )
             for key, item in value.items()
         }
     if isinstance(value, list):
@@ -129,14 +173,25 @@ def replace_atomically(source: Path, target: Path, *, attempts: int = 5) -> None
     what the other writer's own replace is holding for a moment. Measured as an
     intermittent `PermissionError` in the two-writer test, not theorised.
     """
-    for attempt in range(attempts):
+    atomic_io.replace_atomically(source, target, retries=attempts, base_delay_s=0.02)
+
+
+def _read_text_with_retry(
+    path: Path,
+    *,
+    attempts: int = 6,
+    base_delay_s: float = 0.02,
+) -> str:
+    """Read UTF-8 text, retrying transient Windows sharing ``PermissionError``."""
+    tries = max(1, int(attempts))
+    for attempt in range(tries):
         try:
-            os.replace(source, target)
-            return
+            return path.read_text(encoding="utf-8")
         except PermissionError:
-            if attempt >= attempts - 1:
+            if attempt + 1 >= tries:
                 raise
-            time.sleep(0.02 * (attempt + 1))
+            time.sleep(base_delay_s * (attempt + 1))
+    return path.read_text(encoding="utf-8")
 
 
 def write_json(path: str | Path, payload: dict, *, project_root: Path) -> None:
@@ -151,28 +206,21 @@ def write_json(path: str | Path, payload: dict, *, project_root: Path) -> None:
         )
 
 
-def write_json_atomic(path: str | Path, payload: dict, *, project_root: Path) -> None:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = temp_publish_path(target)
-    try:
-        tmp_path.write_text(
-            json.dumps(
-                relativize_payload_paths(payload, project_root=project_root),
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        with tmp_path.open("r+b") as handle:
-            os.fsync(handle.fileno())
-        replace_atomically(tmp_path, target)
-    finally:
-        # After a successful replace there is nothing left to remove; this is
-        # for the failed write, which would otherwise leave staging files
-        # beside the artifact it never became.
-        with contextlib.suppress(OSError):
-            tmp_path.unlink(missing_ok=True)
+def write_json_atomic(
+    path: str | Path,
+    payload: dict,
+    *,
+    project_root: Path,
+    indent: int | None = 2,
+) -> None:
+    relativized = relativize_payload_paths(payload, project_root=project_root)
+    atomic_io.write_json_atomic(
+        path,
+        relativized,
+        indent=indent,
+        ensure_ascii=False,
+        trailing_newline=False,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -196,8 +244,8 @@ class OutputExportError(RuntimeError):
     def __init__(self, lease: OutputLease, *, superseded: bool = False) -> None:
         super().__init__(
             "产物已保存，但输出路径已由其他运行接管，不能覆盖；可从任务卡下载本次结果。"
-            if superseded else
-            "产物已保存，但字幕导出失败；请检查输出目录后重试导出。"
+            if superseded
+            else "产物已保存，但字幕导出失败；请检查输出目录后重试导出。"
         )
         self.lease = lease
         self.superseded = superseded
@@ -215,11 +263,14 @@ class OutputIntegrityError(RuntimeError):
     """An existing output record is unreadable or no longer matches its files."""
 
     def __init__(self) -> None:
-        super().__init__("产物记录或文件缺失、损坏或不可读；请恢复文件后重试。为避免重复计算，未启动新任务。")
+        super().__init__(
+            "产物记录或文件缺失、损坏或不可读；请恢复文件后重试。为避免重复计算，未启动新任务。"
+        )
 
 
 _locks_guard = threading.Lock()
 _target_locks: dict[str, threading.RLock] = {}
+_lock_depth = threading.local()
 
 
 def _target_text(target: str | Path) -> str:
@@ -419,16 +470,48 @@ def _move_store_atomically(entry: Path, destination: Path, *, new_root: Path) ->
         )
 
 
-def migrate_legacy_outputs(project_root: Path) -> int:
+def _cleanup_stale_staging_dirs(
+    store_dir: Path,
+    *,
+    max_age_s: float = _STALE_STAGING_MAX_AGE_S,
+) -> int:
+    """Remove abandoned ``.s-*`` staging dirs older than ``max_age_s``."""
+    removed = 0
+    now = time.time()
+    age_limit = max(0.0, float(max_age_s))
+    try:
+        candidates = sorted(store_dir.glob(".s-*"))
+    except OSError:
+        return 0
+    for leftover in candidates:
+        if not leftover.is_dir():
+            continue
+        try:
+            if age_limit > 0.0 and (now - leftover.stat().st_mtime) < age_limit:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(leftover, ignore_errors=True)
+        if not leftover.exists():
+            removed += 1
+    return removed
+
+
+def migrate_legacy_outputs(
+    project_root: Path,
+    *,
+    stale_staging_max_age_s: float = _STALE_STAGING_MAX_AGE_S,
+) -> int:
     """Relocate committed 1.8.x output stores from ``tmp/outputs/`` into ``outputs/``.
 
     Rewrites ``tmp/outputs/`` path prefixes inside each generation's
     ``manifest.json`` atomically *before* publishing the store into ``outputs/``,
-    and also repairs any store already under ``outputs/`` whose manifests still
-    reference ``tmp/outputs/`` (e.g. after an interrupted migration). Existing
-    targets under ``outputs/`` are never overwritten. Raises the first
-    ``OSError`` encountered after processing remaining stores so callers pause
-    dependent cleanup until migration completes cleanly.
+    also repairs any store already under ``outputs/`` whose manifests still
+    reference ``tmp/outputs/`` (e.g. after an interrupted migration), and sweeps
+    stale abandoned ``.s-*`` staging directories. Existing targets under
+    ``outputs/`` are never overwritten. Raises the first ``OSError`` encountered
+    after processing remaining stores so callers pause dependent cleanup until
+    migration completes cleanly.
     """
     resolved_root = project_root.resolve()
     legacy_root = resolved_root / "tmp" / "outputs"
@@ -463,6 +546,7 @@ def migrate_legacy_outputs(project_root: Path) -> int:
         for store_dir in sorted(new_root.iterdir()):
             if not store_dir.is_dir() or store_dir.name.startswith("."):
                 continue
+            _cleanup_stale_staging_dirs(store_dir, max_age_s=stale_staging_max_age_s)
             try:
                 if _rewrite_store_manifests(
                     store_dir, project_root=resolved_root, is_legacy_source=False
@@ -484,49 +568,72 @@ def migrate_legacy_outputs(project_root: Path) -> int:
 @contextlib.contextmanager
 def _target_lock(target: str | Path, *, project_root: Path):
     root = output_store_root(target, project_root=project_root)
+    key = str(root)
     with _locks_guard:
-        lock = _target_locks.setdefault(str(root), threading.RLock())
+        lock = _target_locks.setdefault(key, threading.RLock())
+    depths: dict[str, int] | None = getattr(_lock_depth, "depths", None)
+    if depths is None:
+        depths = {}
+        _lock_depth.depths = depths
+
     with lock:
+        depth = depths.get(key, 0)
+        if depth > 0:
+            depths[key] = depth + 1
+            try:
+                yield root
+            finally:
+                depths[key] = depth
+            return
+
         root.mkdir(parents=True, exist_ok=True)
         # The file lock also covers a CLI and a Web process sharing a target.
+        # Do NOT write to the lock file before acquiring the OS lock: on
+        # Windows, writing byte 0 while another process holds an msvcrt lock on
+        # byte 0 raises PermissionError immediately instead of retrying.
         with (root / "owner.lock").open("a+b") as handle:
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"0")
-                handle.flush()
             deadline = time.monotonic() + 15.0
+            last_exc: OSError | None = None
             while True:
                 try:
                     handle.seek(0)
                     if os.name == "nt":
                         import msvcrt
+
                         msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                     else:
                         import fcntl
+
                         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
-                except OSError:
+                except OSError as exc:
+                    last_exc = exc
                     if time.monotonic() >= deadline:
-                        raise TimeoutError("等待产物提交锁超时")
+                        raise TimeoutError("等待产物提交锁超时") from last_exc
                     time.sleep(0.02)
+            depths[key] = 1
             try:
                 yield root
             finally:
+                depths.pop(key, None)
                 handle.seek(0)
                 if os.name == "nt":
                     import msvcrt
+
                     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
                     import fcntl
+
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _read_owner(root: Path) -> dict:
     path = root / "current.json"
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_read_text_with_retry(path))
         if (
-            not isinstance(payload, dict) or payload.get("schema") != OWNER_SCHEMA
+            not isinstance(payload, dict)
+            or payload.get("schema") != OWNER_SCHEMA
             or not isinstance(payload.get("owner"), dict)
             or not isinstance(payload.get("commits"), dict)
             or not isinstance(payload.get("exports", {}), dict)
@@ -543,7 +650,11 @@ def _read_owner(root: Path) -> dict:
 
 
 def claim_output(
-    target: str | Path, *, project_root: Path, job_id: str, run_id: str,
+    target: str | Path,
+    *,
+    project_root: Path,
+    job_id: str,
+    run_id: str,
 ) -> OutputLease:
     if not run_id:
         raise ValueError("产物发布必须有 run_id")
@@ -561,7 +672,9 @@ def claim_output(
             sequence = max(int(state.get("sequence", 0)), int(owner.get("sequence", 0))) + 1
             state["sequence"] = sequence
             state["owner"] = {
-                "run_id": run_id, "job_id": job_id, "sequence": sequence,
+                "run_id": run_id,
+                "job_id": job_id,
+                "sequence": sequence,
                 "cancelled": False,
             }
             state["target"] = project_relative(destination, project_root=project_root)
@@ -592,7 +705,10 @@ def _owns(state: dict, lease: OutputLease) -> bool:
 
 
 def owns_output(lease: OutputLease) -> bool:
-    return _owns(_read_owner(output_store_root(lease.target, project_root=lease.project_root)), lease)
+    return _owns(
+        _read_owner(output_store_root(lease.target, project_root=lease.project_root)),
+        lease,
+    )
 
 
 def revoke_output(lease: OutputLease) -> bool:
@@ -624,15 +740,26 @@ def artifact_path(raw: str, project_root: Path) -> Path:
 
 def _generation_dir(lease: OutputLease) -> Path:
     identity = hashlib.sha256(f"{lease.job_id}\0{lease.run_id}".encode()).hexdigest()[:16]
-    return output_store_root(lease.target, project_root=lease.project_root) / "generations" / f"{lease.sequence}-{identity}"
+    return (
+        output_store_root(lease.target, project_root=lease.project_root)
+        / "generations"
+        / f"{lease.sequence}-{identity}"
+    )
 
 
-def _validated_manifest(path: Path, lease: OutputLease, *, verify: bool) -> dict:
+def _validated_manifest(
+    path: Path,
+    lease: OutputLease,
+    *,
+    verify: bool,
+    verify_files: Collection[str] | None = None,
+) -> dict:
     root = output_store_root(lease.target, project_root=lease.project_root)
+    checked_names = set(verify_files) if verify_files is not None else None
     try:
         path = path.resolve()
         path.relative_to((root / "generations").resolve())
-        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest = json.loads(_read_text_with_retry(path))
         if not isinstance(manifest, dict) or (
             manifest.get("schema") != MANIFEST_SCHEMA
             or manifest.get("run_id") != lease.run_id
@@ -653,14 +780,20 @@ def _validated_manifest(path: Path, lease: OutputLease, *, verify: bool) -> dict
             file.relative_to(path.parent)
             if not file.is_file() or file.stat().st_size != manifest["sizes"][name]:
                 raise ValueError("missing or truncated output")
-            if verify and _sha256(file) != manifest["sha256"][name]:
+            should_hash = verify or (checked_names is not None and name in checked_names)
+            if should_hash and _sha256(file) != manifest["sha256"][name]:
                 raise ValueError("output checksum mismatch")
         return manifest
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise OutputIntegrityError() from exc
 
 
-def read_run_manifest(lease: OutputLease, *, verify: bool = False) -> dict | None:
+def read_run_manifest(
+    lease: OutputLease,
+    *,
+    verify: bool = False,
+    verify_files: Collection[str] | None = None,
+) -> dict | None:
     root = output_store_root(lease.target, project_root=lease.project_root)
     state = _read_owner(root)
     if lease.run_id not in state["commits"]:
@@ -668,7 +801,12 @@ def read_run_manifest(lease: OutputLease, *, verify: bool = False) -> dict | Non
     relative = state["commits"][lease.run_id]
     if not isinstance(relative, str):
         raise OutputIntegrityError()
-    return _validated_manifest(root / relative, lease, verify=verify)
+    return _validated_manifest(
+        root / relative,
+        lease,
+        verify=verify,
+        verify_files=verify_files,
+    )
 
 
 def read_prepared_manifest(lease: OutputLease, *, verify: bool = True) -> dict | None:
@@ -682,7 +820,12 @@ def read_prepared_manifest(lease: OutputLease, *, verify: bool = True) -> dict |
     return _validated_manifest(directory / "manifest.json", lease, verify=verify)
 
 
-def commit_output(lease: OutputLease, *, still_current: Callable[[], bool] | None = None) -> dict:
+def commit_output(
+    lease: OutputLease,
+    *,
+    still_current: Callable[[], bool] | None = None,
+    _prepared_manifest: dict | None = None,
+) -> dict:
     """One run has one prepared generation and one atomic visibility change."""
     try:
         with _target_lock(lease.target, project_root=lease.project_root) as root:
@@ -692,10 +835,16 @@ def commit_output(lease: OutputLease, *, still_current: Callable[[], bool] | Non
             committed = read_run_manifest(lease, verify=True)
             if committed is not None:
                 return committed
-            prepared = read_prepared_manifest(lease)
+            prepared = (
+                _prepared_manifest
+                if _prepared_manifest is not None
+                else read_prepared_manifest(lease, verify=True)
+            )
             if prepared is None:
                 raise OutputIntegrityError()
-            state["commits"][lease.run_id] = (_generation_dir(lease) / "manifest.json").relative_to(root).as_posix()
+            state["commits"][lease.run_id] = (
+                (_generation_dir(lease) / "manifest.json").relative_to(root).as_posix()
+            )
             state["current"] = lease.run_id
             write_json_atomic(root / "current.json", state, project_root=lease.project_root)
             return prepared
@@ -705,13 +854,15 @@ def commit_output(lease: OutputLease, *, still_current: Callable[[], bool] | Non
 
 def resume_output(lease: OutputLease) -> dict | None:
     """Recover saved work before entering any compute or backend queue."""
-    committed = read_run_manifest(lease, verify=True)
-    if committed is None:
-        if read_prepared_manifest(lease) is None:
-            return None
-        committed = commit_output(lease)
-    export_output(lease)
-    return committed
+    with _target_lock(lease.target, project_root=lease.project_root):
+        committed = read_run_manifest(lease, verify=True)
+        if committed is None:
+            prepared = read_prepared_manifest(lease, verify=True)
+            if prepared is None:
+                return None
+            committed = commit_output(lease, _prepared_manifest=prepared)
+        export_output(lease)
+        return committed
 
 
 def manifest_paths(manifest: dict, *, project_root: Path) -> list[str]:
@@ -727,7 +878,10 @@ def export_output(lease: OutputLease) -> dict:
     try:
         with _target_lock(lease.target, project_root=lease.project_root) as root:
             state = _read_owner(root)
-            manifest = read_run_manifest(lease, verify=True)
+            # Verify sizes of all files in the generation and SHA-256 of the
+            # exported subtitle itself, avoiding a redundant full-tree hash over
+            # multi-megabyte JSON sidecars that were already verified on commit.
+            manifest = read_run_manifest(lease, verify=False, verify_files=("srt",))
             if manifest is None:
                 raise OutputIntegrityError()
             if not _owns(state, lease) or state.get("current") != lease.run_id:
@@ -778,15 +932,54 @@ class RunOutputs:
         self._generation_dir = _generation_dir(lease)
         self._staged: list[StagedFile] = []
 
+    def __enter__(self) -> RunOutputs:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> Literal[False]:
+        if self._staged or self._staging_dir.exists():
+            self.discard()
+        return False
+
     @property
     def staging_dir(self) -> Path:
         return self._staging_dir
+
+    def _safe_staged_filename(self, index: int, destination_name: str) -> str:
+        """Keep internal generation paths safely under Windows MAX_PATH.
+
+        Normal-length filenames are preserved verbatim; unusually long source
+        stems are deterministically truncated with a short hash while keeping
+        the artifact suffix intact. Full target paths remain recorded in
+        ``manifest["targets"]``.
+        """
+        slot = f"{index:02d}"
+        gen_probe = len(str(self._generation_dir / slot / destination_name))
+        stage_probe = len(str(self._staging_dir / slot / destination_name))
+        if max(gen_probe, stage_probe) <= _WINDOWS_SAFE_PATH_CHARS:
+            return destination_name
+
+        suffix = ""
+        lowered = destination_name.lower()
+        for compound in _COMPOUND_ARTIFACT_SUFFIXES:
+            if lowered.endswith(compound):
+                suffix = destination_name[-len(compound) :]
+                break
+        if not suffix:
+            suffix = Path(destination_name).suffix
+        stem = destination_name[: -len(suffix)] if suffix else destination_name
+        digest = hashlib.sha1(destination_name.encode("utf-8", errors="ignore")).hexdigest()[:8]
+        base_len = max(len(str(self._generation_dir / slot)), len(str(self._staging_dir / slot))) + 1
+        budget = max(16, _WINDOWS_SAFE_PATH_CHARS - base_len)
+        keep = max(1, budget - len(suffix) - len(digest) - 1)
+        return f"{stem[:keep]}-{digest}{suffix}"
 
     def stage(self, target: str | Path, *, name: str, write: Callable[[Path], T]) -> T:
         if any(item.name == name for item in self._staged):
             raise ValueError(f"重复产物名称：{name}")
         destination = Path(target)
-        staged = self._staging_dir / f"{len(self._staged):02d}" / destination.name
+        index = len(self._staged)
+        safe_name = self._safe_staged_filename(index, destination.name)
+        staged = self._staging_dir / f"{index:02d}" / safe_name
         staged.parent.mkdir(parents=True, exist_ok=True)
         result = write(staged)
         self._staged.append(StagedFile(name, staged, destination))
@@ -794,7 +987,8 @@ class RunOutputs:
 
     def stage_json(self, target: str | Path, payload: dict, *, name: str) -> None:
         self.stage(
-            target, name=name,
+            target,
+            name=name,
             write=lambda path: write_json(path, payload, project_root=self.project_root),
         )
 
@@ -805,7 +999,9 @@ class RunOutputs:
         return [item.target for item in self._staged]
 
     def publish(
-        self, *, still_current: Callable[[], bool] | None = None,
+        self,
+        *,
+        still_current: Callable[[], bool] | None = None,
         subtitle_cue_count: int | None = None,
     ) -> dict:
         if not self._staged or not any(item.name == "srt" for item in self._staged):
@@ -821,9 +1017,13 @@ class RunOutputs:
             sizes[item.name] = item.staged.stat().st_size
             hashes[item.name] = _sha256(item.staged)
         manifest = {
-            "schema": MANIFEST_SCHEMA, "run_id": self.run_id,
-            "job_id": self.job_id, "sequence": self.sequence,
-            "files": files, "sizes": sizes, "sha256": hashes,
+            "schema": MANIFEST_SCHEMA,
+            "run_id": self.run_id,
+            "job_id": self.job_id,
+            "sequence": self.sequence,
+            "files": files,
+            "sizes": sizes,
+            "sha256": hashes,
             "targets": {
                 item.name: project_relative(item.target, project_root=self.project_root)
                 for item in self._staged
@@ -832,20 +1032,46 @@ class RunOutputs:
         if subtitle_cue_count is not None:
             manifest["subtitle_cue_count"] = subtitle_cue_count
         write_json_atomic(
-            self._staging_dir / "manifest.json", manifest, project_root=self.project_root,
+            self._staging_dir / "manifest.json",
+            manifest,
+            project_root=self.project_root,
         )
         self._generation_dir.parent.mkdir(parents=True, exist_ok=True)
-        # Preparing is durable but invisible. The fixed per-run name lets a
-        # restart find it without needing another pointer write to succeed.
-        with _target_lock(self.lease.target, project_root=self.project_root):
-            if self._generation_dir.exists():
-                _validated_manifest(self._generation_dir / "manifest.json", self.lease, verify=True)
-                self.discard()
-            else:
-                # Both directories belong to this store: always same-volume.
-                replace_atomically(self._staging_dir, self._generation_dir)
-        self._staged = []
-        return commit_output(self.lease, still_current=still_current)
+        # Ownership check, staging->generation rename, and current.json commit
+        # execute inside one reentrant `_target_lock` critical section:
+        #   - cancelled/superseded runs discard before renaming (no orphan
+        #     `generations/` directories);
+        #   - rename retries transient Windows Defender/sharing locks and maps
+        #     failures to `OutputCommitError`;
+        #   - `commit_output` reuses the freshly hashed manifest without a
+        #     redundant second full-tree SHA-256 pass.
+        try:
+            with _target_lock(self.lease.target, project_root=self.project_root) as root:
+                state = _read_owner(root)
+                if not _owns(state, self.lease) or (
+                    still_current is not None and not still_current()
+                ):
+                    self.discard()
+                    raise OutputsSupersededError("本次运行已取消或输出目标已有更新运行。")
+                if self._generation_dir.exists():
+                    prepared_manifest = _validated_manifest(
+                        self._generation_dir / "manifest.json",
+                        self.lease,
+                        verify=True,
+                    )
+                    self.discard()
+                else:
+                    # Both directories belong to this store: always same-volume.
+                    _rename_dir_with_retry(self._staging_dir, self._generation_dir)
+                    prepared_manifest = manifest
+                self._staged = []
+                return commit_output(
+                    self.lease,
+                    still_current=still_current,
+                    _prepared_manifest=prepared_manifest,
+                )
+        except (OSError, TimeoutError) as exc:
+            raise OutputCommitError(self.lease) from exc
 
     def discard(self) -> None:
         self._staged = []

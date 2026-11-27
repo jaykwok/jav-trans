@@ -82,7 +82,7 @@ def test_build_messages_refuses_more_than_the_cap(profile):
     if cap is None:
         pytest.skip("profile sets no cap")
     over = cap + 1
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         profile.build_messages(
             _segments(over),
             ids=list(range(over)),

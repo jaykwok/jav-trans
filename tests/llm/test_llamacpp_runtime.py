@@ -437,27 +437,27 @@ def test_download_archive_retries_transient_transport_error(tmp_path, monkeypatc
     class _FakeResp:
         headers = {"content-length": str(len(payload))}
 
-        def __enter__(self):
+        async def __aenter__(self):
             return self
 
-        def __exit__(self, *_a):
+        async def __aexit__(self, *_a):
             return False
 
         def raise_for_status(self):
             return None
 
-        def iter_bytes(self, chunk_size=0):
+        async def aiter_bytes(self, chunk_size=0):
             del chunk_size
             yield payload
 
-    class _FakeClient:
+    class _FakeAsyncClient:
         def __init__(self, **_kw):
             pass
 
-        def __enter__(self):
+        async def __aenter__(self):
             return self
 
-        def __exit__(self, *_a):
+        async def __aexit__(self, *_a):
             return False
 
         def stream(self, method, url):
@@ -467,7 +467,7 @@ def test_download_archive_retries_transient_transport_error(tmp_path, monkeypatc
                 raise httpx.ConnectError("[Errno 11001] getaddrinfo failed")
             return _FakeResp()
 
-    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
     monkeypatch.setattr(
         llamacpp_runtime, "_sleep_interruptible", lambda delay, _ev=None: sleeps.append(delay)
     )
@@ -494,10 +494,10 @@ def test_download_archive_does_not_retry_http_404(tmp_path, monkeypatch):
     class _Fake404Resp:
         headers: dict[str, str] = {}
 
-        def __enter__(self):
+        async def __aenter__(self):
             return self
 
-        def __exit__(self, *_a):
+        async def __aexit__(self, *_a):
             return False
 
         def raise_for_status(self):
@@ -505,14 +505,14 @@ def test_download_archive_does_not_retry_http_404(tmp_path, monkeypatch):
             resp = httpx.Response(404, request=req)
             raise httpx.HTTPStatusError("404 Not Found", request=req, response=resp)
 
-    class _FakeClient:
+    class _FakeAsyncClient:
         def __init__(self, **_kw):
             pass
 
-        def __enter__(self):
+        async def __aenter__(self):
             return self
 
-        def __exit__(self, *_a):
+        async def __aexit__(self, *_a):
             return False
 
         def stream(self, method, url):
@@ -520,7 +520,7 @@ def test_download_archive_does_not_retry_http_404(tmp_path, monkeypatch):
             attempts["count"] += 1
             return _Fake404Resp()
 
-    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
 
     with pytest.raises(httpx.HTTPStatusError):
         llamacpp_runtime._download_archive(
@@ -557,7 +557,7 @@ def test_download_archive_refuses_missing_sha256_before_network(tmp_path, monkey
 
     monkeypatch.setattr(
         httpx,
-        "Client",
+        "AsyncClient",
         lambda **_kw: pytest.fail("must refuse unsigned download before opening HTTP client"),
     )
     with pytest.raises(RuntimeError, match="SHA-256"):

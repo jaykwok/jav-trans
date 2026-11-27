@@ -28,10 +28,15 @@ import main
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _STAGE_SOURCES = (
     sorted((PROJECT_ROOT / "src" / "asr").rglob("*.py"))
-    + [PROJECT_ROOT / "src" / "pipeline" / "gpu_worker.py"]
+    + [
+        PROJECT_ROOT / "src" / "pipeline" / "gpu_worker.py",
+        PROJECT_ROOT / "src" / "pipeline" / "gpu_oom_policy.py",
+        PROJECT_ROOT / "src" / "pipeline" / "gpu_worker_runtime.py",
+        PROJECT_ROOT / "src" / "pipeline" / "gpu_worker_client.py",
+    ]
 )
 _READ = re.compile(
-    r"""(?:os\.)?getenv\(\s*["']([A-Z0-9_]+)["']|_env_\w+\(\s*["']([A-Z0-9_]+)["']"""
+    r"""(?:os\.)?getenv\(\s*["']([A-Z0-9_]+)["']|(?:_env_|_override_|env_)\w+\(\s*(?:[^,"'\n]+,\s*)?["']([A-Z0-9_]+)["']"""
 )
 # Names the stage reads that deliberately do not travel through the advanced box.
 _DELIBERATELY_NOT_FORWARDED = {

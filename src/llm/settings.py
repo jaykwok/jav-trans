@@ -43,8 +43,6 @@ def selected_backend_name(name: str | None = None) -> str:
 
 DEFAULT_TARGET_LANG = "简体中文"
 
-OPENAI_COMPATIBILITY_BASE_URL = env_text("OPENAI_COMPATIBILITY_BASE_URL", "") or None
-API_KEY = env_text("API_KEY", "") or None
 LLM_MODEL_NAME = env_text("LLM_MODEL_NAME", "")
 LLM_REASONING_EFFORT = env_text("LLM_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
 # Which output constraint the endpoint gets, and how hard to insist on it.
@@ -171,6 +169,8 @@ def max_source_chars_for_backend(backend_name: str) -> int:
     if normalize_backend_name(backend_name) == "llamacpp":
         return LLAMACPP_BATCH_MAX_SOURCE_CHARS
     return TRANSLATION_BATCH_MAX_SOURCE_CHARS
+
+
 TRANSLATION_API_RETRIES = 4
 TRANSLATION_BATCH_REPAIR_RETRIES = 2
 # Hard cap on requests a single batch may issue. The repair loop resets its

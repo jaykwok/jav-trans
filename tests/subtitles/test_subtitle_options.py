@@ -133,3 +133,31 @@ def test_prepare_bilingual_keeps_adjacent_cues_separate(tmp_path):
     content = path.read_text(encoding="utf-8")
     assert "\n1\n" not in content
     assert content.count("-->") == 2
+
+
+def test_legacy_min_duration_not_evaluated_when_primary_key_is_set(monkeypatch):
+    from core import typed_config
+
+    typed_config.clear_configuration_problems()
+    monkeypatch.setenv("SUBTITLE_MIN_DURATION", "0.8")
+    monkeypatch.setenv("MIN_SUBTITLE_DURATION", "not-a-number")
+
+    options = SubtitleOptions.from_env()
+
+    assert options.min_duration == pytest.approx(0.8)
+    assert typed_config.configuration_problems() == []
+
+
+def test_legacy_min_duration_used_only_when_primary_key_unset_or_blank(monkeypatch):
+    from core import typed_config
+
+    typed_config.clear_configuration_problems()
+    monkeypatch.delenv("SUBTITLE_MIN_DURATION", raising=False)
+    monkeypatch.setenv("MIN_SUBTITLE_DURATION", "0.9")
+
+    assert SubtitleOptions.from_env().min_duration == pytest.approx(0.9)
+    assert typed_config.configuration_problems() == []
+
+    monkeypatch.setenv("SUBTITLE_MIN_DURATION", "   ")
+    assert SubtitleOptions.from_env().min_duration == pytest.approx(0.9)
+    assert typed_config.configuration_problems() == []

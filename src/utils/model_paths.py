@@ -3,9 +3,13 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
+from core.atomic_io import replace_atomically, write_json_atomic
+from core.typed_config import env_float
 from utils.runtime_paths import is_frozen, resource_root, runtime_root
 
 PROJECT_ROOT = runtime_root()
@@ -36,7 +40,6 @@ DEFAULT_INFERENCE_IGNORE_PATTERNS = [
 ]
 MODEL_CONFIG_FILENAMES = ("config.json",)
 MODEL_WEIGHT_PATTERNS = (
-    "model*.safetensors",
     "*.safetensors",
     "pytorch_model*.bin",
     "model*.bin",
@@ -60,14 +63,9 @@ def default_hf_token_path() -> Path:
     return Path(cache_root) / "huggingface" / "token"
 
 
-if is_frozen():
-    os.environ.setdefault("HF_HOME", str(MODELS_ROOT))
-    os.environ.setdefault("HF_HUB_CACHE", str(HF_RUNTIME_CACHE_ROOT / "hub"))
-    os.environ.setdefault("HF_XET_CACHE", str(HF_RUNTIME_CACHE_ROOT / "xet"))
-else:
-    os.environ.setdefault("HF_HOME", "./models")
-    os.environ.setdefault("HF_HUB_CACHE", "./models/hub")
-    os.environ.setdefault("HF_XET_CACHE", "./models/xet")
+os.environ.setdefault("HF_HOME", str(MODELS_ROOT))
+os.environ.setdefault("HF_HUB_CACHE", str(HF_RUNTIME_CACHE_ROOT / "hub"))
+os.environ.setdefault("HF_XET_CACHE", str(HF_RUNTIME_CACHE_ROOT / "xet"))
 os.environ.setdefault("HF_TOKEN_PATH", str(default_hf_token_path()))
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
@@ -169,10 +167,7 @@ def record_model_revision(root: Path, repo_id: str, revision: str) -> dict:
         "schema": MODEL_RECEIPT_SCHEMA, "repo_id": repo_id,
         "revision": require_commit_sha(revision), "files": _model_file_records(root),
     }
-    with (root / MODEL_RECEIPT).open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.flush()
-        os.fsync(handle.fileno())
+    write_json_atomic(root / MODEL_RECEIPT, payload, indent=2, ensure_ascii=False)
     return payload
 
 
@@ -193,9 +188,22 @@ def verify_model_revision(root: Path, repo_id: str, revision: str) -> dict:
     return payload
 
 
+def _remove_path_best_effort(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _resolve_pinned_model(
     explicit_path: str | None, repo_id: str, revision: str, *, download: bool,
     allow_patterns=None, ignore_patterns=None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     revision = require_commit_sha(revision)
     target = _project_path(explicit_path).resolve() if explicit_path else revision_model_dir(repo_id, revision).resolve()
@@ -208,18 +216,30 @@ def _resolve_pinned_model(
     # Keep each SHA separate; only a completed, verified directory is reusable.
     from filelock import FileLock
 
+    lock_timeout_s = env_float("MODEL_DOWNLOAD_LOCK_TIMEOUT_S", 1800.0, minimum=1.0)
     target.parent.mkdir(parents=True, exist_ok=True)
-    with FileLock(str(target.with_name(target.name + ".lock")), timeout=60):
+    with FileLock(str(target.with_name(target.name + ".lock")), timeout=lock_timeout_s):
         if target.exists():
             verify_model_revision(target, repo_id, revision)
             return str(target)
         staging = target.with_name(target.name + ".partial")
-        _download_snapshot(
-            repo_id, staging, revision=revision,
-            allow_patterns=allow_patterns, ignore_patterns=ignore_patterns,
-        )
-        record_model_revision(staging, repo_id, revision)
-        staging.replace(target)
+        # Clear any dirty leftover .partial from a prior interrupted attempt so
+        # stale/unrelated files can never be hashed into the pinned receipt.
+        _remove_path_best_effort(staging)
+        dl_kwargs: dict = {
+            "revision": revision,
+            "allow_patterns": allow_patterns,
+            "ignore_patterns": ignore_patterns,
+        }
+        if cancel_event is not None:
+            dl_kwargs["cancel_event"] = cancel_event
+        try:
+            _download_snapshot(repo_id, staging, **dl_kwargs)
+            record_model_revision(staging, repo_id, revision)
+            replace_atomically(staging, target)
+        except BaseException:
+            _remove_path_best_effort(staging)
+            raise
     return str(target)
 
 
@@ -365,6 +385,7 @@ def _download_snapshot(
     revision: str | None = None,
     allow_patterns: str | list[str] | None = None,
     ignore_patterns: str | list[str] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     try:
         from huggingface_hub import snapshot_download
@@ -391,7 +412,7 @@ def _download_snapshot(
                 allow_patterns=allow_patterns,
                 ignore_patterns=effective_ignore_patterns,
                 endpoint=endpoint,
-                tqdm_class=hf_progress.tqdm_class(),
+                tqdm_class=hf_progress.tqdm_class(cancel_event),
             )
     except BaseException:
         if not existed_before:
@@ -428,25 +449,33 @@ def resolve_model_spec(
     revision: str | None = None,
     allow_patterns: str | list[str] | None = None,
     ignore_patterns: str | list[str] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     if revision is not None:
         return _resolve_pinned_model(
-            explicit_path, repo_id, revision, download=download,
-            allow_patterns=allow_patterns, ignore_patterns=ignore_patterns,
+            explicit_path,
+            repo_id,
+            revision,
+            download=download,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+            cancel_event=cancel_event,
         )
+    dl_kwargs: dict = {
+        "revision": revision,
+        "allow_patterns": allow_patterns,
+        "ignore_patterns": ignore_patterns,
+    }
+    if cancel_event is not None:
+        dl_kwargs["cancel_event"] = cancel_event
+
     if explicit_path:
         candidate = _project_path(explicit_path).resolve()
         if _path_has_model_files(candidate):
             return str(candidate)
         canonical = canonical_model_dir(repo_id).resolve()
         if download and candidate != canonical:
-            return _download_snapshot(
-                repo_id,
-                candidate,
-                revision=revision,
-                allow_patterns=allow_patterns,
-                ignore_patterns=ignore_patterns,
-            )
+            return _download_snapshot(repo_id, candidate, **dl_kwargs)
 
     canonical = canonical_model_dir(repo_id).resolve()
     for candidate in _iter_local_model_candidates(repo_id):
@@ -455,12 +484,6 @@ def resolve_model_spec(
             return str(resolved)
 
     if download:
-        return _download_snapshot(
-            repo_id,
-            canonical,
-            revision=revision,
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-        )
+        return _download_snapshot(repo_id, canonical, **dl_kwargs)
 
     return repo_id

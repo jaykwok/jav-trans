@@ -27,11 +27,12 @@ from pathlib import Path
 import sys
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_ROOT = PROJECT_ROOT / "src"
-for root in (PROJECT_ROOT, SRC_ROOT):
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
+if str(_REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools._common import ensure_src_on_path  # noqa: E402
+
+ensure_src_on_path()
 
 from tools.audits.audit_nav import (  # noqa: E402
     audit_generated_at,

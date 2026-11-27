@@ -23,6 +23,11 @@ def _segments(count: int, *, empty: bool = False) -> list[dict]:
     ]
 
 
+@pytest.fixture(autouse=True)
+def _isolate_project_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+
+
 def _configure_headless(monkeypatch) -> None:
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
 

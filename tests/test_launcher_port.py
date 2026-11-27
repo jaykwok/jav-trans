@@ -1,47 +1,21 @@
-"""A default port is a number someone else also picked.
-
-The launcher used to bind whatever `JAV_SUB_PORT` said and hope. When
-something already held it, `uvicorn.run` raised inside a daemon thread while
-the main thread slept 1.5s and then opened the window anyway - pointing at
-whatever *was* listening on that port. Walking forward to the next free port is
-what Jupyter does with 8888.
-"""
+"""Port allocation, exclusive socket binding, and server readiness checks."""
 
 from __future__ import annotations
 
 import socket
-from pathlib import Path
 import sys
+import types
+from types import SimpleNamespace
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
+import pytest
 
-import importlib.util  # noqa: E402
-
-_spec = importlib.util.spec_from_file_location(
-    "_launcher_probe", PROJECT_ROOT / "launcher.py"
-)
-
-
-def _first_free_port(preferred: int, attempts: int = 20) -> int:
-    """Reimport the function without executing the launcher's module body.
-
-    Importing launcher.py would start resolving ports and pull in webview at
-    import time; the function under test is self-contained, so it is read out
-    of the source instead.
-    """
-    source = (PROJECT_ROOT / "launcher.py").read_text(encoding="utf-8")
-    start = source.index("def _first_free_port(")
-    end = source.index("\nPORT = ", start)
-    namespace: dict = {}
-    exec(compile(source[start:end], "launcher.py", "exec"), namespace)  # noqa: S102
-    return namespace["_first_free_port"](preferred, attempts)
+import launcher
 
 
 def _hold(port: int) -> socket.socket:
     held = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        held.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
     held.bind(("127.0.0.1", port))
     held.listen(1)
     return held
@@ -55,14 +29,14 @@ def _free_port() -> int:
 
 def test_a_free_port_is_returned_unchanged() -> None:
     port = _free_port()
-    assert _first_free_port(port) == port
+    assert launcher._first_free_port(port) == port
 
 
 def test_a_held_port_steps_forward() -> None:
     port = _free_port()
     held = _hold(port)
     try:
-        assert _first_free_port(port) > port
+        assert launcher._first_free_port(port) > port
     finally:
         held.close()
 
@@ -76,7 +50,7 @@ def test_it_walks_past_a_run_of_held_ports() -> None:
                 held.append(_hold(base + offset))
             except OSError:
                 pass
-        resolved = _first_free_port(base)
+        resolved = launcher._first_free_port(base)
         assert resolved >= base
         assert all(resolved != sock.getsockname()[1] for sock in held)
     finally:
@@ -90,34 +64,99 @@ def test_giving_up_returns_the_preferred_port() -> None:
     port = _free_port()
     held = _hold(port)
     try:
-        assert _first_free_port(port, attempts=1) == port
+        assert launcher._first_free_port(port, attempts=1) == port
     finally:
         held.close()
 
 
-def test_the_two_defaults_do_not_collide(monkeypatch) -> None:
-    from core.typed_config import env_int
+def test_bind_free_socket_skips_active_wildcard_listener_and_keeps_exclusive_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-2: ports already answering connect_ex (such as a 0.0.0.0 listener on
+    Windows) are skipped, and the returned socket stays exclusively bound."""
+    base = _free_port()
+    monkeypatch.setattr(launcher, "_port_accepts_connection", lambda candidate: candidate == base)
+    sock, bound_port = launcher._bind_free_socket(base, attempts=5)
+    try:
+        assert bound_port > base
+        assert sock.getsockname() == ("127.0.0.1", bound_port)
+        # On Windows SO_EXCLUSIVEADDRUSE prevents a second bind on the same port.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as competitor:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                competitor.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            with pytest.raises(OSError):
+                competitor.bind(("127.0.0.1", bound_port))
+    finally:
+        sock.close()
 
-    source = (PROJECT_ROOT / "launcher.py").read_text(encoding="utf-8")
-    start = source.index("\nPORT = ")
-    declarations = compile(source[start:source.index("\n\n", start)], "launcher.py", "exec")
-    namespace = {"env_int": env_int, "_first_free_port": lambda preferred: preferred}
-    monkeypatch.delenv("JAV_SUB_PORT", raising=False)
-    monkeypatch.delenv("JAV_SUB_EVENTS_PORT", raising=False)
-    exec(declarations, namespace)
-    assert (namespace["PORT"], namespace["EVENTS_PORT"]) == (2233, 2234)
-    # Equal requested ports at the upper boundary must also remain distinct,
-    # without ever passing an out-of-range number to bind().
-    monkeypatch.setenv("JAV_SUB_PORT", "65535")
-    monkeypatch.setenv("JAV_SUB_EVENTS_PORT", "65535")
-    exec(declarations, namespace)
-    assert namespace["PORT"] == 65535
-    assert 1 <= namespace["EVENTS_PORT"] < 65535
+
+def test_resolve_events_port_avoids_collision_and_upper_boundary() -> None:
+    assert launcher._resolve_events_port(2233, 2234, finder=lambda p: p) == 2234
+    assert launcher._resolve_events_port(2233, 2233, finder=lambda p: p) == 2234
+    events_at_max = launcher._resolve_events_port(65535, 65535, finder=lambda p: p)
+    assert 1 <= events_at_max < 65535
 
 
-def test_the_resolved_events_port_is_published_not_defaulted() -> None:
-    """`setdefault` would leave the app dialling the port that was already
-    taken - the one case this whole helper exists for."""
-    source = (PROJECT_ROOT / "launcher.py").read_text(encoding="utf-8")
-    assert 'os.environ["JAV_SUB_EVENTS_PORT"] = str(EVENTS_PORT)' in source
-    assert 'setdefault("JAV_SUB_EVENTS_PORT"' not in source
+def test_run_server_passes_bound_socket_and_publishes_events_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`JAV_SUB_EVENTS_PORT` must be overwritten with the resolved port and the
+    pre-bound socket must be passed directly into `uvicorn.Server.run(sockets=[sock])`."""
+    captured: dict[str, object] = {}
+
+    class _FakeConfig:
+        def __init__(self, app, *, host, port, log_level):
+            captured["app"] = app
+            captured["host"] = host
+            captured["port"] = port
+            captured["log_level"] = log_level
+
+    class _FakeServer:
+        def __init__(self, config):
+            self.config = config
+            self.started = False
+            self.should_exit = False
+
+        def run(self, *, sockets=None):
+            captured["sockets"] = sockets
+            self.started = True
+
+    fake_uvicorn = types.ModuleType("uvicorn")
+    fake_uvicorn.Config = _FakeConfig
+    fake_uvicorn.Server = _FakeServer
+    fake_web_app = types.ModuleType("web.app")
+    fake_web_app.create_app = lambda: "fake-app"
+    fake_updater = types.ModuleType("core.updater")
+    fake_updater.register_update_exit_callback = lambda cb: captured.setdefault("cb", cb)
+
+    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
+    monkeypatch.setitem(sys.modules, "web.app", fake_web_app)
+    monkeypatch.setitem(sys.modules, "core.updater", fake_updater)
+    monkeypatch.setenv("JAV_SUB_EVENTS_PORT", "9999")
+    monkeypatch.setattr(launcher, "PORT", 2240)
+    monkeypatch.setattr(launcher, "EVENTS_PORT", 2241)
+
+    sock, _port = launcher._bind_free_socket(_free_port())
+    launcher._run_server(sock)
+
+    assert launcher.os.environ["JAV_SUB_EVENTS_PORT"] == "2241"
+    assert captured["sockets"] == [sock]
+    assert sock.fileno() == -1  # closed cleanly in finally
+
+
+def test_wait_for_server_relies_on_started_flag_not_unrelated_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-2: even if another process listens on `port`, _wait_for_server stays
+    False until our own uvicorn Server marks `started = True`."""
+    held = _hold(_free_port())
+    port = int(held.getsockname()[1])
+    try:
+        launcher._server_error.clear()
+        launcher._server_failed.clear()
+        monkeypatch.setattr(launcher, "_uvicorn_server", SimpleNamespace(started=False))
+        assert launcher._wait_for_server(port, timeout_s=0.06) is False
+        monkeypatch.setattr(launcher, "_uvicorn_server", SimpleNamespace(started=True))
+        assert launcher._wait_for_server(port, timeout_s=0.1) is True
+    finally:
+        held.close()

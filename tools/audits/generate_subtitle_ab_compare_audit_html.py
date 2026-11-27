@@ -12,10 +12,14 @@ from pathlib import Path
 from typing import Any
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+if str(_REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
+from tools._common import (  # noqa: E402
+    PROJECT_ROOT,
+    read_json,
+    write_json as _write_json,
+)
 from tools.audits.audit_nav import update_audit_entrypoints  # noqa: E402
 
 
@@ -46,13 +50,8 @@ def rel_url(path: Path, *, from_dir: Path) -> str:
         return path.as_posix()
 
 
-def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    _write_json(path, payload, sort_keys=True, trailing_newline=False)
 
 
 def parse_timestamp(value: str) -> float:

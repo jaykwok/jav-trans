@@ -85,8 +85,8 @@ jav-sub，里面那份会重新安装运行环境、重新下载模型。启动�
   或其他需要管理员权限的目录——程序要在自己的目录里写入 .venv、.python、models、config、logs、outputs、cache、tmp。
 * 需要 NVIDIA 显卡和较新的显卡驱动。驱动过旧时程序会在界面上提示更新。
 * 默认启用本地翻译（免费离线，无需配 Key）。如需改用 API 翻译，展开界面左侧「翻译设置」，
-  将翻译后端切为 API 调用并填好 API Key 与模型后保存。只要日文字幕时，在「自定义 → 参数调优」
-  里打开「不翻译（仅日文字幕）」。
+  将翻译后端切为 API 调用并填好 API Key 与模型后保存。只要日文字幕时，在左侧「字幕输出」
+  里直接选择「仅日文（不翻译）」即可。
 * 如果窗口打不开，安装 Microsoft Edge WebView2 运行时：
   https://developer.microsoft.com/en-us/microsoft-edge/webview2/
 * 出问题时，可提供 logs\ 下相关 .run.log、app-<PID>.log 或 asr-worker-<PID>.log

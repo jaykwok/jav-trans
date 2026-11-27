@@ -6,8 +6,8 @@ from fastapi import APIRouter, HTTPException, Query, Response, status
 
 from core import updater
 from llm.preflight import translation_config_problems
-from web.models import JobSpec, JobState
 from web import pipeline_manager as pm
+from web.models import JobSpec, JobState
 
 
 router = APIRouter()
@@ -20,7 +20,7 @@ async def post_jobs(spec: JobSpec) -> dict[str, list[str]]:
     # Refuse a job whose translation stage cannot possibly run rather than
     # discovering it after ASR has spent ten minutes on the video.
     if not spec.skip_translation:
-        problems = translation_config_problems()
+        problems = await asyncio.to_thread(translation_config_problems)
         if problems:
             raise HTTPException(status_code=400, detail="\n".join(problems))
     jobs = await pm.create_job(spec)
@@ -40,10 +40,6 @@ async def get_jobs(
     response: Response,
     status: str | None = Query(default=None),
 ) -> list[JobState]:
-    # The header dates the whole list, which a per-job field cannot: an empty
-    # list carries no jobs to read a revision from, and "everything was just
-    # deleted" and "this response is from before anything existed" look
-    # identical without it.
     jobs, revision = await pm.jobs_snapshot(status=status)
     response.headers[JOBS_REVISION_HEADER] = str(revision)
     response.headers[JOBS_EPOCH_HEADER] = str(pm.state_epoch())
@@ -54,25 +50,20 @@ async def get_jobs(
 async def get_job_by_id(job_id: str, response: Response) -> JobState:
     job = await pm.get_job(job_id)
     if job is None:
-        # 404 answers two different questions with one word: "there was never
-        # such a job" and "the one you are still showing is gone". Only the
-        # second lets a page drop the card, so a deletion we still remember says
-        # so - and says at which reading, in case an older list arrives after.
         deleted_at = pm.deleted_revision(job_id)
         if deleted_at is not None:
+            epoch_header = str(pm.state_epoch())
             response.headers[JOBS_REVISION_HEADER] = str(deleted_at)
-            response.headers[JOBS_EPOCH_HEADER] = str(pm.state_epoch())
+            response.headers[JOBS_EPOCH_HEADER] = epoch_header
             raise HTTPException(
                 status_code=410,
                 detail="Job deleted",
                 headers={
                     JOBS_REVISION_HEADER: str(deleted_at),
-                    JOBS_EPOCH_HEADER: str(pm.state_epoch()),
+                    JOBS_EPOCH_HEADER: epoch_header,
                 },
             )
         raise HTTPException(status_code=404, detail="Job not found")
-    # The body carries this job's revision; only the epoch it belongs to has
-    # nowhere to live but a header.
     response.headers[JOBS_EPOCH_HEADER] = str(pm.state_epoch())
     return job
 
@@ -85,7 +76,7 @@ async def retry_job(job_id: str) -> JobState:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if not job.spec.skip_translation and await asyncio.to_thread(pm.retry_requires_computation, job):
-        problems = translation_config_problems()
+        problems = await asyncio.to_thread(translation_config_problems)
         if problems:
             raise HTTPException(status_code=400, detail="\n".join(problems))
     retried = await pm.retry_job(job_id)

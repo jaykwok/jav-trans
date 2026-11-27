@@ -1,15 +1,22 @@
-import { $, showToast } from './util.js';
+import { $, showToast, readErrorDetail } from './util.js';
 import { addLog } from './log.js';
 
 const POLL_ACTIVE_MS = 1200;
 const POLL_STARTUP_MS = 2500;
+const MAX_POLL_BACKOFF_MS = 15000;
+const ACTIVE_POLL_STATES = new Set(['checking', 'downloading', 'verifying', 'restarting']);
 
 let pollTimer = null;
+let pollFailures = 0;
 let latestSnapshot = null;
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 MB';
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function isSafeHttpUrl(rawUrl) {
+  return typeof rawUrl === 'string' && /^https?:\/\//i.test(rawUrl.trim());
 }
 
 function renderStatus(data) {
@@ -30,7 +37,7 @@ function renderStatus(data) {
   const latest = data.latest_version ? `v${data.latest_version}` : '';
   const hasNewer = Boolean(data.update_available && latest);
   const st = data.state || 'idle';
-  const busy = st === 'checking' || st === 'downloading' || st === 'verifying' || st === 'restarting';
+  const busy = ACTIVE_POLL_STATES.has(st);
 
   if (autoCheck) autoCheck.checked = data.auto_check_enabled !== false;
 
@@ -104,8 +111,11 @@ function renderStatus(data) {
   }
 
   if (btnCheck) btnCheck.disabled = busy;
-  if (btnOpen) btnOpen.hidden = !data.release_url;
-  if (btnCancel) btnCancel.hidden = !(st === 'downloading' || st === 'verifying');
+  if (btnOpen) btnOpen.hidden = !isSafeHttpUrl(data.release_url);
+  if (btnCancel) {
+    btnCancel.hidden = !(st === 'downloading' || st === 'verifying');
+    if (btnCancel.hidden) btnCancel.disabled = false;
+  }
   if (btnStart) {
     const canOfferStart =
       (st === 'available' || (st === 'error' && hasNewer)) && Boolean(data.can_self_update);
@@ -116,26 +126,38 @@ function renderStatus(data) {
   schedulePoll(st);
 }
 
-function schedulePoll(st) {
+function schedulePoll(st, { backoffFailures = 0 } = {}) {
   if (pollTimer) {
     clearTimeout(pollTimer);
     pollTimer = null;
   }
-  if (st === 'checking') {
-    pollTimer = setTimeout(fetchUpdateStatus, POLL_STARTUP_MS);
-  } else if (st === 'downloading' || st === 'verifying' || st === 'restarting') {
-    pollTimer = setTimeout(fetchUpdateStatus, POLL_ACTIVE_MS);
-  }
+  if (!ACTIVE_POLL_STATES.has(st)) return;
+  const baseMs = st === 'checking' ? POLL_STARTUP_MS : POLL_ACTIVE_MS;
+  const delayMs = backoffFailures > 0
+    ? Math.min(MAX_POLL_BACKOFF_MS, baseMs * Math.pow(2, Math.min(backoffFailures, 4)))
+    : baseMs;
+  pollTimer = setTimeout(fetchUpdateStatus, delayMs);
 }
 
 export async function fetchUpdateStatus() {
   try {
     const res = await fetch('/api/update/status');
-    if (!res.ok) return null;
+    if (!res.ok) {
+      pollFailures += 1;
+      if (latestSnapshot?.state && ACTIVE_POLL_STATES.has(latestSnapshot.state)) {
+        schedulePoll(latestSnapshot.state, { backoffFailures: pollFailures });
+      }
+      return null;
+    }
     const data = await res.json();
+    pollFailures = 0;
     renderStatus(data);
     return data;
   } catch {
+    pollFailures += 1;
+    if (latestSnapshot?.state && ACTIVE_POLL_STATES.has(latestSnapshot.state)) {
+      schedulePoll(latestSnapshot.state, { backoffFailures: pollFailures });
+    }
     return null;
   }
 }
@@ -172,29 +194,33 @@ export function installUpdater() {
   });
 
   btnCheck?.addEventListener('click', async () => {
+    if (btnCheck.disabled) return;
     btnCheck.disabled = true;
     if ($('update-status-text')) $('update-status-text').textContent = '正在检查 GitHub 最新稳定版…';
     try {
       const res = await fetch('/api/update/check', { method: 'POST' });
+      if (!res.ok) throw new Error(await readErrorDetail(res));
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      pollFailures = 0;
       renderStatus(data);
     } catch (err) {
       showToast(`检查更新失败：${err.message}`);
     } finally {
       const st = latestSnapshot?.state;
-      if (st !== 'checking' && st !== 'downloading' && st !== 'verifying' && st !== 'restarting') {
+      if (!ACTIVE_POLL_STATES.has(st)) {
         btnCheck.disabled = false;
       }
     }
   });
 
   btnStart?.addEventListener('click', async () => {
+    if (btnStart.disabled) return;
     btnStart.disabled = true;
     try {
       const res = await fetch('/api/update/start', { method: 'POST' });
+      if (!res.ok) throw new Error(await readErrorDetail(res));
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      pollFailures = 0;
       addLog(`[更新] 开始下载并校验 ${data.tag || data.latest_version || '新版本'}…`, 'info');
       renderStatus(data);
     } catch (err) {
@@ -205,25 +231,28 @@ export function installUpdater() {
   });
 
   btnCancel?.addEventListener('click', async () => {
+    if (btnCancel.disabled) return;
+    btnCancel.disabled = true;
     try {
       const res = await fetch('/api/update/cancel', { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        renderStatus(data);
-        if (data.state === 'restarting' || data.state === 'ready_to_restart') {
-          showToast('校验已完成，正在重启应用更新');
-        } else {
-          showToast('已请求取消更新');
-        }
+      if (!res.ok) throw new Error(await readErrorDetail(res));
+      const data = await res.json();
+      renderStatus(data);
+      if (data.state === 'restarting' || data.state === 'ready_to_restart') {
+        showToast('校验已完成，正在重启应用更新');
+      } else {
+        showToast('已请求取消更新');
       }
-    } catch {
-      /* ignore */
+    } catch (err) {
+      showToast(`取消更新失败：${err.message}`);
+      btnCancel.disabled = false;
     }
   });
 
   btnOpen?.addEventListener('click', () => {
-    if (latestSnapshot?.release_url) {
-      window.open(latestSnapshot.release_url, '_blank', 'noopener,noreferrer');
+    const url = latestSnapshot?.release_url;
+    if (isSafeHttpUrl(url)) {
+      window.open(url, '_blank', 'noopener,noreferrer');
     }
   });
 
@@ -236,8 +265,8 @@ export function installUpdater() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled }),
       });
+      if (!res.ok) throw new Error(await readErrorDetail(res));
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
       renderStatus(data);
       showToast(enabled ? '已开启启动时自动检测更新' : '已关闭启动时自动检测更新');
     } catch (err) {

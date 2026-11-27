@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from asr import audio_encoder
 from asr.backends.qwen import QWEN_ASR_REPO_ID
 from utils.gpu_safety import resolve_inference_device
 from utils.model_paths import resolve_model_spec
@@ -69,8 +70,6 @@ class Qwen3AsrEncoder:
             self.config.device, stage="Qwen3-ASR encoder"
         )
 
-        from transformers import AutoModelForMultimodalLM, AutoProcessor
-
         self.repo_id = self.config.repo_id.strip()
         self.model_path = resolve_model_spec(
             self.config.model_path or None,
@@ -85,15 +84,12 @@ class Qwen3AsrEncoder:
                 "or rerun without --no-download."
             )
         self.torch_dtype = torch_dtype_from_name(self.config.dtype)
-        model_kwargs: dict[str, Any] = {
-            "dtype": self.torch_dtype,
-            "device_map": str(self.device),
-        }
-        if self.config.attention and self.config.attention != "sdpa":
-            model_kwargs["attn_implementation"] = self.config.attention
-        self.processor = AutoProcessor.from_pretrained(self.model_path)
-        self.model = AutoModelForMultimodalLM.from_pretrained(self.model_path, **model_kwargs)
-        self.model.eval()
+        self.model, self.processor = audio_encoder.load_qwen_asr_model(
+            model_spec=self.model_path,
+            device=self.device,
+            dtype=self.torch_dtype,
+            attention=self.config.attention,
+        )
 
     def encode(self, audio: np.ndarray, *, sample_rate: int) -> np.ndarray:
         return self.encode_batch([audio], sample_rate=sample_rate)[0]
@@ -104,54 +100,30 @@ class Qwen3AsrEncoder:
         *,
         sample_rate: int,
     ) -> list[np.ndarray]:
-        import torch
-
         if not audios:
             return []
         if sample_rate != 16000:
             raise ValueError(
                 f"Qwen3-ASR encoder expects 16kHz audio, got {sample_rate}"
             )
-        inputs = self.processor.apply_transcription_request(
-            audio=[np.asarray(audio, dtype=np.float32) for audio in audios],
-            language=[self.config.language] * len(audios) if self.config.language else None,
+        features, output_lengths = audio_encoder.encode_audio_features_batch(
+            self.model,
+            self.processor,
+            audios,
+            device=self.device,
+            dtype=self.torch_dtype,
+            language=self.config.language,
+            stage_label="encoder_features",
         )
-        moved: dict[str, Any] = {}
-        for key, value in inputs.items():
-            if not torch.is_tensor(value):
-                moved[key] = value
-            elif key == "input_features":
-                moved[key] = value.to(device=self.device, dtype=self.torch_dtype)
-            else:
-                moved[key] = value.to(device=self.device)
-
-        input_lengths = moved["input_features_mask"].sum(dim=1)
-        output_lengths = qwen3_asr_audio_output_lengths(input_lengths).detach().cpu().tolist()
-        with torch.inference_mode():
-            audio_features = self.model.get_audio_features(
-                input_features=moved["input_features"],
-                input_features_mask=moved["input_features_mask"],
-            ).pooler_output
-            hidden = audio_features.detach().float().cpu().numpy()
-
-        expected_frames = sum(int(length) for length in output_lengths)
-        if expected_frames != int(hidden.shape[0]):
-            raise RuntimeError(
-                "Qwen3-ASR encoder output frame count mismatch: "
-                f"expected={expected_frames} actual={int(hidden.shape[0])}"
-            )
-        result: list[np.ndarray] = []
-        offset = 0
-        for length in output_lengths:
-            length_int = int(length)
-            result.append(np.asarray(hidden[offset : offset + length_int], dtype=np.float32))
-            offset += length_int
-        return result
+        return audio_encoder.split_encoded_features_numpy(features, output_lengths)
 
     def close(self) -> None:
+        import gc
+
         import torch
 
         self.model = None
         self.processor = None
+        gc.collect()
         if self.device.type == "cuda":
             torch.cuda.empty_cache()

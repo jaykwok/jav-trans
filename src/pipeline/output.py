@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from core.job_context import JobContext
+
+
+def resolve_jobs_temp_root(project_root: Path) -> Path:
+    """Resolve the ephemeral per-job working directory root (default ``tmp/jobs``)."""
+    raw = os.getenv("JOB_TEMP_DIR", "").strip()
+    path = Path(raw).expanduser() if raw else Path("tmp") / "jobs"
+    if not path.is_absolute():
+        path = project_root / path
+    return path.resolve()
 
 
 def resolve_output_dir_for_ctx(

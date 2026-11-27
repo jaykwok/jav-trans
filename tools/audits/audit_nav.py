@@ -7,11 +7,15 @@ import json
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
 from typing import Any, Mapping
 
+if str(_REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from tools._common import PROJECT_ROOT, read_json  # noqa: E402
+
 AUDIT_ROOT = PROJECT_ROOT / "dev" / "audits"
 AUDIT_RM_ROOT = PROJECT_ROOT / "dev" / "rm" / "audit-deletions"
 AUDIT_SERVER_COMMAND = "tools/audits/serve_audits.ps1"
@@ -73,10 +77,6 @@ def rel_url(path: Path, *, from_dir: Path) -> str:
         return path.resolve().relative_to(from_dir.resolve()).as_posix()
     except ValueError:
         return path.as_posix()
-
-
-def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _summary_for(index_path: Path) -> Mapping[str, Any]:
@@ -708,10 +708,10 @@ function setStatus(text) {{
   statusBox.textContent = text || "";
 }}
 function deleteCommand(href) {{
-  return `PYTHONIOENCODING=utf-8 UV_CACHE_DIR=dev/temp/uv-cache uv run python tools/audits/audit_nav.py delete --href "${{href.replaceAll('"', '\\"')}}"`;
+  return `PYTHONIOENCODING=utf-8 UV_CACHE_DIR=cache/uv uv run python tools/audits/audit_nav.py delete --href "${{href.replaceAll('"', '\\"')}}"`;
 }}
 function unregisterCommand(href) {{
-  return `PYTHONIOENCODING=utf-8 UV_CACHE_DIR=dev/temp/uv-cache uv run python tools/audits/audit_nav.py unregister --href "${{href.replaceAll('"', '\\"')}}"`;
+  return `PYTHONIOENCODING=utf-8 UV_CACHE_DIR=cache/uv uv run python tools/audits/audit_nav.py unregister --href "${{href.replaceAll('"', '\\"')}}"`;
 }}
 async function copyText(text) {{
   try {{

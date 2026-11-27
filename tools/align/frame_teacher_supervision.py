@@ -7,23 +7,18 @@ occupancy/boundary hint while canonical full-clip CTC remains the text loss.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import numpy as np
 
 from asr.alignment import ENCODER_FRAME_S, is_acoustic_char
+from tools._common import read_jsonl as _read_jsonl
 
 
 IGNORE_LABEL = -1
 BLANK_LABEL = 0
 SPEECH_LABEL = 1
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    with path.open(encoding="utf-8-sig") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
 
 
 def _lexical(value: str) -> bool:

@@ -33,15 +33,28 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-import unicodedata
+import math
+import re
 
-# Kana that carry no lexical content standing alone. Deliberately does NOT
-# include the consonant rows - see the module docstring for what that cost.
-_CORE_CHARS = set(
+# 1:1 Katakana (ァ..ヶ, U+30A1..U+30F6) -> Hiragana (ぁ..ゖ, U+3041..U+3096).
+# Normalizing once before allow-list and morpheme checks ensures katakana
+# laughter/replies (`ハハハ`, `フフッ`, `ハイ`, `イイ`, `ウン`) are protected
+# and katakana vocalisations (`チュッ`, `ペロペロ`, `ジュル`) decompose identically.
+_KATAKANA_TO_HIRAGANA = str.maketrans(
+    {code: code - 0x60 for code in range(0x30A1, 0x30F7)}
+)
+
+
+def _to_hiragana(text: str) -> str:
+    return text.translate(_KATAKANA_TO_HIRAGANA)
+
+
+# Kana that carry no lexical content standing alone (normalized to hiragana).
+# Deliberately does NOT include the consonant rows - see the module docstring
+# for what that cost.
+_CORE_CHARS = frozenset(
     "あぁいぃうぅえぇおぉっん"
     "はひふへほ"  # panting: はぁ, ふぅ, へぇ - `はい`/`へえ` are in _PROTECTED
-    "アァイィウゥエェオォッン"
-    "ハヒフヘホ"
     "ー〜～"
 )
 
@@ -50,7 +63,7 @@ _CORE_CHARS = set(
 # stray kana to swallow a word.
 _VOCAL_MORPHEMES = (
     "ちゅぱ", "ちゅる", "ちゅぷ", "ぐちゅ", "ぴちゃ", "じゅる", "ぬぷ",
-    "ちゅ", "れろ", "ぺろ", "んぐ", "んむ", "ちゅっ", "ずず", "じゅ",
+    "ちゅ", "れろ", "ぺろ", "んぐ", "んむ", "ずず", "じゅ",
 )
 
 # Both the ASCII and the full-width forms. This filter runs BEFORE the render
@@ -60,7 +73,9 @@ _VOCAL_MORPHEMES = (
 # The trap is that the finished SRT barely shows it - measured on the rendered
 # file the two sets differ by 5 cues, because by then the ellipses are already
 # `…`. The gap only exists at the point where the filter actually runs.
-_DECORATION = set("、。！？!?…‥・「」『』（）()♪ 　　" + ".,-~\"'`;:")
+_DECORATION = frozenset(
+    "、。！？!?…‥・「」『』（）()“”‘’【】《》〈〉♪ 　" + ".,-~\"'`;:"
+)
 
 # Short utterances built only from the above that are nevertheless real speech.
 # Explicit, because nothing orthographic separates them from a moan: `うん` and
@@ -86,13 +101,36 @@ _PROTECTED = frozenset(
         "ええと", "えっと", "えーと", "うーんと",
         "いい", "いいー", "おい", "おーい", "おう",
         "ふーん", "ふうん", "へぇ", "へえ",
-        "ふふ", "ふふっ", "ふふふ", "ふふふふ", "へへ", "へへっ",
-        "ほほ", "はは", "ははっ", "あはは", "うふふ", "えへへ",
+        "ふふ", "ふふっ", "ふふふ", "ふふふふ",
+        "へへ", "へへっ", "へへへ",
+        "ほほ", "ほほほ",
+        "はは", "ははっ", "ははは", "はははは",
+        "あはは", "うふふ", "えへへ",
     }
 )
 
 _MORPHEMES_LONGEST_FIRST = tuple(
     sorted(_VOCAL_MORPHEMES, key=len, reverse=True)
+)
+
+# Atomic possessive longest-first match: semantically identical to the greedy
+# prefix loop, runs in C, and cannot backtrack exponentially on overlapping
+# prefixes such as `んぐちゅ`.
+_VOCAL_DECOMPOSITION_RE = re.compile(
+    r"(?>(?:"
+    + "|".join(re.escape(morpheme) for morpheme in _MORPHEMES_LONGEST_FIRST)
+    + r"|["
+    + re.escape("".join(sorted(_CORE_CHARS)))
+    + r"]))++"
+)
+
+# ASCII/full-width Latin letters, ASCII/full-width digits, and CJK Unified
+# (BMP + Ext A + Ext B..I) and Compatibility Ideographs.
+_LEXICAL_CONTENT_RE = re.compile(
+    r"[A-Za-z0-9"
+    r"\uff10-\uff19\uff21-\uff3a\uff41-\uff5a"
+    r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"\U00020000-\U000323af]"
 )
 
 
@@ -110,9 +148,10 @@ def _is_protected(fragment: str) -> bool:
     grunt and a truncated `イッ(く)` have no lexical boundary between them, and
     the acoustic verdict is the right instrument for those, not this list.
     """
-    if fragment in _PROTECTED:
+    normalized = _to_hiragana(fragment)
+    if normalized in _PROTECTED:
         return True
-    return fragment.endswith("っ") and fragment[:-1] in _PROTECTED
+    return normalized.endswith("っ") and normalized[:-1] in _PROTECTED
 
 
 def _strip_decoration(text: str) -> str:
@@ -136,31 +175,12 @@ def is_decoration_only(text: str) -> bool:
 
 
 def _carries_lexical_content(text: str) -> bool:
-    """Kanji, latin or digits settle it immediately, without decomposition."""
-    for ch in text:
-        if ch.isdigit() or (ch.isascii() and ch.isalpha()):
-            return True
-        if "CJK UNIFIED" in unicodedata.name(ch, ""):
-            return True
-    return False
+    """Kanji, latin (ASCII or full-width) or digits settle it immediately."""
+    return bool(_LEXICAL_CONTENT_RE.search(text))
 
 
 def _decomposes_into_vocalisation(body: str) -> bool:
-    index = 0
-    length = len(body)
-    while index < length:
-        for morpheme in _MORPHEMES_LONGEST_FIRST:
-            if body.startswith(morpheme, index):
-                index += len(morpheme)
-                break
-        else:
-            if body[index] in _CORE_CHARS:
-                index += 1
-            else:
-                # A letter neither the core nor the noise list accounts for.
-                # Something was said here.
-                return False
-    return True
+    return bool(_VOCAL_DECOMPOSITION_RE.fullmatch(_to_hiragana(body)))
 
 
 def _indexed_parts(text: str) -> list[tuple[int, int, str]]:
@@ -170,10 +190,11 @@ def _indexed_parts(text: str) -> list[tuple[int, int, str]]:
     of a cue carries its own measured time, so a character range is also a time
     range. `_parts` is this without the bookkeeping.
     """
+    raw = str(text or "")
     parts: list[tuple[int, int, str]] = []
     current: list[str] = []
     begin = 0
-    for index, ch in enumerate(str(text or "")):
+    for index, ch in enumerate(raw):
         if ch in _DECORATION or ch.isspace():
             if current:
                 parts.append((begin, index, "".join(current)))
@@ -183,12 +204,48 @@ def _indexed_parts(text: str) -> list[tuple[int, int, str]]:
                 begin = index
             current.append(ch)
     if current:
-        parts.append((begin, len(str(text or "")), "".join(current)))
+        parts.append((begin, len(raw), "".join(current)))
     return parts
 
 
 def _parts(text: str) -> list[str]:
     return [body for _, _, body in _indexed_parts(text)]
+
+
+@dataclass(frozen=True, slots=True)
+class _CueTextProfile:
+    """Single-pass text classification reused across run and acoustic passes."""
+
+    body: str
+    protected: bool
+    lexical: bool
+    vocal_text: bool
+
+
+def _analyze_cue_text(text: str) -> _CueTextProfile:
+    raw = str(text or "")
+    body = _strip_decoration(raw)
+    if not body:
+        return _CueTextProfile(
+            body="", protected=False, lexical=False, vocal_text=False
+        )
+    # `あ、うん` still contains the reply, so the allow-list is consulted on
+    # parts as well as on the whole (skipped when no decoration split exists).
+    protected = _is_protected(body) or (
+        len(body) != len(raw) and any(_is_protected(part) for part in _parts(raw))
+    )
+    if protected:
+        return _CueTextProfile(
+            body=body, protected=True, lexical=False, vocal_text=False
+        )
+    lexical = _carries_lexical_content(body)
+    vocal_text = False if lexical else _decomposes_into_vocalisation(body)
+    return _CueTextProfile(
+        body=body,
+        protected=False,
+        lexical=lexical,
+        vocal_text=vocal_text,
+    )
 
 
 def is_non_semantic_vocalisation(text: str) -> bool:
@@ -197,16 +254,7 @@ def is_non_semantic_vocalisation(text: str) -> bool:
     Empty text is not vocalisation - it is nothing, and what an empty cue means
     is the caller's decision, not this module's.
     """
-    body = _strip_decoration(text)
-    if not body:
-        return False
-    if _is_protected(body) or _carries_lexical_content(body):
-        return False
-    # `あ、うん` still contains the reply, so the allow-list is consulted on the
-    # parts as well as on the whole.
-    if any(_is_protected(part) for part in _parts(text)):
-        return False
-    return _decomposes_into_vocalisation(body)
+    return _analyze_cue_text(text).vocal_text
 
 
 @dataclass(frozen=True)
@@ -271,8 +319,8 @@ def _diluted_vocalisation(acoustics: CueAcoustics, *, speech_max: float, vocalis
     )
 
 
-def classify_cue(
-    text: str,
+def _classify_cue_profile(
+    profile: _CueTextProfile,
     acoustics: CueAcoustics | None,
     *,
     vocal_speech_max: float = 0.10,
@@ -281,39 +329,16 @@ def classify_cue(
     kana_vocalisation_min: float = 0.60,
     vocal_text_speech_min: float = 0.30,
 ) -> CueVerdict:
-    """The acoustic half of the verdict, for one cue on its own.
-
-    **Additive, not gating.** This only ever ADDS a reason to drop; a cue the
-    text rule already removes is not re-examined here. Measured on eight films,
-    requiring acoustic confirmation before honouring the text rule put 457 cues
-    back on screen, and sampling them showed `あっ、あっ、あっ`,
-    `あんっ!あんっ!` - plain moaning that the acoustics simply failed to
-    confirm. Text evidence for a run of pure-vocalisation cues is already strong;
-    the acoustics are here to reach what the text cannot see, which is the
-    isolated cue and the onomatopoeia no allow-list spells.
-
-    `protected` wins over everything, including the acoustics. Nothing in the
-    sound separates `ふふふ` from a moan or `いい` from a sigh - that is why the
-    allow-list exists - and an early version of this evaluation omitted the check
-    and duly deleted both.
-
-    Returning `keep` with a reason rather than a bare False: the marked cases are
-    the ones a human should look at, and a verdict nobody can read is a detector
-    running for nothing.
-    """
-    body = _strip_decoration(text)
-    if not body:
+    if not profile.body:
         return CueVerdict(False, REASON_KEPT)
-    if _is_protected(body) or any(_is_protected(part) for part in _parts(text)):
+    if profile.protected:
         return CueVerdict(False, REASON_PROTECTED)
     if acoustics is None:
         # A v1 head, or a cue with no acoustic extent. The caller falls back to
         # the text rule alone, which is the shipped behaviour.
         return CueVerdict(False, REASON_NO_ACOUSTICS)
 
-    vocal_text = is_non_semantic_vocalisation(text)
-    lexical = _carries_lexical_content(body)
-    if vocal_text:
+    if profile.vocal_text:
         if (
             acoustics.speech < vocal_speech_max
             and acoustics.speech_max_run_s < vocal_speech_run_max_s
@@ -324,7 +349,7 @@ def classify_cue(
             # does not protect. Kept and marked; never dropped on text alone.
             return CueVerdict(False, REASON_VOCAL_TEXT_SPEECH_AUDIO)
         return CueVerdict(False, REASON_KEPT)
-    if not lexical:
+    if not profile.lexical:
         # Kana that would not decompose - the onomatopoeia the allow-list misses.
         if (
             acoustics.speech < kana_speech_max
@@ -355,6 +380,47 @@ def classify_cue(
     return CueVerdict(False, REASON_KEPT)
 
 
+def classify_cue(
+    text: str,
+    acoustics: CueAcoustics | None,
+    *,
+    vocal_speech_max: float = 0.10,
+    vocal_speech_run_max_s: float = 0.30,
+    kana_speech_max: float = 0.05,
+    kana_vocalisation_min: float = 0.60,
+    vocal_text_speech_min: float = 0.30,
+) -> CueVerdict:
+    """The acoustic half of the verdict, for one cue on its own.
+
+    **Additive, not gating.** This only ever ADDS a reason to drop; a cue the
+    text rule already removes is not re-examined here. Measured on eight films,
+    requiring acoustic confirmation before honouring the text rule put 457 cues
+    back on screen, and sampling them showed `あっ、あっ、あっ`,
+    `あんっ!あんっ!` - plain moaning that the acoustics simply failed to
+    confirm. Text evidence for a run of pure-vocalisation cues is already strong;
+    the acoustics are here to reach what the text cannot see, which is the
+    isolated cue and the onomatopoeia no allow-list spells.
+
+    `protected` wins over everything, including the acoustics. Nothing in the
+    sound separates `ふふふ` from a moan or `いい` from a sigh - that is why the
+    allow-list exists - and an early version of this evaluation omitted the check
+    and duly deleted both.
+
+    Returning `keep` with a reason rather than a bare False: the marked cases are
+    the ones a human should look at, and a verdict nobody can read is a detector
+    running for nothing.
+    """
+    return _classify_cue_profile(
+        _analyze_cue_text(text),
+        acoustics,
+        vocal_speech_max=vocal_speech_max,
+        vocal_speech_run_max_s=vocal_speech_run_max_s,
+        kana_speech_max=kana_speech_max,
+        kana_vocalisation_min=kana_vocalisation_min,
+        vocal_text_speech_min=vocal_text_speech_min,
+    )
+
+
 def block_text(block: dict) -> str:
     """The Japanese text of a cue, under whichever key currently holds it.
 
@@ -376,7 +442,7 @@ def _safe_seconds(primary, fallback) -> float:
             parsed = float(value)
         except (TypeError, ValueError):
             continue
-        if parsed == parsed:  # not NaN
+        if math.isfinite(parsed):
             return parsed
     return 0.0
 
@@ -610,21 +676,49 @@ def _apply_split(block: dict, split: CueSplit) -> dict:
     updated = dict(block)
     texts = _word_texts(block) or []
     words = list(block.get("words") or [])
-    prefix, suffix = len(split.removed_prefix), len(split.removed_suffix)
+    keep_begin = len(split.removed_prefix)
     if texts:
         total = len(block_text(block))
+        keep_end = total - len(split.removed_suffix)
         position = 0
-        kept_words = []
-        for word, text in zip(words, texts):
-            head, tail = position, position + len(text)
-            position = tail
-            if tail <= prefix or head >= total - suffix:
-                continue
-            kept_words.append(word)
+        kept_words: list[dict] = []
+        if keep_begin < keep_end:
+            for word, text in zip(words, texts):
+                head, tail = position, position + len(text)
+                position = tail
+                if tail <= keep_begin or head >= keep_end:
+                    continue
+                if head >= keep_begin and tail <= keep_end:
+                    kept_words.append(dict(word))
+                    continue
+                # A multi-character word straddles the cut boundary: clip its
+                # text to the surviving slice and clamp its span to the kept
+                # window so `words` continues to reconstruct `split.text`.
+                slice_start = max(0, keep_begin - head)
+                slice_end = min(len(text), keep_end - head)
+                clipped_text = text[slice_start:slice_end]
+                if not clipped_text:
+                    continue
+                clipped = dict(word)
+                clipped["word"] = clipped_text
+                word_start = _safe_seconds(word.get("start"), split.start_s)
+                word_end = _safe_seconds(word.get("end"), split.end_s)
+                clamped_start = min(max(word_start, split.start_s), split.end_s)
+                clamped_end = min(max(word_end, clamped_start), split.end_s)
+                clipped["start"] = clamped_start
+                clipped["end"] = clamped_end
+                kept_words.append(clipped)
         updated["words"] = kept_words
     for key in ("ja_text", "text"):
         if str(block.get(key) or "").strip():
             updated[key] = split.text
+    # Keep character-count metadata aligned with the trimmed text so downstream
+    # `_finalize_layout_fields` does not preserve the pre-split count or flag a
+    # false `source_char_violation`, and drop pre-split acoustic frame shares.
+    updated["source_char_count"] = sum(
+        1 for ch in split.text if not ch.isspace()
+    )
+    updated.pop("acoustic_classes", None)
 
     old_start = _safe_seconds(block.get("acoustic_start"), block.get("start"))
     old_end = _safe_seconds(block.get("acoustic_end"), block.get("end"))
@@ -674,14 +768,23 @@ def block_acoustics(block: dict) -> CueAcoustics | None:
     if not isinstance(shares, dict):
         return None
     try:
-        return CueAcoustics(
-            silence=float(shares["silence"]),
-            vocalisation=float(shares["vocalisation"]),
-            speech=float(shares["speech"]),
-            speech_max_run_s=float(shares.get("speech_max_run_s") or 0.0),
-        )
+        silence = float(shares["silence"])
+        vocalisation = float(shares["vocalisation"])
+        speech = float(shares["speech"])
+        speech_max_run_s = float(shares.get("speech_max_run_s") or 0.0)
     except (KeyError, TypeError, ValueError):
         return None
+    if not all(
+        math.isfinite(value)
+        for value in (silence, vocalisation, speech, speech_max_run_s)
+    ):
+        return None
+    return CueAcoustics(
+        silence=silence,
+        vocalisation=vocalisation,
+        speech=speech,
+        speech_max_run_s=speech_max_run_s,
+    )
 
 
 def vocalisation_run_boundaries(text: str, min_run: int) -> set[int]:
@@ -692,6 +795,9 @@ def vocalisation_run_boundaries(text: str, min_run: int) -> set[int]:
     to the filter. Protected responses and isolated reactions break a run, and
     the caller still has to find an exact measured word edge at each offset.
     """
+    min_run_threshold = int(min_run)
+    if min_run_threshold < 1:
+        return set()
     parts = _indexed_parts(text)
     boundaries: set[int] = set()
     begin: int | None = None
@@ -700,7 +806,7 @@ def vocalisation_run_boundaries(text: str, min_run: int) -> set[int]:
         if vocal and begin is None:
             begin = index
         elif not vocal and begin is not None:
-            if index - begin >= max(2, min_run):
+            if index - begin >= max(2, min_run_threshold):
                 boundaries.update(parts[part][0] for part in range(begin, index))
                 if index < len(parts):
                     boundaries.add(parts[index][0])
@@ -730,12 +836,12 @@ def drop_vocalisation_runs(
     lexicon: it is one rule rather than a growing list of special cases, and it
     degrades safely, because a gap in the word list simply breaks the run.
 
-    Returns the surviving blocks and a diagnostics dict. Nothing is filtered when
-    `min_run` is below 1.
+    Returns the surviving blocks and a diagnostics dict. Text run filtering is
+    skipped when `min_run` is below 1.
     """
-    flags = [
-        bool(is_non_semantic_vocalisation(block_text(block))) for block in blocks
-    ]
+    min_run_threshold = int(min_run)
+    profiles = [_analyze_cue_text(block_text(block)) for block in blocks]
+    flags = [profile.vocal_text for profile in profiles]
     runs: list[tuple[int, int]] = []
     start: int | None = None
     for index, flagged in enumerate(flags):
@@ -749,65 +855,65 @@ def drop_vocalisation_runs(
 
     doomed: set[int] = set()
     dropped_runs = 0
-    for begin, end in runs:
-        if end - begin >= max(1, int(min_run)):
-            doomed.update(range(begin, end))
-            dropped_runs += 1
+    if min_run_threshold >= 1:
+        for begin, end in runs:
+            if end - begin >= min_run_threshold:
+                doomed.update(range(begin, end))
+                dropped_runs += 1
 
     # The acoustic half, added to the text rule rather than gating it. Every cue
     # the run rule already condemned keeps its verdict; this only reaches the
     # ones text cannot see - the isolated moan and the onomatopoeia no
     # allow-list spells.
-    reasons: dict[int, str] = {index: REASON_TEXT_RUN for index in doomed}
     marks: dict[int, str] = {}
     splits: dict[int, CueSplit] = {}
     acoustic_verdicts: Counter[str] = Counter()
     acoustic_dropped = 0
     acoustics_seen = 0
     mixed_cues = 0
-    for index, block in enumerate(blocks):
-        if not use_acoustics or index in doomed:
-            continue
-        acoustics = block_acoustics(block)
-        if acoustics is not None:
-            acoustics_seen += 1
-        verdict = classify_cue(
-            block_text(block),
-            acoustics,
-            vocal_speech_max=vocal_speech_max,
-            vocal_speech_run_max_s=vocal_speech_run_max_s,
-            kana_speech_max=kana_speech_max,
-            kana_vocalisation_min=kana_vocalisation_min,
-            vocal_text_speech_min=vocal_text_speech_min,
-        )
-        acoustic_verdicts[verdict.reason] += 1
-        if verdict.drop:
-            doomed.add(index)
-            reasons[index] = verdict.reason
-            acoustic_dropped += 1
-            continue
-        if verdict.reason in _MARKED_REASONS:
-            marks[index] = verdict.reason
-        if not mixed_cue_split_point(
-            acoustics,
-            _safe_seconds(block.get("acoustic_start"), block.get("start")),
-            _safe_seconds(block.get("acoustic_end"), block.get("end")),
-        ):
-            continue
-        mixed_cues += 1
-        if not split_mixed_cues:
-            continue
-        split = split_mixed_cue(
-            block,
-            acoustic_reader,
-            vocal_speech_max=vocal_speech_max,
-            vocal_speech_run_max_s=vocal_speech_run_max_s,
-            kana_speech_max=kana_speech_max,
-            kana_vocalisation_min=kana_vocalisation_min,
-            vocal_text_speech_min=vocal_text_speech_min,
-        )
-        if split is not None:
-            splits[index] = split
+    if use_acoustics:
+        for index, block in enumerate(blocks):
+            if index in doomed:
+                continue
+            acoustics = block_acoustics(block)
+            if acoustics is not None:
+                acoustics_seen += 1
+            verdict = _classify_cue_profile(
+                profiles[index],
+                acoustics,
+                vocal_speech_max=vocal_speech_max,
+                vocal_speech_run_max_s=vocal_speech_run_max_s,
+                kana_speech_max=kana_speech_max,
+                kana_vocalisation_min=kana_vocalisation_min,
+                vocal_text_speech_min=vocal_text_speech_min,
+            )
+            acoustic_verdicts[verdict.reason] += 1
+            if verdict.drop:
+                doomed.add(index)
+                acoustic_dropped += 1
+                continue
+            if verdict.reason in _MARKED_REASONS:
+                marks[index] = verdict.reason
+            if not mixed_cue_split_point(
+                acoustics,
+                _safe_seconds(block.get("acoustic_start"), block.get("start")),
+                _safe_seconds(block.get("acoustic_end"), block.get("end")),
+            ):
+                continue
+            mixed_cues += 1
+            if not split_mixed_cues:
+                continue
+            split = split_mixed_cue(
+                block,
+                acoustic_reader,
+                vocal_speech_max=vocal_speech_max,
+                vocal_speech_run_max_s=vocal_speech_run_max_s,
+                kana_speech_max=kana_speech_max,
+                kana_vocalisation_min=kana_vocalisation_min,
+                vocal_text_speech_min=vocal_text_speech_min,
+            )
+            if split is not None:
+                splits[index] = split
 
     # A cue that neighboured a dropped run must stop claiming it continues into
     # or out of one. The flags reach the translation prompt as `cont_prev` /
@@ -861,7 +967,7 @@ def drop_vocalisation_runs(
             for index, flagged in enumerate(flags)
             if flagged and index not in doomed
         ),
-        "vocalisation_min_run": max(1, int(min_run)),
+        "vocalisation_min_run": min_run_threshold,
         "vocalisation_acoustics_available": acoustics_seen,
         "vocalisation_cues_dropped_by_acoustics": acoustic_dropped,
         "vocalisation_acoustic_verdicts": dict(acoustic_verdicts),

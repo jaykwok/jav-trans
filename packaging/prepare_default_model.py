@@ -29,6 +29,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from asr.backends.qwen import qwen_asr_repo_id  # noqa: E402
+from core.config import DEFAULT_SETTINGS  # noqa: E402
 from utils.model_paths import (  # noqa: E402
     require_commit_sha, resolve_model_spec, revision_model_dir, verify_model_revision,
 )
@@ -36,10 +38,12 @@ from utils.model_paths import (  # noqa: E402
 PINS_PATH = Path(__file__).resolve().parent / "model-pins.json"
 PINS_SCHEMA = "release_model_pins_v1"
 
+DEFAULT_ASR_REPO_ID = qwen_asr_repo_id(DEFAULT_SETTINGS["ASR_BACKEND"])
+
 REQUIRED_MODEL_SPECS = [
     {
         "label": "bundled default 1.7B ASR / SpeechBoundary model",
-        "repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        "repo_id": DEFAULT_ASR_REPO_ID,
     },
 ]
 

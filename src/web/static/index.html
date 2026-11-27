@@ -30,27 +30,26 @@
 
     <div class="aside-scroll">
 
-      <!-- Preset chips -->
+      <!-- Video & subtitle output -->
       <div class="panel">
-        <div class="panel-title">✨ 预设</div>
-        <div class="preset-chips">
-          <button class="preset-chip" data-preset="standard">标准</button>
-          <button class="preset-chip preset-chip-custom" data-preset="custom">自定义</button>
-        </div>
-      </div>
-
-      <!-- File picker -->
-      <div class="panel">
-        <div class="panel-title">📁 选择视频</div>
+        <div class="panel-title">📁 视频与字幕</div>
         <div class="drop-zone" id="drop-zone">
           <img class="drop-icon" src="/assets/images/icon.png" alt="" aria-hidden="true">
           <p><strong>点击选择（支持多选）</strong>或拖拽视频文件</p>
-          <p class="drop-exts">mp4 / mkv / avi / ts / wmv</p>
+          <p class="drop-exts">mp4 / mkv / avi / ts / wmv / m2ts</p>
         </div>
         <div class="folder-row">
           <button class="btn-sm btn-outline" id="btn-add-folder" type="button" title="选择文件夹，自动扫描其中所有视频文件">📁
             添加文件夹</button>
         </div>
+        <label class="field" style="margin-top:10px">
+          <span>字幕输出</span>
+          <select id="r-mode">
+            <option value="zh" selected>简体中文</option>
+            <option value="bilingual">双语（日文 + 简体中文）</option>
+            <option value="ja_only">仅日文（不翻译）</option>
+          </select>
+        </label>
         <label class="field" style="margin-top:10px">
           <span>输出目录（留空则保存到视频同目录）</span>
           <input type="text" id="f-output-dir" placeholder="例：D:\subs\output">
@@ -104,31 +103,6 @@
               <span class="proxy-test-result" id="proxy-test-result"></span>
             </div>
             <p class="field-hint">填好地址端口并打开开关即可生效；关闭开关可随时禁用，无需清空字段。点「测试连接」验证能否访问 HuggingFace。</p>
-          </div>
-        </details>
-      </div>
-
-      <!-- Tuning (collapsible, custom mode only) -->
-      <div class="panel" id="section-tuning">
-        <details class="panel-collapsible" id="panel-tuning">
-          <summary class="panel-title">⚙️ 参数调优</summary>
-          <div class="form-grid">
-            <label class="field">
-              <span>字幕模式</span>
-              <select id="r-mode"></select>
-              <span class="field-hint">选项名称会随“翻译设置 → 目标语言”自动更新。</span>
-            </label>
-            <div class="toggle-row">
-              <span>不翻译（仅日文字幕）</span>
-              <label class="toggle"><input type="checkbox" id="r-skip-translation"><span class="slider"></span></label>
-            </div>
-            <label class="field">
-              <span>并行翻译 Worker 数</span>
-              <input type="number" id="t-translation-max-workers" value="4" min="1" max="64">
-              <span class="field-hint">只影响并发请求数，不影响成本；调高通常更快，遇到限速请调低。</span>
-            </label>
-            <button class="btn btn-outline" id="btn-save-custom" type="button">保存自定义任务模板</button>
-            <p class="field-hint">自定义任务模板只保存在本机浏览器中，不写入 <code>config/config.json</code>；翻译设置请使用下方的独立保存按钮。</p>
           </div>
         </details>
       </div>
@@ -187,13 +161,17 @@
                 </select>
                 <span class="field-hint">决定全片翻译强度与成本（成本主要来自思维链输出）；复译可疑字幕时不降档（none 除外）。其他兼容 API 按各自规则执行。</span>
               </label>
+
+              <label class="field">
+                <span>并发请求数</span>
+                <input type="number" id="t-translation-max-workers" value="4" min="1" max="64">
+                <span class="field-hint">只影响并发请求数，不影响成本；调高通常更快，遇到限速请调低。</span>
+              </label>
             </div>
 
             <div id="llamacpp-backend-fields">
               <p class="field-hint">
-                启用后若 <code>models/runtime/llama-cpp/</code> 不存在，会自动下载匹配当前 CUDA 主版本的 <code>llama-server</code>（约 226MB，复用内置 CUDA 运行库并自动探测 GPU）。<br>
-                固定使用 Hy-MT3-7B Q4_K_M，首次翻译自动下载模型约 4.8GB（建议开代理），期间临时释放 ASR 显存，用完自动重载。<br>
-                与 API 共用 JSON 批翻译、术语表与局部复译流程，本地默认按 32 条/批携带邻句上下文运行，并按显存自动适配上下文与并发槽位。
+                首次使用自动下载本地翻译引擎与 Hy-MT3-7B 模型（约 5GB，建议开启代理），自动适配显卡显存。
               </p>
             </div>
 

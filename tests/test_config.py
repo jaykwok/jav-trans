@@ -453,3 +453,141 @@ class TestProxyExemptsLoopback:
         config.apply_network_proxy_environment("")
         assert "NO_PROXY" not in os.environ
         assert "HTTP_PROXY" not in os.environ
+
+
+def test_update_config_file_uses_stringify_and_rejects_non_scalars(tmp_path):
+    import pytest
+
+    cfg_path = tmp_path / "config" / "config.json"
+    config.update_config_file(
+        {"AUDIO_DYNAUDNORM": False, "RUN_LOG_ENABLED": True, "PROXY_PORT": 7890, "EMPTY": None},
+        path=cfg_path,
+    )
+    saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert saved == {
+        "AUDIO_DYNAUDNORM": "0",
+        "RUN_LOG_ENABLED": "1",
+        "PROXY_PORT": "7890",
+        "EMPTY": "",
+    }
+
+    with pytest.raises(ValueError, match="non-scalar"):
+        config.update_config_file({"BAD_LIST": [1, 2, 3]}, path=cfg_path)
+    with pytest.raises(ValueError, match="non-scalar"):
+        config.update_config_file({"BAD_DICT": {"a": 1}}, path=cfg_path)
+    # Existing file stays untouched after rejected non-scalar writes.
+    assert json.loads(cfg_path.read_text(encoding="utf-8")) == saved
+
+
+def test_network_proxy_url_from_env_validates_host_port_and_ipv6(monkeypatch):
+    from core import typed_config
+
+    typed_config.clear_configuration_problems()
+    try:
+        monkeypatch.setenv("PROXY_PROTOCOL", "http")
+        # Bare IPv6 gets bracketed automatically.
+        monkeypatch.setenv("PROXY_HOST", "::1")
+        monkeypatch.setenv("PROXY_PORT", "7890")
+        assert config.network_proxy_url_from_env() == "http://[::1]:7890"
+        assert typed_config.configuration_problems() == []
+
+        # Bracketed IPv6 and userinfo@IPv6 also work cleanly.
+        monkeypatch.setenv("PROXY_HOST", "[2001:db8::1]")
+        assert config.network_proxy_url_from_env() == "http://[2001:db8::1]:7890"
+        monkeypatch.setenv("PROXY_HOST", "user:pass@::1")
+        assert config.network_proxy_url_from_env() == "http://user:pass@[::1]:7890"
+
+        # Invalid ports are rejected and recorded.
+        monkeypatch.setenv("PROXY_HOST", "127.0.0.1")
+        for bad_port in ("0", "65536", "-1", "abc", "7890.5"):
+            monkeypatch.setenv("PROXY_PORT", bad_port)
+            assert config.network_proxy_url_from_env() == ""
+            assert any(p.startswith("PROXY_PORT=") for p in typed_config.configuration_problems())
+
+        # Invalid hosts are rejected and recorded (with credentials redacted).
+        monkeypatch.setenv("PROXY_PORT", "7890")
+        for bad_host in (
+            "http://127.0.0.1",
+            "127.0.0.1/path",
+            "127.0.0.1?a=1",
+            "127.0.0.1#frag",
+            "127.0.0.1 8080",
+            "127.0.0.1:7890",
+            "secret:pass@bad/host",
+        ):
+            monkeypatch.setenv("PROXY_HOST", bad_host)
+            assert config.network_proxy_url_from_env() == ""
+            problems = typed_config.configuration_problems()
+            assert any(p.startswith("PROXY_HOST=") for p in problems)
+            assert "secret" not in " ".join(problems)
+
+        # Fixing both clears all proxy problems.
+        monkeypatch.setenv("PROXY_HOST", "127.0.0.1")
+        monkeypatch.setenv("PROXY_PORT", "7890")
+        assert config.network_proxy_url_from_env() == "http://127.0.0.1:7890"
+        assert typed_config.configuration_problems() == []
+    finally:
+        typed_config.clear_configuration_problems()
+
+
+def test_frozen_private_config_normalizes_frozen_path_keys(monkeypatch, tmp_path):
+    private_path = tmp_path / "config" / "config.json"
+    private_path.parent.mkdir(parents=True, exist_ok=True)
+    private_path.write_text(
+        json.dumps({"HF_HOME": "./custom_models", "RUN_LOG_DIR": "./custom_logs"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(config, "CONFIG_PATH", private_path)
+    monkeypatch.setattr(config, "is_frozen", lambda: True)
+    monkeypatch.setattr(config, "DEFAULT_SETTINGS", {"HF_HOME": "./models", "RUN_LOG_DIR": "./logs/jobs"})
+    monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.delenv("RUN_LOG_DIR", raising=False)
+
+    config.load_config()
+
+    assert os.environ["HF_HOME"] == str((tmp_path / "custom_models").resolve())
+    assert os.environ["RUN_LOG_DIR"] == str((tmp_path / "custom_logs").resolve())
+
+
+def test_config_load_error_warning_is_deduplicated_across_repeated_loads(monkeypatch, tmp_path, capsys):
+    bad_path = tmp_path / "config" / "config.json"
+    bad_path.parent.mkdir(parents=True, exist_ok=True)
+    bad_path.write_text("{not-json", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_PATH", bad_path)
+    monkeypatch.setattr(config, "DEFAULT_SETTINGS", {})
+    monkeypatch.setattr(config, "_CONFIG_LOAD_ERROR", "")
+    monkeypatch.setattr(config, "_LAST_REPORTED_CONFIG_LOAD_ERROR", "")
+
+    config.load_config()
+    first_out = capsys.readouterr().out
+    assert "[WARN]" in first_out
+    assert config.config_load_error()
+
+    # Second load with same error must not spam warnings again.
+    config.load_config()
+    second_out = capsys.readouterr().out
+    assert second_out == ""
+    assert config.config_load_error()
+
+
+def test_job_context_flag_and_none_workers(monkeypatch, tmp_path):
+    from core import job_context, typed_config
+
+    typed_config.clear_configuration_problems()
+    assert job_context._flag("", True) is True
+    assert job_context._flag("   ", True) is True
+    assert job_context._flag("0", True) is False
+    assert job_context._flag("invalid", True) is True
+    # _flag uses explicit environ dict, so global typed_config problems stay untouched.
+    assert typed_config.configuration_problems() == []
+
+    monkeypatch.delenv("RUN_LOG_ENABLED", raising=False)
+    ctx = JobContext.from_spec(
+        SimpleNamespace(translation_max_workers=None, run_log_enabled=""),
+        job_id="job-none",
+        job_temp_dir=str(tmp_path),
+        cache_path=str(tmp_path / "cache.jsonl"),
+    )
+    assert ctx.translation_max_workers == 4
+    assert ctx.run_log_enabled is True

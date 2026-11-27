@@ -40,6 +40,7 @@ from llm.errors import (
     RetryableTranslationFormatError,
 )
 from llm.preflight import require_translation_config
+from llm.profiles.json_v3 import TRANSLATION_OUTPUT_SCHEMA
 
 _raise_if_cancelled = transport_util._raise_if_cancelled
 _emit_progress = transport_util._emit_progress
@@ -48,30 +49,7 @@ _get_nested_value = transport_util._get_nested_value
 _is_retryable_api_error = transport_util._is_retryable_api_error
 _stream_interrupted_format_error = transport_util._stream_interrupted_format_error
 _emit_stream_content_progress = transport_util._emit_stream_content_progress
-
-_JSON_OUTPUT_LABEL = "LLM JSON"
-
-# Default structured-output schema when the caller does not pass one. The
-# orchestration layer normally supplies the profile's schema explicitly.
-_DEFAULT_OUTPUT_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "translations": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "id": {"type": "integer"},
-                    "text": {"type": "string"},
-                },
-                "required": ["id", "text"],
-            },
-        },
-    },
-    "required": ["translations"],
-}
+_sanitize_error_text = transport_util._sanitize_error_text
 
 # The async client the current request owns. A ContextVar rather than an
 # argument so `_create_response` keeps its `(request, cancel_event)` shape, and
@@ -160,7 +138,7 @@ def _responses_text_format(
             "type": "json_schema",
             "name": schema_name,
             "strict": True,
-            "schema": schema or _DEFAULT_OUTPUT_SCHEMA,
+            "schema": schema or TRANSLATION_OUTPUT_SCHEMA,
         }
     }
 
@@ -257,7 +235,7 @@ async def _abackoff_sleep(
 ) -> None:
     # asyncio.sleep, not the interruptible thread sleep: cancelling the task has
     # to reach the wait between retries as well as the request itself.
-    delay = transport_util._request_backoff_delay(attempt)
+    delay = transport_util._request_backoff_delay(attempt, exc)
     transport_util._record_api_retry_event(exc, attempt, delay)
     await asyncio.sleep(delay)
     _raise_if_cancelled(cancel_event)
@@ -383,7 +361,13 @@ def _response_error(response) -> tuple[str, str]:
 # mishandled it". Only what has actually been observed on the wire belongs
 # here - a retryable failure misfiled as terminal kills a film that would have
 # recovered. Zhipu/GLM answers `cyber_policy`; add others as they show up.
-_CONTENT_POLICY_ERROR_CODES = frozenset({"cyber_policy"})
+_CONTENT_POLICY_ERROR_CODES = frozenset(
+    {
+        "cyber_policy",
+        "content_policy_violation",
+        "content_filter",
+    }
+)
 
 # The three spellings of the same parameter across OpenAI-compatible endpoints.
 _MAX_TOKENS_PARAM_NAMES = ("max_tokens", "max_output_tokens", "max_completion_tokens")
@@ -429,8 +413,13 @@ _UNSUPPORTED_PARAM_RE = re.compile(
 # property of this batch's prompt, not of the endpoint, and writing it down as
 # an output ceiling under-books every shorter batch for the next 30 days.
 _COMBINED_BUDGET_RE = re.compile(
-    r"(?:input|prompt|context|combined|together with|sum of|plus|total)"
-    r"|输入|上下文|提示词|总和",
+    r"(?:(?:input|prompt)\s*(?:tokens?|length|size)|"
+    r"(?:input|prompt)\s+(?:and|with|\+)\s+(?:output|completion|max_)|"
+    r"context(?:\s*(?:length|window|limit|size|tokens?))?|"
+    r"combined|together with|sum of|\bplus\b|\+|"
+    r"total\s*(?:tokens?|length|context))"
+    r"|(?:(?:输入|提示词)\s*(?:长度|token|数|和|与|加|\+)|"
+    r"上下文(?:长度|窗口|上限|限制)?|总(?:长度|token|计|和))",
     re.IGNORECASE,
 )
 # "The number you sent is too big", without a number attached. Enough to retry
@@ -521,6 +510,28 @@ def _accepted_max_tokens(message: str, sent: int) -> int | None:
     return max(usable) if usable else None
 
 
+def _redact_exception_in_place(exc: Exception) -> None:
+    """Scrub URL credentials and Bearer tokens on an escaping exception."""
+    try:
+        if exc.args:
+            new_args = tuple(
+                _sanitize_error_text(arg) if isinstance(arg, str) else arg
+                for arg in exc.args
+            )
+            if new_args != exc.args:
+                exc.args = new_args
+    except (AttributeError, TypeError):
+        pass
+    msg = getattr(exc, "message", None)
+    if isinstance(msg, str):
+        safe = _sanitize_error_text(msg)
+        if safe != msg:
+            try:
+                exc.message = safe
+            except (AttributeError, TypeError):
+                pass
+
+
 def _provider_error_reason(code: str, message: str, sent: int) -> Exception | None:
     """The terminal/learnable meaning of a provider error, if it has one.
 
@@ -529,19 +540,20 @@ def _provider_error_reason(code: str, message: str, sent: int) -> Exception | No
     opened. Splitting them is how an endpoint that answers 400 before the first
     SSE frame used to bypass every rule below.
     """
-    if code in _CONTENT_POLICY_ERROR_CODES:
+    safe_message = _sanitize_error_text(message)
+    if str(code or "").strip().lower() in _CONTENT_POLICY_ERROR_CODES:
         return ContentPolicyRefusalError(
             "OpenAI Responses API refused this request on content policy "
-            f"(code={code}): {message}"
+            f"(code={code}): {safe_message}"
         )
-    if sent > 0 and _mentions_max_tokens(message):
-        kind = _max_tokens_refusal_kind(message)
+    if sent > 0 and _mentions_max_tokens(safe_message):
+        kind = _max_tokens_refusal_kind(safe_message)
         if kind == "output":
             return MaxTokensRejectedError(
                 f"OpenAI Responses API rejected max_tokens={sent} "
-                f"(code={code}): {message}",
+                f"(code={code}): {safe_message}",
                 sent=sent,
-                limit=_accepted_max_tokens(message, sent),
+                limit=_accepted_max_tokens(safe_message, sent),
             )
         if kind == "request":
             # Retried, never recorded: the ladder can find a budget that fits
@@ -549,7 +561,7 @@ def _provider_error_reason(code: str, message: str, sent: int) -> Exception | No
             # cache is read by every other batch of the film.
             return MaxTokensRejectedError(
                 f"OpenAI Responses API rejected max_tokens={sent} against a "
-                f"combined input+output limit (code={code}): {message}",
+                f"combined input+output limit (code={code}): {safe_message}",
                 sent=sent,
                 learnable=False,
             )
@@ -560,7 +572,7 @@ def _provider_error_reason(code: str, message: str, sent: int) -> Exception | No
             # ones it cannot place are exactly the ones worth collecting.
             return MaxTokensRejectedError(
                 f"OpenAI Responses API rejected max_tokens={sent} without "
-                f"saying the value was too large (code={code}): {message}",
+                f"saying the value was too large (code={code}): {safe_message}",
                 sent=sent,
                 learnable=False,
             )
@@ -730,6 +742,7 @@ def _chat_responses(
                 reason = _provider_error_reason(
                     *_exception_error_fields(exc), effective_max_tokens
                 )
+                _redact_exception_in_place(exc)
                 if reason is not None:
                     raise reason from exc
                 raise
@@ -786,14 +799,23 @@ def _chat_responses(
                         continue
 
                     if event_type == "response.incomplete":
-                        outcome["incomplete_response"] = _response_event_response(event)
+                        incomplete = _response_event_response(event)
+                        outcome["incomplete_response"] = incomplete
+                        _emit_usage(on_usage, _get_nested_value(incomplete, "usage"))
                         continue
 
                     if event_type in {"response.failed", "response.error", "error"}:
                         outcome["failed_error"] = event
+                        failed_resp = _response_event_response(event)
+                        _emit_usage(
+                            on_usage,
+                            _get_nested_value(failed_resp, "usage")
+                            or _get_nested_value(event, "usage"),
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                _redact_exception_in_place(exc)
                 if _is_retryable_api_error(exc):
                     raise _stream_interrupted_format_error(exc) from exc
                 raise
@@ -821,8 +843,9 @@ def _chat_responses(
         )
         if reason is not None:
             raise reason
+        safe_detail = _sanitize_error_text(error_message or str(failed_error))
         raise RetryableTranslationFormatError(
-            f"OpenAI Responses API failed: {error_message or failed_error}"
+            f"OpenAI Responses API failed: {safe_detail}"
         )
 
     if incomplete_response is not None:
@@ -836,7 +859,7 @@ def _chat_responses(
                 limit=effective_max_tokens,
             )
         raise RetryableTranslationFormatError(
-            f"OpenAI Responses API returned incomplete response: {reason or 'unknown'}"
+            f"OpenAI Responses API returned incomplete response: {_sanitize_error_text(reason or 'unknown')}"
         )
 
     refusal_text = str(
@@ -846,7 +869,7 @@ def _chat_responses(
         refusal_text = _extract_response_refusal_text(completed_response)
     if refusal_text:
         raise ContentPolicyRefusalError(
-            f"OpenAI Responses API refused this request: {refusal_text}"
+            f"OpenAI Responses API refused this request: {_sanitize_error_text(refusal_text)}"
         )
 
     final_content_str = "".join(stream_state["final_content"])
@@ -902,6 +925,7 @@ class OpenAICompatBackend(BaseTranslationBackend):
         top_p: float = 0.9,
         max_tokens: int = 65536,
         response_format: dict | None = None,
+        response_schema_name: str = "subtitle_translations",
         reasoning_effort: str | None = None,
         expected_count: int = 0,
         cancel_event=None,
@@ -920,6 +944,7 @@ class OpenAICompatBackend(BaseTranslationBackend):
             on_usage=on_usage,
             cancel_event=cancel_event,
             response_schema=response_format,
+            response_schema_name=response_schema_name,
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,

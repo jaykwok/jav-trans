@@ -2,15 +2,15 @@ import { state } from './state.js';
 import { gpuAlert } from './dom.js';
 import { escHtml, readErrorDetail } from './util.js';
 import { addLog } from './log.js';
+import { coalesce } from './coalesce.js';
 
-// Three states the user has to be able to tell apart: a stop that was asked for
-// (the job badge says 停止中), a stop that is in progress, and a stop that could
-// not be confirmed. The last one pauses GPU dispatch, so it must never be shown
-// as if the machine were merely busy.
 const STATE_LABEL = {
   cleaning: '正在清理 GPU 子进程',
   cleanup_failed: 'GPU 子进程未能停止，已暂停派发新的 GPU 任务',
 };
+
+let retryingCleanup = false;
+let recheckingGpu = false;
 
 function shouldShow(gpu) {
   if (!gpu) return false;
@@ -30,8 +30,6 @@ export function renderGpuState() {
     gpuAlert._html = '';
     return;
   }
-  // Cancelling a local request stops this app waiting; llama-server may still
-  // be generating, and its VRAM is still gone. Saying so beats implying idle.
   const isDanger = gpu.state === 'cleanup_failed' || Boolean(gpu.local_translation?.cleanup?.stuck);
   const label = STATE_LABEL[gpu.state]
     || (gpu.local_translation?.cleanup?.stuck
@@ -39,12 +37,12 @@ export function renderGpuState() {
       : gpu.local_translation?.draining
         ? '已取消的本地翻译请求可能仍在生成，显存尚未释放'
         : 'GPU 资源仍被占用');
-  const busy = gpu.state === 'cleaning';
+  const retryBusy = gpu.state === 'cleaning' || retryingCleanup;
   const html = `
     <div class="gpu-alert-row">
       <span class="gpu-alert-label${isDanger ? ' danger' : ''}">${escHtml(label)}</span>
-      <button class="btn-sm btn-outline" type="button" data-gpu-recheck>重新检查</button>
-      <button class="btn-sm btn-outline" type="button" data-gpu-retry${busy ? ' disabled' : ''}>重试清理</button>
+      <button class="btn-sm btn-outline" type="button" data-gpu-recheck${recheckingGpu ? ' disabled' : ''}>重新检查</button>
+      <button class="btn-sm btn-outline" type="button" data-gpu-retry${retryBusy ? ' disabled' : ''}>${retryingCleanup ? '清理中…' : '重试清理'}</button>
     </div>`;
   gpuAlert.classList.toggle('danger', isDanger);
   if (gpuAlert._html !== html) {
@@ -56,7 +54,7 @@ export function renderGpuState() {
 
 let lastGpuFetchError = '';
 
-export async function fetchGpuState() {
+async function requestGpuState() {
   try {
     const r = await fetch('/api/gpu-state');
     if (!r.ok) {
@@ -80,22 +78,38 @@ export async function fetchGpuState() {
   }
 }
 
+const refreshGpuState = coalesce(requestGpuState);
+
+export function fetchGpuState() {
+  return refreshGpuState('gpu');
+}
+
 export function installGpuState() {
   if (!gpuAlert) return;
   gpuAlert.addEventListener('click', async e => {
-    if (e.target.closest('[data-gpu-recheck]')) {
-      await fetchGpuState();
+    const recheckBtn = e.target.closest('[data-gpu-recheck]');
+    if (recheckBtn) {
+      if (recheckingGpu) return;
+      recheckingGpu = true;
+      renderGpuState();
+      try {
+        await fetchGpuState();
+      } finally {
+        recheckingGpu = false;
+        renderGpuState();
+      }
       return;
     }
-    if (e.target.closest('[data-gpu-retry]')) {
+    const retryBtn = e.target.closest('[data-gpu-retry]');
+    if (retryBtn) {
+      if (retryingCleanup || retryBtn.disabled) return;
+      retryingCleanup = true;
+      renderGpuState();
       addLog('重试清理 GPU 子进程…', 'stage-start');
       try {
         const r = await fetch('/api/gpu-state/retry-cleanup', { method: 'POST' });
         if (r.ok) {
           state.gpuState = await r.json();
-          renderGpuState();
-          // "released" here means every owner confirmed - the ASR worker alone
-          // saying so was how the banner claimed a card that was still busy.
           const clear = state.gpuState.state === 'released' && !state.gpuState.gpu_blocked;
           addLog(
             clear ? 'GPU 资源已全部释放，队列恢复派发' : 'GPU 资源仍未确认释放',
@@ -106,10 +120,14 @@ export function installGpuState() {
         }
       } catch (error) {
         addLog(`重试清理失败：${error.message}`, 'stage-error');
+      } finally {
+        retryingCleanup = false;
+        renderGpuState();
       }
     }
   });
-  // Slower than the job poll: this only changes when a process refuses to die,
-  // and the backend is already retrying on its own backoff.
-  setInterval(fetchGpuState, 5000);
+  setInterval(() => {
+    if (typeof document !== 'undefined' && document.hidden) return;
+    fetchGpuState();
+  }, 5000);
 }

@@ -1,21 +1,27 @@
-import { state, MAX_LOG } from './state.js';
+import { MAX_LOG } from './state.js';
 import { logScroll } from './dom.js';
 import { showToast } from './util.js';
 
+const AUTO_SCROLL_THRESHOLD_PX = 24;
+
+function isNearBottom(container) {
+  if (!container) return true;
+  const remaining = container.scrollHeight - container.scrollTop - container.clientHeight;
+  return remaining <= AUTO_SCROLL_THRESHOLD_PX;
+}
+
 export function addLog(text, cls = '') {
-  state.logLines.push({ text, cls });
-  if (state.logLines.length > MAX_LOG) state.logLines.shift();
+  const shouldScroll = isNearBottom(logScroll);
   const line = document.createElement('div');
   line.className = 'log-line' + (cls ? ' ' + cls : '');
   line.textContent = new Date().toLocaleTimeString() + '  ' + text;
   logScroll.appendChild(line);
   while (logScroll.children.length > MAX_LOG) logScroll.removeChild(logScroll.firstChild);
-  logScroll.scrollTop = logScroll.scrollHeight;
+  if (shouldScroll) logScroll.scrollTop = logScroll.scrollHeight;
 }
 
 export function installLog() {
   document.getElementById('log-clear')?.addEventListener('click', () => {
-    state.logLines = [];
     logScroll.innerHTML = '';
   });
   document.getElementById('log-copy-all')?.addEventListener('click', async () => {
@@ -29,6 +35,8 @@ export function installLog() {
     }
   });
   logScroll.addEventListener('click', e => {
+    const selection = window.getSelection?.()?.toString();
+    if (selection && selection.length > 0) return;
     const line = e.target.closest('.log-line');
     if (!line) return;
     line.classList.toggle('expanded');

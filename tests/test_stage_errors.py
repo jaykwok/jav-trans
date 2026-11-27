@@ -215,3 +215,62 @@ def test_a_moved_video_is_reported_before_ffmpeg_can_blame_the_file(tmp_path):
         pipeline_main._run_asr_alignment_impl(str(missing), ctx=ctx)
     assert stage_errors.VIDEO_FILE_MISSING in str(excinfo.value)
     assert str(missing) in str(excinfo.value)
+
+
+def test_huggingface_http_errors_map_to_model_download_advice_not_translation_api():
+    class HfHubHTTPError(RuntimeError):
+        def __init__(self, message: str, status_code: int) -> None:
+            super().__init__(message)
+            self.response = _ResponseHolder._Response(status_code)
+
+    msg_401 = describe_stage_failure(
+        HfHubHTTPError("401 Client Error for https://huggingface.co/private/repo", 401)
+    )
+    assert msg_401.startswith(stage_errors.HF_AUTH_REQUIRED)
+    assert not msg_401.startswith(stage_errors.INVALID_API_KEY)
+
+    msg_404 = describe_stage_failure(
+        _HttpError("404 Client Error: Not Found for url: https://hf-mirror.com/foo/bar", 404)
+    )
+    assert msg_404.startswith(stage_errors.HF_REPO_NOT_FOUND)
+    assert not msg_404.startswith(stage_errors.MODEL_NOT_FOUND)
+
+    msg_429 = describe_stage_failure(
+        HfHubHTTPError("429 Too Many Requests for https://huggingface.co/x", 429)
+    )
+    assert msg_429.startswith(stage_errors.HF_RATE_LIMITED)
+    assert not msg_429.startswith(stage_errors.RATE_LIMITED)
+
+
+def test_host_ram_oom_is_distinguished_from_gpu_vram_oom():
+    ram_exc = RuntimeError("Physical RAM budget exceeded: 31.2 GB / 32.0 GB")
+    ram_msg = describe_stage_failure(ram_exc)
+    assert ram_msg.startswith(stage_errors.HOST_RAM_OUT_OF_MEMORY)
+    assert not ram_msg.startswith(stage_errors.OUT_OF_MEMORY)
+
+    mem_msg = describe_stage_failure(MemoryError("unable to allocate array"))
+    assert mem_msg.startswith(stage_errors.HOST_RAM_OUT_OF_MEMORY)
+
+
+def test_describe_stage_failure_redacts_url_credentials_everywhere():
+    exc = RuntimeError("proxy socks5://alice:s3cr@t@127.0.0.1:1080 failed")
+    msg = describe_stage_failure(exc)
+    assert "alice" not in msg
+    assert "s3cr@t" not in msg
+    assert "socks5://***@127.0.0.1:1080" in msg
+
+
+def test_english_detail_continues_rule_matching_while_chinese_detail_short_circuits():
+    class _WorkerErr(RuntimeError):
+        def __init__(self, detail: str) -> None:
+            super().__init__(f"worker: {detail}")
+            self.detail = detail
+
+    oom_msg = describe_stage_failure(_WorkerErr("CUDA out of memory. Tried to allocate 256 MiB"))
+    assert oom_msg.startswith(stage_errors.OUT_OF_MEMORY)
+
+    ram_msg = describe_stage_failure(_WorkerErr("Physical RAM budget exceeded: 96%"))
+    assert ram_msg.startswith(stage_errors.HOST_RAM_OUT_OF_MEMORY)
+
+    # Dead constant removed.
+    assert not hasattr(stage_errors, "TRANSLATION_PANEL")

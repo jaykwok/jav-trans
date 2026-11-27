@@ -7,6 +7,11 @@ from helpers import ASR_17B_BACKEND, make_job_context
 from pipeline import audio as pipeline_audio
 
 
+@pytest.fixture(autouse=True)
+def _isolate_project_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+
+
 def test_proxy_changes_and_cleared_values_reach_a_persistent_worker(monkeypatch):
     from core.config import NETWORK_PROXY_ENV_KEYS
     from types import SimpleNamespace

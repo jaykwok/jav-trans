@@ -67,7 +67,20 @@ def qwen_asr_min_physical_vram_mb_by_repo() -> dict[str, int]:
                 f"Invalid ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO repo {repo_id!r}; "
                 f"expected one of {sorted(QWEN_ASR_BACKEND_REPOS)}"
             )
-        mapping[repo_id] = max(1, int(value.strip()))
+        raw_value = value.strip()
+        try:
+            parsed = int(raw_value)
+        except ValueError as exc:
+            raise ValueError(
+                "Invalid ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO value "
+                f"{raw_value!r} for {repo_id!r}; expected positive integer"
+            ) from exc
+        if parsed <= 0:
+            raise ValueError(
+                "Invalid ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO value "
+                f"{parsed} for {repo_id!r}; expected positive integer"
+            )
+        mapping[repo_id] = parsed
     return mapping
 
 

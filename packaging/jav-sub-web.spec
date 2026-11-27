@@ -79,6 +79,18 @@ def _which_tool(name: str, env_name: str) -> Path:
     return Path(found).resolve()
 
 
+_FFMPEG_DLL_PATTERNS = (
+    "avcodec-*.dll",
+    "avdevice-*.dll",
+    "avfilter-*.dll",
+    "avformat-*.dll",
+    "avutil-*.dll",
+    "postproc-*.dll",
+    "swresample-*.dll",
+    "swscale-*.dll",
+)
+
+
 def _ffmpeg_binaries() -> list[tuple[str, str]]:
     tools = [
         _which_tool("ffmpeg.exe", "JAV_SUB_FFMPEG_EXE"),
@@ -102,11 +114,12 @@ def _ffmpeg_binaries() -> list[tuple[str, str]]:
         if key not in seen:
             seen.add(key)
             bundled.append((str(tool), "bin"))
-        for dll in tool.parent.glob("*.dll"):
-            dll_key = str(dll.resolve()).lower()
-            if dll_key not in seen:
-                seen.add(dll_key)
-                bundled.append((str(dll.resolve()), "bin"))
+        for pattern in _FFMPEG_DLL_PATTERNS:
+            for dll in tool.parent.glob(pattern):
+                dll_key = str(dll.resolve()).lower()
+                if dll_key not in seen:
+                    seen.add(dll_key)
+                    bundled.append((str(dll.resolve()), "bin"))
     return bundled
 
 
@@ -178,16 +191,41 @@ hiddenimports = [
     "torchcodec",
     "transformers",
 ]
-hiddenimports += collect_submodules(
-    "webview",
-    filter=lambda name: not name.startswith("webview.platforms.android"),
-)
+def _webview_submodule_filter(name: str) -> bool:
+    if name.startswith("webview.__pyinstaller"):
+        return False
+    if not name.startswith("webview.platforms."):
+        return True
+    if sys.platform == "win32":
+        return name in {
+            "webview.platforms.winforms",
+            "webview.platforms.edgechromium",
+            "webview.platforms.win32",
+        }
+    return not name.startswith("webview.platforms.android")
+
+
+hiddenimports += collect_submodules("webview", filter=_webview_submodule_filter)
 hiddenimports += collect_submodules("transformers.generation")
 hiddenimports += collect_submodules("torchcodec")
-hiddenimports += collect_submodules("transformers.models.mamba2")
 hiddenimports += collect_submodules("transformers.models.qwen2")
 hiddenimports += collect_submodules("transformers.models.qwen3")
 hiddenimports += collect_submodules("transformers.models.qwen3_asr")
+
+excludes = [
+    "pytest",
+    "_pytest",
+    "PyInstaller",
+    "ruff",
+    "sklearn",
+    "tkinter",
+    "unittest",
+    "pydoc_data",
+    "doctest",
+    "pdb",
+    "idlelib",
+    "torch.testing",
+]
 
 a = Analysis(
     [str(ROOT / "launcher.py")],
@@ -198,7 +236,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

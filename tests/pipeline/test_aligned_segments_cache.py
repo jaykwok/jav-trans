@@ -10,6 +10,11 @@ from subtitles.options import BASE_FPS
 from helpers import make_job_context, run_pipeline
 
 
+@pytest.fixture(autouse=True)
+def _isolate_project_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+
+
 def _assert_no_project_absolute_path(text: str) -> None:
     assert main.PROJECT_ROOT.resolve().as_posix() not in text.replace("\\", "/")
 
@@ -221,7 +226,7 @@ def test_asr_alignment_stage_writes_resume_signature_e2e(monkeypatch, tmp_path):
         skip_translation=True,
     )
 
-    real_write_json = main._write_json
+    real_write_json = main._write_json_atomic
     aligned_writes: list[dict] = []
 
     def spy_write_json(path: str, payload: dict) -> None:
@@ -254,7 +259,7 @@ def test_asr_alignment_stage_writes_resume_signature_e2e(monkeypatch, tmp_path):
             {"transcript_chunks": [], "stage_timings": {}},
         )
 
-    monkeypatch.setattr(main, "_write_json", spy_write_json)
+    monkeypatch.setattr(main, "_write_json_atomic", spy_write_json)
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(
         main.asr_stage_worker_module,

@@ -25,15 +25,21 @@ import hashlib
 import json
 import logging
 import os
-
-from core.typed_config import env_bool, env_text
 import uuid
 import wave
 from pathlib import Path
 from typing import Any
 
-from asr.backends.registry import current_asr_backend
 from asr.backends.qwen import active_qwen_asr_model_id
+from asr.backends.registry import current_asr_backend
+from asr.decode_guard import (
+    MIN_REPEATS,
+    explicit_token_cap,
+    loop_budget_fraction,
+    loop_guard_enabled,
+    tokens_per_second_ceiling,
+)
+from core.typed_config import env_bool, env_float, env_int, env_text
 
 logger = logging.getLogger(__name__)
 CACHE_SCHEMA = "asr_result_cache_v1"
@@ -112,6 +118,13 @@ def _signature_json(payload: dict) -> str:
     return json.dumps(_jsonable(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _optional_positive_int_env(name: str) -> int | None:
+    if not _env_text(name, ""):
+        return None
+    parsed = env_int(name, 0, minimum=1)
+    return parsed or None
+
+
 def model_signature() -> dict:
     return {
         "schema": CACHE_SCHEMA,
@@ -126,36 +139,59 @@ def model_signature() -> dict:
         },
         "language": {
             "asr_language": _env_text("ASR_LANGUAGE", "Japanese") or "Japanese",
-            "asr_force_language": _env_lower("ASR_FORCE_LANGUAGE", "1"),
+            "asr_force_language": env_bool("ASR_FORCE_LANGUAGE", True),
         },
         "generation": {
-            # Empty means "derive the budget from each chunk's duration", which
+            # None means "derive the budget from each chunk's duration", which
             # is the default; an explicit value is a hard ceiling that can
             # truncate, so it changes the text and belongs here either way.
-            "asr_max_new_tokens": _env_text("ASR_MAX_NEW_TOKENS", ""),
+            "asr_max_new_tokens": explicit_token_cap(),
             # The rate ceiling *is* the budget when no explicit cap is set.
-            "asr_decode_tokens_per_second": _env_text(
-                "ASR_DECODE_TOKENS_PER_SECOND", ""
+            "asr_decode_tokens_per_second": round(
+                float(tokens_per_second_ceiling()), 6
             ),
-            "asr_repetition_penalty": _env_text("ASR_REPETITION_PENALTY", "1.05"),
+            "asr_repetition_penalty": round(
+                float(env_float("ASR_REPETITION_PENALTY", 1.05, minimum=1.0)), 6
+            ),
             # The loop guard ends sequences early, so it is part of what the text
-            # *is* - not a speed setting. Left out of the signature it made the
-            # cache lie: switching it off replayed guard-on text and made the two
-            # settings indistinguishable, which is exactly the comparison anyone
-            # touching the guard needs to run.
-            "asr_decode_loop_guard": _env_lower("ASR_DECODE_LOOP_GUARD", "1"),
-            "asr_decode_loop_budget_fraction": _env_text(
-                "ASR_DECODE_LOOP_BUDGET_FRACTION", ""
+            # *is* - not a speed setting.
+            "asr_decode_loop_guard": loop_guard_enabled(),
+            "asr_decode_loop_budget_fraction": round(
+                float(loop_budget_fraction()), 6
             ),
-            "asr_decode_loop_max_ngram": _env_text("ASR_DECODE_LOOP_MAX_NGRAM", ""),
-            "asr_decode_loop_min_repeats": _env_text("ASR_DECODE_LOOP_MIN_REPEATS", ""),
-            "asr_decode_loop_min_tokens": _env_text("ASR_DECODE_LOOP_MIN_TOKENS", ""),
+            "asr_decode_loop_max_ngram": _optional_positive_int_env(
+                "ASR_DECODE_LOOP_MAX_NGRAM"
+            ),
+            "asr_decode_loop_min_repeats": env_int(
+                "ASR_DECODE_LOOP_MIN_REPEATS", MIN_REPEATS, minimum=1
+            ),
+            "asr_decode_loop_min_tokens": _optional_positive_int_env(
+                "ASR_DECODE_LOOP_MIN_TOKENS"
+            ),
         },
     }
 
 
 def _signature_hash(signature: dict) -> str:
     return hashlib.sha1(_signature_json(signature).encode()).hexdigest()[:12]
+
+
+def pcm_audio_sha256(
+    pcm_bytes: bytes,
+    *,
+    nchannels: int,
+    sampwidth: int,
+    framerate: int,
+    nframes: int,
+) -> str:
+    """Content hash of raw PCM bytes + WAV geometry, matching ``chunk_audio_sha256``."""
+    header = (
+        f"channels={int(nchannels)};width={int(sampwidth)};"
+        f"rate={int(framerate)};frames={int(nframes)}"
+    )
+    digest = hashlib.sha256(header.encode())
+    digest.update(pcm_bytes)
+    return digest.hexdigest()
 
 
 def chunk_audio_sha256(chunk_path: str | Path) -> str:
@@ -216,11 +252,23 @@ def _read_entry(entry_path: Path) -> dict | None:
     return payload
 
 
-def lookup(chunk_path: str | Path) -> dict | None:
+def lookup(
+    chunk_path: str | Path,
+    *,
+    audio_sha256: str | None = None,
+    signature: dict | None = None,
+    cache_dir: Path | None = None,
+) -> dict | None:
     if not result_cache_enabled():
         return None
     try:
-        entry_path = _cache_dir(model_signature()) / f"{chunk_audio_sha256(chunk_path)}.json"
+        resolved_dir = (
+            cache_dir
+            if cache_dir is not None
+            else _cache_dir(signature if signature is not None else model_signature())
+        )
+        digest = audio_sha256 or chunk_audio_sha256(chunk_path)
+        entry_path = resolved_dir / f"{digest}.json"
     except Exception as exc:
         logger.warning("ASR text cache lookup failed for %s: %s", Path(chunk_path).name, exc)
         return None
@@ -235,24 +283,32 @@ def lookup(chunk_path: str | Path) -> dict | None:
     return dict(text_result)
 
 
-def store(chunk_path: str | Path, text_result: dict) -> None:
+def store(
+    chunk_path: str | Path,
+    text_result: dict,
+    *,
+    audio_sha256: str | None = None,
+    signature: dict | None = None,
+    cache_dir: Path | None = None,
+) -> None:
     if not result_cache_enabled():
         return
     if _is_timed_out_result(text_result) or _is_quarantined_result(text_result):
         return
     try:
-        signature = model_signature()
-        cache_dir = _cache_dir(signature)
+        resolved_signature = signature if signature is not None else model_signature()
+        resolved_dir = cache_dir if cache_dir is not None else _cache_dir(resolved_signature)
+        digest = audio_sha256 or chunk_audio_sha256(chunk_path)
         sanitized = {
             key: value
             for key, value in text_result.items()
-            if key != "normalized_path"
+            if key not in {"normalized_path", "audio_sha256"}
         }
-        signature_path = cache_dir / "signature.json"
+        signature_path = resolved_dir / "signature.json"
         if not signature_path.exists():
-            _atomic_write_json(signature_path, signature)
+            _atomic_write_json(signature_path, resolved_signature)
         _atomic_write_json(
-            cache_dir / f"{chunk_audio_sha256(chunk_path)}.json",
+            resolved_dir / f"{digest}.json",
             {"schema": CACHE_SCHEMA, "text_result": sanitized},
         )
     except Exception as exc:
@@ -267,18 +323,24 @@ def restore_text_result(chunk: dict, cached: dict) -> dict:
     result = dict(cached)
     current_path = str(Path(chunk["path"]).resolve())
     result["normalized_path"] = current_path
-    try:
-        with wave.open(current_path, "rb") as wav_file:
-            frames = wav_file.getnframes()
-            rate = wav_file.getframerate()
-        result["duration"] = frames / rate if rate else 0.0
-    except Exception as exc:
-        logger.warning(
-            "Could not read chunk wav duration for %s (%s); using cached duration",
-            Path(current_path).name,
-            exc,
-        )
-        result["duration"] = float(result.get("duration", 0.0))
+    if chunk.get("audio_sha256"):
+        result["audio_sha256"] = str(chunk["audio_sha256"])
+    chunk_duration = chunk.get("duration")
+    if isinstance(chunk_duration, (int, float)) and float(chunk_duration) > 0.0:
+        result["duration"] = float(chunk_duration)
+    else:
+        try:
+            with wave.open(current_path, "rb") as wav_file:
+                frames = wav_file.getnframes()
+                rate = wav_file.getframerate()
+            result["duration"] = frames / rate if rate else 0.0
+        except Exception as exc:
+            logger.warning(
+                "Could not read chunk wav duration for %s (%s); using cached duration",
+                Path(current_path).name,
+                exc,
+            )
+            result["duration"] = float(result.get("duration", 0.0))
     result.setdefault("language", "Japanese")
     result.setdefault("text", "")
     result.setdefault("raw_text", result.get("text", ""))
@@ -348,42 +410,41 @@ def finalize_signature() -> dict | None:
     signature["alignment_head"] = {"sha256": head_digest}
     # The head checkpoint is not the only thing that decides the stored word
     # times: `speech_extent` walks both edges outward afterwards, capped by these
-    # two constants, and both were retuned on 2026-08-10. Without them in the key
-    # a cap change is invisible to the cache - old entries keep serving the old
-    # boundaries indefinitely, and the only symptom is subtitles that quietly
-    # disagree with the code that supposedly produced them. Same reasoning that
-    # put the audio filter chain into `get_audio_cache_key`.
-    from asr.alignment import CODA_EXTEND_MAX_S, ONSET_BACKOFF_MAX_S
+    # two constants, and `blank_bias` shifts character edges during Viterbi.
+    from asr.alignment import (
+        CODA_EXTEND_MAX_S,
+        ONSET_BACKOFF_MAX_S,
+        blank_bias_from_env,
+    )
 
+    signature["blank_bias"] = round(float(blank_bias_from_env()), 6)
     signature["edge_caps"] = {
         "onset_backoff_max_s": round(float(ONSET_BACKOFF_MAX_S), 6),
         "coda_extend_max_s": round(float(CODA_EXTEND_MAX_S), 6),
     }
-    # Bump when the code that turns spans into words changes what it stores, for
-    # the same reason the caps are here: the head and the text are unchanged, so
-    # nothing else in this key can notice. Version 2 stopped dropping the
-    # zero-width spans an acoustic-only head gives punctuation. Version 3 bounds
-    # every word into its own chunk's audio, so a coda walked to the last
-    # encoder frame stops at the chunk edge instead of one frame past it, on top
-    # of the next chunk's first word.
-    #
-    # Both versions were found the hard way, and identically: the fixed pipeline
-    # re-ran and returned byte-identical output because every chunk was served
-    # from entries written before the fix. Version 3's re-run even repeated the
-    # alignment stage for 26s and still produced the same 24 out-of-chunk word
-    # ends, down to the microsecond.
     signature["word_build_version"] = 3
     return signature
 
 
-def finalize_lookup(chunk_path: str | Path, *, text: str) -> tuple[dict, list[str]] | None:
+def finalize_lookup(
+    chunk_path: str | Path,
+    *,
+    text: str,
+    audio_sha256: str | None = None,
+    signature: dict | None = None,
+    cache_dir: Path | None = None,
+) -> tuple[dict, list[str]] | None:
     if not result_cache_enabled():
         return None
-    signature = finalize_signature()
-    if signature is None:
-        return None
+    resolved_dir = cache_dir
+    if resolved_dir is None:
+        resolved_signature = signature if signature is not None else finalize_signature()
+        if resolved_signature is None:
+            return None
+        resolved_dir = _cache_dir(resolved_signature)
     try:
-        entry_path = _cache_dir(signature) / f"{chunk_audio_sha256(chunk_path)}.json"
+        digest = audio_sha256 or chunk_audio_sha256(chunk_path)
+        entry_path = resolved_dir / f"{digest}.json"
     except Exception as exc:
         logger.warning("ASR finalize cache lookup failed for %s: %s", Path(chunk_path).name, exc)
         return None
@@ -409,21 +470,25 @@ def finalize_store(
     text: str,
     result: dict,
     log: list[str],
+    audio_sha256: str | None = None,
+    signature: dict | None = None,
+    cache_dir: Path | None = None,
 ) -> None:
     if not result_cache_enabled():
         return
     if str(result.get("alignment_mode") or "") != _ALIGNED_FINALIZE_MODE:
         return
-    signature = finalize_signature()
-    if signature is None:
+    resolved_signature = signature if signature is not None else finalize_signature()
+    if resolved_signature is None:
         return
     try:
-        cache_dir = _cache_dir(signature)
-        signature_path = cache_dir / "signature.json"
+        resolved_dir = cache_dir if cache_dir is not None else _cache_dir(resolved_signature)
+        digest = audio_sha256 or chunk_audio_sha256(chunk_path)
+        signature_path = resolved_dir / "signature.json"
         if not signature_path.exists():
-            _atomic_write_json(signature_path, signature)
+            _atomic_write_json(signature_path, resolved_signature)
         _atomic_write_json(
-            cache_dir / f"{chunk_audio_sha256(chunk_path)}.json",
+            resolved_dir / f"{digest}.json",
             {
                 "schema": CACHE_SCHEMA,
                 "stage": "final",

@@ -13,19 +13,21 @@ whole lifetime: waiting for the connection and the response headers, receiving
 the body, parsing it, and closing the request. Cancelling that task aborts the
 socket operation itself, wherever it happens to be parked.
 
-Two things this deliberately is not:
-
-- It does not wrap a *synchronous* request in a thread and cancel the future.
-  That cancels the wrapper and leaves the socket read exactly where it was.
-- It does not touch a shared client. The unit of cancellation is one request,
-  so cancelling job A cannot disturb job B's in-flight request.
+Reusing one private event loop per worker thread avoids repeated IOCP /
+socketpair churn on Windows while preserving strict cross-task isolation: each
+worker thread owns its own loop and each request owns its own HTTP client, so
+cancelling job A never disturbs job B's in-flight request.
 """
 
 from __future__ import annotations
 
 import asyncio
+import atexit
+import contextlib
+import inspect
 import logging
 import threading
+import weakref
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
@@ -47,6 +49,80 @@ _CANCEL_POLL_S = 0.05
 # many times to ask before leaving it to the loop teardown.
 _CANCEL_RETRY_S = 0.5
 _CANCEL_ATTEMPTS = 8
+
+_THREAD_LOOP = threading.local()
+_LOOP_HOLDERS_LOCK = threading.Lock()
+_LOOP_HOLDERS: "weakref.WeakSet[_ThreadLoopHolder]" = weakref.WeakSet()
+
+
+class _ThreadLoopHolder:
+    """Owns one worker thread's private event loop and closes it on thread exit."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.loop: asyncio.AbstractEventLoop | None = loop
+        with _LOOP_HOLDERS_LOCK:
+            _LOOP_HOLDERS.add(self)
+
+    def close(self) -> None:
+        loop = self.loop
+        self.loop = None
+        if loop is None or loop.is_closed():
+            return
+        if loop.is_running():
+            return
+        try:
+            pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+            if pending:
+                for task in pending:
+                    task.cancel()
+                with contextlib.suppress(Exception):
+                    loop.run_until_complete(asyncio.wait(pending, timeout=0.5))
+            with contextlib.suppress(Exception):
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            with contextlib.suppress(Exception):
+                loop.run_until_complete(loop.shutdown_default_executor())
+        finally:
+            with contextlib.suppress(Exception):
+                loop.close()
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self.close()
+
+
+def _close_all_thread_loops() -> None:
+    with _LOOP_HOLDERS_LOCK:
+        holders = list(_LOOP_HOLDERS)
+    for holder in holders:
+        with contextlib.suppress(Exception):
+            holder.close()
+
+
+atexit.register(_close_all_thread_loops)
+
+
+def _acquire_thread_loop() -> asyncio.AbstractEventLoop:
+    holder: _ThreadLoopHolder | None = getattr(_THREAD_LOOP, "holder", None)
+    if (
+        holder is not None
+        and holder.loop is not None
+        and not holder.loop.is_closed()
+        and not holder.loop.is_running()
+    ):
+        return holder.loop
+    loop = asyncio.new_event_loop()
+    _THREAD_LOOP.holder = _ThreadLoopHolder(loop)
+    return loop
+
+
+def _discard_thread_loop(loop: asyncio.AbstractEventLoop) -> None:
+    holder: _ThreadLoopHolder | None = getattr(_THREAD_LOOP, "holder", None)
+    if holder is not None and holder.loop is loop:
+        _THREAD_LOOP.holder = None
+        holder.close()
+    elif not loop.is_closed() and not loop.is_running():
+        with contextlib.suppress(Exception):
+            loop.close()
 
 
 async def _watch_for_cancel(
@@ -131,18 +207,41 @@ def run_cancellable_request(
     # queuing must take effect now, not after one more request is issued.
     if _cancel_requested(cancel_event):
         raise TranslationCancelledError("任务已取消")
+    loop = _acquire_thread_loop()
+    reusable = True
     try:
-        return asyncio.run(
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(
             _run_with_watcher(operation, cancel_event, poll_interval_s)
         )
     except asyncio.CancelledError as exc:
         if _cancel_requested(cancel_event):
             raise TranslationCancelledError("任务已取消") from exc
-        logger.warning("Async translation request was cancelled without cancel_event set", exc_info=True)
+        logger.warning(
+            "Async translation request was cancelled without cancel_event set",
+            exc_info=True,
+        )
         raise RuntimeError("异步翻译请求被意外中断（CancelledError）") from exc
+    finally:
+        try:
+            pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+            if pending:
+                for task in pending:
+                    task.cancel()
+                loop.run_until_complete(asyncio.wait(pending, timeout=1.0))
+                if any(not task.done() for task in pending):
+                    reusable = False
+            if reusable:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            reusable = False
+        finally:
+            asyncio.set_event_loop(None)
+            if not reusable:
+                _discard_thread_loop(loop)
 
 
-async def close_quietly(resource: Any) -> None:
+async def close_quietly(resource: Any, *, timeout_s: float = 5.0) -> None:
     """Close a stream/client without letting cleanup change the outcome.
 
     Idempotent by contract: callers close in a `finally` that may run after the
@@ -151,15 +250,33 @@ async def close_quietly(resource: Any) -> None:
     """
     if resource is None:
         return
-    closer = getattr(resource, "close", None)
-    if closer is None:
+    closer = getattr(resource, "aclose", None)
+    if not callable(closer):
+        closer = getattr(resource, "close", None)
+    if not callable(closer):
         return
     try:
         result = closer()
-        if asyncio.iscoroutine(result):
-            # Cancellation is what got us here on the cancel path; shield the
-            # close so it is not cancelled before it releases the socket.
-            await asyncio.shield(asyncio.ensure_future(result))
+        if inspect.isawaitable(result):
+            close_task = asyncio.ensure_future(result)
+            try:
+                await asyncio.wait_for(asyncio.shield(close_task), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                close_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait_for(close_task, timeout=0.5)
+            except asyncio.CancelledError:
+                if not close_task.done():
+                    try:
+                        await asyncio.wait_for(close_task, timeout=0.5)
+                    except BaseException:
+                        if not close_task.done():
+                            close_task.cancel()
+                            with contextlib.suppress(BaseException):
+                                await asyncio.wait_for(close_task, timeout=0.2)
+                else:
+                    with contextlib.suppress(BaseException):
+                        close_task.exception()
     except asyncio.CancelledError:
         pass
     except Exception as exc:

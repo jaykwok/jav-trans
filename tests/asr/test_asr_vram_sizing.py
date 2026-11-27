@@ -22,13 +22,17 @@ def test_estimate_matches_measured_rtx_4060_ti_points():
 
 
 def test_select_plan_scales_across_vram_tiers_and_caps_at_24():
-    # 8 GB clean desktop -> jumps directly to 8-9 (not old conservative 5).
+    # 8 GB clean desktop (free=7075 MiB): sizes conservatively enough to leave
+    # non-PyTorch CUDA/cuDNN workspace + WDDM headroom so neither chunking nor
+    # longest-first dense 30s ASR batches spill into shared system RAM.
     p8_clean = select_asr_batch_plan(
         total_vram_mb=8188.0,
         budget_mb=8188.0 * 0.95,
         free_vram_mb=7075.0,
     )
-    assert 8 <= p8_clean.batch_size <= 10
+    assert 6 <= p8_clean.batch_size <= 7
+    assert 5 <= p8_clean.feature_batch_size <= 7
+    assert 5 <= p8_clean.align_batch_size <= 7
     assert p8_clean.estimated_reserved_mb <= p8_clean.usable_vram_mb
 
     # 8 GB heavily loaded desktop -> automatically steps down to avoid WDDM spill.

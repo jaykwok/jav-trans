@@ -53,6 +53,7 @@ been writable.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -74,6 +75,8 @@ _MAX_ENTRIES = 16
 # Stop bisecting once the bracket is this tight. The room still unclaimed is
 # then worth less than the rejected round trip it would take to claim it.
 _CONVERGED_GAP = 1024
+_CACHE_KEY: tuple[Path, int, int] | None = None
+_CACHE_PAYLOAD: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -141,26 +144,59 @@ def _empty_payload() -> dict[str, Any]:
 
 
 def _load_payload() -> dict[str, Any]:
+    global _CACHE_KEY, _CACHE_PAYLOAD
+    target = limits_path()
     try:
-        payload = json.loads(limits_path().read_text(encoding="utf-8"))
+        st = target.stat()
+        sig = (target, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return _empty_payload()
+    if _CACHE_KEY == sig and _CACHE_PAYLOAD is not None:
+        return {
+            "schema": _CACHE_PAYLOAD["schema"],
+            "limits": dict(_CACHE_PAYLOAD["limits"]),
+        }
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
     except Exception:
         return _empty_payload()
     if not isinstance(payload, dict) or payload.get("schema") != LIMITS_SCHEMA:
         return _empty_payload()
     if not isinstance(payload.get("limits"), dict):
         payload["limits"] = {}
+    _CACHE_KEY = sig
+    _CACHE_PAYLOAD = {
+        "schema": payload["schema"],
+        "limits": dict(payload["limits"]),
+    }
     return payload
 
 
 def _write_payload(payload: dict[str, Any]) -> None:
+    global _CACHE_KEY, _CACHE_PAYLOAD
     target = limits_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
-    tmp.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    tmp.replace(target)
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        tmp.replace(target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    try:
+        st = target.stat()
+        _CACHE_KEY = (target, st.st_mtime_ns, st.st_size)
+        _CACHE_PAYLOAD = {
+            "schema": payload["schema"],
+            "limits": dict(payload["limits"]),
+        }
+    except OSError:
+        _CACHE_KEY = None
+        _CACHE_PAYLOAD = None
 
 
 def _entry_limits(entry: Any) -> EndpointLimits:

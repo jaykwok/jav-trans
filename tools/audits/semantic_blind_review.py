@@ -31,11 +31,12 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-if str(ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(ROOT / "src"))
+if str(_REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools._common import ensure_src_on_path  # noqa: E402
+
+ensure_src_on_path()
 
 LETTERS = "abcdefghijklmnopqrstuvwxyz"
 

@@ -12,6 +12,7 @@ be run rather than asserted about as source text.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -26,6 +27,8 @@ HARNESS = Path(__file__).resolve().parent / "js" / "jobs_merge_reducer.mjs"
 def test_delivery_retry_clicks_do_not_depend_on_translation_settings() -> None:
     node = shutil.which("node")
     if node is None:
+        if os.getenv("JAV_SUB_CI_STRICT") == "1":
+            pytest.fail("node is not installed")
         pytest.skip("node is not installed")
     completed = subprocess.run(
         [node, str(HARNESS.with_name("jobs_delivery_retry.mjs")), str(MODULE.with_name("jobsRender.js"))],
@@ -37,6 +40,8 @@ def test_delivery_retry_clicks_do_not_depend_on_translation_settings() -> None:
 def test_the_reducer_drops_what_arrived_out_of_order() -> None:
     node = shutil.which("node")
     if node is None:
+        if os.getenv("JAV_SUB_CI_STRICT") == "1":
+            pytest.fail("node is not installed; the reducer harness needs it")
         pytest.skip("node is not installed; the reducer harness needs it")
 
     completed = subprocess.run(

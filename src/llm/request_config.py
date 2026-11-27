@@ -70,6 +70,9 @@ SNAPSHOT_KEYS: tuple[str, ...] = (
     "OPENAI_COMPATIBILITY_BASE_URL",
     "LLM_MODEL_NAME",
     "LLM_REASONING_EFFORT",
+    "LLAMACPP_GGUF_PATH",
+    "LLAMACPP_MODEL_REPO",
+    "LLAMACPP_MODEL_FILE",
 )
 
 _ACTIVE = threading.local()

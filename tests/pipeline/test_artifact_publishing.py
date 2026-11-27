@@ -71,19 +71,20 @@ class TestTwoWritersOfOneTargetDoNotCollide:
     """
 
     def test_both_writers_finish(self, monkeypatch, tmp_path) -> None:
+        from core import atomic_io
+
         target = tmp_path / "quality-report.json"
         staged = threading.Barrier(2, timeout=10)
-        real_write_text = Path.write_text
+        real_replace = atomic_io.replace_atomically
 
-        def write_text_then_wait(self, *args, **kwargs):
-            written = real_write_text(self, *args, **kwargs)
-            if self.name.endswith(".tmp"):
-                # Hold both writers between staging and publishing: with one
-                # shared staging name this is exactly the losing interleaving.
+        def replace_after_barrier(src, dst, **kwargs):
+            if Path(dst) == target:
+                # Hold both writers between staging and publishing so both
+                # threads race `os.replace` onto the same target concurrently.
                 staged.wait()
-            return written
+            return real_replace(src, dst, **kwargs)
 
-        monkeypatch.setattr(Path, "write_text", write_text_then_wait)
+        monkeypatch.setattr(atomic_io, "replace_atomically", replace_after_barrier)
         failures: list[BaseException] = []
 
         def write(index: int) -> None:

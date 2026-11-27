@@ -3,7 +3,7 @@ let pasteTarget = null;
 let pasteMenu = null;
 
 function isPasteableControl(el) {
-  if (!el) return false;
+  if (!el || el.disabled || el.readOnly) return false;
   if (el.tagName === 'TEXTAREA') return true;
   if (el.tagName !== 'INPUT') return false;
   return PASTEABLE_INPUT_TYPES.has((el.type || '').toLowerCase());

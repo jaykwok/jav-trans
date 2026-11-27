@@ -15,7 +15,6 @@ import os
 import re
 import sys
 import threading
-import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import IO, Any
@@ -24,7 +23,7 @@ from urllib.parse import urlsplit, urlunsplit
 from utils.runtime_paths import runtime_path
 
 _LOGGER = logging.getLogger(__name__)
-_URL_CREDENTIALS_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s@]+)@")
+_URL_CREDENTIALS_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s?#\"'<>]+)@")
 
 _NTSTATUS_NAMES: dict[int, str] = {
     0x80000003: "STATUS_BREAKPOINT",
@@ -172,6 +171,11 @@ def format_exception_chain(
 
 
 def _close_fault_streams() -> None:
+    try:
+        if faulthandler.is_enabled():
+            faulthandler.disable()
+    except Exception:
+        pass
     with _PROCESS_LOG_LOCK:
         streams = list(_FAULT_STREAMS.values())
         _FAULT_STREAMS.clear()
@@ -274,22 +278,34 @@ def _prune_old_process_logs(
         return
     primary_re = re.compile(rf"^{re.escape(stem)}-\d+{re.escape(suffix)}$")
     try:
-        candidates = [
-            path
-            for path in base_dir.iterdir()
-            if path.is_file()
-            and primary_re.match(path.name) is not None
-            and path.resolve() not in exclude
-        ]
+        entries = list(base_dir.iterdir())
     except OSError:
         return
-    if len(candidates) <= keep:
+
+    all_files: list[Path] = []
+    primary_entries: list[tuple[float, Path]] = []
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+        except OSError:
+            continue
+        all_files.append(entry)
+        if primary_re.match(entry.name) is None:
+            continue
+        try:
+            resolved = entry.resolve()
+            if resolved in exclude:
+                continue
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        primary_entries.append((mtime, entry))
+
+    if len(primary_entries) <= keep:
         return
-    try:
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
-        return
-    for old_log in candidates[keep:]:
+    primary_entries.sort(key=lambda item: item[0], reverse=True)
+    for _mtime, old_log in primary_entries[keep:]:
         try:
             old_log.unlink()
         except OSError:
@@ -297,16 +313,12 @@ def _prune_old_process_logs(
             # Windows; skip the entire process group rather than pruning its backups.
             continue
         backup_re = re.compile(rf"^{re.escape(old_log.name)}\.\d+$")
-        siblings: list[Path] = [old_log.with_name(f"{old_log.stem}-fault{suffix}")]
-        try:
-            for entry in base_dir.iterdir():
-                if entry.is_file() and backup_re.match(entry.name) is not None:
-                    siblings.append(entry)
-        except OSError:
-            pass
-        for target in siblings:
+        fault_name = f"{old_log.stem}-fault{suffix}"
+        for target in all_files:
+            if target.name != fault_name and backup_re.match(target.name) is None:
+                continue
             try:
-                if target.is_file() and target.resolve() not in exclude:
+                if target.resolve() not in exclude:
                     target.unlink()
             except OSError:
                 pass
@@ -352,6 +364,12 @@ def configure_process_logging(
             if install_hooks:
                 _install_exception_hooks()
             return log_path
+        if existing is not None:
+            _INSTALLED_HANDLERS.pop(log_path, None)
+            try:
+                existing.close()
+            except OSError:
+                pass
 
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -426,11 +444,3 @@ def redirect_process_stdio_to_file(stream: IO[str]) -> bool:
     sys.stderr = stream
     sys.stdout = stream
     return True
-
-
-def format_traceback_tail(exc: BaseException, *, max_lines: int = 12) -> str:
-    lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
-    flat = [line.rstrip() for chunk in lines for line in chunk.splitlines() if line.strip()]
-    if len(flat) <= max_lines:
-        return "\n".join(flat)
-    return "\n".join(flat[-max_lines:])

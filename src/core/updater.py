@@ -29,6 +29,10 @@ from typing import Any, Callable
 
 import httpx
 
+from core.atomic_io import (
+    other_launcher_instances_running as _other_launcher_instances_running_shared,
+    write_json_atomic,
+)
 from core.config import network_proxy_url_from_env
 from utils.runtime_paths import runtime_root
 
@@ -72,6 +76,24 @@ _REQUIRED_PAYLOAD_ENTRIES = (
 _CHECK_TIMEOUT_S = 8.0
 _DOWNLOAD_TIMEOUT_S = 60.0
 _DOWNLOAD_CHUNK_BYTES = 256 * 1024
+_MAX_ARCHIVE_MEMBERS = 10_000
+_MAX_ARCHIVE_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_GITHUB_ALLOWED_REDIRECT_SUFFIXES = (
+    "github.com",
+    "githubusercontent.com",
+    "githubassets.com",
+)
+_WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{idx}" for idx in range(1, 10)),
+        *(f"LPT{idx}" for idx in range(1, 10)),
+    }
+)
 _UPDATE_IN_PROGRESS_STATES = frozenset(
     {"downloading", "verifying", "ready_to_restart", "restarting"}
 )
@@ -184,11 +206,58 @@ def _is_allowed_download_url(url: str) -> bool:
         parsed = urllib.parse.urlsplit(url.strip())
     except ValueError:
         return False
-    if parsed.scheme == "https" and bool(parsed.netloc):
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https" and bool(host):
         return True
-    if parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost"}:
+    if parsed.scheme == "http" and host in _LOOPBACK_HOSTS:
         return True
     return False
+
+
+def _is_host_in_suffixes(host: str, suffixes: tuple[str, ...]) -> bool:
+    normalized = host.rstrip(".").lower()
+    for suffix in suffixes:
+        if normalized == suffix or normalized.endswith(f".{suffix}"):
+            return True
+    return False
+
+
+def _is_allowed_redirect_target(origin_url: str, target_url: str) -> bool:
+    if not _is_allowed_download_url(target_url):
+        return False
+    try:
+        origin = urllib.parse.urlsplit(origin_url.strip())
+        target = urllib.parse.urlsplit(target_url.strip())
+    except ValueError:
+        return False
+    # Never allow HTTPS -> HTTP (or other non-HTTPS) downgrade, even to loopback.
+    if origin.scheme == "https" and target.scheme != "https":
+        return False
+    origin_host = (origin.hostname or "").rstrip(".").lower()
+    target_host = (target.hostname or "").rstrip(".").lower()
+    if not target_host:
+        return False
+    if target_host == origin_host or (
+        origin_host and target_host.endswith(f".{origin_host}")
+    ):
+        return True
+    if _is_host_in_suffixes(target_host, _GITHUB_ALLOWED_REDIRECT_SUFFIXES):
+        return True
+    return False
+
+
+def _validate_redirect_response(response: httpx.Response) -> None:
+    if not response.is_redirect:
+        return
+    location = response.headers.get("location")
+    if not location:
+        return
+    origin_url = str(response.url)
+    target_url = urllib.parse.urljoin(origin_url, location.strip())
+    if not _is_allowed_redirect_target(origin_url, target_url):
+        raise UpdateError(
+            f"更新下载重定向目标不受信任或试图协议降级（{target_url}），已拒绝。"
+        )
 
 
 def _extract_asset_sha256(asset: dict[str, Any]) -> str:
@@ -331,8 +400,22 @@ def _validate_archive_member_path(name: str) -> PurePosixPath:
     normalized = name.replace("\\", "/")
     if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
         raise UpdateError(f"安装包包含绝对路径（{name}），已拒绝解压。")
-    pure = PurePosixPath(normalized)
-    if any(part in {"..", ""} for part in pure.parts):
+    raw_trimmed = normalized[:-1] if normalized.endswith("/") else normalized
+    if not raw_trimmed:
+        raise UpdateError(f"安装包包含空路径或越界路径（{name}），已拒绝解压。")
+    raw_parts = raw_trimmed.split("/")
+    for part in raw_parts:
+        if part in {".", "..", ""}:
+            raise UpdateError(f"安装包包含越界路径（{name}），已拒绝解压。")
+        if ":" in part:
+            raise UpdateError(f"安装包路径包含非法字符 ':'（{name}），已拒绝解压。")
+        if part.endswith(" ") or part.endswith("."):
+            raise UpdateError(f"安装包路径段末尾包含非法空格或点号（{name}），已拒绝解压。")
+        stem = part.split(".", 1)[0].rstrip(" ").upper()
+        if stem in _WINDOWS_RESERVED_DEVICE_NAMES:
+            raise UpdateError(f"安装包包含 Windows 保留设备名路径（{name}），已拒绝解压。")
+    pure = PurePosixPath(raw_trimmed)
+    if not pure.parts or any(part in {".", "..", ""} for part in pure.parts):
         raise UpdateError(f"安装包包含越界路径（{name}），已拒绝解压。")
     return pure
 
@@ -347,27 +430,67 @@ def safe_extract_zip(
     dest_dir: Path,
     *,
     cancel_event: threading.Event | None = None,
+    max_members: int = _MAX_ARCHIVE_MEMBERS,
+    max_total_bytes: int = _MAX_ARCHIVE_UNCOMPRESSED_BYTES,
 ) -> Path:
     """Safely extract ``archive_path`` into ``dest_dir`` and return the payload root.
 
-    Rejects absolute paths, drive prefixes, ``..`` traversal, and symlinks.
+    Rejects absolute paths, drive prefixes, ``..``/``.`` traversal, Windows ADS/
+    reserved device names/trailing space or dot, symlinks, Windows case-folding
+    path collisions, and Zip Bombs (member count / uncompressed byte caps).
     Automatically unwraps a single top-level wrapper folder (e.g. ``jav-sub/``)
     so the returned directory directly contains ``jav-sub.exe``, ``launcher.py``,
     ``src/``, and ``release-files.json``.
     """
     extract_root = dest_dir.resolve()
     extract_root.mkdir(parents=True, exist_ok=True)
+    member_limit = max(1, int(max_members))
+    byte_limit = max(1, int(max_total_bytes))
+    seen_files_cf: dict[str, str] = {}
+    seen_dirs_cf: dict[str, str] = {}
+    total_extracted_bytes = 0
     try:
         with zipfile.ZipFile(archive_path, "r") as zf:
             infos = zf.infolist()
             if not infos:
                 raise UpdateError("安装包为空，已拒绝升级。")
+            if len(infos) > member_limit:
+                raise UpdateError(
+                    f"安装包成员数量超过安全上限（{len(infos)} > {member_limit}），已拒绝解压。"
+                )
             for info in infos:
                 if cancel_event is not None and cancel_event.is_set():
                     raise UpdateCancelledError("已取消更新。")
                 if _is_zip_symlink(info):
                     raise UpdateError(f"安装包包含符号链接（{info.filename}），已拒绝解压。")
                 pure = _validate_archive_member_path(info.filename)
+                posix_path = pure.as_posix()
+                path_cf = posix_path.casefold()
+
+                # Check every ancestor directory for case-folding collisions (e.g. SRC/ vs src/)
+                # and file-vs-directory collisions on Windows filesystems.
+                parent_end = len(pure.parts) if info.is_dir() else len(pure.parts) - 1
+                for depth in range(1, parent_end + 1):
+                    dir_posix = "/".join(pure.parts[:depth])
+                    dir_cf = dir_posix.casefold()
+                    if dir_cf in seen_files_cf:
+                        raise UpdateError(
+                            f"安装包包含文件与目录大小写冲突（{info.filename}），已拒绝解压。"
+                        )
+                    prev_dir = seen_dirs_cf.get(dir_cf)
+                    if prev_dir is not None and prev_dir != dir_posix:
+                        raise UpdateError(
+                            f"安装包包含目录大小写冲突（{prev_dir} 与 {dir_posix}），已拒绝解压。"
+                        )
+                    seen_dirs_cf[dir_cf] = dir_posix
+
+                if not info.is_dir():
+                    if path_cf in seen_files_cf or path_cf in seen_dirs_cf:
+                        raise UpdateError(
+                            f"安装包包含重复或大小写冲突路径（{info.filename}），已拒绝解压。"
+                        )
+                    seen_files_cf[path_cf] = posix_path
+
                 target = (extract_root / Path(*pure.parts)).resolve()
                 try:
                     target.relative_to(extract_root)
@@ -376,6 +499,8 @@ def safe_extract_zip(
                 if info.is_dir():
                     target.mkdir(parents=True, exist_ok=True)
                     continue
+                if info.file_size > byte_limit or total_extracted_bytes + info.file_size > byte_limit:
+                    raise UpdateError("安装包解压体积超过安全上限，已拒绝解压。")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(info, "r") as src, target.open("wb") as dst:
                     while True:
@@ -384,6 +509,9 @@ def safe_extract_zip(
                         chunk = src.read(1024 * 1024)
                         if not chunk:
                             break
+                        total_extracted_bytes += len(chunk)
+                        if total_extracted_bytes > byte_limit:
+                            raise UpdateError("安装包解压体积超过安全上限，已拒绝解压。")
                         dst.write(chunk)
     except zipfile.BadZipFile as exc:
         raise UpdateError("下载的更新包不是有效的 ZIP 文件。") from exc
@@ -426,12 +554,17 @@ def verify_staged_payload(
     shipped = set(indexed_files)
     if "launcher.py" not in shipped or not any(p.startswith("src/") for p in shipped):
         raise UpdateError("更新包中的 release-files.json 缺少核心程序条目。")
+    seen_index_cf: set[str] = set()
     for rel in indexed_files:
         if cancel_event is not None and cancel_event.is_set():
             raise UpdateCancelledError("已取消更新。")
         pure = _validate_archive_member_path(rel)
         if pure.parts[0].casefold() in _PROTECTED_TOP_DIRS:
             raise UpdateError(f"更新包试图写入受保护目录（{rel}），已拒绝安装。")
+        rel_cf = pure.as_posix().casefold()
+        if rel_cf in seen_index_cf:
+            raise UpdateError(f"更新包清单包含重复或大小写冲突路径（{rel}），已拒绝安装。")
+        seen_index_cf.add(rel_cf)
         candidate = (staged / Path(*pure.parts)).resolve()
         try:
             candidate.relative_to(staged)
@@ -453,12 +586,16 @@ def verify_staged_payload(
 
     if not isinstance(manifest_payload, dict) or manifest_payload.get("schema") != RELEASE_MANIFEST_SCHEMA:
         raise UpdateError("发行清单 release-manifest.json schema 无效。")
+    git_meta = manifest_payload.get("git")
+    if isinstance(git_meta, dict) and git_meta.get("dirty") is True:
+        raise UpdateError("发行清单标记为未提交的脏构建（git.dirty=true），已拒绝安装。")
     manifest_files = manifest_payload.get("files")
     if not isinstance(manifest_files, list) or not manifest_files:
         raise UpdateError("发行清单 release-manifest.json 缺少文件校验列表。")
 
     verified_dist_files = 0
     recorded_dist: set[str] = set()
+    recorded_dist_cf: set[str] = set()
     for entry in manifest_files:
         if cancel_event is not None and cancel_event.is_set():
             raise UpdateCancelledError("已取消更新。")
@@ -469,9 +606,22 @@ def verify_staged_payload(
         rel = str(entry.get("path") or "")
         expected_hash = str(entry.get("sha256") or "").lower()
         expected_bytes = entry.get("bytes")
-        if not rel or not _SHA256_RE.fullmatch(expected_hash) or type(expected_bytes) is not int:
+        if (
+            not rel
+            or not _SHA256_RE.fullmatch(expected_hash)
+            or type(expected_bytes) is not int
+            or expected_bytes < 0
+        ):
             raise UpdateError(f"发行清单条目损坏：{rel!r}")
         pure = _validate_archive_member_path(rel)
+        if pure.parts[0].casefold() in _PROTECTED_TOP_DIRS:
+            raise UpdateError(f"发行清单试图写入受保护目录（{rel}），已拒绝安装。")
+        posix_rel = pure.as_posix()
+        rel_cf = posix_rel.casefold()
+        if posix_rel in recorded_dist:
+            raise UpdateError(f"发行清单包含重复路径：{rel}")
+        if rel_cf in recorded_dist_cf:
+            raise UpdateError(f"发行清单包含大小写冲突路径：{rel}")
         target = (staged / Path(*pure.parts)).resolve()
         try:
             target.relative_to(staged)
@@ -483,7 +633,8 @@ def verify_staged_payload(
             raise UpdateError(f"更新包文件大小校验失败：{rel}")
         if _sha256_file(target) != expected_hash:
             raise UpdateError(f"更新包文件 SHA-256 校验失败：{rel}")
-        recorded_dist.add(pure.as_posix())
+        recorded_dist.add(posix_rel)
+        recorded_dist_cf.add(rel_cf)
         verified_dist_files += 1
     if verified_dist_files == 0:
         raise UpdateError("发行清单中没有任何可核验的发布载荷文件。")
@@ -501,56 +652,29 @@ def verify_staged_payload(
 
 def other_launcher_instances_running(root: Path | None = None) -> bool:
     """Detect whether another ``launcher.py`` window is holding a slot in ``tmp/launcher``."""
-    instance_dir = _project_root(root) / "tmp" / "launcher"
-    if not instance_dir.is_dir():
-        return False
-    own_name = f"instance-{os.getpid()}.lock"
-    try:
-        slots = sorted(instance_dir.glob("instance-*.lock"))
-    except OSError:
-        return True
-    for slot in slots:
-        if slot.name == own_name:
-            continue
-        if os.name == "nt":
-            try:
-                slot.unlink()
-            except FileNotFoundError:
-                continue
-            except OSError:
-                return True
-        else:
-            try:
-                import fcntl
-
-                with slot.open("r+", encoding="utf-8") as probe:
-                    try:
-                        fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except OSError:
-                        return True
-                    fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
-                slot.unlink(missing_ok=True)
-            except FileNotFoundError:
-                continue
-            except OSError:
-                return True
-    return False
+    return _other_launcher_instances_running_shared(_project_root(root))
 
 
 def _http_client(timeout_s: float) -> httpx.Client:
     proxy_url = network_proxy_url_from_env()
-    kwargs: dict[str, Any] = {
-        "timeout": httpx.Timeout(connect=10.0, read=timeout_s, write=15.0, pool=10.0),
-        "follow_redirects": True,
-        "headers": {
+    mounts: dict[str, httpx.BaseTransport] = {
+        "all://127.0.0.1": httpx.HTTPTransport(),
+        "all://localhost": httpx.HTTPTransport(),
+        "all://[::1]": httpx.HTTPTransport(),
+    }
+    if proxy_url:
+        mounts["all://"] = httpx.HTTPTransport(proxy=proxy_url)
+    return httpx.Client(
+        timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=15.0, pool=10.0),
+        follow_redirects=True,
+        event_hooks={"response": [_validate_redirect_response]},
+        headers={
             "User-Agent": f"jav-sub/{current_app_version()}",
             "Accept": "application/vnd.github+json",
         },
-        "trust_env": not bool(proxy_url),
-    }
-    if proxy_url:
-        kwargs["proxy"] = proxy_url
-    return httpx.Client(**kwargs)
+        mounts=mounts,
+        trust_env=not bool(proxy_url),
+    )
 
 
 def write_pending_update_descriptor(
@@ -577,17 +701,7 @@ def write_pending_update_descriptor(
         "prepared_at": _utc_now(),
     }
     target = updates_dir / PENDING_UPDATE_FILE_NAME
-    tmp = updates_dir / f"{PENDING_UPDATE_FILE_NAME}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
-    try:
-        with tmp.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        tmp.replace(target)
-    finally:
-        tmp.unlink(missing_ok=True)
-    return target
+    return write_json_atomic(target, payload, indent=2, ensure_ascii=False)
 
 
 _exit_callback_lock = threading.Lock()
@@ -623,6 +737,7 @@ class UpdateManager:
         self._error = ""
         self._checked_at = ""
         self._cancel_event: threading.Event | None = None
+        self._active_client: httpx.Client | None = None
         self._worker: threading.Thread | None = None
         self._check_thread: threading.Thread | None = None
         self._check_generation = 0
@@ -772,9 +887,16 @@ class UpdateManager:
         return self.snapshot()
 
     def cancel_update(self) -> dict[str, Any]:
+        client_to_close: httpx.Client | None = None
         with self._lock:
             if self._cancel_event is not None and self._state in {"downloading", "verifying"}:
                 self._cancel_event.set()
+                client_to_close = self._active_client
+        if client_to_close is not None:
+            try:
+                client_to_close.close()
+            except Exception:
+                log.debug("Ignoring error closing active update HTTP client on cancel", exc_info=True)
         return self.snapshot()
 
     def _run_download_and_stage(
@@ -789,58 +911,78 @@ class UpdateManager:
         archive_path = version_dir / UPDATE_ARCHIVE_NAME
         extract_dir = version_dir / "extract"
         staged_dir = version_dir / "staged"
+        pending_path: Path | None = None
         try:
             version_dir.mkdir(parents=True, exist_ok=True)
             with _http_client(_DOWNLOAD_TIMEOUT_S) as client:
-                expected_sha = info.asset_sha256
-                if info.sha256_url:
-                    sha_resp = client.get(info.sha256_url)
-                    sha_resp.raise_for_status()
-                    sidecar_sha = parse_sha256_sidecar(sha_resp.text, UPDATE_ARCHIVE_NAME)
-                    if not sidecar_sha:
-                        raise UpdateError("无法解析安装包 SHA-256 校验文件，已中止升级。")
-                    if expected_sha and expected_sha != sidecar_sha:
-                        raise UpdateError("安装包摘要与 .sha256 文件不一致，已中止升级。")
-                    expected_sha = sidecar_sha
-                if not expected_sha or not _SHA256_RE.fullmatch(expected_sha):
-                    raise UpdateError("缺少有效的安装包 SHA-256 校验摘要，已拒绝下载。")
+                with self._lock:
+                    if cancel_event.is_set():
+                        raise UpdateCancelledError("已取消更新下载。")
+                    self._active_client = client
+                try:
+                    expected_sha = info.asset_sha256
+                    if info.sha256_url:
+                        if cancel_event.is_set():
+                            raise UpdateCancelledError("已取消更新下载。")
+                        sha_resp = client.get(info.sha256_url)
+                        sha_resp.raise_for_status()
+                        sidecar_sha = parse_sha256_sidecar(sha_resp.text, UPDATE_ARCHIVE_NAME)
+                        if not sidecar_sha:
+                            raise UpdateError("无法解析安装包 SHA-256 校验文件，已中止升级。")
+                        if expected_sha and expected_sha != sidecar_sha:
+                            raise UpdateError("安装包摘要与 .sha256 文件不一致，已中止升级。")
+                        expected_sha = sidecar_sha
+                    if not expected_sha or not _SHA256_RE.fullmatch(expected_sha):
+                        raise UpdateError("缺少有效的安装包 SHA-256 校验摘要，已拒绝下载。")
 
-                if not info.manifest_url or not _is_allowed_download_url(info.manifest_url):
-                    raise UpdateError(f"缺少有效的发行清单（{UPDATE_MANIFEST_NAME}），已拒绝下载。")
-                m_resp = client.get(info.manifest_url)
-                m_resp.raise_for_status()
-                manifest_payload = m_resp.json()
+                    if cancel_event.is_set():
+                        raise UpdateCancelledError("已取消更新下载。")
+                    if not info.manifest_url or not _is_allowed_download_url(info.manifest_url):
+                        raise UpdateError(f"缺少有效的发行清单（{UPDATE_MANIFEST_NAME}），已拒绝下载。")
+                    m_resp = client.get(info.manifest_url)
+                    m_resp.raise_for_status()
+                    manifest_payload = m_resp.json()
 
-                if cancel_event.is_set():
-                    raise UpdateCancelledError("已取消更新下载。")
+                    if cancel_event.is_set():
+                        raise UpdateCancelledError("已取消更新下载。")
 
-                digest = hashlib.sha256()
-                downloaded = 0
-                with client.stream("GET", info.archive_url) as stream:
-                    stream.raise_for_status()
-                    try:
-                        header_total = int(stream.headers.get("Content-Length") or 0)
-                    except ValueError:
-                        header_total = 0
-                    if header_total > 0:
-                        with self._lock:
-                            self._total_bytes = header_total
-                    with archive_part.open("wb") as out:
-                        for chunk in stream.iter_bytes(chunk_size=_DOWNLOAD_CHUNK_BYTES):
-                            if cancel_event.is_set():
-                                raise UpdateCancelledError("已取消更新下载。")
-                            if not chunk:
-                                continue
-                            out.write(chunk)
-                            digest.update(chunk)
-                            downloaded += len(chunk)
+                    digest = hashlib.sha256()
+                    downloaded = 0
+                    with client.stream("GET", info.archive_url) as stream:
+                        stream.raise_for_status()
+                        try:
+                            header_total = int(stream.headers.get("Content-Length") or 0)
+                        except ValueError:
+                            header_total = 0
+                        if header_total > 0:
                             with self._lock:
-                                self._downloaded_bytes = downloaded
+                                self._total_bytes = header_total
+                        with archive_part.open("wb") as out:
+                            for chunk in stream.iter_bytes(chunk_size=_DOWNLOAD_CHUNK_BYTES):
+                                if cancel_event.is_set():
+                                    raise UpdateCancelledError("已取消更新下载。")
+                                if not chunk:
+                                    continue
+                                out.write(chunk)
+                                digest.update(chunk)
+                                downloaded += len(chunk)
+                                with self._lock:
+                                    self._downloaded_bytes = downloaded
 
-                actual_sha = digest.hexdigest()
-                if actual_sha != expected_sha:
-                    raise UpdateError("安装包 SHA-256 校验失败，文件可能已损坏，请重试。")
-                archive_part.replace(archive_path)
+                    actual_sha = digest.hexdigest()
+                    if actual_sha != expected_sha:
+                        raise UpdateError("安装包 SHA-256 校验失败，文件可能已损坏，请重试。")
+                    archive_part.replace(archive_path)
+                except UpdateCancelledError:
+                    raise
+                except Exception as exc:
+                    if cancel_event.is_set():
+                        raise UpdateCancelledError("已取消更新下载。") from exc
+                    raise
+                finally:
+                    with self._lock:
+                        if self._active_client is client:
+                            self._active_client = None
 
             with self._lock:
                 if cancel_event.is_set():
@@ -875,7 +1017,7 @@ class UpdateManager:
                 self._error = ""
 
             archive_path.unlink(missing_ok=True)
-            write_pending_update_descriptor(
+            pending_path = write_pending_update_descriptor(
                 base,
                 from_version=from_version,
                 info=info,
@@ -883,10 +1025,25 @@ class UpdateManager:
                 zip_sha256=actual_sha,
                 manifest_verified=manifest_verified,
             )
-            if not request_update_restart():
+            try:
+                restarted = request_update_restart()
+            except Exception as exc:
+                log.exception("Update exit callback failed after staging update")
+                try:
+                    pending_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                pending_path = None
+                raise UpdateError(f"触发自动重启失败：{exc}") from exc
+            if not restarted:
                 with self._lock:
                     self._state = "ready_to_restart"
         except UpdateCancelledError:
+            if pending_path is not None:
+                try:
+                    pending_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             shutil.rmtree(version_dir, ignore_errors=True)
             with self._lock:
                 self._state = "available"
@@ -894,6 +1051,11 @@ class UpdateManager:
                 self._error = ""
         except Exception as exc:  # noqa: BLE001 - report clean error to UI
             log.exception("Self-update download/verification failed")
+            if pending_path is not None:
+                try:
+                    pending_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             shutil.rmtree(version_dir, ignore_errors=True)
             with self._lock:
                 self._state = "error"
@@ -901,10 +1063,13 @@ class UpdateManager:
                 self._error = str(exc)
 
 
-_manager = UpdateManager()
+_manager: UpdateManager | None = UpdateManager()
 
 
 def get_update_manager() -> UpdateManager:
+    global _manager
+    if _manager is None:
+        _manager = UpdateManager()
     return _manager
 
 

@@ -7,9 +7,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response
 
 from core import events, updater
 from core.config import DEFAULT_SETTINGS, config_load_error, load_config
@@ -24,6 +24,7 @@ from utils.runtime_paths import resource_root
 from web import broadcaster, pipeline_manager
 from web.job_store import JobPersistenceError
 from web.routes import config, events as event_routes, files, jobs, update as update_routes
+from web.security import LocalSecurityMiddleware
 
 
 log = logging.getLogger(__name__)
@@ -102,11 +103,29 @@ def _warn_configuration_problems() -> None:
         log.warning("configuration problem scan skipped: %r", exc)
 
 
+async def _cancel_and_gather(tasks: list[asyncio.Task]) -> None:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if not tasks:
+        return
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for task, result in zip(tasks, results):
+        if isinstance(result, BaseException) and not isinstance(
+            result, asyncio.CancelledError
+        ):
+            log.error(
+                "Background task %s ended with an error during shutdown",
+                task.get_name(),
+                exc_info=result,
+            )
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     configure_process_logging("app.log")
     attach_asyncio_exception_handler(asyncio.get_running_loop())
-    load_config()
+    await asyncio.to_thread(load_config)
     _warn_configuration_problems()
     _warn_translation_budget()
     listener_task: asyncio.Task | None = None
@@ -118,6 +137,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         except OSError:
             log.exception("Failed to bind SSE TCP listener on 127.0.0.1:%s", port)
         else:
+
             def _on_listener_done(task: asyncio.Task) -> None:
                 # Surface unexpected runtime failures on the listener task.
                 if task.cancelled():
@@ -143,30 +163,21 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
             updater.get_update_manager().start_background_check()
         yield
     finally:
+        # 1. Stop accepting new pipeline events before tearing down the listener.
         events.configure_sink("")
-        for task in worker_tasks:
-            task.cancel()
+        if listener_task is not None:
+            await _cancel_and_gather([listener_task])
+        # 2. Signal all in-flight work, then stop worker & progress tasks cleanly.
+        pipeline_manager.signal_all_cancel_events()
+        pending_progress = list(broadcaster._pending_progress_tasks)
+        await _cancel_and_gather([*worker_tasks, *pending_progress])
+        # 3. Drain queued loggers, flush durable job state, and shut down executor.
         await pipeline_manager.shutdown_executor()
-        if listener_task is not None:
-            listener_task.cancel()
-        tasks = [*worker_tasks]
-        if listener_task is not None:
-            tasks.append(listener_task)
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for task, result in zip(tasks, results):
-                if isinstance(result, BaseException) and not isinstance(
-                    result, asyncio.CancelledError
-                ):
-                    log.error(
-                        "Background task %s ended with an error during shutdown",
-                        task.get_name(),
-                        exc_info=result,
-                    )
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="jav-sub Web", lifespan=_lifespan)
+    app.add_middleware(LocalSecurityMiddleware)
 
     @app.exception_handler(JobPersistenceError)
     async def persistence_error(request: Request, exc: JobPersistenceError):
@@ -187,6 +198,10 @@ def create_app() -> FastAPI:
     @app.exception_handler(pipeline_manager.JobOutputConflict)
     async def output_conflict(_request: Request, exc: pipeline_manager.JobOutputConflict):
         return JSONResponse(status_code=409, content={"detail": str(exc), "job_id": exc.job_id})
+
+    @app.exception_handler(pipeline_manager.JobStateConflictError)
+    async def state_conflict(_request: Request, exc: pipeline_manager.JobStateConflictError):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.exception_handler(pipeline_manager.UpdateInProgressError)
     async def update_in_progress(_request: Request, exc: pipeline_manager.UpdateInProgressError):
@@ -240,7 +255,14 @@ def create_app() -> FastAPI:
         assets_dir = Path(__file__).resolve().parents[1] / "assets"
 
     def _asset_response(relative_path: str, media_type: str) -> Response:
-        return Response((assets_dir / relative_path).read_bytes(), media_type=media_type)
+        target = assets_dir / relative_path
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="Asset not found")
+        return FileResponse(
+            target,
+            media_type=media_type,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     @app.get("/assets/images/icon.png", include_in_schema=False)
     async def app_icon_png() -> Response:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -23,7 +24,10 @@ def seven_zip():
     for choice in choices:
         if choice and Path(choice).is_file():
             return Path(choice)
-    pytest.skip("7-Zip CLI is required for the real archive smoke")
+    msg = "7-Zip CLI is required for the real archive smoke"
+    if os.getenv("JAV_SUB_CI_STRICT") == "1":
+        pytest.fail(msg)
+    pytest.skip(msg)
 
 
 @pytest.fixture

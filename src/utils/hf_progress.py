@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, ClassVar
 
 from huggingface_hub.utils.tqdm import tqdm as _base_tqdm
 
@@ -186,13 +188,18 @@ class HfDownloadProgressTqdm(_base_tqdm):  # type: ignore[misc, valid-type]
       instead and the (here, reliable) ``.transfer`` twin is shown.
     """
 
-    _AGGREGATE_LABELS = {"huggingface_hub.snapshot_download": "模型文件"}
-    _SUPPRESSED_NAMES = {
-        "huggingface_hub.snapshot_download.transfer",
-        "huggingface_hub.xet_get",
-    }
+    _AGGREGATE_LABELS: ClassVar[MappingProxyType[str, str]] = MappingProxyType(
+        {"huggingface_hub.snapshot_download": "模型文件"}
+    )
+    _SUPPRESSED_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "huggingface_hub.snapshot_download.transfer",
+            "huggingface_hub.xet_get",
+        }
+    )
 
     def __init__(self, *args, **kwargs):
+        self._hf_lock = threading.Lock()
         self._hf_progress_unit = kwargs.get("unit", "it")
         self._hf_progress_name = str(kwargs.get("name") or "")
         self._hf_progress_is_suppressed = self._hf_progress_name in self._SUPPRESSED_NAMES
@@ -202,6 +209,7 @@ class HfDownloadProgressTqdm(_base_tqdm):  # type: ignore[misc, valid-type]
         self._hf_progress_started = time.perf_counter()
         self._hf_progress_last_emit = 0.0
         self._hf_progress_last_pct = -1
+        self._hf_progress_last_total: float | int | None = self._hf_progress_total
         self._hf_progress_finished = False
         # Bound once, here. huggingface_hub builds the bar on the thread that
         # asked for the file but drives `update` from its own transfer threads,
@@ -211,12 +219,13 @@ class HfDownloadProgressTqdm(_base_tqdm):  # type: ignore[misc, valid-type]
         # translation model's progress arrived under.
         self._hf_identity = current_identity()
         super().__init__(*args, **kwargs)
-        if self._hf_should_emit:
-            extra: dict[str, Any] = {"file": self._hf_progress_file}
-            size_mb = _mb(self._hf_progress_total)
-            if size_mb is not None:
-                extra["size_mb"] = size_mb
-            _emit("start", extra, self._hf_identity)
+        with self._hf_lock:
+            if self._hf_should_emit and not self._hf_progress_finished:
+                extra: dict[str, Any] = {"file": self._hf_progress_file}
+                size_mb = _mb(self._hf_progress_total)
+                if size_mb is not None:
+                    extra["size_mb"] = size_mb
+                _emit("start", extra, self._hf_identity)
 
     @property
     def _hf_should_emit(self) -> bool:
@@ -230,76 +239,91 @@ class HfDownloadProgressTqdm(_base_tqdm):  # type: ignore[misc, valid-type]
         return result
 
     def close(self):
+        lock = getattr(self, "_hf_lock", None)
         try:
-            return super().close()
+            if hasattr(self, "disable"):
+                return super().close()
+            return None
         finally:
-            if self._hf_should_emit and not self._hf_progress_finished:
-                self._hf_progress_finished = True
-                _emit(
-                    "done",
-                    {
-                        "file": self._hf_progress_file,
-                        "elapsed_s": round(
-                            time.perf_counter() - self._hf_progress_started,
-                            2,
-                        ),
-                    },
-                    self._hf_identity,
-                )
+            if lock is not None:
+                with lock:
+                    if self._hf_should_emit and not self._hf_progress_finished:
+                        self._hf_progress_finished = True
+                        _emit(
+                            "done",
+                            {
+                                "file": self._hf_progress_file,
+                                "elapsed_s": round(
+                                    time.perf_counter() - self._hf_progress_started,
+                                    2,
+                                ),
+                            },
+                            self._hf_identity,
+                        )
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if exc_type is not None and self._hf_should_emit:
-            self._hf_progress_finished = True
-            _emit(
-                "error",
-                {
-                    "file": self._hf_progress_file,
-                    "elapsed_s": round(
-                        time.perf_counter() - self._hf_progress_started,
-                        2,
-                    ),
-                    "error": str(exc_value or exc_type.__name__),
-                },
-                self._hf_identity,
-            )
+        if exc_type is not None:
+            with self._hf_lock:
+                if self._hf_should_emit and not self._hf_progress_finished:
+                    self._hf_progress_finished = True
+                    _emit(
+                        "error",
+                        {
+                            "file": self._hf_progress_file,
+                            "elapsed_s": round(
+                                time.perf_counter() - self._hf_progress_started,
+                                2,
+                            ),
+                            "error": str(exc_value or exc_type.__name__),
+                        },
+                        self._hf_identity,
+                    )
         return super().__exit__(exc_type, exc_value, traceback)
 
     def _hf_emit_progress(self) -> None:
-        if not self._hf_should_emit or self._hf_progress_finished:
-            return
-        now = time.perf_counter()
-        total = self.total or self._hf_progress_total
-        current = float(getattr(self, "n", 0) or 0)
-        pct: int | None = None
-        if total:
-            pct = max(0, min(100, int(current * 100 / float(total))))
-            if pct == self._hf_progress_last_pct and now - self._hf_progress_last_emit < 1.0:
+        with self._hf_lock:
+            if not self._hf_should_emit or self._hf_progress_finished:
                 return
-            if pct != 100 and now - self._hf_progress_last_emit < 0.5:
+            now = time.perf_counter()
+            total = self.total or self._hf_progress_total
+            current = float(getattr(self, "n", 0) or 0)
+            pct: int | None = None
+            if total:
+                pct = max(0, min(100, int(current * 100 / float(total))))
+                if (
+                    self._hf_progress_last_pct >= 0
+                    and pct < self._hf_progress_last_pct
+                    and total == self._hf_progress_last_total
+                ):
+                    pct = self._hf_progress_last_pct
+                if pct == self._hf_progress_last_pct and now - self._hf_progress_last_emit < 1.0:
+                    return
+                if pct != 100 and now - self._hf_progress_last_emit < 0.5:
+                    return
+                self._hf_progress_last_pct = pct
+                self._hf_progress_last_total = total
+            elif now - self._hf_progress_last_emit < 1.0:
                 return
-            self._hf_progress_last_pct = pct
-        elif now - self._hf_progress_last_emit < 1.0:
-            return
-        self._hf_progress_last_emit = now
+            self._hf_progress_last_emit = now
 
-        extra: dict[str, Any] = {"file": self._hf_progress_file}
-        if pct is not None:
-            extra["pct"] = pct
-        # snapshot_download's reconstruct total starts at 0 and grows as each
-        # file registers, so the size shown at "start" (0) would otherwise
-        # never update again -- re-report it as it settles.
-        size_mb = _mb(total)
-        if size_mb is not None:
-            extra["size_mb"] = size_mb
-        rate = None
-        try:
-            rate = self.format_dict.get("rate")
-        except Exception:
+            extra: dict[str, Any] = {"file": self._hf_progress_file}
+            if pct is not None:
+                extra["pct"] = pct
+            # snapshot_download's reconstruct total starts at 0 and grows as each
+            # file registers, so the size shown at "start" (0) would otherwise
+            # never update again -- re-report it as it settles.
+            size_mb = _mb(total)
+            if size_mb is not None:
+                extra["size_mb"] = size_mb
             rate = None
-        speed_mb = _mb(rate)
-        if speed_mb is not None:
-            extra["speed_mb"] = speed_mb
-        _emit("progress", extra, self._hf_identity)
+            try:
+                rate = self.format_dict.get("rate")
+            except Exception:
+                rate = None
+            speed_mb = _mb(rate)
+            if speed_mb is not None:
+                extra["speed_mb"] = speed_mb
+            _emit("progress", extra, self._hf_identity)
 
 
 class DownloadCancelled(RuntimeError):
@@ -326,6 +350,15 @@ def tqdm_class(cancel_event=None) -> type:
         return HfDownloadProgressTqdm
 
     class _CancellableHfDownloadProgressTqdm(HfDownloadProgressTqdm):
+        def __init__(self, *args, **kwargs):
+            self.disable = True
+            self._hf_lock = threading.Lock()
+            self._hf_progress_finished = True
+            self._hf_progress_is_suppressed = True
+            if cancel_event.is_set():
+                raise DownloadCancelled("下载已取消")
+            super().__init__(*args, **kwargs)
+
         def update(self, n=1):
             if cancel_event.is_set():
                 raise DownloadCancelled("下载已取消")

@@ -51,7 +51,8 @@ async def cancel_update() -> dict:
 async def set_auto_update_check(body: AutoCheckPreference) -> dict:
     value = "0" if body.enabled else "1"
     try:
-        update_config_file(
+        await asyncio.to_thread(
+            update_config_file,
             {"JAV_SUB_DISABLE_UPDATE_CHECK": value},
             path=config_routes._config_file_path(),
         )

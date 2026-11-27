@@ -56,6 +56,28 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _free_ports(count: int, *, exclude: set[int] | None = None) -> list[int]:
+    """Allocate ``count`` distinct free localhost ports without racing reuse."""
+    sockets: list[socket.socket] = []
+    ports: list[int] = []
+    blocked = set(exclude or ())
+    try:
+        while len(ports) < count:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+            if port in blocked:
+                sock.close()
+                continue
+            blocked.add(port)
+            sockets.append(sock)
+            ports.append(port)
+    finally:
+        for sock in sockets:
+            sock.close()
+    return ports
+
+
 def _make_mock_release_assets(version: str = "1.9.1") -> tuple[bytes, str, bytes]:
     files: dict[str, bytes] = {
         "jav-sub.exe": f"fake-exe-{version}".encode("utf-8"),
@@ -195,7 +217,19 @@ class _CDPPage:
         self.http_errors: list[tuple[int, str]] = []
         self.dialogs: list[tuple[str, str]] = []
         self.accept_confirm = True
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._reader_task = asyncio.create_task(self._read_loop())
+
+    def _spawn_bg(self, coro: Any) -> None:
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+
+        def _done(done_task: asyncio.Task[Any]) -> None:
+            self._bg_tasks.discard(done_task)
+            if not done_task.cancelled():
+                done_task.exception()
+
+        task.add_done_callback(_done)
 
     async def _read_loop(self) -> None:
         try:
@@ -238,7 +272,7 @@ class _CDPPage:
                     message = str(params.get("message") or "")
                     self.dialogs.append((dtype, message))
                     accept = self.accept_confirm if dtype == "confirm" else True
-                    asyncio.create_task(
+                    self._spawn_bg(
                         self.send("Page.handleJavaScriptDialog", {"accept": accept})
                     )
         except asyncio.CancelledError:
@@ -283,10 +317,10 @@ class _CDPPage:
 
     async def close(self) -> None:
         self._reader_task.cancel()
-        try:
-            await self._reader_task
-        except asyncio.CancelledError:
-            pass
+        bg_tasks = list(self._bg_tasks)
+        for task in bg_tasks:
+            task.cancel()
+        await asyncio.gather(self._reader_task, *bg_tasks, return_exceptions=True)
 
 
 def _wait_for_cdp_ws_url(cdp_port: int, *, timeout_s: float = 15.0) -> str:
@@ -322,7 +356,10 @@ def _wait_for_http_ready(port: int, *, timeout_s: float = 15.0) -> None:
 def test_web_ui_full_browser_click_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     browser = _find_chromium_binary()
     if browser is None:
-        pytest.skip("No Chromium/Edge executable available for headless browser E2E test")
+        msg = "No Chromium/Edge executable available for headless browser E2E test"
+        if os.getenv("JAV_SUB_CI_STRICT") == "1":
+            pytest.fail(msg)
+        pytest.skip(msg)
 
     install_dir = _make_fake_install(tmp_path / "pkg", version="1.9.0")
     sample_video = tmp_path / "sample-a.mp4"
@@ -331,9 +368,7 @@ def test_web_ui_full_browser_click_e2e(tmp_path: Path, monkeypatch: pytest.Monke
     edge_profile.mkdir()
 
     mock_gh_server, mock_gh_port, expected_zip_sha = _start_mock_release_server("1.9.1")
-    app_port = _free_port()
-    events_port = _free_port()
-    cdp_port = _free_port()
+    app_port, events_port, cdp_port = _free_ports(3, exclude={mock_gh_port})
 
     # Isolate every writable path & runtime side effect to tmp_path.
     monkeypatch.setenv("TRANSLATION_BACKEND", "llamacpp")
@@ -431,7 +466,8 @@ def test_web_ui_full_browser_click_e2e(tmp_path: Path, monkeypatch: pytest.Monke
                             backend: document.getElementById('translation-backend').value,
                             localVisible: getComputedStyle(document.getElementById('llamacpp-backend-fields')).display !== 'none',
                             openaiHidden: getComputedStyle(document.getElementById('openai-backend-fields')).display === 'none',
-                            tuningHidden: getComputedStyle(document.getElementById('section-tuning')).display === 'none',
+                            noPresets: document.querySelectorAll('.preset-chip').length === 0,
+                            noTuning: document.getElementById('section-tuning') === null,
                             submitDisabled: document.getElementById('btn-submit').disabled,
                         }))()"""
                     )
@@ -439,7 +475,8 @@ def test_web_ui_full_browser_click_e2e(tmp_path: Path, monkeypatch: pytest.Monke
                         "backend": "llamacpp",
                         "localVisible": True,
                         "openaiHidden": True,
-                        "tuningHidden": True,
+                        "noPresets": True,
+                        "noTuning": True,
                         "submitDisabled": True,
                     }
 
@@ -477,7 +514,7 @@ def test_web_ui_full_browser_click_e2e(tmp_path: Path, monkeypatch: pytest.Monke
                     en_labels = await page.eval(
                         "[...document.getElementById('r-mode').options].map(o => o.textContent)"
                     )
-                    assert any("英文字幕" in lbl for lbl in en_labels)
+                    assert en_labels == ["English", "双语（日文 + English）", "仅日文（不翻译）"]
                     await page.eval(
                         """(() => {
                             const lang = document.getElementById('api-target-lang');
@@ -504,43 +541,94 @@ def test_web_ui_full_browser_click_e2e(tmp_path: Path, monkeypatch: pytest.Monke
                     assert saved_cfg["TRANSLATION_BACKEND"] == "llamacpp"
                     assert saved_cfg["TRANSLATION_GLOSSARY"] == "テスト-测试"
 
-                    # 3. Preset chips (custom <-> standard), skip-translation dimming, custom template save.
-                    await page.eval("document.querySelector('.preset-chip[data-preset=\"custom\"]').click()")
+                    # 3. Simplified sidebar: no presets/tuning, merged 3-choice subtitle output with dynamic target lang,
+                    #    ja_only dimming translation panel, and concurrency field visible only under OpenAI backend.
                     assert await page.eval(
-                        "getComputedStyle(document.getElementById('section-tuning')).display !== 'none'"
-                    )
-                    await page.eval("document.querySelector('#panel-tuning > summary').click()")
-                    await page.eval("document.getElementById('r-skip-translation').click()")
+                        """(() => ({
+                            presets: document.querySelectorAll('.preset-chip').length,
+                            sectionTuning: !!document.getElementById('section-tuning'),
+                            panelTuning: !!document.getElementById('panel-tuning'),
+                            skipSwitch: !!document.getElementById('r-skip-translation'),
+                            saveCustom: !!document.getElementById('btn-save-custom'),
+                        }))()"""
+                    ) == {
+                        "presets": 0,
+                        "sectionTuning": False,
+                        "panelTuning": False,
+                        "skipSwitch": False,
+                        "saveCustom": False,
+                    }
                     assert await page.eval(
-                        "document.getElementById('panel-translation').classList.contains('disabled')"
+                        """(() => [...document.getElementById('r-mode').options].map(o => [o.value, o.textContent]))()"""
+                    ) == [
+                        ["zh", "简体中文"],
+                        ["bilingual", "双语（日文 + 简体中文）"],
+                        ["ja_only", "仅日文（不翻译）"],
+                    ]
+                    await page.eval(
+                        """(() => {
+                            const lang = document.getElementById('api-target-lang');
+                            lang.value = 'English';
+                            lang.dispatchEvent(new Event('change', { bubbles: true }));
+                        })()"""
                     )
-                    await page.eval("document.getElementById('r-skip-translation').click()")
-                    assert not await page.eval(
+                    assert await page.eval(
+                        """(() => [...document.getElementById('r-mode').options].map(o => [o.value, o.textContent]))()"""
+                    ) == [
+                        ["zh", "English"],
+                        ["bilingual", "双语（日文 + English）"],
+                        ["ja_only", "仅日文（不翻译）"],
+                    ]
+                    await page.eval(
+                        """(() => {
+                            const lang = document.getElementById('api-target-lang');
+                            lang.value = '简体中文';
+                            lang.dispatchEvent(new Event('change', { bubbles: true }));
+                        })()"""
+                    )
+                    await page.eval(
+                        """(() => {
+                            const mode = document.getElementById('r-mode');
+                            mode.value = 'ja_only';
+                            mode.dispatchEvent(new Event('change', { bubbles: true }));
+                        })()"""
+                    )
+                    assert await page.eval(
                         "document.getElementById('panel-translation').classList.contains('disabled')"
                     )
                     await page.eval(
                         """(() => {
-                            document.getElementById('r-mode').value = 'bilingual';
-                            document.getElementById('t-translation-max-workers').value = '6';
-                            document.getElementById('btn-save-custom').click();
+                            const mode = document.getElementById('r-mode');
+                            mode.value = 'zh';
+                            mode.dispatchEvent(new Event('change', { bubbles: true }));
                         })()"""
                     )
-                    await page.eval("document.querySelector('.preset-chip[data-preset=\"standard\"]').click()")
+                    assert not await page.eval(
+                        "document.getElementById('panel-translation').classList.contains('disabled')"
+                    )
                     assert await page.eval(
-                        """(() => ({
-                            tuningHidden: getComputedStyle(document.getElementById('section-tuning')).display === 'none',
-                            mode: document.getElementById('r-mode').value,
-                            workers: document.getElementById('t-translation-max-workers').value,
-                        }))()"""
-                    ) == {"tuningHidden": True, "mode": "zh", "workers": "4"}
-                    await page.eval("document.querySelector('.preset-chip[data-preset=\"custom\"]').click()")
+                        "document.getElementById('t-translation-max-workers').offsetParent === null"
+                    )
+                    await page.eval(
+                        """(() => {
+                            const sel = document.getElementById('translation-backend');
+                            sel.value = 'openai';
+                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        })()"""
+                    )
                     assert await page.eval(
-                        """(() => ({
-                            mode: document.getElementById('r-mode').value,
-                            workers: document.getElementById('t-translation-max-workers').value,
-                        }))()"""
-                    ) == {"mode": "bilingual", "workers": "6"}
-                    await page.eval("document.querySelector('.preset-chip[data-preset=\"standard\"]').click()")
+                        "document.getElementById('t-translation-max-workers').offsetParent !== null"
+                    )
+                    await page.eval(
+                        """(() => {
+                            const sel = document.getElementById('translation-backend');
+                            sel.value = 'llamacpp';
+                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        })()"""
+                    )
+                    assert await page.eval(
+                        "document.getElementById('t-translation-max-workers').offsetParent === null"
+                    )
 
                     # 4. Network proxy panel toggle on -> save -> off -> clear.
                     await page.eval("document.querySelector('#panel-proxy > summary').click()")
@@ -679,6 +767,14 @@ def test_web_ui_full_browser_click_e2e(tmp_path: Path, monkeypatch: pytest.Monke
                     assert await page.eval("document.getElementById('update-modal').hidden") is True
                     await page.eval("document.getElementById('btn-update-trigger').click()")
                     assert await page.eval("document.getElementById('update-modal').hidden") is False
+                    close_inside_modal = await page.eval(
+                        """(() => {
+                            const m = document.querySelector('.update-modal').getBoundingClientRect();
+                            const b = document.getElementById('btn-update-close').getBoundingClientRect();
+                            return b.left >= m.left && b.right <= m.right && b.top >= m.top && b.bottom <= m.bottom;
+                        })()"""
+                    )
+                    assert close_inside_modal is True
                     await page.eval("document.getElementById('btn-update-close').click()")
                     assert await page.eval("document.getElementById('update-modal').hidden") is True
 
@@ -741,4 +837,3 @@ def test_web_ui_full_browser_click_e2e(tmp_path: Path, monkeypatch: pytest.Monke
             except subprocess.TimeoutExpired:
                 edge_proc.kill()
                 edge_proc.wait(timeout=5.0)
-        os.environ.pop("JAV_SUB_UPDATE_API_URL", None)

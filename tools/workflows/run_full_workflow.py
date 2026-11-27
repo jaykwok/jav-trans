@@ -15,10 +15,12 @@ from types import SimpleNamespace
 from typing import Any
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+if str(_REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools._common import PROJECT_ROOT, ensure_src_on_path  # noqa: E402
+
+ensure_src_on_path()
 
 from asr.backends.qwen import active_qwen_asr_model_id
 from core.config import load_config

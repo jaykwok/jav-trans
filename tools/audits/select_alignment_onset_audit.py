@@ -35,10 +35,15 @@ import sys
 
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
+if str(_REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools._common import (  # noqa: E402
+    ensure_src_on_path,
+    read_jsonl as _read_jsonl,
+)
+
+ensure_src_on_path()
 
 SELECTION_SCHEMA = "alignment_onset_audit_selection_v1"
 MANIFEST_SCHEMA = "alignment_onset_audit_manifest_v1"
@@ -61,11 +66,6 @@ DEFAULT_STRATUM_SIZES: dict[str, int] = {
     "probe_late_150ms": 25,
     "probe_late_400ms": 25,
 }
-
-
-def _read_jsonl(path: Path) -> list[dict]:
-    with path.open(encoding="utf-8-sig") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
 
 
 def main() -> None:

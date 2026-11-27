@@ -276,7 +276,7 @@ class TestExtractionAndPayloadVerification:
             archive = tmp_path / f"bad-{idx}.zip"
             with zipfile.ZipFile(archive, "w") as zf:
                 zf.writestr(member_name, data)
-            with pytest.raises(updater.UpdateError, match="越界路径|绝对路径"):
+            with pytest.raises(updater.UpdateError, match=r"越界路径|绝对路径"):
                 updater.safe_extract_zip(archive, tmp_path / f"out-{idx}")
 
         # Symlink inside ZIP must be refused.
@@ -324,6 +324,152 @@ class TestExtractionAndPayloadVerification:
         (staged_ok / "sneaky.dll").write_bytes(b"sneaky")
         with pytest.raises(updater.UpdateError, match="未登记的额外文件"):
             updater.verify_staged_payload(staged_ok, expected_version="1.9.1", manifest_payload=manifest)
+
+    def test_validate_archive_member_path_rejects_dot_ads_reserved_and_trailing_chars(self) -> None:
+        bad_names = [
+            "",
+            ".",
+            "./",
+            "./jav-sub/file.txt",
+            "jav-sub/./file.txt",
+            "jav-sub//file.txt",
+            "jav-sub/file.txt:evil",
+            "jav-sub/CON",
+            "jav-sub/con.txt",
+            "jav-sub/src/NUL.py",
+            "jav-sub/COM1.dll",
+            "jav-sub/lpt9.a.b",
+            "jav-sub/file.txt ",
+            "jav-sub/file.txt.",
+        ]
+        for bad in bad_names:
+            with pytest.raises(updater.UpdateError):
+                updater._validate_archive_member_path(bad)
+
+    def test_safe_extract_rejects_zip_bomb_and_windows_case_collisions(self, tmp_path: Path) -> None:
+        # Member count cap
+        many_zip = tmp_path / "many.zip"
+        with zipfile.ZipFile(many_zip, "w") as zf:
+            for idx in range(5):
+                zf.writestr(f"jav-sub/f{idx}.txt", b"x")
+        with pytest.raises(updater.UpdateError, match="成员数量"):
+            updater.safe_extract_zip(many_zip, tmp_path / "out-many", max_members=3)
+
+        # Uncompressed byte cap
+        big_zip = tmp_path / "big.zip"
+        with zipfile.ZipFile(big_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("jav-sub/big.bin", b"A" * 4096)
+        with pytest.raises(updater.UpdateError, match="体积超过安全上限"):
+            updater.safe_extract_zip(big_zip, tmp_path / "out-big", max_total_bytes=1024)
+
+        # Windows case-folding file collision
+        case_zip = tmp_path / "case.zip"
+        with zipfile.ZipFile(case_zip, "w") as zf:
+            zf.writestr("jav-sub/src/Main.py", b"a")
+            zf.writestr("jav-sub/src/main.py", b"b")
+        with pytest.raises(updater.UpdateError, match="大小写冲突"):
+            updater.safe_extract_zip(case_zip, tmp_path / "out-case")
+
+        # Windows case-folding directory collision
+        dir_case_zip = tmp_path / "dir-case.zip"
+        with zipfile.ZipFile(dir_case_zip, "w") as zf:
+            zf.writestr("jav-sub/SRC/a.py", b"a")
+            zf.writestr("jav-sub/src/b.py", b"b")
+        with pytest.raises(updater.UpdateError, match="大小写冲突"):
+            updater.safe_extract_zip(dir_case_zip, tmp_path / "out-dir-case")
+
+    def test_verify_staged_payload_rejects_dirty_git_protected_manifest_and_duplicate_or_case_paths(
+        self, tmp_path: Path
+    ) -> None:
+        zip_ok, manifest = _build_release_zip(version="1.9.1")
+        arch_ok = tmp_path / "ok.zip"
+        arch_ok.write_bytes(zip_ok)
+        staged = updater.safe_extract_zip(arch_ok, tmp_path / "ex-ok")
+
+        # git.dirty is True must be refused; git.dirty is False passes.
+        dirty_manifest = json.loads(json.dumps(manifest))
+        dirty_manifest["git"] = {"commit": "a" * 40, "dirty": True}
+        with pytest.raises(updater.UpdateError, match="脏构建"):
+            updater.verify_staged_payload(staged, expected_version="1.9.1", manifest_payload=dirty_manifest)
+
+        clean_manifest = json.loads(json.dumps(manifest))
+        clean_manifest["git"] = {"commit": "a" * 40, "dirty": False}
+        assert updater.verify_staged_payload(staged, expected_version="1.9.1", manifest_payload=clean_manifest) is True
+
+        # Protected directory in manifest["files"] must be refused.
+        prot_manifest = json.loads(json.dumps(manifest))
+        prot_manifest["files"].append(
+            {
+                "path": "config/config.json",
+                "root": "dist",
+                "bytes": 2,
+                "sha256": _sha256_bytes(b"{}"),
+            }
+        )
+        with pytest.raises(updater.UpdateError, match="受保护目录"):
+            updater.verify_staged_payload(staged, expected_version="1.9.1", manifest_payload=prot_manifest)
+
+        # Duplicate path in manifest["files"] must be refused.
+        dup_manifest = json.loads(json.dumps(manifest))
+        dup_manifest["files"].append(dict(dup_manifest["files"][0]))
+        with pytest.raises(updater.UpdateError, match="重复路径"):
+            updater.verify_staged_payload(staged, expected_version="1.9.1", manifest_payload=dup_manifest)
+
+        # Windows case-folding collision in manifest["files"] must be refused.
+        cf_manifest = json.loads(json.dumps(manifest))
+        readme_entry = next(e for e in cf_manifest["files"] if e["path"] == "README.txt")
+        colliding = dict(readme_entry)
+        colliding["path"] = "readme.txt"
+        cf_manifest["files"].append(colliding)
+        with pytest.raises(updater.UpdateError, match="大小写冲突"):
+            updater.verify_staged_payload(staged, expected_version="1.9.1", manifest_payload=cf_manifest)
+
+    def test_http_client_blocks_unsafe_redirects_and_exempts_loopback_proxy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 1. Redirect hook checks HTTPS->HTTP downgrade & untrusted domain redirects.
+        def _run_redirect(origin: str, location: str) -> httpx.Response:
+            def handler(request: httpx.Request) -> httpx.Response:
+                if str(request.url) == origin:
+                    return httpx.Response(302, headers={"Location": location})
+                return httpx.Response(200, text="ok")
+
+            with httpx.Client(
+                transport=httpx.MockTransport(handler),
+                follow_redirects=True,
+                event_hooks={"response": [updater._validate_redirect_response]},
+            ) as client:
+                return client.get(origin)
+
+        # HTTPS -> HTTP downgrade (even to loopback) must be refused.
+        with pytest.raises(updater.UpdateError, match=r"协议降级|不受信任"):
+            _run_redirect("https://github.com/a", "http://github.com/b")
+        with pytest.raises(updater.UpdateError, match=r"协议降级|不受信任"):
+            _run_redirect("https://github.com/a", "http://127.0.0.1/b")
+
+        # Cross-domain redirect to untrusted domain must be refused.
+        with pytest.raises(updater.UpdateError, match="不受信任"):
+            _run_redirect("https://github.com/a", "https://evil.attacker.invalid/b")
+
+        # GitHub release asset CDN redirect and same-host redirect are allowed.
+        ok_gh = _run_redirect(
+            "https://github.com/jaykwok/jav-sub/releases/download/v1.0.0/a.zip",
+            "https://release-assets.githubusercontent.com/blob/a.zip",
+        )
+        assert ok_gh.status_code == 200
+        ok_same = _run_redirect("https://example.invalid/a", "https://example.invalid/b")
+        assert ok_same.status_code == 200
+
+        # 2. _http_client exempts loopback from configured proxy.
+        monkeypatch.setenv("PROXY_PROTOCOL", "http")
+        monkeypatch.setenv("PROXY_HOST", "127.0.0.1")
+        monkeypatch.setenv("PROXY_PORT", "7890")
+        with updater._http_client(5.0) as client:
+            for url in ("http://127.0.0.1:8080/a", "http://localhost:8080/a", "http://[::1]:8080/a"):
+                t = client._transport_for_url(httpx.URL(url))
+                assert getattr(t._pool, "_proxy_url", None) is None
+            remote = client._transport_for_url(httpx.URL("https://api.github.com/repos"))
+            assert getattr(remote._pool, "_proxy_url", None) is not None
 
 
 class TestUpdateManagerAndPolicy:
@@ -568,6 +714,97 @@ class TestUpdateManagerAndPolicy:
             assert not updates_dir.exists() or list(updates_dir.iterdir()) == []
             assert mgr.snapshot()["state"] == "available"
             assert mgr.is_update_in_progress() is False
+        finally:
+            updater.register_update_exit_callback(None)
+
+    def test_manager_cancel_closes_active_http_client_and_restart_failure_cleans_pending_descriptor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        install = _make_installed_dir(tmp_path / "pkg", version="1.9.0")
+        zip_bytes, manifest = _build_release_zip(version="1.9.1")
+        zip_sha = _sha256_bytes(zip_bytes)
+        api_url = "https://example.invalid/repos/jaykwok/jav-sub/releases/latest"
+        payload = _release_payload(tag="v1.9.1", zip_bytes=zip_bytes, zip_sha=zip_sha)
+
+        # 1. Active HTTP client is closed on cancel_update(), unblocking a stalled read.
+        in_read = threading.Event()
+        closed_evt = threading.Event()
+
+        class _TrackedClient(httpx.Client):
+            def close(self) -> None:
+                closed_evt.set()
+                super().close()
+
+        class _BlockingStream(httpx.SyncByteStream):
+            def __iter__(self):
+                in_read.set()
+                closed_evt.wait(timeout=5.0)
+                raise httpx.ReadError("client closed on cancel")
+
+        def stall_handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url == api_url:
+                return httpx.Response(200, json=payload)
+            if url.endswith(".sha256"):
+                return httpx.Response(200, text=f"{zip_sha}  jav-sub-windows-x64.zip\n")
+            if url.endswith("release-manifest.json"):
+                return httpx.Response(200, json=manifest)
+            if url.endswith(".zip"):
+                return httpx.Response(200, stream=_BlockingStream())
+            return httpx.Response(404)
+
+        monkeypatch.setenv("JAV_SUB_UPDATE_API_URL", api_url)
+        monkeypatch.setattr(updater.os, "name", "nt")
+        monkeypatch.setattr(
+            updater,
+            "_http_client",
+            lambda _t: _TrackedClient(transport=httpx.MockTransport(stall_handler)),
+        )
+
+        mgr = updater.UpdateManager(root=install)
+        mgr.check_now()
+        mgr.start_update(active_jobs_count=0)
+        assert in_read.wait(timeout=5.0)
+        mgr.cancel_update()
+        assert closed_evt.is_set()
+        assert mgr._worker is not None
+        mgr._worker.join(timeout=5.0)
+        assert mgr.snapshot()["state"] == "available"
+
+        # 2. If request_update_restart() raises after staging, pending-update.json
+        #    MUST be cleaned up alongside staged_dir (no dangling descriptor).
+        monkeypatch.setattr(
+            updater,
+            "_http_client",
+            _mock_http_client(
+                {
+                    api_url: (200, payload, None),
+                    "https://example.invalid/releases/jav-sub-windows-x64.zip.sha256": (
+                        200,
+                        f"{zip_sha}  jav-sub-windows-x64.zip\n",
+                        None,
+                    ),
+                    "https://example.invalid/releases/release-manifest.json": (200, manifest, None),
+                    "https://example.invalid/releases/jav-sub-windows-x64.zip": (200, zip_bytes, None),
+                }
+            ),
+        )
+
+        def _failing_exit() -> None:
+            raise RuntimeError("exit hook boom")
+
+        updater.register_update_exit_callback(_failing_exit)
+        try:
+            mgr.start_update(active_jobs_count=0)
+            assert mgr._worker is not None
+            mgr._worker.join(timeout=10.0)
+            snap = mgr.snapshot()
+            assert snap["state"] == "error"
+            assert "exit hook boom" in snap["error"]
+            pending_path = install / "tmp" / "updates" / updater.PENDING_UPDATE_FILE_NAME
+            assert not pending_path.exists()
+            updates_dir = install / "tmp" / "updates"
+            assert not updates_dir.exists() or list(updates_dir.iterdir()) == []
         finally:
             updater.register_update_exit_callback(None)
 

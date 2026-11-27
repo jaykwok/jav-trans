@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 
+from tools._common import read_json as read_json, write_json as write_json
+
 TERMINAL_STATUSES = {"done", "failed", "cancelled"}
 
 
@@ -19,15 +21,6 @@ def timestamp_prefix() -> str:
 
 def default_run_dir(slug: str) -> Path:
     return Path("dev") / "temp" / f"{timestamp_prefix()}_{slug}"
-
-
-def write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def http_json(method: str, url: str, payload: Any | None = None, *, timeout_s: float = 30.0) -> Any:

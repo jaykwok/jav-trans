@@ -292,17 +292,34 @@ class TestCutProvenance:
         )
         assert provenance["pause_cut_count"] == 2
 
-    def test_a_merged_sliver_keeps_the_cut_that_made_it(self) -> None:
-        """The merge removes a boundary, not the search that placed it.
+    def test_a_resplit_sliver_keeps_its_fallback_cut_provenance(self) -> None:
+        """Re-splitting an over-ceiling tail sliver preserves fallback accounting.
 
         Forgetting it here would understate how often the film gave the chunker
-        nowhere legal to cut, which is the whole point of the record.
+        nowhere legal to cut, while capping every emitted chunk at `max_s`.
         """
         chunks, provenance = plan_chunk_cuts([], 61.0, max_s=30.0, min_s=2.0)
-        assert len(chunks) == 2
+        assert len(chunks) == 3
         assert provenance["cut_count"] == 2
         assert provenance["max_chunk_fallback_count"] == 2
-        assert provenance["chunk_duration_max_s"] == pytest.approx(31.0)
+        assert provenance["chunk_duration_max_s"] == pytest.approx(30.0)
+
+    def test_tail_sliver_resplits_instead_of_exceeding_max_s(self) -> None:
+        """A sliver after a full max_s chunk must never be merged past max_s."""
+        chunks, provenance = plan_chunk_cuts([], 61.0, max_s=30.0, min_s=2.0)
+        assert len(chunks) == 3
+        assert chunks[0][0] == 0.0 and chunks[-1][1] == pytest.approx(61.0)
+        assert all(2.0 - 1e-9 <= end - begin <= 30.0 + 1e-9 for begin, end in chunks)
+        assert provenance["chunk_duration_max_s"] <= 30.0 + 1e-9
+
+        # When a legal pause exists inside the rebalance window, prefer it.
+        chunks_paused, prov_paused = plan_chunk_cuts(
+            [(54.5, 55.5), (59.5, 60.5)], 61.0, max_s=30.0, min_s=2.0
+        )
+        assert len(chunks_paused) == 3
+        assert chunks_paused[1] == (pytest.approx(30.0), pytest.approx(55.0))
+        assert chunks_paused[2] == (pytest.approx(55.0), pytest.approx(61.0))
+        assert prov_paused["chunk_duration_max_s"] <= 30.0 + 1e-9
 
     def test_audio_short_enough_to_pass_whole_reports_no_cuts(self) -> None:
         chunks, provenance = plan_chunk_cuts([(3.0, 4.0)], 12.0, max_s=30.0)

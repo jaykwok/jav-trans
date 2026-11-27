@@ -50,6 +50,7 @@ def test_runtime_ephemeral_cleanup_keeps_reusable_caches(tmp_path, monkeypatch):
         job_temp_root=jobs,
         asr_chunk_root=chunks,
         project_root=tmp_path,
+        min_age_s=0.0,
     )
 
     assert not jobs.exists()

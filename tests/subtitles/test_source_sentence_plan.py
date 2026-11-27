@@ -2,7 +2,9 @@ from copy import deepcopy
 
 import pytest
 
+from subtitles import writer
 from subtitles.options import SubtitleOptions
+from subtitles.source_boundaries import source_boundary_hints
 from subtitles.writer import prepare_srt_blocks, write_bilingual_srt
 
 
@@ -116,3 +118,73 @@ def test_non_speech_isolation_never_cuts_isolated_reactions_or_protected_speech(
     text = "そうなんですか、" + middle + "それならここで待っています。"
     cues = prepare_srt_blocks([_source(text)], options=SubtitleOptions())
     assert [cue["ja_text"] for cue in cues] == [text]
+
+
+def _source_with_zero_width_spaces(text, *, gap_after="", gap=0.0, char_s=0.15):
+    words = []
+    cursor = 0.0
+    boundary = text.index(gap_after) + len(gap_after) if gap_after else -1
+    for index, char in enumerate(text):
+        if index == boundary:
+            cursor += gap
+        end = cursor if (char in "。、！？「」（）" or char.isspace()) else cursor + char_s
+        words.append({
+            "word": char,
+            "start": cursor,
+            "end": end,
+            "timestamp_kind": "ctc_forced_alignment",
+        })
+        cursor = end
+    return {"text": text, "ja_text": text, "start": 0.0, "end": cursor, "words": words}
+
+
+def test_sentence_punctuation_followed_by_spaces_emits_single_rightmost_boundary():
+    assert source_boundary_hints("そうだ。 次の文") == {5: "sentence_punctuation"}
+    assert source_boundary_hints("そうだ。   次の文") == {7: "sentence_punctuation"}
+    assert source_boundary_hints("そうだ。　次の文") == {5: "sentence_punctuation"}
+
+    cues = _plan(_source_with_zero_width_spaces("そうだ。 次の文"))
+    assert [cue["ja_text"] for cue in cues] == ["そうだ。", "次の文"]
+    assert all(cue["exact_measured_timeline"] for cue in cues)
+
+
+def test_comma_followed_by_space_emits_single_rightmost_clause_boundary():
+    first, second = "明日の仕事が早く終わったら、 ", "そちらに寄るよ。"
+    hints = source_boundary_hints(first + second)
+    assert hints == {len(first): "clause_with_pause"}
+
+    block = _source_with_zero_width_spaces(first + second, gap_after=first, gap=0.8)
+    cues = _plan(block, max_source_chars=12)
+    assert [cue["ja_text"] for cue in cues] == ["明日の仕事が早く終わったら、", "そちらに寄るよ。"]
+    assert cues[0]["text_break_type"] == "clause_with_pause"
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("「未闭合。次の文。", ["「未闭合。", "次の文。"]),
+        ("（未闭合。次の文。また次。", ["（未闭合。", "次の文。", "また次。"]),
+        ("「未闭合。「閉じた。」次の文。", ["「未闭合。", "「閉じた。」", "次の文。"]),
+        ("「（未闭合。」次の文。", ["「（未闭合。」", "次の文。"]),
+    ],
+)
+def test_unclosed_opening_quotes_or_brackets_do_not_blind_subsequent_splits(text, expected):
+    cues = _plan(_source_with_zero_width_spaces(text))
+    assert [cue["ja_text"] for cue in cues] == expected
+
+
+def test_dp_does_not_advance_sentence_start_onto_unreachable_zero_width_boundary(monkeypatch):
+    block = _source_with_zero_width_spaces("そうだ。 次の文")
+    # Simulate consecutive zero-width mandatory boundaries at word 4 and word 5.
+    monkeypatch.setattr(
+        writer,
+        "_source_word_boundaries",
+        lambda *_args, **_kwargs: {
+            4: ("sentence_punctuation", 0.0),
+            5: ("sentence_punctuation", 0.0),
+        },
+    )
+    plan = writer._exact_safe_dp_plan(block, options=SubtitleOptions())
+    assert plan is not None
+    assert len(plan["pieces"]) == 2
+    assert plan["reason"] == "split"

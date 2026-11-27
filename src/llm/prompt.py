@@ -3,6 +3,7 @@ import re
 
 from llm.glossary import normalize_glossary_text
 from llm.context import SourceContext
+from llm.output_checks import is_chinese_target
 
 
 # v4.1: lean source JSON omits unused start/end/duration_sec fields, and
@@ -21,13 +22,6 @@ def _normalize_source_text(text: str) -> str:
     cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = "\n".join(line.strip() for line in cleaned.split("\n") if line.strip())
     return cleaned.strip()
-
-
-def _safe_float(value, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _serialize_segments(
@@ -127,7 +121,7 @@ def _build_system_prompt(
         name_homophone=name_guidance["homophone"],
     )
     effective_glossary = normalize_glossary_text(glossary)
-    if any(marker in effective_target_lang.lower() for marker in ("中文", "chinese", "zh")):
+    if is_chinese_target(effective_target_lang):
         prompt += (
             "\n原文明确提及性器官、且用户词汇表没有另行指定时，中文默认用词为「肉棒」「小穴」；"
             "只用于对应的原文含义，不据此补词或加强语气。"
@@ -259,7 +253,16 @@ def _build_batch_messages(
             + json.dumps(focus_payload, ensure_ascii=False, separators=(",", ":"))
         )
 
-    source_payload = source_payload_override or _serialize_segments(batch_segments)
+    needs_source_payload = full_source_payload is None and not focus
+    source_payload = (
+        (
+            source_payload_override
+            if source_payload_override is not None
+            else _serialize_segments(batch_segments)
+        )
+        if needs_source_payload
+        else ""
+    )
     # Compact system prompt applies either on every windowed local request
     # (no full_source_payload and no whole-film summary) or on later API
     # batches when compact_system_prompt_enabled is opted in.

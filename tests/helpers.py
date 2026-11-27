@@ -41,7 +41,7 @@ def make_job_context(
     translation_max_workers: int = 4,
     translation_cache_path: Path | str | None = None,
     run_log_enabled: bool = False,
-    run_log_dir: Path | str = "./tmp/log",
+    run_log_dir: Path | str = "./logs/jobs",
 ) -> JobContext:
     video = Path(video_path)
     effective_job_id = sanitize_job_id(job_id or video.stem)

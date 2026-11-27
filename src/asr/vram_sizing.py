@@ -22,29 +22,45 @@ from dataclasses import dataclass
 # Calibrated on Qwen3-ASR-1.7B-JA-Anime-Galgame-hf (bf16/fp16, 30s chunks, sdpa).
 _BASE_WEIGHTS_BF16_MIB = 3906.0
 _PER_SAMPLE_ALLOC_30S_BF16_MIB = 224.0
+# Calibrated encoder-only pass on RTX 4060 Ti 8 GB (bf16, 30s windows):
+# batch=1 -> 4116 MiB, batch=4 -> 4782 MiB, batch=8 -> 5673 MiB, batch=16 -> 7434 MiB
+# (~222 MiB/window plus ~32 MiB for the CTC alignment head and scratch buffers).
+_ENCODER_PER_SAMPLE_ALLOC_30S_BF16_MIB = 222.0
+_ALIGNMENT_HEAD_WEIGHTS_MIB = 32.0
 _BASE_CHUNK_MAX_S = 30.0
 _BASE_DECODE_TOKENS = 300
 # Qwen3-1.7B KV cache: 28 layers * 2(K+V) * 8 kv_heads * 128 dim * 2 B ≈ 0.109 MiB/tok.
 _KV_MIB_PER_EXTRA_TOKEN_BF16 = 0.11
 
 # PyTorch CUDA caching allocator fragmentation/reserved multiplier over allocated
-# peak (measured 7096 / 6360 = 1.116 at batch=11).
+# peak:
+#   - ASR generate: measured 7096 / 6360 = 1.116 at batch=11 -> 1.12x
+#   - Encoder + AlignmentHead (170 x 30s windows): measured 5524 / 4806.7 = 1.149x -> 1.15x
 _ALLOCATOR_RESERVED_FACTOR = 1.12
+_ENCODER_RESERVED_FACTOR = 1.15
 
 # Safety reserves to prevent Windows WDDM shared-memory spill.
-# When live free VRAM is known, desktop usage is already excluded from
-# `free + own_reserved`, so only a modest transient headroom reserve is needed.
+# Measured on RTX 4060 Ti 8 GB (8188 MiB total, 7075 MiB free):
+#   - Non-PyTorch CUDA/cuDNN context & workspace uses ~490 MiB outside
+#     torch.cuda.memory_reserved() (free=1366 MiB at res=5218 MiB).
+#   - Multi-batch caching-allocator fragmentation adds ~300 MiB over single-batch
+#     peaks (res=5218 -> 5524 MiB over 170 windows).
+#   - Remaining ~170 MiB protects against transient WDDM/desktop spikes under
+#     longest-first dense 30s batching (batch=8 spilled 68-86 MiB to shared VRAM;
+#     batch=6 keeps >400 MiB dedicated VRAM free with 0 spill).
 # When live free VRAM is unavailable (e.g. unit-test stubs or pre-init probes),
 # reserve enough from physical total VRAM for typical Windows desktop overhead.
-_FREE_HEADROOM_MIB = 448.0
-_FREE_HEADROOM_FRACTION = 0.05
+_FREE_HEADROOM_MIB = 960.0
+_FREE_HEADROOM_FRACTION = 0.08
 _TOTAL_DESKTOP_RESERVE_MIB = 1280.0
 _TOTAL_DESKTOP_RESERVE_FRACTION = 0.10
 
-# Upper bound on auto batch size: ASR batches run in chronological order without
-# duration bucketing, so batches larger than 24 add padding waste with minimal
-# GPU compute gain even on 16-24 GB cards.
+# Upper bound on auto batch size: batches larger than 24 add minimal GPU compute
+# gain even on 16-24 GB cards.
 MAX_AUTO_ASR_BATCH_SIZE = 24
+# Upper bound on auto encoder/alignment batch size: encoder speedup saturates by
+# batch 4-8 on 8 GB cards; capping at 12 avoids unnecessary peak spikes on larger cards.
+MAX_AUTO_ENCODER_BATCH_SIZE = 12
 
 
 @dataclass(frozen=True)
@@ -63,6 +79,8 @@ class AsrBatchPlan:
     attention: str
     chunk_max_s: float
     source: str
+    feature_batch_size: int = 4
+    align_batch_size: int = 4
 
 
 def _normalize_dtype(dtype: str) -> str:
@@ -93,6 +111,39 @@ def _effective_decode_tokens(
         return int(max_new_tokens)
     rate = max(1.0, float(tokens_per_second or 10.0))
     return max(32, int(round(max(1.0, float(chunk_max_s)) * rate)))
+
+
+def _solve_batch_closed_form(
+    *,
+    weights_mb: float,
+    per_sample_mb: float,
+    usable_vram_mb: float,
+    cap: int,
+    reserved_factor: float = _ALLOCATOR_RESERVED_FACTOR,
+) -> int:
+    """Closed-form O(1) solver for max batch in [1, cap] with rounded reserved <= usable."""
+    if usable_vram_mb <= 0.0 or per_sample_mb <= 0.0 or cap <= 1:
+        return 1
+    max_alloc = usable_vram_mb / reserved_factor
+    if max_alloc <= weights_mb:
+        return 1
+    candidate = min(cap, max(1, int((max_alloc - weights_mb) // per_sample_mb)))
+    # Adjust by at most 1 for 0.1 MiB rounding on reserved_mb.
+    while candidate < cap:
+        next_alloc = round(weights_mb + (candidate + 1) * per_sample_mb, 1)
+        next_res = round(next_alloc * reserved_factor, 1)
+        if next_res <= usable_vram_mb:
+            candidate += 1
+        else:
+            break
+    while candidate > 1:
+        cur_alloc = round(weights_mb + candidate * per_sample_mb, 1)
+        cur_res = round(cur_alloc * reserved_factor, 1)
+        if cur_res > usable_vram_mb:
+            candidate -= 1
+        else:
+            break
+    return candidate
 
 
 def estimate_asr_vram_mb(
@@ -130,6 +181,59 @@ def estimate_asr_vram_mb(
     allocated_mb = round(weights_mb + max(1, int(batch_size)) * per_sample_mb, 1)
     reserved_mb = round(allocated_mb * _ALLOCATOR_RESERVED_FACTOR, 1)
     return allocated_mb, reserved_mb, weights_mb, per_sample_mb
+
+
+def estimate_encoder_vram_mb(
+    batch_size: int,
+    *,
+    dtype: str = "bfloat16",
+    chunk_max_s: float = _BASE_CHUNK_MAX_S,
+    include_alignment_head: bool = True,
+) -> tuple[float, float, float, float]:
+    """Estimate VRAM for pure encoder + CTC alignment head passes.
+
+    Used to size ``ASR_FEATURE_BATCH_SIZE`` (chunking) and ``ASR_ALIGN_BATCH_SIZE``
+    (forced alignment) while the 1.7B ASR weights remain resident on CUDA.
+    """
+    norm_dtype = _normalize_dtype(dtype)
+    dtype_scale = 2.0 if norm_dtype == "float32" else 1.0
+    clamped_chunk_s = min(120.0, max(5.0, float(chunk_max_s or _BASE_CHUNK_MAX_S)))
+    chunk_scale = max(0.35, clamped_chunk_s / _BASE_CHUNK_MAX_S)
+
+    head_mb = _ALIGNMENT_HEAD_WEIGHTS_MIB if include_alignment_head else 0.0
+    weights_mb = round(_BASE_WEIGHTS_BF16_MIB * dtype_scale + head_mb, 1)
+    per_sample_mb = round(
+        _ENCODER_PER_SAMPLE_ALLOC_30S_BF16_MIB * chunk_scale * dtype_scale,
+        1,
+    )
+    allocated_mb = round(weights_mb + max(1, int(batch_size)) * per_sample_mb, 1)
+    reserved_mb = round(allocated_mb * _ENCODER_RESERVED_FACTOR, 1)
+    return allocated_mb, reserved_mb, weights_mb, per_sample_mb
+
+
+def select_encoder_batch_size(
+    *,
+    usable_vram_mb: float,
+    dtype: str = "bfloat16",
+    chunk_max_s: float = _BASE_CHUNK_MAX_S,
+    max_batch: int = MAX_AUTO_ENCODER_BATCH_SIZE,
+    include_alignment_head: bool = True,
+) -> int:
+    """Select an encoder/alignment batch size directly via closed-form VRAM budget."""
+    cap = max(1, int(max_batch))
+    _, _, weights_mb, per_sample_mb = estimate_encoder_vram_mb(
+        1,
+        dtype=dtype,
+        chunk_max_s=chunk_max_s,
+        include_alignment_head=include_alignment_head,
+    )
+    return _solve_batch_closed_form(
+        weights_mb=weights_mb,
+        per_sample_mb=per_sample_mb,
+        usable_vram_mb=max(0.0, float(usable_vram_mb or 0.0)),
+        cap=cap,
+        reserved_factor=_ENCODER_RESERVED_FACTOR,
+    )
 
 
 def select_asr_batch_plan(
@@ -181,8 +285,7 @@ def select_asr_batch_plan(
 
     usable_vram_mb = round(min(caps), 1) if caps else 0.0
 
-    chosen = 1
-    chosen_alloc, chosen_res, weights_mb, per_sample_mb = estimate_asr_vram_mb(
+    _, _, weights_mb, per_sample_mb = estimate_asr_vram_mb(
         1,
         dtype=norm_dtype,
         chunk_max_s=clamped_chunk_s,
@@ -190,26 +293,30 @@ def select_asr_batch_plan(
         max_new_tokens=max_new_tokens,
         tokens_per_second=tokens_per_second,
     )
-    if usable_vram_mb > 0.0:
-        for candidate in range(1, cap + 1):
-            alloc_mb, res_mb, w_mb, s_mb = estimate_asr_vram_mb(
-                candidate,
-                dtype=norm_dtype,
-                chunk_max_s=clamped_chunk_s,
-                attention=norm_attn,
-                max_new_tokens=max_new_tokens,
-                tokens_per_second=tokens_per_second,
-            )
-            if res_mb <= usable_vram_mb:
-                chosen = candidate
-                chosen_alloc, chosen_res, weights_mb, per_sample_mb = (
-                    alloc_mb,
-                    res_mb,
-                    w_mb,
-                    s_mb,
-                )
-            else:
-                break
+    chosen = _solve_batch_closed_form(
+        weights_mb=weights_mb,
+        per_sample_mb=per_sample_mb,
+        usable_vram_mb=usable_vram_mb,
+        cap=cap,
+    )
+    chosen_alloc, chosen_res, weights_mb, per_sample_mb = estimate_asr_vram_mb(
+        chosen,
+        dtype=norm_dtype,
+        chunk_max_s=clamped_chunk_s,
+        attention=norm_attn,
+        max_new_tokens=max_new_tokens,
+        tokens_per_second=tokens_per_second,
+    )
+    feature_batch_size = select_encoder_batch_size(
+        usable_vram_mb=usable_vram_mb,
+        dtype=norm_dtype,
+        chunk_max_s=_BASE_CHUNK_MAX_S,
+    )
+    align_batch_size = select_encoder_batch_size(
+        usable_vram_mb=usable_vram_mb,
+        dtype=norm_dtype,
+        chunk_max_s=clamped_chunk_s,
+    )
 
     return AsrBatchPlan(
         batch_size=chosen,
@@ -226,4 +333,6 @@ def select_asr_batch_plan(
         attention=norm_attn,
         chunk_max_s=clamped_chunk_s,
         source="formula_vram",
+        feature_batch_size=feature_batch_size,
+        align_batch_size=align_batch_size,
     )

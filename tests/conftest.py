@@ -37,6 +37,27 @@ os.environ["LLM_MODEL_NAME"] = "test-model"
 
 
 @pytest.fixture(autouse=True)
+def _isolate_host_config_and_singletons(monkeypatch, tmp_path):
+    """Keep tests isolated from any developer-local config/config.json and process singletons."""
+    from core import config as core_config
+
+    monkeypatch.setattr(core_config, "CONFIG_PATH", tmp_path / "isolated-config.json")
+    yield
+    try:
+        from core import updater
+
+        updater._manager = updater.UpdateManager()
+    except Exception:
+        pass
+    try:
+        from web.routes import config as config_routes
+
+        config_routes._CUDA_ENV_CACHE = None
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
 def _close_test_local_translation_backend():
     yield
     # Defence in depth for a test that explicitly opted into llama.cpp and then

@@ -1,10 +1,16 @@
+import logging
 import re
+import time
 import uuid
 import wave
 from pathlib import Path
 from typing import Callable
 
+from asr.result_cache import pcm_audio_sha256
 from core.typed_config import env_bool, env_text
+
+logger = logging.getLogger(__name__)
+_EXTRACT_STAGE_MIN_INTERVAL_S = 0.25
 
 
 def current_asr_chunk_root() -> Path:
@@ -35,7 +41,8 @@ def _extract_wav_chunks(
     chunk_dir.mkdir(parents=True, exist_ok=False)
 
     chunk_infos: list[dict] = []
-    with wave.open(audio_path, "rb") as reader:
+    audio_path_str = str(audio_path)
+    with wave.open(audio_path_str, "rb") as reader:
         params = reader.getparams()
         frame_rate = reader.getframerate()
         total_frames = reader.getnframes()
@@ -57,48 +64,81 @@ def _extract_wav_chunks(
             )
 
         total_chunks = len(valid_spans)
+        frame_bytes = max(1, params.nchannels * params.sampwidth)
+        report_step = max(1, total_chunks // 20)
+        last_reported_idx = 0
+        last_reported_at = 0.0
 
-        for idx, (span_index, start_frame, end_frame, start_time, end_time) in enumerate(
+        for idx, (span_index, start_frame, end_frame, start_time, _end_time) in enumerate(
             valid_spans, 1
         ):
             if on_stage:
-                on_stage(f"音频切块 {idx}/{total_chunks}...")
+                now = time.monotonic()
+                if (
+                    idx == 1
+                    or idx == total_chunks
+                    or idx - last_reported_idx >= report_step
+                    or now - last_reported_at >= _EXTRACT_STAGE_MIN_INTERVAL_S
+                ):
+                    on_stage(f"音频切块 {idx}/{total_chunks}...")
+                    last_reported_idx = idx
+                    last_reported_at = now
 
             reader.setpos(start_frame)
             expected_frames = end_frame - start_frame
             frames = reader.readframes(expected_frames)
-            expected_bytes = expected_frames * params.nchannels * params.sampwidth
+            expected_bytes = expected_frames * frame_bytes
+            actual_frames = len(frames) // frame_bytes
             if len(frames) < expected_bytes:
-                import logging
-
-                logging.getLogger(__name__).warning(
+                logger.warning(
                     "Short WAV read while extracting chunk %d: expected_bytes=%d actual_bytes=%d",
-                    idx - 1,
+                    len(chunk_infos),
                     expected_bytes,
                     len(frames),
                 )
+            if actual_frames <= 0:
+                logger.warning(
+                    "Skipping zero-frame WAV chunk at span_index=%d (start_frame=%d)",
+                    span_index,
+                    start_frame,
+                )
+                continue
+            aligned_bytes = actual_frames * frame_bytes
+            if len(frames) != aligned_bytes:
+                frames = frames[:aligned_bytes]
 
-            chunk_path = chunk_dir / f"chunk_{idx - 1:04d}.wav"
+            chunk_index = len(chunk_infos)
+            actual_end_time = (start_frame + actual_frames) / frame_rate
+            actual_duration = actual_frames / frame_rate
+            audio_sha256 = pcm_audio_sha256(
+                frames,
+                nchannels=params.nchannels,
+                sampwidth=params.sampwidth,
+                framerate=frame_rate,
+                nframes=actual_frames,
+            )
+
+            chunk_path = chunk_dir / f"chunk_{chunk_index:04d}.wav"
             with wave.open(str(chunk_path), "wb") as writer:
-                writer.setparams(params)
+                writer.setnchannels(params.nchannels)
+                writer.setsampwidth(params.sampwidth)
+                writer.setframerate(frame_rate)
                 writer.writeframes(frames)
 
             chunk_infos.append(
                 {
-                    "index": idx - 1,
+                    "index": chunk_index,
                     "source_span_index": span_index,
                     "start": start_time,
-                    "end": end_time,
+                    "end": actual_end_time,
+                    "duration": actual_duration,
+                    "audio_sha256": audio_sha256,
                     "path": str(chunk_path),
                     "source_audio_path": source_audio_path,
                 }
             )
 
     return chunk_dir, chunk_infos
-
-
-def _chunk_duration(chunk: dict) -> float:
-    return max(0.0, float(chunk.get("end", 0.0)) - float(chunk.get("start", 0.0)))
 
 
 # --- where to cut ---------------------------------------------------------
@@ -212,12 +252,36 @@ def plan_chunk_cuts(
     chunks.append((cursor, total_s))
 
     if len(chunks) > 1 and chunks[-1][1] - chunks[-1][0] < min_s:
-        # A sliver at the end is not worth its own decode call, and merging it
-        # backwards keeps the tiling exact. The cut it removes was still made, so
-        # it stays in the provenance: dropping it would understate how often the
-        # search found nowhere legal to cut.
-        tail = chunks.pop()
-        chunks[-1] = (chunks[-1][0], tail[1])
+        # A sliver at the end is not worth its own decode call. Merge it
+        # backwards when the combined span still fits within `max_s`; otherwise
+        # re-split the combined tail so neither chunk exceeds `max_s`.
+        merged_start = chunks[-2][0]
+        merged_end = chunks[-1][1]
+        if merged_end - merged_start <= max_s + 1e-9:
+            # The cut it removes was still made, so it stays in the provenance:
+            # dropping it would understate how often the search found nowhere
+            # legal to cut.
+            chunks.pop()
+            chunks[-1] = (merged_start, merged_end)
+        else:
+            low = max(merged_start + min_s, merged_end - max_s)
+            high = min(merged_start + max_s, merged_end - min_s)
+            if low <= high + 1e-9:
+                legal_pauses = [
+                    (point, width)
+                    for point, width in candidates
+                    if low - 1e-9 <= point <= high + 1e-9
+                ]
+                if legal_pauses:
+                    new_cut, new_width = max(legal_pauses, key=lambda item: item[0])
+                else:
+                    new_cut, new_width = (merged_start + merged_end) / 2.0, None
+            else:
+                new_cut, new_width = (merged_start + merged_end) / 2.0, None
+            chunks[-2] = (merged_start, new_cut)
+            chunks[-1] = (new_cut, merged_end)
+            if cut_widths:
+                cut_widths[-1] = new_width
     return chunks, _cut_provenance(chunks, cut_widths)
 
 

@@ -53,7 +53,8 @@ def _fake_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, roots=(), 
     bin_dir.mkdir(exist_ok=True)
     for name in ("ffmpeg", "ffprobe"):
         (bin_dir / f"{name}{suffix}").write_text("", encoding="utf-8")
-    (bin_dir / "avcodec-62.dll").write_text("", encoding="utf-8")
+    for dll in ("avcodec-62.dll", "avformat-62.dll", "avutil-60.dll"):
+        (bin_dir / dll).write_text("", encoding="utf-8")
     return venv
 
 
@@ -125,22 +126,63 @@ class TestEnvironmentIntegrity:
         (tmp_path / "launcher.py").unlink()
         assert bootstrap.diagnose()["payload"] == ["launcher.py"]
 
+    @pytest.mark.parametrize("missing_dll", ["avcodec-62.dll", "avformat-62.dll", "avutil-60.dll"])
     def test_ffmpeg_exes_without_their_dlls_are_still_broken(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, missing_dll: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """torchcodec loads the shared libraries, not the executables."""
         if bootstrap.os.name != "nt":
             pytest.skip("Windows-only packaging detail")
         _fake_install(tmp_path, monkeypatch, roots=ALL_ROOTS)
-        (tmp_path / "bin" / "avcodec-62.dll").unlink()
+        (tmp_path / "bin" / missing_dll).unlink()
         assert "av*.dll" in bootstrap.ffmpeg_problem()
 
-    def test_an_ffmpeg_on_path_counts(
+    def test_an_ffmpeg_on_path_counts_only_with_shared_dlls(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        ffmpeg_exe = tools_dir / ("ffmpeg.exe" if bootstrap.os.name == "nt" else "ffmpeg")
+        ffprobe_exe = tools_dir / ("ffprobe.exe" if bootstrap.os.name == "nt" else "ffprobe")
+        ffmpeg_exe.write_text("", encoding="utf-8")
+        ffprobe_exe.write_text("", encoding="utf-8")
         monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
-        monkeypatch.setattr(bootstrap.shutil, "which", lambda _: "C:/tools/ffmpeg.exe")
+        monkeypatch.setattr(
+            bootstrap.shutil,
+            "which",
+            lambda name: str(ffmpeg_exe if name == "ffmpeg" else ffprobe_exe),
+        )
+        if bootstrap.os.name == "nt":
+            assert "av*.dll" in bootstrap.ffmpeg_problem()
+            for dll in ("avcodec-62.dll", "avformat-62.dll", "avutil-60.dll"):
+                (tools_dir / dll).write_text("", encoding="utf-8")
         assert bootstrap.ffmpeg_problem() == ""
+
+    def test_probe_imports_injects_bin_and_verifies_torchcodec_loader(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        captured: dict[str, object] = {}
+
+        class _Completed:
+            returncode = 0
+            stdout = b""
+            stderr = b""
+
+        def fake_run(cmd, *, cwd, capture_output, env, timeout):
+            captured["cmd"] = cmd
+            captured["env"] = env
+            return _Completed()
+
+        monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+        monkeypatch.setattr(bootstrap, "venv_python", lambda: Path(sys.executable))
+        monkeypatch.setattr(bootstrap.subprocess, "run", fake_run)
+        assert bootstrap.probe_imports(("torchcodec",)) == []
+        env_path = str(captured["env"]["PATH"]).split(bootstrap.os.pathsep)
+        assert env_path[0] == str(bin_dir)
+        assert "get_ffmpeg_library_versions" in captured["cmd"][2]
+        assert "add_dll_directory" in captured["cmd"][2]
 
     def test_the_import_probe_reports_which_package_failed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -316,32 +358,103 @@ class TestConsoleWindow:
 
 
 class TestReadyHandshake:
-    """The two halves of the handshake live in different files and must agree.
+    """Behavioral contract for the ready handshake between bootstrap.py and launcher.py."""
 
-    A rename on either side is silent: the console would simply never hide, or
-    would hide before the window existed.
-    """
+    def test_default_ready_path_is_isolated_per_pid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+        monkeypatch.setattr(bootstrap, "READY_PATH", bootstrap._DEFAULT_READY_PATH)
+        monkeypatch.setattr(bootstrap.os, "getpid", lambda: 1111)
+        first = bootstrap._effective_ready_path()
+        monkeypatch.setattr(bootstrap.os, "getpid", lambda: 2222)
+        second = bootstrap._effective_ready_path()
+        assert first == tmp_path / "tmp" / ".app-ready-1111"
+        assert second == tmp_path / "tmp" / ".app-ready-2222"
+        assert first != second
 
-    def _launcher_source(self) -> str:
-        return (Path(bootstrap.__file__).parent / "launcher.py").read_text(encoding="utf-8")
+    def test_launcher_signals_the_exact_ready_file_bootstrap_watches(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import launcher
 
-    def test_the_app_signals_the_variable_the_launcher_sets(self) -> None:
-        assert 'os.environ["JAV_SUB_READY_FILE"] = str(READY_PATH)' in Path(
-            bootstrap.__file__
-        ).read_text(encoding="utf-8")
-        assert 'os.getenv("JAV_SUB_READY_FILE"' in self._launcher_source()
+        monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+        monkeypatch.setattr(bootstrap, "READY_PATH", bootstrap._DEFAULT_READY_PATH)
+        visible: list[bool] = []
+        monkeypatch.setattr(bootstrap, "set_console_visible", lambda value: visible.append(value))
+        monkeypatch.setattr(bootstrap, "venv_python", lambda: Path("python"))
 
-    def test_the_signal_waits_for_the_server_instead_of_sleeping(self) -> None:
-        source = self._launcher_source()
-        # Signalled from _bind, i.e. once the window object exists, and only
-        # after the socket answers - not after a fixed sleep.
-        assert "if not _wait_for_server(PORT):" in source
-        assert "time.sleep(1.5)" not in source
+        def fake_run(_command):
+            ready_env = bootstrap.os.environ.get("JAV_SUB_READY_FILE", "")
+            assert ready_env.endswith(f".app-ready-{bootstrap.os.getpid()}")
+            launcher._signal_app_ready()
+            for _ in range(200):
+                if visible:
+                    return 0
+                bootstrap.time.sleep(0.02)
+            return 0
 
-    def test_a_dead_server_thread_is_reported_not_hidden(self) -> None:
-        source = self._launcher_source()
-        assert "_server_error.append(exc)" in source
-        assert "--doctor" in source
+        monkeypatch.setattr(bootstrap, "run_streaming", fake_run)
+        assert bootstrap.launch([]) == 0
+        assert visible == [False]
+
+    def test_wait_for_server_checks_started_flag_and_aborts_on_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from types import SimpleNamespace
+        import launcher
+
+        monkeypatch.setattr(launcher, "_uvicorn_server", SimpleNamespace(started=False))
+        launcher._server_error.clear()
+        launcher._server_failed.clear()
+        assert launcher._wait_for_server(2233, timeout_s=0.05) is False
+
+        monkeypatch.setattr(launcher, "_uvicorn_server", SimpleNamespace(started=True))
+        assert launcher._wait_for_server(2233, timeout_s=0.2) is True
+
+        launcher._server_error.append(RuntimeError("boom"))
+        launcher._server_failed.set()
+        assert launcher._wait_for_server(2233, timeout_s=1.0) is False
+        launcher._server_error.clear()
+        launcher._server_failed.clear()
+
+    def test_a_dead_server_thread_reports_doctor_hint_without_signalling_ready(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import launcher
+
+        monkeypatch.setattr(launcher, "_ROOT", tmp_path)
+        monkeypatch.setattr(launcher, "_configure_runtime_environment", lambda: ())
+        slot = launcher._claim_instance_slot(tmp_path)
+        assert slot is not None
+        monkeypatch.setattr(launcher, "_claim_instance_slot", lambda _root: slot)
+        monkeypatch.setattr(launcher, "_bind_free_socket", lambda port, **_k: (None, port))
+        monkeypatch.setattr(launcher, "_resolve_events_port", lambda _p, e: e)
+
+        def fail_server(_sock=None):
+            launcher._server_error.append(RuntimeError("missing dep"))
+            launcher._server_failed.set()
+
+        reported: list[tuple[str, list[str]]] = []
+        monkeypatch.setattr(launcher, "_run_server", fail_server)
+        monkeypatch.setattr(
+            launcher,
+            "_report_fatal_startup_error",
+            lambda summary, details=None: reported.append((summary, list(details or []))),
+        )
+        monkeypatch.setattr(
+            launcher,
+            "_signal_app_ready",
+            lambda: pytest.fail("must not signal ready when server failed"),
+        )
+        try:
+            assert launcher.main([]) == 1
+        finally:
+            launcher._cleanup_temp()
+        assert reported
+        combined = "\n".join([reported[0][0], *reported[0][1]])
+        assert "missing dep" in combined
+        assert "--doctor" in combined
 
 
 class TestLaunchRecovery:

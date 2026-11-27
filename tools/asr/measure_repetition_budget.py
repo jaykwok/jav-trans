@@ -39,10 +39,12 @@ import statistics
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
+if str(_REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools._common import ensure_src_on_path  # noqa: E402
+
+ensure_src_on_path()
 
 
 def longest_repeating_tail(ids: list[int], max_ngram: int) -> tuple[int, int, int]:

@@ -140,6 +140,37 @@ class TestWhatIsRecorded:
         assert typed_config.env_float("A_NUMBER", 1.0) == 3.0
         assert typed_config.configuration_problems() == []
 
+    def test_env_text_clears_old_problem_on_non_empty_value(self, monkeypatch):
+        typed_config.record_configuration_problem("A_TEXT", "bad", "旧问题")
+        assert typed_config.configuration_problems()
+
+        monkeypatch.setenv("A_TEXT", "valid-value")
+        assert typed_config.env_text("A_TEXT", "fallback") == "valid-value"
+        assert typed_config.configuration_problems() == []
+
+    def test_explicit_environ_never_mutates_global_problems(self, monkeypatch):
+        monkeypatch.setenv("A_COUNT", "bad")
+        assert typed_config.env_int("A_COUNT", 7) == 7
+        before = typed_config.configuration_problems()
+        assert len(before) == 1
+
+        # Reading valid values from an explicit dict must NOT clear the global problem.
+        assert typed_config.env_int("A_COUNT", 7, environ={"A_COUNT": "4"}) == 4
+        assert typed_config.env_text("A_COUNT", "x", environ={"A_COUNT": "ok"}) == "ok"
+        assert typed_config.configuration_problems() == before
+
+        # Reading invalid values from an explicit dict must NOT add global problems.
+        assert typed_config.env_int("OTHER_INT", 5, environ={"OTHER_INT": "nope"}) == 5
+        assert typed_config.env_float("OTHER_FLT", 1.5, environ={"OTHER_FLT": "nan"}) == 1.5
+        assert typed_config.env_bool("OTHER_BOOL", True, environ={"OTHER_BOOL": "maybe"}) is True
+        assert (
+            typed_config.env_choice(
+                "OTHER_CHOICE", "a", choices=("a", "b"), environ={"OTHER_CHOICE": "z"}
+            )
+            == "a"
+        )
+        assert typed_config.configuration_problems() == before
+
 
 class TestWhatOutOfRangeMeans:
     def test_a_cap_is_clamped_to_the_nearest_legal_value(self, monkeypatch):

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import time
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Callable
 
+from core import atomic_io
 from pipeline import artifact_store
 from utils.model_paths import PROJECT_ROOT
 
@@ -68,6 +68,14 @@ def serialize_asr_artifacts(artifacts: AsrArtifacts) -> dict:
         if name == "logger":
             continue
         value = getattr(artifacts, name)
+        if name == "pipeline_started":
+            # Monotonic perf_counter values are meaningless across processes/reboots;
+            # persist elapsed seconds so load_translation_artifacts_snapshot can
+            # reconstruct a coherent pipeline_started on the current clock.
+            started = float(value) if isinstance(value, (int, float)) else 0.0
+            elapsed = max(0.0, time.perf_counter() - started) if started > 0.0 else 0.0
+            payload["prior_elapsed_s"] = round(elapsed, 6)
+            continue
         if name in ASR_ARTIFACT_PATH_FIELDS:
             payload[name] = _project_relative(value)
         elif isinstance(value, Path):
@@ -85,18 +93,13 @@ def _project_relative(path: str | Path | None) -> str | None:
 
 
 def _write_json_atomic(path: str | Path, payload: dict) -> None:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = artifact_store.temp_publish_path(target)
-    try:
-        tmp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        tmp_path.replace(target)
-    finally:
-        with contextlib.suppress(OSError):
-            tmp_path.unlink(missing_ok=True)
+    atomic_io.write_json_atomic(
+        path,
+        payload,
+        indent=None,
+        ensure_ascii=False,
+        trailing_newline=False,
+    )
 
 
 def write_translation_artifacts_snapshot(
@@ -170,11 +173,19 @@ def load_translation_artifacts_snapshot(
         if values.get("video_duration_s") is not None
         else None
     )
-    if values.get("pipeline_started") is None:
-        values["pipeline_started"] = time.perf_counter()
+    now_perf = time.perf_counter()
+    prior_elapsed = payload.get("prior_elapsed_s")
+    if isinstance(prior_elapsed, (int, float)) and prior_elapsed >= 0.0:
+        values["pipeline_started"] = now_perf - float(prior_elapsed)
+    else:
+        raw_started = values.get("pipeline_started")
+        if isinstance(raw_started, (int, float)) and 0.0 < float(raw_started) <= now_perf:
+            values["pipeline_started"] = float(raw_started)
+        else:
+            values["pipeline_started"] = now_perf
     values["audio_cache_key"] = str(values.get("audio_cache_key") or "")
     values["video_stem"] = str(values.get("video_stem") or snapshot_path.stem)
-    values["device"] = str(values.get("device") or "cpu")
+    values["device"] = str(values.get("device") or "unknown")
     values["backend_label"] = str(values.get("backend_label") or "")
     values["job_id"] = str(values.get("job_id") or "")
     values["aligned_cache_signature"] = (

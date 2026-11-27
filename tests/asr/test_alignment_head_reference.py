@@ -32,7 +32,9 @@ def models_root(monkeypatch, tmp_path):
     root = tmp_path / "models"
     root.mkdir()
     monkeypatch.setattr(model_paths, "MODELS_ROOT", root)
-    monkeypatch.setattr(alignment, "_bundled_head_path", lambda filename: "")
+    monkeypatch.setattr(
+        alignment, "_bundled_head_path", lambda filename, revision="": ""
+    )
     return root
 
 
@@ -196,9 +198,31 @@ def test_bundled_copy_wins_over_the_hub(monkeypatch, no_network, tmp_path):
     bundled = tmp_path / "bundled" / "ctc_aligner.pt"
     bundled.parent.mkdir()
     bundled.write_bytes(b"weights")
-    monkeypatch.setattr(alignment, "_bundled_head_path", lambda filename: str(bundled))
+    monkeypatch.setattr(
+        alignment, "_bundled_head_path", lambda filename, revision="": str(bundled)
+    )
 
     assert alignment.resolve_alignment_head_path(DEFAULT_REFERENCE) == str(bundled)
+
+
+def test_bundled_head_path_checks_revision_sidecar_when_pinned(monkeypatch, tmp_path):
+    from utils import model_paths, runtime_paths
+
+    bundled_root = tmp_path / "bundled"
+    bundled_root.mkdir()
+    head = bundled_root / "ctc_aligner.pt"
+    head.write_bytes(b"weights")
+    monkeypatch.setattr(model_paths, "BUNDLED_MODELS_ROOT", bundled_root)
+    monkeypatch.setattr(runtime_paths, "is_frozen", lambda: True)
+
+    # Unpinned reference accepts the bundled copy without a sidecar.
+    assert alignment._bundled_head_path("ctc_aligner.pt", "") == str(head)
+    # Pinned revision without a sidecar must NOT match.
+    assert alignment._bundled_head_path("ctc_aligner.pt", "a" * 40) == ""
+
+    alignment._revision_marker(head).write_text("b" * 40, encoding="utf-8")
+    assert alignment._bundled_head_path("ctc_aligner.pt", "a" * 40) == ""
+    assert alignment._bundled_head_path("ctc_aligner.pt", "b" * 40) == str(head)
 
 
 def test_finalize_signature_keys_off_the_resolved_bytes(monkeypatch, tmp_path):

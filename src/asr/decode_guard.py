@@ -194,12 +194,197 @@ def _windows(max_ngram: int, min_repeats: int, min_tokens: int) -> list[tuple[in
     return pairs
 
 
+def _coerce_row_param(
+    value: int | Sequence[int],
+    batch: int,
+    *,
+    name: str,
+) -> list[int]:
+    if isinstance(value, int):
+        return [int(value)] * batch
+    if hasattr(value, "tolist") and not isinstance(value, (str, bytes)):
+        raw = value.tolist()
+        if isinstance(raw, int):
+            return [int(raw)] * batch
+        items = [int(item) for item in raw]
+    else:
+        items = [int(item) for item in value]
+    if len(items) != batch:
+        raise ValueError(
+            f"{name} length ({len(items)}) must match batch size ({batch})"
+        )
+    return items
+
+
+def _detect_repetition_loop_vectorized(
+    suffix: "torch.Tensor",
+    *,
+    row_max_ngrams: list[int],
+    min_repeats: int,
+    row_min_tokens: list[int],
+    cache: dict | None = None,
+) -> "torch.Tensor":
+    """Vectorized periodicity test across all active n-grams in one batched pass.
+
+    A tail of length ``W = n * R`` consists of ``R`` copies of its final
+    ``n``-gram if and only if ``suffix[:, t] == suffix[:, t + n]`` for every
+    ``t`` in ``[L - W, L - n)``. Reversing only the needed tail slice maps all
+    periods ``n`` onto one ``(B, M, K)`` comparison, cutting ~210 per-step CUDA
+    kernel launches down to a handful with zero host syncs.
+    """
+    import torch
+
+    batch, length = int(suffix.shape[0]), int(suffix.shape[1])
+    device = suffix.device
+    if batch == 0 or length == 0:
+        return torch.zeros(batch, dtype=torch.bool, device=device)
+
+    min_repeats_int = max(1, int(min_repeats))
+    uniform = (
+        len(set(row_min_tokens)) == 1 and len(set(row_max_ngrams)) == 1
+    )
+
+    if uniform:
+        mt = max(1, int(row_min_tokens[0]))
+        mn = max(0, int(row_max_ngrams[0]))
+        if mn <= 0 or length < mt:
+            return torch.zeros(batch, dtype=torch.bool, device=device)
+        active_n: list[int] = []
+        active_req: list[int] = []
+        max_window = 0
+        for ngram in range(1, mn + 1):
+            repeats = max(min_repeats_int, -(-mt // ngram))
+            window = ngram * repeats
+            if window <= length:
+                active_n.append(ngram)
+                active_req.append(window - ngram)
+                if window > max_window:
+                    max_window = window
+        if not active_n:
+            return torch.zeros(batch, dtype=torch.bool, device=device)
+        max_k = max(active_req)
+        if max_k == 0:
+            return torch.ones(batch, dtype=torch.bool, device=device)
+
+        cache_key = (
+            "uniform",
+            device,
+            tuple(active_n),
+            max_window,
+            max_k,
+            mn,
+            mt,
+            min_repeats_int,
+        )
+        cached = cache.get(cache_key) if cache is not None else None
+        if cached is None:
+            n_t = torch.tensor(active_n, dtype=torch.long, device=device)
+            req_t = torch.tensor(active_req, dtype=torch.long, device=device)
+            k_row = torch.arange(max_k, dtype=torch.long, device=device)
+            shifted_idx = (n_t[:, None] + k_row[None, :]).clamp_max(max_window - 1)
+            ignore_mask = (k_row[None, :] >= req_t[:, None]).unsqueeze(0)
+            cached = (shifted_idx, ignore_mask)
+            if cache is not None:
+                cache[cache_key] = cached
+        else:
+            shifted_idx, ignore_mask = cached
+
+        rev = suffix[:, length - max_window :].flip(dims=(1,))
+        lhs = rev[:, :max_k].unsqueeze(1)
+        rhs = rev[:, shifted_idx]
+        return ((lhs == rhs) | ignore_mask).all(dim=2).any(dim=1)
+
+    # Per-row thresholds: keep only n-grams feasible for at least one row.
+    max_mn = max((max(0, v) for v in row_max_ngrams), default=0)
+    if max_mn <= 0 or length < min(max(1, v) for v in row_min_tokens):
+        return torch.zeros(batch, dtype=torch.bool, device=device)
+
+    active_n = []
+    feasible_cols: list[list[bool]] = []
+    req_cols: list[list[int]] = []
+    max_window = 0
+    max_k = 0
+    for ngram in range(1, max_mn + 1):
+        col_feasible: list[bool] = []
+        col_req: list[int] = []
+        any_row = False
+        for row_mt, row_mn in zip(row_min_tokens, row_max_ngrams):
+            if ngram > row_mn:
+                col_feasible.append(False)
+                col_req.append(0)
+                continue
+            repeats = max(min_repeats_int, -(-max(1, row_mt) // ngram))
+            window = ngram * repeats
+            if window <= length:
+                any_row = True
+                col_feasible.append(True)
+                req = window - ngram
+                col_req.append(req)
+                if window > max_window:
+                    max_window = window
+                if req > max_k:
+                    max_k = req
+            else:
+                col_feasible.append(False)
+                col_req.append(0)
+        if any_row:
+            active_n.append(ngram)
+            feasible_cols.append(col_feasible)
+            req_cols.append(col_req)
+
+    if not active_n:
+        return torch.zeros(batch, dtype=torch.bool, device=device)
+
+    # Transpose (M, B) -> (B, M)
+    feasible_rows = [
+        [feasible_cols[col][row] for col in range(len(active_n))]
+        for row in range(batch)
+    ]
+    if max_k == 0:
+        return torch.tensor(feasible_rows, dtype=torch.bool, device=device).any(dim=1)
+
+    req_rows = [
+        [req_cols[col][row] for col in range(len(active_n))]
+        for row in range(batch)
+    ]
+    per_row_key = (
+        "per_row",
+        device,
+        tuple(active_n),
+        max_window,
+        max_k,
+        tuple(tuple(row) for row in feasible_rows),
+        tuple(row_min_tokens),
+        tuple(row_max_ngrams),
+        min_repeats_int,
+    )
+    cached_per_row = cache.get(per_row_key) if cache is not None else None
+    if cached_per_row is None:
+        n_t = torch.tensor(active_n, dtype=torch.long, device=device)
+        k_row = torch.arange(max_k, dtype=torch.long, device=device)
+        shifted_idx = (n_t[:, None] + k_row[None, :]).clamp_max(max_window - 1)
+        feasible_t = torch.tensor(feasible_rows, dtype=torch.bool, device=device)
+        req_t = torch.tensor(req_rows, dtype=torch.long, device=device)
+        ignore_mask = k_row[None, None, :] >= req_t[:, :, None]
+        cached_per_row = (shifted_idx, feasible_t, ignore_mask)
+        if cache is not None:
+            cache[per_row_key] = cached_per_row
+    else:
+        shifted_idx, feasible_t, ignore_mask = cached_per_row
+
+    rev = suffix[:, length - max_window :].flip(dims=(1,))
+    lhs = rev[:, :max_k].unsqueeze(1)
+    rhs = rev[:, shifted_idx]
+    period_hit = ((lhs == rhs) | ignore_mask).all(dim=2) & feasible_t
+    return period_hit.any(dim=1)
+
+
 def detect_repetition_loop(
     suffix: "torch.Tensor",
     *,
-    max_ngram: int | None = None,
+    max_ngram: int | Sequence[int] | None = None,
     min_repeats: int | None = None,
-    min_tokens: int | None = None,
+    min_tokens: int | Sequence[int] | None = None,
 ) -> "torch.Tensor":
     """Per-sequence: does this end in an n-gram repeated to the threshold?
 
@@ -207,26 +392,52 @@ def detect_repetition_loop(
     `.tolist()` here would force a host sync on every decode step, which is the
     cost this whole module exists to avoid paying twice.
 
-    Defaults come from `loop_guard_config()`, so a caller that passes nothing
-    tests the same thresholds production uses.
+    ``min_tokens`` (and ``max_ngram``) may be either a scalar int shared across
+    the batch or a per-row sequence matching ``suffix.shape[0]``.
     """
-    import torch
+    batch = int(suffix.shape[0])
+    per_row_min_tokens = (
+        min_tokens is not None and not isinstance(min_tokens, int)
+    )
+    per_row_max_ngram = (
+        max_ngram is not None and not isinstance(max_ngram, int)
+    )
 
-    if max_ngram is None or min_repeats is None or min_tokens is None:
+    if per_row_min_tokens or per_row_max_ngram:
         derived = loop_guard_config()
-        max_ngram = derived[0] if max_ngram is None else max_ngram
-        min_repeats = derived[1] if min_repeats is None else min_repeats
-        min_tokens = derived[2] if min_tokens is None else min_tokens
+        resolved_min_repeats = (
+            derived[1] if min_repeats is None else int(min_repeats)
+        )
+        row_min_tokens = (
+            [derived[2]] * batch
+            if min_tokens is None
+            else _coerce_row_param(min_tokens, batch, name="min_tokens")
+        )
+        if max_ngram is None:
+            row_max_ngrams = [
+                max(1, mt // max(1, resolved_min_repeats))
+                for mt in row_min_tokens
+            ]
+        else:
+            row_max_ngrams = _coerce_row_param(
+                max_ngram, batch, name="max_ngram"
+            )
+    else:
+        if max_ngram is None or min_repeats is None or min_tokens is None:
+            derived = loop_guard_config()
+            max_ngram = derived[0] if max_ngram is None else max_ngram
+            min_repeats = derived[1] if min_repeats is None else min_repeats
+            min_tokens = derived[2] if min_tokens is None else min_tokens
+        resolved_min_repeats = int(min_repeats)
+        row_min_tokens = [int(min_tokens)] * batch
+        row_max_ngrams = [int(max_ngram)] * batch
 
-    batch, length = suffix.shape
-    done = torch.zeros(batch, dtype=torch.bool, device=suffix.device)
-    for ngram, repeats in _windows(max_ngram, min_repeats, min_tokens):
-        window = ngram * repeats
-        if length < window:
-            continue
-        block = suffix[:, length - window :].reshape(batch, repeats, ngram)
-        done |= (block == block[:, -1:, :]).all(dim=2).all(dim=1)
-    return done
+    return _detect_repetition_loop_vectorized(
+        suffix,
+        row_max_ngrams=row_max_ngrams,
+        min_repeats=resolved_min_repeats,
+        row_min_tokens=row_min_tokens,
+    )
 
 
 def build_stopping_criteria(
@@ -279,27 +490,52 @@ def build_stopping_criteria(
         criteria.append(TokenBudgetCriteria())
 
     if guard_on:
-        max_ngram, min_repeats, min_tokens = loop_guard_config(
-            max(budgets) if budgets else None
-        )
+        if budgets:
+            per_row_configs = [loop_guard_config(budget) for budget in budgets]
+            row_max_ngrams = [cfg[0] for cfg in per_row_configs]
+            min_repeats = per_row_configs[0][1]
+            row_min_tokens = [cfg[2] for cfg in per_row_configs]
+            min_activation_tokens = min(row_min_tokens)
+        else:
+            scalar_max_ngram, min_repeats, scalar_min_tokens = loop_guard_config(None)
+            row_max_ngrams = None
+            row_min_tokens = None
+            min_activation_tokens = scalar_min_tokens
 
         class RepetitionLoopCriteria(StoppingCriteria):
+            def __init__(self) -> None:
+                self._index_cache: dict = {}
+
             def __call__(self, input_ids, scores, **kwargs):
                 import torch
 
+                rows = int(input_ids.shape[0])
                 suffix = input_ids[:, prompt_length:]
                 # Nothing can reach the bar before this, and skipping the check
                 # keeps the first half of every decode free of the guard's
                 # tensor work.
-                if suffix.shape[1] < min_tokens:
+                if int(suffix.shape[1]) < min_activation_tokens:
                     return torch.zeros(
-                        input_ids.shape[0], dtype=torch.bool, device=input_ids.device
+                        rows, dtype=torch.bool, device=input_ids.device
                     )
-                return detect_repetition_loop(
+                if row_min_tokens is not None and row_max_ngrams is not None:
+                    if rows != len(row_min_tokens):
+                        return torch.zeros(
+                            rows, dtype=torch.bool, device=input_ids.device
+                        )
+                    return _detect_repetition_loop_vectorized(
+                        suffix,
+                        row_max_ngrams=row_max_ngrams,
+                        min_repeats=min_repeats,
+                        row_min_tokens=row_min_tokens,
+                        cache=self._index_cache,
+                    )
+                return _detect_repetition_loop_vectorized(
                     suffix,
-                    max_ngram=max_ngram,
+                    row_max_ngrams=[scalar_max_ngram] * rows,
                     min_repeats=min_repeats,
-                    min_tokens=min_tokens,
+                    row_min_tokens=[scalar_min_tokens] * rows,
+                    cache=self._index_cache,
                 )
 
         criteria.append(RepetitionLoopCriteria())

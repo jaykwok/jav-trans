@@ -26,6 +26,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -36,6 +37,7 @@ from core.diagnostics import format_exception_chain
 from llm import prompt as prompt_module
 from llm import settings as llm_settings
 from llm import transport_util
+from llm import zh_variant
 from llm.glossary import parse_glossary_pairs
 from llm.errors import (
     TERMINAL_TRANSLATION_ERRORS,
@@ -55,6 +57,36 @@ _raise_if_cancelled = transport_util._raise_if_cancelled
 _emit_progress = transport_util._emit_progress
 
 
+def _callable_accepts_two_positional(fn: Callable) -> bool:
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params):
+        return True
+    positional = [
+        p
+        for p in params
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    return len(positional) >= 2
+
+
+def _inspect_bounded_schema_flags(profile) -> tuple[bool, bool]:
+    try:
+        params = inspect.signature(profile.bounded_schema).parameters
+    except (TypeError, ValueError):
+        return (False, False)
+    has_varkw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    return ("ids" in params or has_varkw, "forbid_kana" in params or has_varkw)
+
+
 def apply_repair_pass(
     segments: list[dict],
     zh_texts: list[str],
@@ -64,7 +96,8 @@ def apply_repair_pass(
     extra_glossary: str = "",
     on_progress: Callable[[dict], None] | None = None,
     cancel_event: threading.Event | None = None,
-    cache_writer: Callable[[list[str]], None] | None = None,
+    cache_writer: Callable[..., None] | None = None,
+    source_context: SourceContext | None = None,
 ) -> tuple[list[str], dict | None]:
     """Reissue flagged ids cheap-first, escalating only what is still wrong.
 
@@ -97,9 +130,22 @@ def apply_repair_pass(
     glossary = session.glossary
     target_lang = session.target_lang
     character_reference = session.character_reference
-    glossary_pairs = parse_glossary_pairs(glossary) if glossary else []
+    to_target_variant = zh_variant.converter_for(target_lang)
+
+    def _to_target_variant(text: str) -> str:
+        return (
+            to_target_variant(text)
+            if text and to_target_variant is not None
+            else text
+        )
+
+    glossary_pairs = (
+        [(src, _to_target_variant(dst)) for src, dst in parse_glossary_pairs(glossary)]
+        if glossary
+        else []
+    )
     repair_ids, reasons = _select_translation_repair_ids(
-        segments, zh_texts, glossary
+        segments, zh_texts, glossary, glossary_pairs=glossary_pairs
     )
     if not repair_ids:
         return zh_texts, None
@@ -113,10 +159,21 @@ def apply_repair_pass(
     repaired_ids: set[int] = set()
     format_split_count = 0
     request_count = 0
-    request_cap = max(1, int(llm_settings.TRANSLATION_BATCH_MAX_REQUESTS))
     initial_span = max(1, int(session.batch_size))
+    batch_max_requests = max(1, int(llm_settings.TRANSLATION_BATCH_MAX_REQUESTS))
+    request_cap = max(
+        batch_max_requests,
+        math.ceil(len(repair_ids) / max(1, initial_span)) * 4 + 8,
+    )
     none_effort = "none"
     escalated_effort = session.repair_reasoning_effort if session.reasoning_effort else "none"
+    repair_source_context = source_context or SourceContext.build(segments)
+    schema_supports_ids, schema_supports_forbid_kana = _inspect_bounded_schema_flags(profile)
+    cache_writer_takes_ids = (
+        _callable_accepts_two_positional(cache_writer)
+        if cache_writer is not None
+        else False
+    )
 
     _emit_progress(
         on_progress,
@@ -141,17 +198,10 @@ def apply_repair_pass(
         ids: list[int],
         forbid_kana: bool = False,
     ) -> dict | None:
-        try:
-            params = inspect.signature(profile.bounded_schema).parameters
-        except (TypeError, ValueError):
-            params = {}
-        has_varkw = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
-        )
         kwargs: dict = {}
-        if ids and ("ids" in params or has_varkw):
+        if ids and schema_supports_ids:
             kwargs["ids"] = list(ids)
-        if forbid_kana and ("forbid_kana" in params or has_varkw):
+        if forbid_kana and schema_supports_forbid_kana:
             kwargs["forbid_kana"] = True
         return profile.bounded_schema(request_segments, **kwargs)
 
@@ -178,6 +228,7 @@ def apply_repair_pass(
             character_reference=character_reference,
             extra_glossary=extra_glossary,
             compact=(session.backend_name == "llamacpp"),
+            source_context=repair_source_context,
         )
         request_kwargs: dict = {
             "response_schema": profile.schema,
@@ -221,12 +272,15 @@ def apply_repair_pass(
         missing: list[int] = []
         for idx in group:
             _raise_if_cancelled(cancel_event)
-            text = parsed[idx]
-            if text:
+            raw_text = parsed[idx]
+            if raw_text:
                 source = _repair_source_text(segments[idx])
                 previous = _repair_translation_text(segments[idx], repaired_texts, idx)
+                raw_is_echo = _has_source_echo(source, raw_text)
+                converted_text = raw_text if raw_is_echo else _to_target_variant(raw_text)
+                is_echo = raw_is_echo or _has_source_echo(source, converted_text)
                 if (
-                    _has_source_echo(source, text)
+                    is_echo
                     and previous.strip()
                     and not _has_source_echo(source, previous)
                 ):
@@ -235,13 +289,16 @@ def apply_repair_pass(
                         idx,
                     )
                     continue
-                repaired_texts[idx] = text
-                repaired_ids.add(idx)
+                repaired_texts[idx] = converted_text
+                if not is_echo:
+                    repaired_ids.add(idx)
             else:
                 missing.append(idx)
         if not missing:
             return []
-        if len(missing) == len(group) and len(group) > 1:
+        if len(missing) == len(group):
+            if len(group) <= 1:
+                return list(group)
             format_split_count += 1
             midpoint = max(1, len(group) // 2)
             return request_group(
@@ -269,7 +326,12 @@ def apply_repair_pass(
         flagged: list[int] = []
         for idx in candidates:
             source = _repair_source_text(segments[idx])
-            target = _repair_translation_text(segments[idx], repaired_texts, idx)
+            raw_target = _repair_translation_text(segments[idx], repaired_texts, idx)
+            target = (
+                raw_target
+                if _has_source_echo(source, raw_target)
+                else _to_target_variant(raw_target)
+            )
             local_reasons = _detect_repair_reasons(
                 source, target, glossary_pairs
             )
@@ -278,7 +340,7 @@ def apply_repair_pass(
                 flagged.append(idx)
         return flagged
 
-    def persist_repairs(texts: list[str]) -> None:
+    def persist_repairs(texts: list[str], ids: set[int] | None = None) -> None:
         """Write what was actually fixed back into the translation cache.
 
         Runs on the degraded path as well as the clean one: a repair that
@@ -286,10 +348,14 @@ def apply_repair_pass(
         it. Idempotent - `_save_cache_entry` appends and reads dedupe by
         last-write-wins per batch_key.
         """
-        if not repaired_ids or cache_writer is None:
+        target_ids = set(repaired_ids if ids is None else ids)
+        if not target_ids or cache_writer is None:
             return
         try:
-            cache_writer(texts)
+            if cache_writer_takes_ids:
+                cache_writer(texts, target_ids)
+            else:
+                cache_writer(texts)
         except TranslationCancelledError:
             raise
         except Exception as exc:
@@ -320,7 +386,7 @@ def apply_repair_pass(
         # says the next request cannot succeed either, and stage 2's escalation
         # is still a request. Persist what stage 1 did fix, then let the type
         # the backend raised reach the caller unchanged.
-        persist_repairs(repaired_texts)
+        persist_repairs(repaired_texts, repaired_ids)
         raise
     except Exception as exc:
         # A request-level failure at this tier almost always repeats for
@@ -374,7 +440,7 @@ def apply_repair_pass(
                 )
             )
     except TERMINAL_TRANSLATION_ERRORS:
-        persist_repairs(repaired_texts)
+        persist_repairs(repaired_texts, repaired_ids)
         raise
     except Exception as exc:
         request_error = exc
@@ -393,6 +459,7 @@ def apply_repair_pass(
     # subtitle compression.
     final_echoes = lingering_echoes()
     if final_echoes:
+        persist_repairs(repaired_texts, repaired_ids)
         detail = (
             f" after {format_exception_chain(request_error)}"
             if request_error is not None
@@ -413,7 +480,7 @@ def apply_repair_pass(
         # array on every exit from this function; ids the detectors still flag
         # are reported as unresolved rather than being hidden behind a rollback.
         still_flagged = recheck(repair_ids)
-        persist_repairs(repaired_texts)
+        persist_repairs(repaired_texts, repaired_ids)
         error_chain = format_exception_chain(request_error)
         logger.warning(
             "Translation repair failed (%s): %s",
@@ -446,7 +513,7 @@ def apply_repair_pass(
             **transport_util._merge_usage_metrics(request_usages),
         }
 
-    persist_repairs(repaired_texts)
+    persist_repairs(repaired_texts, repaired_ids)
     timing = {
         "mode": "translation_repair_pass",
         "start_index": min(repair_ids),
@@ -535,6 +602,8 @@ def _select_translation_repair_ids(
     segments: list[dict],
     zh_texts: list[str],
     glossary: str = "",
+    *,
+    glossary_pairs: list[tuple[str, str]] | None = None,
 ) -> tuple[list[int], dict[int, list[str]]]:
     """Lines with an actionable output defect, with why.
 
@@ -553,7 +622,11 @@ def _select_translation_repair_ids(
     this detector the cheaper tier silently costs the one part of the output the
     user stated exactly.
     """
-    pairs = parse_glossary_pairs(glossary) if glossary else []
+    pairs = (
+        list(glossary_pairs)
+        if glossary_pairs is not None
+        else (parse_glossary_pairs(glossary) if glossary else [])
+    )
     repair_ids: list[int] = []
     reasons: dict[int, list[str]] = {}
     for idx, seg in enumerate(segments):
@@ -595,10 +668,15 @@ def _build_repair_messages(
     character_reference: str,
     compact: bool = False,
     extra_glossary: str = "",
+    source_context: SourceContext | None = None,
 ) -> list[dict]:
+    effective_target_lang = (
+        (target_lang or llm_settings.DEFAULT_TARGET_LANG).strip()
+        or llm_settings.DEFAULT_TARGET_LANG
+    )
     system_prompt = prompt_module._build_system_prompt(
         character_reference,
-        target_lang=target_lang,
+        target_lang=effective_target_lang,
         glossary=glossary,
         compact=compact,
     )
@@ -609,17 +687,23 @@ def _build_repair_messages(
         "reason 只是问题类别提示，不是固定译文；最终译文必须服从原文和既定术语。"
         "保持否定、条件、施受关系和真实重复的作用，不为了通过长度检查添加或删除含义。"
     )
+    ctx = source_context or SourceContext.build(segments)
+    focus = ctx.focus(
+        repair_ids, radius=llm_settings.TRANSLATION_REPAIR_CONTEXT_RADIUS
+    )
     context_items = _build_repair_context_items(
         segments,
         zh_texts,
         repair_ids,
         reasons,
+        source_context=ctx,
+        focus=focus,
     )
     user_parts = [
         "【翻译修复任务】",
         f"requested_ids = {prompt_module._format_requested_ids(repair_ids)}",
         "只返回 requested_ids 中列出的 id，恰好返回这些 id，不要返回 context_only 项。",
-        "每个 text 只能是修复后的中文字幕；不要解释原因。",
+        f"每个 text 只能是修复后的{effective_target_lang}字幕；不要解释原因。",
     ]
     # Legacy caller-supplied examples remain nonbinding; the main pipeline
     # never promotes repeated whole-line renderings into user terminology.
@@ -629,9 +713,10 @@ def _build_repair_messages(
     user_parts.extend(
         [
             "【局部上下文 JSON】",
-            json.dumps(context_items, ensure_ascii=False, indent=2),
-            "【完整语义单元】\n" + json.dumps(
-                SourceContext.build(segments).focus(repair_ids)["semantic_units"], ensure_ascii=False
+            json.dumps(context_items, ensure_ascii=False, separators=(",", ":")),
+            "【完整语义单元】\n"
+            + json.dumps(
+                focus["semantic_units"], ensure_ascii=False, separators=(",", ":")
             ),
             '输出 JSON：{"translations":[{"id":0,"text":"..."}]}',
         ]
@@ -647,11 +732,14 @@ def _build_repair_context_items(
     zh_texts: list[str],
     repair_ids: list[int],
     reasons: dict[int, list[str]],
+    *,
+    source_context: SourceContext | None = None,
+    focus: dict | None = None,
 ) -> list[dict]:
-    focus = SourceContext.build(segments).focus(
+    resolved_focus = focus or (source_context or SourceContext.build(segments)).focus(
         repair_ids, radius=llm_settings.TRANSLATION_REPAIR_CONTEXT_RADIUS
     )
-    indexes = {row["id"] for row in focus["items"]}
+    indexes = {row["id"] for row in resolved_focus["items"]}
 
     items = []
     repair_id_set = set(repair_ids)
@@ -680,8 +768,6 @@ def _public_repair_reasons(local_reasons: list[str]) -> list[str]:
             public.append("japanese_remaining")
         elif reason == "glossary_violation":
             public.append("glossary_violation")
-        elif reason == "inconsistent_rendering":
-            public.append("inconsistent_rendering")
         else:
             public.append("translation_quality")
     return list(dict.fromkeys(public))

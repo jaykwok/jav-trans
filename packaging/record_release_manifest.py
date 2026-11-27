@@ -198,7 +198,7 @@ def _resolve(entry: dict, dist_dir: Path) -> Path:
     return path
 
 
-def verify(manifest_path: Path, dist_dir: Path) -> int:
+def verify(manifest_path: Path, dist_dir: Path, *, dist_only: bool = False) -> int:
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     if payload.get("schema") != MANIFEST_SCHEMA:
         print(f"[packaging] {manifest_path} 不是发行清单", file=sys.stderr)
@@ -209,9 +209,15 @@ def verify(manifest_path: Path, dist_dir: Path) -> int:
         except (OSError, ValueError) as exc:
             print(f"[packaging] 模型载荷验证失败：{exc}", file=sys.stderr)
             return 1
+    all_entries = payload.get("files") or []
+    entries = [
+        entry
+        for entry in all_entries
+        if not dist_only or entry.get("root") == "dist"
+    ]
     missing: list[str] = []
     changed: list[str] = []
-    for entry in payload.get("files") or []:
+    for entry in entries:
         path = _resolve(entry, dist_dir)
         if not path.is_file():
             missing.append(entry["path"])
@@ -220,7 +226,7 @@ def verify(manifest_path: Path, dist_dir: Path) -> int:
             changed.append(entry["path"])
 
     recorded = {
-        (entry.get("root"), entry["path"]) for entry in payload.get("files") or []
+        (entry.get("root"), entry["path"]) for entry in entries
     }
     extra = [
         path.relative_to(dist_dir).as_posix()
@@ -239,7 +245,7 @@ def verify(manifest_path: Path, dist_dir: Path) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"[packaging] 清单一致：{len(payload.get('files') or [])} 个文件")
+    print(f"[packaging] 清单一致：{len(entries)} 个文件")
     return 0
 
 
@@ -249,9 +255,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", default="dist/release-assets/release-manifest.json")
     parser.add_argument("--skip-models", action="store_true", help="record an explicitly model-free build")
     parser.add_argument(
+        "--require-clean",
+        action="store_true",
+        help="fail with a non-zero exit code when the git working tree is dirty",
+    )
+    parser.add_argument(
         "--verify",
         default="",
         help="check an existing manifest against --dist instead of writing one",
+    )
+    parser.add_argument(
+        "--dist-only",
+        action="store_true",
+        help="with --verify, check only dist payload entries (for historical archives)",
     )
     args = parser.parse_args(argv)
 
@@ -266,12 +282,18 @@ def main(argv: list[str] | None = None) -> int:
         manifest_path = Path(args.verify)
         if not manifest_path.is_absolute():
             manifest_path = ROOT / manifest_path
-        return verify(manifest_path, dist_dir)
+        return verify(manifest_path, dist_dir, dist_only=args.dist_only)
 
     try:
         manifest = build_manifest(dist_dir, require_models=not args.skip_models)
     except (OSError, ValueError) as exc:
         print(f"[packaging] 发行载荷验证失败：{exc}", file=sys.stderr)
+        return 1
+    if args.require_clean and manifest["git"]["dirty"]:
+        print(
+            "[packaging] 错误：工作区有未提交改动（--require-clean），已拒绝生成发行清单。",
+            file=sys.stderr,
+        )
         return 1
     output = Path(args.output)
     if not output.is_absolute():

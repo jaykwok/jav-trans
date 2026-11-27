@@ -248,14 +248,7 @@ def test_asr_transcribe_delete_path_survives_system_exit(monkeypatch, tmp_path, 
 
 def test_launcher_sweep_and_cleanup_survive_system_exit(monkeypatch, tmp_path, caplog):
     import shutil
-
-    project_root = Path(__file__).resolve().parents[1]
-    source = (project_root / "launcher.py").read_text(encoding="utf-8")
-    start = source.index("# Globs inside tmp/")
-    end = source.index("def _version_tuple(", start)
-    namespace: dict = {}
-    preamble = "import json, os, shutil, time\nfrom pathlib import Path\n"
-    exec(compile(preamble + source[start:end], "launcher.py", "exec"), namespace)  # noqa: S102
+    import launcher
 
     chunk_dir = tmp_path / "tmp" / "chunks" / "job-a"
     chunk_dir.mkdir(parents=True)
@@ -263,7 +256,7 @@ def test_launcher_sweep_and_cleanup_survive_system_exit(monkeypatch, tmp_path, c
 
     monkeypatch.setattr(shutil, "rmtree", lambda *a, **kw: (_ for _ in ()).throw(SystemExit(1)))
     with caplog.at_level(logging.WARNING):
-        namespace["_sweep_temp"](tmp_path)
+        launcher._sweep_temp(tmp_path)
 
     assert "SystemExit" in caplog.text
 

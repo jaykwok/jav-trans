@@ -119,3 +119,36 @@ def test_count_banned_ja_punctuation():
     assert count_banned_ja_punctuation("待って、行こう。") == 2
     assert count_banned_ja_punctuation("待って 行こう") == 0
     assert count_banned_ja_punctuation("本当に?") == 1
+
+
+def test_closing_quotes_and_brackets_never_gain_an_inner_space():
+    assert normalize_ja_subtitle_text("「本当？」と言った") == "「本当？」と言った"
+    assert normalize_ja_subtitle_text("「そうだ。」と言った") == "「そうだ」と言った"
+    assert normalize_ja_subtitle_text("「そうだ。」") == "「そうだ」"
+    assert normalize_ja_subtitle_text("（本当！）") == "（本当！）"
+    assert normalize_ja_subtitle_text("「そうだ。行こう。」") == (
+        f"「そうだ{FULLWIDTH_SPACE}行こう」"
+    )
+    for sample in ("「本当？」と言った", "「そうだ。」と言った", "（本当！）"):
+        once = normalize_ja_subtitle_text(sample)
+        assert normalize_ja_subtitle_text(once) == once
+        assert count_banned_ja_punctuation(once) == 0
+
+
+def test_wrap_deducts_stripped_boundary_space_to_avoid_phantom_overflow():
+    # 13 units + fullwidth space (1) + 11 units = 25 units. Counting the
+    # stripped space toward the top line used to report 14 units (+100 penalty)
+    # and forced a mid-word break (`漢字\nあ　アイウエオ...`).
+    text = f"あいうえおかきくけこ漢字あ{FULLWIDTH_SPACE}アイウエオカキクケコサ"
+    assert wrap_ja_subtitle_text(text) == "あいうえおかきくけこ漢字あ\nアイウエオカキクケコサ"
+
+    exact_pair = f"あいうえおかきくけこさしす{FULLWIDTH_SPACE}たちつてとなにぬねのはひふ"
+    lines = wrap_ja_subtitle_text(exact_pair).split("\n")
+    assert lines == ["あいうえおかきくけこさしす", "たちつてとなにぬねのはひふ"]
+    assert max(ja_display_units(line) for line in lines) == 13.0
+
+
+def test_wrap_does_not_open_a_line_with_wave_dash():
+    rendered = wrap_ja_subtitle_text("ああああ〜あああああ", line_max_units=5)
+    _top, bottom = rendered.split("\n")
+    assert not bottom.startswith("〜")

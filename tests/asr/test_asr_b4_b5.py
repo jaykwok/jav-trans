@@ -75,22 +75,23 @@ def test_asr_text_transcribe_passes_only_audio_paths(monkeypatch, tmp_path):
     class FakeBackend:
         is_subprocess = False
         request_batch_size = 1
-        audio_paths: list[str] = []
+
+        def __init__(self) -> None:
+            self.audio_paths: list[str] = []
 
         def transcribe_texts(self, audio_paths, on_stage=None):
             del on_stage
             self.audio_paths.extend(audio_paths)
-            index = len(self.audio_paths) - 1
-            text = f"text-{index}"
             return [
                 {
-                    "text": text,
-                    "raw_text": text,
+                    "text": f"text-{Path(path).stem}",
+                    "raw_text": f"text-{Path(path).stem}",
                     "duration": 0.4,
                     "language": "Japanese",
-                    "normalized_path": str(tmp_path / f"c{index}.wav"),
+                    "normalized_path": path,
                     "log": ["fake"],
                 }
+                for path in audio_paths
             ]
 
     backend = FakeBackend()
@@ -102,8 +103,10 @@ def test_asr_text_transcribe_passes_only_audio_paths(monkeypatch, tmp_path):
         on_stage=stages.append,
     )
 
-    assert [result["text"] for result in results] == ["text-0", "text-1"]
-    assert backend.audio_paths == [chunk["path"] for chunk in chunks]
+    # Longest chunk (c1: 0.45s) runs before shorter chunk (c0: 0.40s), while
+    # returned results are restored to chronological chunk index order.
+    assert [result["text"] for result in results] == ["text-c0", "text-c1"]
+    assert backend.audio_paths == [chunks[1]["path"], chunks[0]["path"]]
     assert stages[2] == "ASR 文本转写 1/2 batch=2 size=1 start"
     assert stages[3].startswith("ASR 文本转写 2/2 batch=2 size=1 done")
 

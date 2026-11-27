@@ -12,6 +12,7 @@ run rather than asserted about as source text.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -26,7 +27,10 @@ HARNESS = Path(__file__).resolve().parent / "js" / "request_coalescing.mjs"
 def test_repeated_refreshes_collapse_into_one_request() -> None:
     node = shutil.which("node")
     if node is None:
-        pytest.skip("node is not installed; the coalescing harness needs it")
+        msg = "node is not installed; the coalescing harness needs it"
+        if os.getenv("JAV_SUB_CI_STRICT") == "1":
+            pytest.fail(msg)
+        pytest.skip(msg)
 
     completed = subprocess.run(
         [node, str(HARNESS), str(MODULE)],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import subprocess
 import time
@@ -36,6 +37,8 @@ if os.name == "nt":
 
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
     _JobObjectExtendedLimitInformation = 9
+    _PROCESS_TERMINATE = 0x0001
+    _PROCESS_SET_QUOTA = 0x0100
 
     class _IO_COUNTERS(ctypes.Structure):
         _fields_ = [
@@ -83,6 +86,8 @@ if os.name == "nt":
         kernel32.SetInformationJobObject.restype = wintypes.BOOL
         kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
         kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
         return kernel32
@@ -120,6 +125,52 @@ if os.name == "nt":
             wintypes.HANDLE(int(win32_handle)),
         ):
             raise ctypes.WinError(ctypes.get_last_error())
+
+    def bind_process_to_kill_on_close_job(job_handle: int | None, process_or_pid: Any) -> int:
+        """Assign a ``multiprocessing.Process``, ``Popen``, or raw PID to a kill-on-close Job.
+
+        When ``job_handle`` is ``None``, creates a fresh kill-on-close Job Object
+        (and closes it if assignment fails). When ``job_handle`` is provided,
+        assigns to that existing Job Object and returns ``int(job_handle)``.
+        """
+        owns_job = job_handle is None
+        job = create_kill_on_close_job() if owns_job else int(job_handle)
+        opened_handle: int | None = None
+        try:
+            win32_handle: Any = None
+            pid: int | None = None
+            if isinstance(process_or_pid, int) and not isinstance(process_or_pid, bool):
+                pid = process_or_pid
+            else:
+                win32_handle = getattr(process_or_pid, "_handle", None) or getattr(
+                    getattr(process_or_pid, "_popen", None), "_handle", None
+                )
+                if not win32_handle:
+                    raw_pid = getattr(process_or_pid, "pid", None)
+                    if isinstance(raw_pid, int) and not isinstance(raw_pid, bool):
+                        pid = raw_pid
+            if win32_handle:
+                assign_handle_to_job(job, int(win32_handle))
+            elif pid is not None and pid > 0:
+                opened = _KERNEL32.OpenProcess(
+                    _PROCESS_SET_QUOTA | _PROCESS_TERMINATE,
+                    False,
+                    wintypes.DWORD(pid),
+                )
+                if not opened:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                opened_handle = int(opened)
+                assign_handle_to_job(job, opened_handle)
+            else:
+                raise RuntimeError("process has no win32 handle or valid pid to assign")
+            return int(job)
+        except BaseException:
+            if owns_job:
+                close_kill_on_close_job(job)
+            raise
+        finally:
+            if opened_handle is not None:
+                close_kill_on_close_job(opened_handle)
 
     def bind_kill_on_close_job(win32_handle) -> int | None:
         """Put a running child in a kill-on-close Job Object.
@@ -177,6 +228,10 @@ else:  # pragma: no cover - project targets Windows
 
     def assign_handle_to_job(job: int, win32_handle: int) -> None:
         del job, win32_handle
+        raise NotImplementedError("Windows Job Objects are only available on Windows")
+
+    def bind_process_to_kill_on_close_job(job_handle: int | None, process_or_pid: Any) -> int:
+        del job_handle, process_or_pid
         raise NotImplementedError("Windows Job Objects are only available on Windows")
 
     def bind_kill_on_close_job(win32_handle) -> int | None:
@@ -275,28 +330,52 @@ def retry_unreleased_cleanup() -> dict[str, int]:
     }
 
 
-def _reap(proc: subprocess.Popen, job_handle) -> tuple[str, Any]:
-    """Take the child down and wait for it, escalating until it is gone.
+def _close_pipes(proc: subprocess.Popen) -> None:
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is None:
+            continue
+        try:
+            if not getattr(pipe, "closed", False):
+                pipe.close()
+        except OSError:
+            pass
 
-    Returns the child's state and the job handle *still open* - None only when
-    the handle was actually closed. Reporting a failed close as "released" would
-    leak the handle, and because the job is kill-on-close, the tree inside it
-    would then outlive every attempt to stop it.
+
+def _reap_with_output(proc: subprocess.Popen, job_handle) -> tuple[str, Any, Any, Any]:
+    """Take the child tree down and collect any partial captured output.
+
+    On Windows with a ``KILL_ON_JOB_CLOSE`` Job Object, closing the handle
+    first terminates the entire process tree (including grandchildren) in one
+    OS operation before draining pipes with a short timeout. Returns
+    ``(process_state, remaining_job_handle, stdout, stderr)`` where
+    ``remaining_job_handle`` is ``None`` only when the handle actually closed.
     """
+    if job_handle and close_kill_on_close_job(job_handle):
+        job_handle = None
     try:
         if child_state(proc) != "gone":
             proc.kill()
     except Exception:
         pass
+    out: Any = None
+    err: Any = None
     try:
-        proc.communicate(timeout=10)
+        out, err = proc.communicate(timeout=2.0)
+    except subprocess.TimeoutExpired as exc:
+        out, err = exc.output, exc.stderr
     except Exception:
-        pass
-    # Last resort for a child that ignored kill() or left grandchildren: the
-    # job object takes the whole tree with it when the handle closes.
-    if job_handle and close_kill_on_close_job(job_handle):
-        job_handle = None
-    return child_state(proc), job_handle
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            pass
+    _close_pipes(proc)
+    return child_state(proc), job_handle, out, err
+
+
+def _reap(proc: subprocess.Popen, job_handle) -> tuple[str, Any]:
+    """Take the child down and wait for it, escalating until it is gone."""
+    state, remaining, _out, _err = _reap_with_output(proc, job_handle)
+    return state, remaining
 
 
 def run_cancellable(
@@ -321,7 +400,21 @@ def run_cancellable(
     Raises `SubprocessCancelledError` on cancel and `subprocess.TimeoutExpired`
     on timeout; with `check=True`, `subprocess.CalledProcessError` on failure.
     """
+    if not command:
+        raise ValueError("command must not be empty")
+    poll_val = float(poll_interval_s)
+    if not math.isfinite(poll_val) or poll_val <= 0:
+        raise ValueError(f"poll_interval_s must be a positive finite number, got {poll_interval_s!r}")
+    slice_s = max(0.01, poll_val)
+
+    timeout_val: float | None = None
+    if timeout_s is not None:
+        timeout_val = float(timeout_s)
+        if not math.isfinite(timeout_val):
+            raise ValueError(f"timeout_s must be finite, got {timeout_s!r}")
+
     popen_kwargs: dict = dict(no_window_subprocess_kwargs())
+    popen_kwargs["stdin"] = subprocess.DEVNULL
     if capture_output:
         popen_kwargs["stdout"] = subprocess.PIPE
         popen_kwargs["stderr"] = subprocess.PIPE
@@ -331,15 +424,15 @@ def run_cancellable(
         popen_kwargs["errors"] = errors
 
     proc = subprocess.Popen(command, **popen_kwargs)
-    job_handle = bind_kill_on_close_job(_popen_win32_handle(proc))
-    deadline = (
-        time.monotonic() + timeout_s
-        if timeout_s is not None and timeout_s > 0
-        else None
-    )
-    slice_s = max(0.01, float(poll_interval_s))
+    job_handle = None
     reaped = False
     try:
+        job_handle = bind_kill_on_close_job(_popen_win32_handle(proc))
+        deadline = (
+            time.monotonic() + timeout_val
+            if timeout_val is not None and timeout_val > 0
+            else None
+        )
         while True:
             wait_s = slice_s
             if deadline is not None:
@@ -350,7 +443,7 @@ def run_cancellable(
             except subprocess.TimeoutExpired:
                 pass
             if cancel_requested is not None and cancel_requested():
-                state, job_handle = _reap(proc, job_handle)
+                state, job_handle, _out, _err = _reap_with_output(proc, job_handle)
                 _track_unreleased(proc, command, state, job_handle, "cancel")
                 job_handle = None
                 reaped = True
@@ -358,16 +451,23 @@ def run_cancellable(
                     f"cancelled while running: {os.path.basename(str(command[0]))}"
                 )
             if deadline is not None and time.monotonic() >= deadline:
-                state, job_handle = _reap(proc, job_handle)
+                state, job_handle, partial_out, partial_err = _reap_with_output(
+                    proc, job_handle
+                )
                 _track_unreleased(proc, command, state, job_handle, "timeout")
                 job_handle = None
                 reaped = True
-                raise subprocess.TimeoutExpired(command, float(timeout_s or 0.0))
+                raise subprocess.TimeoutExpired(
+                    command,
+                    float(timeout_val or 0.0),
+                    output=partial_out,
+                    stderr=partial_err,
+                )
     except BaseException:
         # Cancel and timeout already reaped and recorded why; re-reaping here
         # would only overwrite the specific reason with a generic one.
         if not reaped and (job_handle is not None or child_state(proc) != "gone"):
-            state, job_handle = _reap(proc, job_handle)
+            state, job_handle, _out, _err = _reap_with_output(proc, job_handle)
             _track_unreleased(proc, command, state, job_handle, "error")
             job_handle = None
         raise

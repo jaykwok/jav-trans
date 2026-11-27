@@ -5,14 +5,21 @@ import argparse
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from record_release_manifest import ROOT, sha256_of, verify
-from utils.subprocess_tools import no_window_subprocess_kwargs
+_PACKAGING_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _PACKAGING_DIR.parent
+for _entry in (_PROJECT_ROOT / "src", _PACKAGING_DIR):
+    if str(_entry) not in sys.path:
+        sys.path.insert(0, str(_entry))
+
+from record_release_manifest import ROOT, sha256_of, verify  # noqa: E402
+from utils.subprocess_tools import no_window_subprocess_kwargs  # noqa: E402
 
 
 def archive_release(

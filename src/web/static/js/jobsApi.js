@@ -16,9 +16,6 @@ import {
 const JOBS_REVISION_HEADER = 'X-Jobs-Revision';
 const JOBS_EPOCH_HEADER = 'X-Jobs-Epoch';
 const ACTIVE_POLL_MS = 3000;
-// Nothing is running, but the state can still change under the page: another
-// tab deleting a job, or the service restarting. Slow enough to be free, often
-// enough that a stale list is not permanent.
 const IDLE_POLL_MS = 15000;
 
 function headerNumber(response, name, fallback) {
@@ -35,10 +32,6 @@ function epochOf(response) {
   return headerNumber(response, JOBS_EPOCH_HEADER, NO_EPOCH);
 }
 
-// Both refreshes are coalesced per subject: `fetchJob` per job id, `fetchAllJobs`
-// under one shared key. Correctness does not depend on it - ordering is settled
-// by revision in the reducer - so this only drops requests whose answer is
-// already on its way.
 const refreshJob = coalesce(requestJob);
 const refreshAllJobs = coalesce(requestAllJobs);
 
@@ -62,7 +55,7 @@ function reportJobsApiError(context, detail) {
 
 async function requestJob(id) {
   try {
-    const r = await fetch(`/api/jobs/${id}`);
+    const r = await fetch(`/api/jobs/${encodeURIComponent(id)}`);
     const epoch = epochOf(r);
     const era = compareEpoch(epoch, state.jobsEpoch);
     if (era > 0) {
@@ -71,8 +64,6 @@ async function requestJob(id) {
     }
     if (era < 0) return;
     if (r.status === 410) {
-      // Deleted, and the server still remembers when. A 404 could equally mean
-      // "never existed", which is not a reason to remove a card.
       const before = state.jobs;
       const deletion = {
         deletedRevision: listRevisionOf(r), deletedEpoch: epoch, appliedEpoch: state.jobsEpoch,
@@ -98,7 +89,7 @@ async function requestJob(id) {
       appliedEpoch: state.jobsEpoch,
       tombstones: state.jobsTombstones,
     });
-    if (state.jobs === before) return;  // a response older than what we hold
+    if (state.jobs === before) return;
     renderJobs();
   } catch (error) {
     reportJobsApiError(`刷新任务 ${id} 出错`, error?.message || String(error));
@@ -122,7 +113,7 @@ async function requestAllJobs() {
       appliedEpoch: state.jobsEpoch,
       tombstones: state.jobsTombstones,
     });
-    if (!merged.applied) return;  // an older list, or an older server run
+    if (!merged.applied) return;
     state.jobs = merged.jobs;
     state.jobsRevision = merged.revision;
     state.jobsEpoch = merged.epoch;
@@ -136,18 +127,15 @@ async function requestAllJobs() {
 export function startJobPolling() {
   let idleElapsed = 0;
   setInterval(() => {
-    // SSE progress can arrive just before the final job state is persisted.
-    // Keep a lightweight reconciliation poll while jobs are active so a missed
-    // or early final event cannot leave the UI stuck in an active state.
+    // Pause background polling while the tab is hidden; visibilitychange in
+    // main.js triggers an immediate resync when the user returns.
+    if (typeof document !== 'undefined' && document.hidden) return;
     const hasActive = Object.values(state.jobs).some(j => ACTIVE_STATUSES.has(j.status));
     if (hasActive) {
       idleElapsed = 0;
       fetchAllJobs();
       return;
     }
-    // An all-terminal page used to stop polling entirely, so a job deleted in
-    // another tab - or a restart that emptied the list - stayed on screen until
-    // someone reloaded. It has nothing to wait for, so it just waits longer.
     idleElapsed += ACTIVE_POLL_MS;
     if (idleElapsed >= IDLE_POLL_MS) {
       idleElapsed = 0;

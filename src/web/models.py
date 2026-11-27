@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.config import (
     DEFAULT_REASONING_EFFORT,
@@ -19,7 +20,7 @@ class JobSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     video_paths: list[str] = Field(min_length=1, max_length=200)
-    output_dir: str | None = None
+    output_dir: str | None = Field(default=None, max_length=4096)
     subtitle_mode: Literal["zh", "bilingual"] = "zh"
     skip_translation: bool = False
     # 4, not 16. Workers do not cost tokens directly, but they set the batch
@@ -34,6 +35,30 @@ class JobSpec(BaseModel):
     translation_glossary: str | None = Field(default=None, max_length=20000)
     llm_reasoning_effort: Literal["none", "low", "high"] | None = None
     resume_from_job_id: str = Field(default="", max_length=128)
+
+    @field_validator("video_paths")
+    @classmethod
+    def _validate_video_paths(cls, paths: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for raw in paths:
+            if not isinstance(raw, str):
+                raise ValueError("视频路径必须是字符串")
+            if "\x00" in raw:
+                raise ValueError("视频路径包含非法空字符")
+            text = raw.strip()
+            if not text:
+                raise ValueError("视频路径不能为空")
+            cleaned.append(text)
+        return cleaned
+
+    @field_validator("output_dir")
+    @classmethod
+    def _validate_output_dir(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if "\x00" in value:
+            raise ValueError("输出目录路径包含非法空字符")
+        return value
 
 
 class JobState(BaseModel):
@@ -98,9 +123,9 @@ class SettingsRead(BaseModel):
 class SettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    api_key: str | None = None
-    base_url: str | None = None
-    model: str | None = None
+    api_key: str | None = Field(default=None, max_length=4096)
+    base_url: str | None = Field(default=None, max_length=2048)
+    model: str | None = Field(default=None, max_length=256)
     proxy_protocol: Literal["http", "https", "socks5"] | None = None
     proxy_host: str | None = Field(default=None, max_length=255)
     proxy_port: int | None = Field(default=None, ge=1, le=65535)
@@ -109,3 +134,56 @@ class SettingsUpdate(BaseModel):
     target_lang: str | None = Field(default=None, max_length=64)
     translation_backend: Literal["openai", "llamacpp"] | None = None
     disable_update_check: bool | None = None
+
+    @field_validator("api_key")
+    @classmethod
+    def _validate_api_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if "\r" in value or "\n" in value or "\x00" in value:
+            raise ValueError("API Key 不能包含换行符或空字符")
+        return value
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if "\r" in value or "\n" in value or "\x00" in value:
+            raise ValueError("模型名称不能包含换行符或空字符")
+        return value
+
+    @field_validator("base_url")
+    @classmethod
+    def _validate_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        trimmed = value.strip()
+        if not trimmed:
+            return ""
+        if any(ch.isspace() or ch == "\x00" for ch in trimmed):
+            raise ValueError("API Base URL 不能包含空白或换行字符")
+        try:
+            parsed = urlsplit(trimmed)
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError("API Base URL 格式无效，请填写合法的 http(s):// 地址") from exc
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("API Base URL 必须以 http:// 或 https:// 开头并包含有效主机名")
+        return trimmed
+
+    @field_validator("proxy_host")
+    @classmethod
+    def _validate_proxy_host(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        trimmed = value.strip()
+        if not trimmed:
+            return ""
+        if (
+            "://" in trimmed
+            or any(ch.isspace() for ch in trimmed)
+            or any(ch in "/?#\x00" for ch in trimmed)
+        ):
+            raise ValueError("代理地址格式无效，请仅填写主机名或 IP（不要包含协议头、路径或空格）")
+        return trimmed

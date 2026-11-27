@@ -29,11 +29,12 @@ import time
 
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_ROOT = PROJECT_ROOT / "src"
-for root in (PROJECT_ROOT, SRC_ROOT):
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
+if str(_REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools._common import ensure_src_on_path, read_jsonl as _read_jsonl  # noqa: E402
+
+ensure_src_on_path()
 
 from asr.alignment import (  # noqa: E402
     ALIGNMENT_MODEL_SCHEMA,
@@ -60,11 +61,6 @@ from tools.align.frame_teacher_supervision import (  # noqa: E402
     compile_sparse_frame_targets,
     load_accepted_frame_teachers,
 )
-
-
-def _read_jsonl(path: Path) -> list[dict]:
-    with path.open(encoding="utf-8-sig") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
 
 
 class FeatureCache:

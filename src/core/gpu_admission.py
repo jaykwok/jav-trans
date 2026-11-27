@@ -214,6 +214,14 @@ def _claim_conflict(kind: str) -> str:
     return ""
 
 
+def _notify_free() -> None:
+    with _FREE:
+        _FREE.notify_all()
+
+
+resources.register_release_listener(_notify_free)
+
+
 def _live_conflict(kind: str) -> str:
     """The safety net: a live GPU record of a kind ``kind`` may not displace.
 
@@ -223,10 +231,9 @@ def _live_conflict(kind: str) -> str:
     check late still beats never blocking at all.
     """
     tolerated = _tolerated(kind)
-    for record in resources.live():
-        if record["holds_gpu"] and record["kind"] not in tolerated:
-            return f"{record['kind']} pid={record['pid']}"
-    return ""
+    if not resources.has_live_gpu_conflict(tolerated):
+        return ""
+    return resources.live_gpu_conflict_label(tolerated)
 
 
 def acquire(
@@ -253,13 +260,13 @@ def acquire(
         with _FREE:
             # Every read that decides this grant happens inside this section,
             # never before it. They take the registry's own short lock and
-            # nothing in `core.resources` ever takes `_FREE`, so there is no
-            # cycle; a check taken outside is a check that can go stale before
-            # it is acted on. `_claim_conflict` is the one that closes the
-            # handover race, because a claim appears in the same lock section
-            # that gives the permit up (see `handover`). The `_live_conflict`
-            # scan behind it is the weaker safety net for records registered
-            # outside the protocol.
+            # nothing in `core.resources` ever takes `_FREE` while holding it,
+            # so there is no cycle; a check taken outside is a check that can go
+            # stale before it is acted on. `_claim_conflict` is the one that
+            # closes the handover race, because a claim appears in the same lock
+            # section that gives the permit up (see `handover`). The
+            # `_live_conflict` scan behind it is the weaker safety net for
+            # records registered outside the protocol.
             blocked = resources.gpu_blocked()
             conflict = ""
             if not blocked:
@@ -272,19 +279,23 @@ def acquire(
                     since=time.time(),
                 )
                 return _HOLDER
-            if deadline is not None and time.monotonic() >= deadline:
-                held = _HOLDER.kind if _HOLDER is not None else ""
-                reason = (
-                    "有未确认退出的 GPU 子进程"
-                    if blocked
-                    else f"{conflict} 仍在占用显存"
-                    if conflict
-                    else f"{held or '另一个阶段'} 正在使用 GPU"
-                )
-                raise GpuAdmissionTimeout(
-                    f"等待 GPU 使用许可超过 {timeout_s:g}s（{kind}）：{reason}。"
-                )
-            _FREE.wait(_POLL_S)
+            wait_s = _POLL_S
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    held = _HOLDER.kind if _HOLDER is not None else ""
+                    reason = (
+                        "有未确认退出的 GPU 子进程"
+                        if blocked
+                        else f"{conflict} 仍在占用显存"
+                        if conflict
+                        else f"{held or '另一个阶段'} 正在使用 GPU"
+                    )
+                    raise GpuAdmissionTimeout(
+                        f"等待 GPU 使用许可超过 {timeout_s:g}s（{kind}）：{reason}。"
+                    )
+                wait_s = min(wait_s, remaining)
+            _FREE.wait(wait_s)
 
 
 def release(permit: GpuPermit | None) -> bool:
@@ -348,6 +359,15 @@ def holder() -> GpuPermit | None:
         return _HOLDER
 
 
+def _is_blocked_unlocked(kind: str) -> bool:
+    return bool(
+        _HOLDER is not None
+        or resources.gpu_blocked()
+        or _claim_conflict(kind)
+        or resources.has_live_gpu_conflict(_tolerated(kind))
+    )
+
+
 def blocked_for(kind: str) -> bool:
     """Would :func:`acquire` have to wait right now?
 
@@ -355,12 +375,7 @@ def blocked_for(kind: str) -> bool:
     the ASR stage and park inside the transcription call.
     """
     with _FREE:
-        return bool(
-            _HOLDER is not None
-            or resources.gpu_blocked()
-            or _claim_conflict(kind)
-            or _live_conflict(kind)
-        )
+        return _is_blocked_unlocked(kind)
 
 
 def claims() -> list[dict[str, Any]]:
@@ -371,13 +386,17 @@ def claims() -> list[dict[str, Any]]:
 
 
 def snapshot() -> dict[str, Any]:
-    """Permit and claim state for the diagnostics panel."""
-    current = holder()
+    """Atomic permit and claim state for the diagnostics panel."""
+    with _FREE:
+        _prune_claims()
+        current = _HOLDER
+        resident = [claim.view() for claim in _CLAIMS.values()]
+        asr_blocked = _is_blocked_unlocked(ASR)
     return {
         "held": current is not None,
         "holder": current.view() if current is not None else None,
-        "resident": claims(),
-        "asr_blocked": blocked_for(ASR),
+        "resident": resident,
+        "asr_blocked": asr_blocked,
     }
 
 

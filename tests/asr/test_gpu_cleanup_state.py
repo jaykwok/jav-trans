@@ -226,17 +226,15 @@ def test_retrying_an_old_handle_never_closes_the_live_workers_job(monkeypatch):
     worker's kill-on-close job, taking its process tree with it. Records are per
     child now, and a live one is never a cleanup target.
     """
-    import asr.local_backend as local_backend
-
     closed: list[int] = []
     monkeypatch.setattr(
         gpu_worker,
         "close_kill_on_close_job",
         lambda handle: (closed.append(handle), False)[1],
     )
-    monkeypatch.setattr(local_backend, "_create_kill_on_close_job_object", lambda: 202)
+    monkeypatch.setattr(gpu_worker, "create_kill_on_close_job", lambda: 202)
     monkeypatch.setattr(
-        local_backend, "_assign_process_to_job_object", lambda job, process: None
+        gpu_worker, "bind_process_to_kill_on_close_job", lambda job, process: None
     )
 
     client = gpu_worker._GpuWorkerClient()

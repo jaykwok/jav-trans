@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import re
 
-from core.diagnostics import format_exception_chain, format_exit_code
-
-TRANSLATION_PANEL = "「翻译设置」"
+from core.diagnostics import (
+    format_exception_chain,
+    format_exit_code,
+    redact_url_credentials,
+)
 
 MISSING_API_KEY = (
     "缺少翻译 API Key：请打开「翻译设置」，在「API Key」中填写密钥并保存后重试；"
@@ -68,6 +70,18 @@ OPENROUTER_GUARDRAIL_BLOCKED = (
 RATE_LIMITED = (
     "翻译服务限速（429）且重试已用尽：请把「并行翻译 Worker 数」调低后重试。"
 )
+HF_AUTH_REQUIRED = (
+    "模型下载鉴权失败（401/403）：请确认是否需要执行 `hf auth login` 登录 Hugging Face Token"
+    "（或申请该受限仓库访问权限），并检查「网络代理」与镜像地址（HF_ENDPOINT）配置。"
+)
+HF_REPO_NOT_FOUND = (
+    "模型仓库或文件不存在（404）：请检查模型仓库 ID、Hugging Face 镜像地址（HF_ENDPOINT）"
+    "或「网络代理」设置后重试。"
+)
+HF_RATE_LIMITED = (
+    "Hugging Face 模型下载触发限速（429）：请稍后重试，或执行 `hf auth login` 配置 Token、"
+    "在「网络代理」中切换代理节点。"
+)
 # Reached from two very different stages (model download, translation request),
 # so it names both remedies instead of guessing which one applies.
 CANNOT_REACH_SERVICE = (
@@ -90,6 +104,9 @@ CUDA_UNAVAILABLE = (
     "显卡不可用：本项目需要 NVIDIA 显卡和可用的 CUDA，"
     "请更新显卡驱动后重启应用（也请确认没有在虚拟机/远程桌面里禁用了显卡）。"
 )
+HOST_RAM_OUT_OF_MEMORY = (
+    "系统内存（RAM）不足：请先关闭占用大量内存的程序后重试。"
+)
 OUT_OF_MEMORY = (
     "显存不足：请先关掉占用显存的程序（游戏、浏览器硬件加速等），"
     '或在 config/config.json 中设 "ASR_BATCH_SIZE": 2 降低批大小后重试。'
@@ -100,8 +117,9 @@ OUT_OF_MEMORY = (
 # the instruction verbs rather than a bare "请" keeps a provider's own Chinese
 # error ("请求过于频繁") from looking like one of ours.
 _ALREADY_ACTIONABLE = re.compile(
-    "请(?:在|打开|填|先|为|更新|检查|确认|把|降低|选择|安装|关闭|设置|使用|改)"
+    "请(?:在|打开|填|先|为|更新|检查|确认|把|降低|选择|安装|关闭|设置|使用|改|稍后)"
 )
+_HAS_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 _STATUS_MESSAGES = {
     401: INVALID_API_KEY,
@@ -110,6 +128,29 @@ _STATUS_MESSAGES = {
     404: MODEL_NOT_FOUND,
     429: RATE_LIMITED,
 }
+
+_HF_STATUS_MESSAGES = {
+    401: HF_AUTH_REQUIRED,
+    403: HF_AUTH_REQUIRED,
+    404: HF_REPO_NOT_FOUND,
+    429: HF_RATE_LIMITED,
+}
+
+_HF_CLASS_MARKERS = (
+    "hfhub",
+    "repositorynotfound",
+    "entrynotfound",
+    "gatedrepo",
+    "localentrynotfound",
+)
+
+_HF_DOMAIN_MARKERS = (
+    "huggingface.co",
+    "hf-mirror.com",
+    "hf.co",
+)
+
+_HF_HTTP_STATUS_RE = re.compile(r"\b(401|403|404|429)\b")
 
 _CONNECTION_NAME_MARKERS = (
     "apiconnection",
@@ -135,6 +176,65 @@ def _status_code(exc: BaseException) -> int | None:
         return int(status) if status is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _is_huggingface_error(exc: BaseException, message: str) -> bool:
+    cls_names = [cls.__name__.lower() for cls in type(exc).__mro__]
+    if any(
+        marker in cls_name
+        for cls_name in cls_names
+        for marker in _HF_CLASS_MARKERS
+    ):
+        return True
+    haystack_parts = [message.lower()]
+    response = getattr(exc, "response", None)
+    if response is not None:
+        resp_url = getattr(response, "url", None)
+        if resp_url:
+            haystack_parts.append(str(resp_url).lower())
+        req = getattr(response, "request", None)
+        if req is not None:
+            req_url = getattr(req, "url", None)
+            if req_url:
+                haystack_parts.append(str(req_url).lower())
+    request = getattr(exc, "request", None)
+    if request is not None:
+        req_url = getattr(request, "url", None)
+        if req_url:
+            haystack_parts.append(str(req_url).lower())
+    haystack = " ".join(haystack_parts)
+    return any(domain in haystack for domain in _HF_DOMAIN_MARKERS)
+
+
+def _hf_error_status(exc: BaseException, message: str, status: int | None) -> int | None:
+    if status in _HF_STATUS_MESSAGES:
+        return status
+    cls_names = [cls.__name__.lower() for cls in type(exc).__mro__]
+    if any("gatedrepo" in cls_name for cls_name in cls_names):
+        return 403
+    if any(
+        "repositorynotfound" in cls_name or "entrynotfound" in cls_name
+        for cls_name in cls_names
+    ):
+        return 404
+    match = _HF_HTTP_STATUS_RE.search(message)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _is_host_ram_oom(exc: BaseException, name: str, lowered: str) -> bool:
+    if "physical ram budget exceeded" in lowered:
+        return True
+    if "host ram" in lowered and ("budget" in lowered or "out of memory" in lowered):
+        return True
+    if isinstance(exc, MemoryError):
+        return True
+    if "memoryerror" in name and not any(
+        gpu_word in lowered for gpu_word in ("cuda", "gpu", "vram", "cublas", "cudnn")
+    ):
+        return True
+    return False
 
 
 def _mentions_ffmpeg(exc: BaseException, message: str) -> bool:
@@ -185,13 +285,13 @@ def _cause_detail(exc: BaseException, message: str) -> str:
     return chain or message
 
 
-def describe_stage_failure(exc: BaseException) -> str:
-    """Best-effort actionable message for a job that failed in some stage."""
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, str) and detail.strip():
-        return detail.strip()
+def _describe_stage_failure_raw(exc: BaseException) -> str:
+    raw_detail = getattr(exc, "detail", None)
+    detail_text = raw_detail.strip() if isinstance(raw_detail, str) and raw_detail.strip() else ""
+    if detail_text and (_ALREADY_ACTIONABLE.search(detail_text) or _HAS_CJK_RE.search(detail_text)):
+        return detail_text
 
-    message = str(exc).strip()
+    message = detail_text or str(exc).strip()
     lowered = message.lower()
     name = type(exc).__name__.lower()
 
@@ -209,12 +309,22 @@ def describe_stage_failure(exc: BaseException) -> str:
             return f"{FFMPEG_EXTRACT_FAILED}{_ffmpeg_failure_detail(exc)}"
 
     status = _status_code(exc)
+    if _is_huggingface_error(exc, message):
+        hf_status = _hf_error_status(exc, message, status)
+        if hf_status in _HF_STATUS_MESSAGES:
+            base = _HF_STATUS_MESSAGES[hf_status]
+            return f"{base}（服务端原文：{message}）" if message else base
+
     if status == 404 and "no endpoints found that can handle" in lowered:
         return f"{NO_ROUTE_FOR_STRICT_JSON}（服务端原文：{message}）"
     if status == 404 and ("guardrail" in lowered or "data policy" in lowered):
         return f"{OPENROUTER_GUARDRAIL_BLOCKED}（服务端原文：{message}）"
     if status in _STATUS_MESSAGES:
-        return f"{_STATUS_MESSAGES[status]}（服务端原文：{message}）" if message else _STATUS_MESSAGES[status]
+        return (
+            f"{_STATUS_MESSAGES[status]}（服务端原文：{message}）"
+            if message
+            else _STATUS_MESSAGES[status]
+        )
 
     if any(marker in name for marker in _CONNECTION_NAME_MARKERS):
         cause_text = _cause_detail(exc, message)
@@ -227,12 +337,32 @@ def describe_stage_failure(exc: BaseException) -> str:
     if "cuda is unavailable" in lowered or "requires cuda" in lowered:
         return f"{CUDA_UNAVAILABLE}（原始错误：{message}）" if message else CUDA_UNAVAILABLE
 
-    if "out of memory" in lowered or "outofmemory" in name:
+    if _is_host_ram_oom(exc, name, lowered):
+        return (
+            f"{HOST_RAM_OUT_OF_MEMORY}（原始错误：{message}）"
+            if message
+            else HOST_RAM_OUT_OF_MEMORY
+        )
+
+    if (
+        "out of memory" in lowered
+        or "outofmemory" in name
+        or "vram budget exceeded" in lowered
+        or "shared vram spill" in lowered
+        or "cumemalloc" in lowered
+    ):
         return f"{OUT_OF_MEMORY}（原始错误：{message}）" if message else OUT_OF_MEMORY
 
+    if detail_text:
+        return detail_text
     if exc.__cause__ is not None:
         return format_exception_chain(exc)
     return message or type(exc).__name__
+
+
+def describe_stage_failure(exc: BaseException) -> str:
+    """Best-effort actionable message for a job that failed in some stage."""
+    return redact_url_credentials(_describe_stage_failure_raw(exc))
 
 
 __all__ = [
@@ -240,6 +370,10 @@ __all__ = [
     "CUDA_UNAVAILABLE",
     "FFMPEG_EXTRACT_FAILED",
     "FFMPEG_MISSING",
+    "HF_AUTH_REQUIRED",
+    "HF_RATE_LIMITED",
+    "HF_REPO_NOT_FOUND",
+    "HOST_RAM_OUT_OF_MEMORY",
     "INSUFFICIENT_BALANCE",
     "INVALID_API_KEY",
     "MISSING_API_KEY",
@@ -250,7 +384,6 @@ __all__ = [
     "OPENROUTER_GUARDRAIL_BLOCKED",
     "OUT_OF_MEMORY",
     "RATE_LIMITED",
-    "TRANSLATION_PANEL",
     "VIDEO_FILE_MISSING",
     "describe_stage_failure",
 ]

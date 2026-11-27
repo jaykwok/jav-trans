@@ -15,6 +15,11 @@ from pipeline.stage_log import _parse_asr_stage_event, _timing_summary_rows
 from helpers import make_job_context, run_pipeline
 
 
+@pytest.fixture(autouse=True)
+def _isolate_project_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+
+
 def _configure_headless(monkeypatch) -> None:
     monkeypatch.setenv("STAGE_EVENT_SINK", "memory")
     monkeypatch.setattr(

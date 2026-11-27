@@ -13,8 +13,12 @@ const { coalesce } = await import(pathToFileURL(modulePath).href);
 /** A request whose completion the test decides. */
 function deferred() {
   let settle;
-  const promise = new Promise(resolve => { settle = resolve; });
-  return { promise, settle };
+  let reject;
+  const promise = new Promise((resolve, rej) => {
+    settle = resolve;
+    reject = rej;
+  });
+  return { promise, settle, reject };
 }
 
 /** Let every queued follow-up actually start. */
@@ -24,8 +28,6 @@ function flush() {
 
 const cases = {
   async 'a burst during one request becomes one follow-up'() {
-    // The reported cost: every SSE event issues a GET, and translation emits
-    // them faster than a request completes.
     const opened = [];
     let pending = deferred();
     const refresh = coalesce(id => {
@@ -35,7 +37,7 @@ const cases = {
 
     const first = refresh('a');
     for (let i = 0; i < 20; i += 1) refresh('a');
-    assert.deepEqual(opened, ['a']);  // still one request open
+    assert.deepEqual(opened, ['a']);
 
     const settle = pending.settle;
     pending = deferred();
@@ -43,9 +45,8 @@ const cases = {
     await first;
     await flush();
 
-    // One follow-up, not twenty: the events that arrived while the first was
-    // open could not have been answered any sooner than by its successor.
     assert.deepEqual(opened, ['a', 'a']);
+    pending.settle();
   },
 
   async 'a quiet subject issues no follow-up'() {
@@ -66,27 +67,73 @@ const cases = {
     refresh('a');
     refresh('b');
 
-    // Coalescing is per subject: a slow answer about one job must not delay
-    // the first question about another.
     assert.deepEqual(opened, ['a', 'b']);
     pending.settle();
   },
 
-  async 'callers during a request join the one in flight'() {
-    const pending = deferred();
-    const refresh = coalesce(() => pending.promise.then(() => 'answer'));
+  async 'trailing callers share one deferred promise that settles after the follow-up'() {
+    let callCount = 0;
+    const req1 = deferred();
+    const req2 = deferred();
+    const refresh = coalesce(() => {
+      callCount += 1;
+      return callCount === 1
+        ? req1.promise.then(() => 'stale')
+        : req2.promise.then(() => 'fresh');
+    });
 
     const first = refresh('a');
-    const joined = refresh('a');
+    const trailing1 = refresh('a');
+    const trailing2 = refresh('a');
 
-    assert.equal(joined, first);
-    pending.settle();
-    assert.equal(await joined, 'answer');
+    assert.notEqual(trailing1, first);
+    assert.equal(trailing1, trailing2);
+
+    let trailingSettled = false;
+    trailing1.then(() => { trailingSettled = true; });
+
+    req1.settle();
+    assert.equal(await first, 'stale');
+    await flush();
+    // Must still be waiting for the follow-up request, not resolved by req1.
+    assert.equal(trailingSettled, false);
+    assert.equal(callCount, 2);
+
+    req2.settle();
+    assert.equal(await trailing1, 'fresh');
+    assert.equal(await trailing2, 'fresh');
+    assert.equal(trailingSettled, true);
+  },
+
+  async 'an unobserved trailing rejection does not trigger unhandledRejection or wedge the key'() {
+    let unhandled = 0;
+    const onUnhandled = () => { unhandled += 1; };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      let attempt = 0;
+      const req1 = deferred();
+      const refresh = coalesce(() => {
+        attempt += 1;
+        if (attempt === 1) return req1.promise;
+        if (attempt === 2) return Promise.reject(new Error('transient follow-up failure'));
+        return Promise.resolve('recovered');
+      });
+
+      const first = refresh('a');
+      // Fire-and-forget trailing call (not awaited).
+      refresh('a');
+      req1.settle();
+      await first;
+      await flush();
+
+      assert.equal(unhandled, 0);
+      assert.equal(await refresh('a'), 'recovered');
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
   },
 
   async 'a failed request does not wedge the subject'() {
-    // `finally`, not `then`: a rejected refresh that left the key marked in
-    // flight would silently stop the page updating that job forever.
     const opened = [];
     const refresh = coalesce(id => {
       opened.push(id);

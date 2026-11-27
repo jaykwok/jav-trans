@@ -270,5 +270,82 @@ def test_pins_require_full_commit_sha(revision):
         model_paths.require_commit_sha(revision)
 
 
+def test_require_clean_gate_rejects_dirty_worktree_and_allows_clean(tmp_path, monkeypatch):
+    dist = _dist(tmp_path)
+    out_dirty = tmp_path / "dirty-manifest.json"
+    monkeypatch.setattr(manifest_tool, "git_state", lambda: {"commit": "a" * 40, "dirty": True})
+    assert manifest_tool.main(["--dist", str(dist), "--output", str(out_dirty), "--skip-models", "--require-clean"]) == 1
+    assert not out_dirty.exists()
+
+    out_clean = tmp_path / "clean-manifest.json"
+    monkeypatch.setattr(manifest_tool, "git_state", lambda: {"commit": "a" * 40, "dirty": False})
+    assert manifest_tool.main(["--dist", str(dist), "--output", str(out_clean), "--skip-models", "--require-clean"]) == 0
+    assert out_clean.is_file()
+
+
+def test_verify_dist_only_validates_historical_archive_despite_repo_drift(tmp_path):
+    dist = _dist(tmp_path)
+    payload = manifest_tool.build_manifest(dist)
+    # Simulate a historical manifest whose repo-root uv.lock hash no longer matches HEAD.
+    for entry in payload["files"]:
+        if entry["root"] == "repo":
+            entry["sha256"] = "0" * 64
+    manifest_path = tmp_path / "historical-manifest.json"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert manifest_tool.verify(manifest_path, dist, dist_only=False) == 1
+    assert manifest_tool.verify(manifest_path, dist, dist_only=True) == 0
+
+    # Dist payload tampering must still be caught under dist_only=True.
+    (dist / "llama-server.exe").write_bytes(b"tampered")
+    assert manifest_tool.verify(manifest_path, dist, dist_only=True) == 1
+
+
+def test_prepare_default_model_derives_repo_from_core_config():
+    from core.config import DEFAULT_SETTINGS
+
+    assert prepare_tool.DEFAULT_ASR_REPO_ID == DEFAULT_SETTINGS["ASR_BACKEND"]
+    assert prepare_tool.REQUIRED_MODEL_SPECS[0]["repo_id"] == DEFAULT_SETTINGS["ASR_BACKEND"]
+
+
+def test_pyinstaller_specs_trim_retired_models_unused_platforms_and_non_ffmpeg_dlls(tmp_path, monkeypatch):
+    web_spec = (ROOT / "packaging/jav-sub-web.spec").read_text(encoding="utf-8")
+    assert "transformers.models.mamba2" not in web_spec
+    assert "transformers.models.qwen3_asr" in web_spec
+    assert "webview.platforms.winforms" in web_spec
+    assert "webview.platforms.edgechromium" in web_spec
+    for pkg in ("pytest", "_pytest", "PyInstaller", "ruff", "sklearn", "tkinter", "torch.testing"):
+        assert f'"{pkg}"' in web_spec
+
+    # Verify _ffmpeg_binaries() in jav-sub-web.spec copies only FFmpeg family DLLs.
+    tools = tmp_path / "ffmpeg-bin"
+    tools.mkdir()
+    for name in ("ffmpeg.exe", "ffprobe.exe", "avcodec-62.dll", "avformat-62.dll", "avutil-60.dll", "swscale-8.dll", "unrelated.dll"):
+        (tools / name).write_bytes(b"x")
+    monkeypatch.setenv("JAV_SUB_FFMPEG_EXE", str(tools / "ffmpeg.exe"))
+    monkeypatch.setenv("JAV_SUB_FFPROBE_EXE", str(tools / "ffprobe.exe"))
+    hooks = ModuleType("PyInstaller.utils.hooks")
+    hooks.collect_data_files = lambda *_a, **_k: []
+    hooks.collect_submodules = lambda *_a, **_k: []
+    hooks.copy_metadata = lambda *_a, **_k: []
+    monkeypatch.setitem(sys.modules, "PyInstaller.utils.hooks", hooks)
+    monkeypatch.setenv("JAV_SUB_SKIP_MODELS", "1")
+    tree = ast.parse(web_spec, str(ROOT / "packaging/jav-sub-web.spec"))
+    boundary = next(
+        idx for idx, node in enumerate(tree.body)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "binaries" for t in node.targets)
+    )
+    ns = {"SPECPATH": str(ROOT / "packaging")}
+    exec(compile(ast.Module(body=tree.body[:boundary], type_ignores=[]), "jav-sub-web.spec", "exec"), ns)
+    bundled_names = {Path(src).name for src, _dst in ns["_ffmpeg_binaries"]()}
+    assert {"ffmpeg.exe", "ffprobe.exe", "avcodec-62.dll", "avformat-62.dll", "avutil-60.dll", "swscale-8.dll"} == bundled_names
+    assert "unrelated.dll" not in bundled_names
+
+    setup_spec = (ROOT / "packaging/jav-sub-setup.spec").read_text(encoding="utf-8")
+    for mod in ("sqlite3", "_sqlite3", "decimal", "asyncio", "multiprocessing", "xmlrpc", "ensurepip", "venv", "pytest", "PyInstaller", "setuptools"):
+        assert f'"{mod}"' in setup_spec
+
+
 def pytest_fail(message: str):
     raise AssertionError(message)

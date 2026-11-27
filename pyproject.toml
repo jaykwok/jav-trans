@@ -1,6 +1,6 @@
 [project]
 name = "jav-sub"
-version = "1.0.0"
+version = "1.0.1"
 requires-python = ">3.14"
 dependencies = [
     "accelerate",
@@ -49,7 +49,6 @@ dev = [
     "pyinstaller",
     "pytest",
     "ruff==0.17.4",
-    "scikit-learn",
 ]
 
 # torchaudio is deliberately absent, and cannot be added on this stack: neither
@@ -98,4 +97,5 @@ norecursedirs = [
 target-version = "py314"
 
 [tool.ruff.lint]
-select = ["F", "E9", "B012", "B020", "B023"]
+select = ["F", "E9", "E711", "E712", "E721", "E722", "B", "RUF006", "RUF043"]
+ignore = ["B905"]

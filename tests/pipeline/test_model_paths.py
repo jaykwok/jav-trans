@@ -424,3 +424,71 @@ def test_an_explicit_token_path_is_respected(monkeypatch):
 
     source = inspect.getsource(model_paths)
     assert 'os.environ.setdefault("HF_TOKEN_PATH"' in source
+
+
+def test_source_mode_cache_defaults_use_absolute_models_root():
+    import inspect
+
+    source = inspect.getsource(model_paths)
+    assert '"./models"' not in source
+    assert '"./models/hub"' not in source
+    assert '"./models/xet"' not in source
+    assert "model*.safetensors" not in model_paths.MODEL_WEIGHT_PATTERNS
+    assert "*.safetensors" in model_paths.MODEL_WEIGHT_PATTERNS
+
+
+def test_resolve_model_spec_and_download_snapshot_forward_cancel_event(monkeypatch, tmp_path):
+    import threading
+    from utils import hf_progress
+
+    monkeypatch.setattr(model_paths, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(model_paths, "MODELS_ROOT", tmp_path / "models")
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+
+    cancel = threading.Event()
+    cancel.set()
+    seen_tqdm = []
+
+    def fake_snapshot_download(**kwargs):
+        seen_tqdm.append(kwargs["tqdm_class"])
+        # Instantiating the cancellable tqdm class with set cancel_event must abort.
+        kwargs["tqdm_class"](total=100, unit="B", desc="w.safetensors", disable=True)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+
+    with pytest.raises(hf_progress.DownloadCancelled):
+        model_paths.resolve_model_spec(
+            None,
+            "owner/repo",
+            download=True,
+            cancel_event=cancel,
+        )
+    assert len(seen_tqdm) == 1
+    assert seen_tqdm[0] is not hf_progress.HfDownloadProgressTqdm
+
+
+def test_resolve_pinned_model_cleans_dirty_partial_before_downloading(monkeypatch, tmp_path):
+    sha = "a" * 40
+    monkeypatch.setattr(model_paths, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(model_paths, "MODELS_ROOT", tmp_path / "models")
+
+    target = model_paths.revision_model_dir("owner/repo", sha).resolve()
+    dirty_partial = target.with_name(target.name + ".partial")
+    dirty_partial.mkdir(parents=True)
+    stale_file = dirty_partial / "stale_garbage.bin"
+    stale_file.write_bytes(b"stale")
+
+    def fake_download(repo_id, target_dir, **kwargs):
+        assert not (target_dir / "stale_garbage.bin").exists()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        (target_dir / "config.json").write_text("{}", encoding="utf-8")
+        (target_dir / "model.safetensors").write_bytes(b"fresh")
+        return str(target_dir)
+
+    monkeypatch.setattr(model_paths, "_download_snapshot", fake_download)
+
+    resolved = model_paths.resolve_model_spec(None, "owner/repo", download=True, revision=sha)
+    assert resolved == str(target)
+    assert not (target / "stale_garbage.bin").exists()
+    assert (target / model_paths.MODEL_RECEIPT).is_file()
+    assert not dirty_partial.exists()

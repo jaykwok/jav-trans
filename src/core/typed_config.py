@@ -61,7 +61,9 @@ _problems: dict[str, ConfigProblem] = {}
 _problem_lock = threading.Lock()
 
 
-def _record(field: str, value: str, problem: str) -> None:
+def _record(field: str, value: str, problem: str, *, track: bool = True) -> None:
+    if not track:
+        return
     entry = ConfigProblem(field=field, value=value, problem=problem)
     with _problem_lock:
         previous = _problems.get(field)
@@ -72,9 +74,21 @@ def _record(field: str, value: str, problem: str) -> None:
         log.warning("Configuration problem: %s", entry.message())
 
 
-def _clear(field: str) -> None:
+def _clear(field: str, *, track: bool = True) -> None:
+    if not track:
+        return
     with _problem_lock:
         _problems.pop(field, None)
+
+
+def record_configuration_problem(field: str, value: str, problem: str) -> None:
+    """Record a validation problem for a non-numeric or composite configuration field."""
+    _record(field, value, problem, track=True)
+
+
+def clear_configuration_problem(field: str) -> None:
+    """Clear any previously recorded problem for ``field``."""
+    _clear(field, track=True)
 
 
 def configuration_problems() -> list[str]:
@@ -103,10 +117,12 @@ def env_text(
     environ: dict[str, str] | None = None,
 ) -> str:
     """A configured string, or the default when it is unset or blank."""
+    track = environ is None
     value = _raw(name, environ=environ).strip()
     if not value:
-        _clear(name)
+        _clear(name, track=track)
         return default
+    _clear(name, track=track)
     return value.lower() if lower else value
 
 
@@ -118,17 +134,19 @@ def env_choice(
     environ: dict[str, str] | None = None,
 ) -> str:
     """One of `choices`, case-insensitively. Anything else is recorded."""
+    track = environ is None
     value = _raw(name, environ=environ).strip().lower()
     if not value:
-        _clear(name)
+        _clear(name, track=track)
         return default
     if value in choices:
-        _clear(name)
+        _clear(name, track=track)
         return value
     _record(
         name,
         value,
         f"不是可用取值（{'、'.join(choices)}），已按 {default!r} 处理",
+        track=track,
     )
     return default
 
@@ -139,17 +157,23 @@ def env_bool(
     *,
     environ: dict[str, str] | None = None,
 ) -> bool:
+    track = environ is None
     value = _raw(name, environ=environ).strip().lower()
     if not value:
-        _clear(name)
+        _clear(name, track=track)
         return default
     if value in _TRUE_WORDS:
-        _clear(name)
+        _clear(name, track=track)
         return True
     if value in _FALSE_WORDS:
-        _clear(name)
+        _clear(name, track=track)
         return False
-    _record(name, value, f"不是开关值（1/0、true/false、on/off），已按 {default} 处理")
+    _record(
+        name,
+        value,
+        f"不是开关值（1/0、true/false、on/off），已按 {default} 处理",
+        track=track,
+    )
     return default
 
 
@@ -174,18 +198,24 @@ def _in_range(
     maximum: float | None,
     out_of_range: str,
     formatter,
+    track: bool = True,
 ) -> float:
     if minimum is not None and value < minimum:
         bound, limit = minimum, f"低于允许的最小值 {formatter(minimum)}"
     elif maximum is not None and value > maximum:
         bound, limit = maximum, f"高于允许的最大值 {formatter(maximum)}"
     else:
-        _clear(name)
+        _clear(name, track=track)
         return value
     if out_of_range == CLAMP:
-        _record(name, formatter(value), f"{limit}，已按该边界处理")
+        _record(name, formatter(value), f"{limit}，已按该边界处理", track=track)
         return bound
-    _record(name, formatter(value), f"{limit}，已按默认值 {formatter(default)} 处理")
+    _record(
+        name,
+        formatter(value),
+        f"{limit}，已按默认值 {formatter(default)} 处理",
+        track=track,
+    )
     return default
 
 
@@ -198,9 +228,10 @@ def env_int(
     out_of_range: str = CLAMP,
     environ: dict[str, str] | None = None,
 ) -> int:
+    track = environ is None
     raw = _raw(name, environ=environ).strip()
     if not raw:
-        _clear(name)
+        _clear(name, track=track)
         return default
     try:
         # `int(float(...))` on purpose: `.env` files written by hand and by the
@@ -211,7 +242,7 @@ def env_int(
             raise ValueError(raw)
         value = int(parsed)
     except (TypeError, ValueError):
-        _record(name, raw, f"不是整数，已按默认值 {default} 处理")
+        _record(name, raw, f"不是整数，已按默认值 {default} 处理", track=track)
         return default
     return int(
         _in_range(
@@ -222,6 +253,7 @@ def env_int(
             maximum=maximum,
             out_of_range=out_of_range,
             formatter=lambda item: str(int(item)),
+            track=track,
         )
     )
 
@@ -235,19 +267,20 @@ def env_float(
     out_of_range: str = CLAMP,
     environ: dict[str, str] | None = None,
 ) -> float:
+    track = environ is None
     raw = _raw(name, environ=environ).strip()
     if not raw:
-        _clear(name)
+        _clear(name, track=track)
         return default
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        _record(name, raw, f"不是数字，已按默认值 {default} 处理")
+        _record(name, raw, f"不是数字，已按默认值 {default} 处理", track=track)
         return default
     if not math.isfinite(value):
         # inf and nan parse as floats and then poison every duration derived
         # from them without raising anywhere.
-        _record(name, raw, f"不是有限数字，已按默认值 {default} 处理")
+        _record(name, raw, f"不是有限数字，已按默认值 {default} 处理", track=track)
         return default
     return float(
         _in_range(
@@ -258,6 +291,7 @@ def env_float(
             maximum=maximum,
             out_of_range=out_of_range,
             formatter=lambda item: f"{float(item):g}",
+            track=track,
         )
     )
 
@@ -266,6 +300,7 @@ __all__ = [
     "CLAMP",
     "FALL_BACK",
     "ConfigProblem",
+    "clear_configuration_problem",
     "clear_configuration_problems",
     "configuration_problems",
     "env_bool",
@@ -273,4 +308,5 @@ __all__ = [
     "env_float",
     "env_int",
     "env_text",
+    "record_configuration_problem",
 ]

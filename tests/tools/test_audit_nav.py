@@ -65,7 +65,17 @@ def test_audit_index_lists_latest_without_auto_refresh(tmp_path: Path):
     assert "127.0.0.1:8765" not in index
     assert "audit_nav.py serve" not in index
     assert "audit_nav.py delete --href" in index
+    assert "dev/temp/uv-cache" not in index
+    assert "UV_CACHE_DIR=cache/uv" in index
     assert "按更新时间倒序排列" in index
+
+
+def test_serve_audits_script_uses_cache_uv_default():
+    script = (
+        Path(__file__).resolve().parents[2] / "tools" / "audits" / "serve_audits.ps1"
+    ).read_text(encoding="utf-8")
+    assert "dev/temp/uv-cache" not in script
+    assert '"cache/uv"' in script
 
 
 def test_latest_audit_entry_is_static_link(tmp_path: Path):

@@ -27,6 +27,7 @@ line was left untranslated, which the profiles already treat as a hard failure.
 from __future__ import annotations
 
 import re
+import threading
 from collections.abc import Callable
 
 # Order matters: 繁體/正體 must be tested before the generic "chinese" fallbacks,
@@ -44,6 +45,7 @@ _CONFIG_BY_VARIANT = {"simplified": "t2s", "traditional": "s2tw"}
 
 _converters: dict[str, Callable[[str], str]] = {}
 _unavailable = False
+_CONVERTERS_LOCK = threading.Lock()
 
 
 def target_variant(target_lang: str) -> str | None:
@@ -72,24 +74,28 @@ def converter_for(target_lang: str) -> Callable[[str], str] | None:
     global _unavailable
 
     variant = target_variant(target_lang)
-    if variant is None or _unavailable:
+    if variant is None:
         return None
-    if variant in _converters:
-        return _converters[variant]
-    try:
-        from opencc import OpenCC
-    except ImportError:
-        # A venv built before this dependency existed. Degrading to the previous
-        # behaviour beats failing a translation run over a cosmetic pass.
-        _unavailable = True
-        print(
-            "[translation] 未安装 opencc-python-reimplemented，跳过简繁转换；"
-            "请重新执行 uv sync"
-        )
-        return None
-    converter = OpenCC(_CONFIG_BY_VARIANT[variant])
-    _converters[variant] = converter.convert
-    return converter.convert
+    with _CONVERTERS_LOCK:
+        if _unavailable:
+            return None
+        cached = _converters.get(variant)
+        if cached is not None:
+            return cached
+        try:
+            from opencc import OpenCC
+        except ImportError:
+            # A venv built before this dependency existed. Degrading to the previous
+            # behaviour beats failing a translation run over a cosmetic pass.
+            _unavailable = True
+            print(
+                "[translation] 未安装 opencc-python-reimplemented，跳过简繁转换；"
+                "请重新执行 uv sync"
+            )
+            return None
+        converter = OpenCC(_CONFIG_BY_VARIANT[variant])
+        _converters[variant] = converter.convert
+        return converter.convert
 
 
 def convert(text: str, target_lang: str) -> str:

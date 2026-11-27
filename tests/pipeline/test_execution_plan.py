@@ -120,5 +120,5 @@ class TestSettlingItAfterAsr:
 def test_a_plan_is_a_value_not_a_handle():
     plan = ExecutionPlan.for_run(_ctx(), has_segments=True)
 
-    with pytest.raises(Exception):
+    with pytest.raises(AttributeError):
         plan.translates = False  # frozen: a plan cannot change mid-run

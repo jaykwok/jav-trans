@@ -29,3 +29,8 @@ def test_audit_core_downloads_labels_when_opened_as_a_local_file() -> None:
     assert "new Blob([content]" in AUDIT_REVIEW_CORE_JS
     assert "link.download=filename" in AUDIT_REVIEW_CORE_JS
     assert "link.click()" in AUDIT_REVIEW_CORE_JS
+
+
+def test_audit_core_partition_validator_accepts_caller_defined_labels() -> None:
+    assert "function validateAuditPartition(segments,frameCount,labels)" in AUDIT_REVIEW_CORE_JS
+    assert "auditPartitionLabelSet" in AUDIT_REVIEW_CORE_JS

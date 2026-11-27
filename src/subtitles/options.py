@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 from core.typed_config import FALL_BACK, env_bool, env_choice, env_float, env_int, env_text
 
@@ -32,6 +31,25 @@ LAYOUT_ENGINE = "source_sentence_first_v4"
 # the layout stamp above does not move with it - the cuts land where they did,
 # which is the reason these are two fields rather than one.
 TIMING_MODEL = "measured_lexical_extent_v3"
+
+
+def _env_float_with_legacy(
+    primary: str,
+    legacy: str,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    """Read `primary` when configured, falling back to `legacy` lazily.
+
+    Evaluating `legacy` eagerly as `primary`'s default argument would parse the
+    retired key even when `primary` is explicitly set, polluting
+    `typed_config.configuration_problems()` with warnings for an unused key.
+    """
+    if env_text(primary, ""):
+        return env_float(primary, default, minimum=minimum, maximum=maximum)
+    return env_float(legacy, default, minimum=minimum, maximum=maximum)
 
 
 @dataclass(frozen=True)
@@ -143,9 +161,10 @@ class SubtitleOptions:
             max_display_duration_s=env_float(
                 "SUBTITLE_MAX_DISPLAY_DURATION_S", 7.0, minimum=0.0
             ),
-            min_duration=env_float(
+            min_duration=_env_float_with_legacy(
                 "SUBTITLE_MIN_DURATION",
-                env_float("MIN_SUBTITLE_DURATION", 0.6, minimum=0.0),
+                "MIN_SUBTITLE_DURATION",
+                0.6,
                 minimum=0.0,
             ),
             reading_cps=env_float("SUBTITLE_READING_CPS", 7.0, minimum=1.0, out_of_range=FALL_BACK),

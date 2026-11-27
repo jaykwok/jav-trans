@@ -51,6 +51,22 @@ excludes = [
     "tkinter",
     "unittest",
     "pydoc_data",
+    "sqlite3",
+    "_sqlite3",
+    "decimal",
+    "asyncio",
+    "multiprocessing",
+    "xmlrpc",
+    "pydoc",
+    "doctest",
+    "pdb",
+    "idlelib",
+    "ensurepip",
+    "venv",
+    "pytest",
+    "_pytest",
+    "PyInstaller",
+    "setuptools",
 ]
 
 a = Analysis(

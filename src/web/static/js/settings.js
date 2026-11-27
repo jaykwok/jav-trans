@@ -1,32 +1,24 @@
-import { state } from './state.js';
-import { $, escHtml, showToast, readErrorDetail } from './util.js';
+import { $, showToast, readErrorDetail } from './util.js';
 import { addLog } from './log.js';
 import { loadFormMemory, saveFormMemory, applyFormMemory } from './formMemory.js';
-import { setActivePreset } from './presets.js';
 import { setModelComboboxOptions, installModelCombobox } from './modelCombobox.js';
+import { refreshModelRequirements } from './modelRequirements.js';
+import {
+  updateProxyFieldsState,
+  applyProxySettingsToForm,
+  readProxySettingsFromForm,
+  shouldIncludeProxyOnSubmit,
+  installProxySettings,
+} from './proxySettings.js';
 
-const _SUBTITLE_MODE_LABELS = {
-  '简体中文': {
-    zh: '简体中文字幕（仅译文）',
-    bilingual: '中日双语字幕（简体）',
-  },
-  '繁體中文': {
-    zh: '繁體中文字幕（仅译文）',
-    bilingual: '中日双语字幕（繁體）',
-  },
-  English: {
-    zh: '英文字幕（仅译文）',
-    bilingual: '英日双语字幕',
-  },
-};
+export { refreshModelRequirements } from './modelRequirements.js';
+export { updateProxyFieldsState } from './proxySettings.js';
 
 export function subtitleModeLabel(mode, targetLang) {
-  const labels = _SUBTITLE_MODE_LABELS[targetLang];
-  if (labels?.[mode]) return labels[mode];
-  const language = String(targetLang || '目标语言').trim() || '目标语言';
-  return mode === 'bilingual'
-    ? `${language}／日文双语字幕`
-    : `${language}字幕（仅译文）`;
+  if (mode === 'ja_only') return '仅日文（不翻译）';
+  const language = String(targetLang || '简体中文').trim() || '简体中文';
+  if (mode === 'bilingual') return `双语（日文 + ${language}）`;
+  return language;
 }
 
 export function updateSubtitleModeLabels() {
@@ -38,101 +30,77 @@ export function updateSubtitleModeLabels() {
   }
 }
 
-let _modelRequirementsRequestSeq = 0;
-let _modelRequirementsTimer = null;
-let _lastCudaStatus = null;
-
-const MODEL_REQUIREMENTS_POLL_MS = 15000;
-
-// The notice used to be drawn once at page load, so the "缺少 <model>" banner
-// stayed up through the download that removed the reason for it - and for the
-// whole run after that. Re-check on a timer while something is still missing.
-function scheduleModelRequirementsPoll(missingModels) {
-  if (_modelRequirementsTimer) {
-    clearTimeout(_modelRequirementsTimer);
-    _modelRequirementsTimer = null;
-  }
-  if (!missingModels) return;
-  _modelRequirementsTimer = setTimeout(() => {
-    _modelRequirementsTimer = null;
-    refreshModelRequirements({ includeCuda: false });
-  }, MODEL_REQUIREMENTS_POLL_MS);
+export function updateSkipTransState() {
+  const skip = $('r-mode')?.value === 'ja_only';
+  const panel = $('panel-translation');
+  if (panel) panel.classList.toggle('disabled', skip);
 }
 
-function renderModelRequirements(payload) {
-  const notice = $('model-requirements-notice');
-  const panel = $('panel-model-requirements');
-  if (!notice) return;
-  const missing = (payload.required_models || []).filter(item => !item.present);
-  // Polls skip the CUDA probe (it spawns a torch import), so keep the last
-  // verdict instead of reading its absence as "no problem".
-  if (payload.cuda) _lastCudaStatus = payload.cuda;
-  const cuda = payload.cuda || _lastCudaStatus || {};
-  const cudaProblem = cuda.status && cuda.status !== 'ok';
-  scheduleModelRequirementsPoll(missing.length > 0);
-  if (!missing.length && !cudaProblem) {
-    if (panel) panel.hidden = true;
-    notice.textContent = '';
-    return;
+export function formatGlossaryForTextarea(raw) {
+  const text = String(raw || '').replace(/\r\n?/g, '\n').trim();
+  if (!text) return '';
+  if (text.includes('\n')) {
+    return text.split('\n').map(line => line.trim()).filter(Boolean).join('\n');
   }
-  if (panel) panel.hidden = false;
+  // Legacy single-line comma-separated glossary: split only where a comma starts
+  // a new `source-target` pair so commas inside a translation target stay intact.
+  return text
+    .split(/,\s*(?=[^,\n]+(?:\s*(?:->|→|-)\s*[^,\n]+))/)
+    .map(entry => entry.trim())
+    .filter(Boolean)
+    .join('\n');
+}
 
-  const sections = [];
-  if (missing.length) {
-    let message;
-    if (payload.download_disabled) {
-      message = '缺少本地模型文件，且已关闭自动下载，需要先准备本地模型。';
+function parseGlossaryLine(line) {
+  const trimmed = String(line || '').trim();
+  if (!trimmed) return { empty: true, normalized: '', convertedArrow: false, invalid: false };
+  let separator = null;
+  let sepIdx = -1;
+  for (const candidate of ['→', '->', '-']) {
+    const idx = trimmed.indexOf(candidate);
+    if (idx >= 0 && (sepIdx < 0 || idx < sepIdx)) {
+      sepIdx = idx;
+      separator = candidate;
+    }
+  }
+  if (!separator || sepIdx <= 0) {
+    return { empty: false, normalized: '', convertedArrow: false, invalid: true };
+  }
+  const source = trimmed.slice(0, sepIdx).trim();
+  const target = trimmed.slice(sepIdx + separator.length).trim();
+  if (!source || !target) {
+    return { empty: false, normalized: '', convertedArrow: false, invalid: true };
+  }
+  // Normalize fullwidth/ASCII commas inside target to Chinese dunhao only if
+  // needed? No: store newline-separated so user wording survives round-trips.
+  return {
+    empty: false,
+    normalized: `${source}-${target}`,
+    convertedArrow: separator !== '-',
+    invalid: false,
+  };
+}
+
+export function inspectGlossaryText(raw) {
+  const lines = String(raw || '').replace(/\r\n?/g, '\n').split('\n');
+  const entries = [];
+  const invalidLines = [];
+  let convertedArrows = 0;
+  for (const line of lines) {
+    const parsed = parseGlossaryLine(line);
+    if (parsed.empty) continue;
+    if (parsed.invalid) {
+      invalidLines.push(line.trim());
     } else {
-      message = `首次使用需要下载 ${missing.length} 个模型；下载完成后会复用本地缓存。`;
-    }
-    const missingText = missing
-      .map(item => item.short_name || item.repo_id || '')
-      .filter(Boolean)
-      .join('、');
-    sections.push(`${escHtml(message)}<br><strong>缺少：</strong>${escHtml(missingText)}`);
-  }
-
-  if (cudaProblem) {
-    const smi = cuda.nvidia_smi || {};
-    const runtime = cuda.torch_cuda_version ? `PyTorch CUDA ${cuda.torch_cuda_version}` : '';
-    const driverCuda = smi.cuda_version ? `驱动 CUDA ${smi.cuda_version}` : '';
-    const driver = smi.driver_version ? `驱动 ${smi.driver_version}` : '';
-    const detail = [runtime, driverCuda, driver].filter(Boolean).join(' · ');
-    const message = cuda.message || 'CUDA 环境不可用，请更新 NVIDIA 显卡驱动后重启应用。';
-    sections.push(`${escHtml(message)}${detail ? `<br><strong>环境：</strong>${escHtml(detail)}` : ''}`);
-  }
-
-  notice.innerHTML = sections.join('<br>');
-  notice.hidden = false;
-}
-
-export async function refreshModelRequirements({ includeCuda = true } = {}) {
-  const notice = $('model-requirements-notice');
-  if (!notice) return;
-
-  const requestSeq = ++_modelRequirementsRequestSeq;
-  const url = includeCuda
-    ? '/api/model-requirements'
-    : '/api/model-requirements?include_cuda=0';
-  try {
-    const r = await fetch(url);
-    if (requestSeq !== _modelRequirementsRequestSeq) return;
-    if (!r.ok) {
-      const detail = await readErrorDetail(r);
-      addLog(`检查运行环境与模型状态失败（HTTP ${r.status}）：${detail}`, 'stage-error');
-      notice.innerHTML = escHtml(`运行环境/模型检测失败（HTTP ${r.status}）：${detail}`);
-      notice.hidden = false;
-      return;
-    }
-    renderModelRequirements(await r.json());
-  } catch (error) {
-    if (requestSeq === _modelRequirementsRequestSeq) {
-      const msg = error?.message || String(error);
-      addLog(`检查运行环境与模型状态出错：${msg}`, 'stage-error');
-      notice.innerHTML = escHtml(`运行环境/模型检测失败：${msg}`);
-      notice.hidden = false;
+      if (parsed.convertedArrow) convertedArrows += 1;
+      entries.push(parsed.normalized);
     }
   }
+  return {
+    serialized: entries.join('\n'),
+    invalidLines,
+    convertedArrows,
+  };
 }
 
 export async function loadConfig() {
@@ -145,21 +113,29 @@ export async function loadConfig() {
     const cfg = await r.json();
 
     const modeSel = $('r-mode');
-    modeSel.innerHTML = '';
-    for (const m of (cfg.subtitle_modes || [])) {
-      const opt = document.createElement('option');
-      opt.value = m;
-      opt.textContent = subtitleModeLabel(m, $('api-target-lang')?.value);
-      modeSel.appendChild(opt);
+    if (modeSel) {
+      const modes = [...(cfg.subtitle_modes || ['zh', 'bilingual'])];
+      if (!modes.includes('ja_only')) modes.push('ja_only');
+      modeSel.innerHTML = '';
+      for (const m of modes) {
+        const opt = document.createElement('option');
+        opt.value = m;
+        opt.textContent = subtitleModeLabel(m, $('api-target-lang')?.value);
+        modeSel.appendChild(opt);
+      }
+      if (cfg.defaults?.skip_translation) {
+        modeSel.value = 'ja_only';
+      } else if (cfg.defaults?.subtitle_mode && modes.includes(cfg.defaults.subtitle_mode)) {
+        modeSel.value = cfg.defaults.subtitle_mode;
+      }
     }
-    if (cfg.defaults?.subtitle_mode) modeSel.value = cfg.defaults.subtitle_mode;
 
     const d = cfg.defaults ?? {};
-    if (d.translation_max_workers   != null) $('t-translation-max-workers').value = d.translation_max_workers;
-    if (d.skip_translation          != null) $('r-skip-translation').checked      = !!d.skip_translation;
+    const workersEl = $('t-translation-max-workers');
+    if (d.translation_max_workers != null && workersEl) workersEl.value = d.translation_max_workers;
     applyFormMemory();
     updateSubtitleModeLabels();
-    setActivePreset(state.activePreset);
+    updateSkipTransState();
     refreshModelRequirements();
   } catch (error) {
     addLog(`加载默认配置出错：${error?.message || String(error)}`, 'stage-error');
@@ -179,36 +155,20 @@ export async function loadSettings({ previewsOnly = false } = {}) {
       ? '当前：' + s.api_key_preview
       : '当前：未设置';
     $('api-model-preview').textContent = s.model ? '当前：' + s.model : '当前：未设置';
-    // Saving can finish after the user starts another edit. Refresh only the
-    // saved-value labels then; reloading the whole form would discard it.
     if (previewsOnly) return;
 
-    // Translation backend
     const backendSel = $('translation-backend');
     if (backendSel && s.translation_backend) {
       backendSel.value = s.translation_backend;
       backendSel.dispatchEvent(new Event('change'));
     }
 
-    // OpenAI backend fields
     if (s.base_url) $('api-base-url').value = s.base_url;
     if (s.model) {
       setModelComboboxOptions([s.model], { selected: s.model });
     }
 
-    const proxyProtocol = $('proxy-protocol');
-    if (proxyProtocol) proxyProtocol.value = s.proxy_protocol || 'http';
-    const proxyHost = $('proxy-host');
-    if (proxyHost) proxyHost.value = s.proxy_host || '';
-    const proxyPort = $('proxy-port');
-    if (proxyPort) proxyPort.value = s.proxy_port || '';
-    // Proxy is "on" exactly when a host and port are configured; reflect that
-    // in the enable switch and the summary status pill, and disable the fields
-    // when off so the state is obvious.
-    const proxyOn = !!(s.proxy_host && s.proxy_port);
-    const proxyEnabled = $('proxy-enabled');
-    if (proxyEnabled) proxyEnabled.checked = proxyOn;
-    updateProxyFieldsState();
+    applyProxySettingsToForm(s);
 
     const effort = $('api-reasoning-effort');
     if (effort) effort.value = s.llm_reasoning_effort || 'low';
@@ -217,8 +177,7 @@ export async function loadSettings({ previewsOnly = false } = {}) {
     updateSubtitleModeLabels();
     const glossary = $('api-glossary');
     if (glossary) {
-      glossary.value = (s.translation_glossary || '')
-        .split(',').map(t => t.trim()).filter(Boolean).join('\n');
+      glossary.value = formatGlossaryForTextarea(s.translation_glossary);
     }
 
     const isConfigured = s.translation_backend === 'llamacpp'
@@ -233,25 +192,13 @@ export async function loadSettings({ previewsOnly = false } = {}) {
   }
 }
 
-function normalizeGlossaryLine(line) {
-  const trimmed = line.trim();
-  if (!trimmed || trimmed.includes('→') || trimmed.includes('->') || !trimmed.includes('-')) return '';
-  const [source, ...rest] = trimmed.split('-');
-  const target = rest.join('-').trim();
-  const normalizedSource = source.trim();
-  return normalizedSource && target ? `${normalizedSource}-${target}` : '';
-}
-
 // JobSpec is `extra="forbid"`, so the job body may carry only fields it
-// declares. Backend choice belongs to the settings API
-// (already persisted by `syncSettingsFromFormForSubmit` before submit) and
-// would make POST /api/jobs fail with 422 if they leaked in here.
+// declares. Backend choice belongs to the settings API.
 export function readJobTranslationSpecFromForm() {
   return {
     llm_reasoning_effort: $('api-reasoning-effort')?.value || 'low',
     target_lang:          $('api-target-lang')?.value || '简体中文',
-    translation_glossary: ($('api-glossary')?.value || '')
-      .split('\n').map(normalizeGlossaryLine).filter(Boolean).join(', '),
+    translation_glossary: inspectGlossaryText($('api-glossary')?.value || '').serialized,
   };
 }
 
@@ -261,24 +208,6 @@ export function readTranslationSettingsFromForm() {
     translation_backend: backend,
     ...readJobTranslationSpecFromForm(),
   };
-}
-
-function updateProxyFieldsState() {
-  const on = !!($('proxy-enabled')?.checked);
-  const testBtn = $('btn-proxy-test');
-  const testing = !!testBtn?.dataset.testing;
-  const enabled = $('proxy-enabled');
-  if (enabled) enabled.disabled = testing;
-  for (const id of ['proxy-protocol', 'proxy-host', 'proxy-port']) {
-    const el = $(id);
-    if (el) el.disabled = !on || testing;
-  }
-  if (testBtn) testBtn.disabled = !on || testing;
-  const tag = $('proxy-status-tag');
-  if (tag) {
-    tag.textContent = on ? '已启用' : '未启用';
-    tag.dataset.on = on ? 'on' : 'off';
-  }
 }
 
 function buildSettingsBodyFromForm({ includeConnection = false, includeProxy = false, includeTranslation = true } = {}) {
@@ -292,26 +221,7 @@ function buildSettingsBodyFromForm({ includeConnection = false, includeProxy = f
     if (model) body.model = model;
   }
   if (includeProxy) {
-    // The enable switch is the single source of truth for on/off. Switch off
-    // -> clear host/port on save (the backend tears down the proxy). Switch on
-    // -> require both address and a valid port before saving.
-    const enabled = !!$('proxy-enabled')?.checked;
-    const host = ($('proxy-host')?.value || '').trim();
-    const portText = ($('proxy-port')?.value || '').trim();
-    if (enabled && (!host || !portText)) throw new Error('请填写代理地址和端口');
-    let parsedPort = null;
-    if (enabled && portText) {
-      if (!/^\d+$/.test(portText)) {
-        throw new Error('代理端口必须是 1-65535 的数字');
-      }
-      parsedPort = Number(portText);
-      if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
-        throw new Error('代理端口必须是 1-65535 的数字');
-      }
-    }
-    body.proxy_protocol = $('proxy-protocol')?.value || 'http';
-    body.proxy_host = enabled ? host : '';
-    body.proxy_port = enabled && portText ? parsedPort : null;
+    Object.assign(body, readProxySettingsFromForm());
   }
   return body;
 }
@@ -334,7 +244,7 @@ export function saveSettingsBody(body) {
       headers: { 'Content-Type': 'application/json' },
       body: serialized,
     });
-    if (!r.ok) throw new Error(await r.text());
+    if (!r.ok) throw new Error(await readErrorDetail(r));
     const data = typeof r.json === 'function' ? await r.json().catch(() => ({ ok: true })) : { ok: true };
     clearApiKeyInputIfSaved(body);
     return data;
@@ -346,7 +256,7 @@ export function saveSettingsBody(body) {
 export async function syncSettingsFromFormForSubmit() {
   const body = buildSettingsBodyFromForm({
     includeConnection: true,
-    includeProxy: true,
+    includeProxy: shouldIncludeProxyOnSubmit(),
   });
   await saveSettingsBody(body);
   saveFormMemory();
@@ -354,101 +264,7 @@ export async function syncSettingsFromFormForSubmit() {
 
 export function installSettingsPanel() {
   installModelCombobox();
-
-  let proxyRevision = 0;
-  const invalidateProxyTest = () => {
-    proxyRevision += 1;
-    const result = $('proxy-test-result');
-    if (result) { result.textContent = ''; result.className = 'proxy-test-result'; }
-  };
-  const saveProxySettings = async ({ notify = true } = {}) => {
-    const revision = proxyRevision;
-    const body = buildSettingsBodyFromForm({ includeProxy: true, includeTranslation: false });
-    await saveSettingsBody(body);
-    saveFormMemory();
-    if (notify && revision === proxyRevision) {
-      showToast(body.proxy_host && body.proxy_port ? '代理设置已保存' : '代理已关闭');
-    }
-    return body;
-  };
-  const onProxyChange = async () => {
-    invalidateProxyTest();
-    const revision = proxyRevision;
-    updateProxyFieldsState();
-    try {
-      await saveProxySettings();
-      if (revision === proxyRevision) updateProxyFieldsState();
-    } catch (e) {
-      if (revision !== proxyRevision) return;
-      showToast('保存代理设置失败：' + e.message);
-      const tag = $('proxy-status-tag');
-      if (tag) tag.textContent = '未保存';
-    }
-  };
-  for (const id of ['proxy-protocol', 'proxy-host', 'proxy-port']) {
-    const el = $(id);
-    if (el) {
-      el.addEventListener('input', invalidateProxyTest);
-      el.addEventListener('change', onProxyChange);
-    }
-  }
-  $('proxy-enabled')?.addEventListener('change', onProxyChange);
-
-  const proxyTestBtn = $('btn-proxy-test');
-  proxyTestBtn?.addEventListener('click', async () => {
-    if (proxyTestBtn.disabled) return;
-    const resultEl = $('proxy-test-result');
-    const prevText = proxyTestBtn.textContent;
-    const revision = proxyRevision;
-    proxyTestBtn.dataset.testing = '1';
-    updateProxyFieldsState();
-    proxyTestBtn.textContent = '测试中…';
-    if (resultEl) { resultEl.textContent = ''; resultEl.className = 'proxy-test-result'; }
-    try {
-      // Apply the proxy to the runtime env first, then ask the backend to try
-      // reaching HuggingFace through it -- a wrong port fails loud here instead
-      // of silently hanging later model downloads.
-      const saved = await saveProxySettings({ notify: false });
-      const r = await fetch('/api/proxy-test', { method: 'POST' });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
-      const current = buildSettingsBodyFromForm({ includeProxy: true, includeTranslation: false });
-      if (revision !== proxyRevision || JSON.stringify(current) !== JSON.stringify(saved)) {
-        throw new Error('代理配置已变化，请重新测试');
-      }
-      const canonicalProxyUrl = rawUrl => {
-        const text = String(rawUrl || '').trim();
-        const match = text.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(?:([^/\s]+)@)?(.+)$/);
-        if (!match) return text.toLowerCase();
-        const [, scheme, creds, hostPort] = match;
-        return `${scheme.toLowerCase()}://${creds ? '***@' : ''}${hostPort.toLowerCase()}`;
-      };
-      const expectedUrl = canonicalProxyUrl(
-        `${saved.proxy_protocol}://${saved.proxy_host}:${saved.proxy_port}`,
-      );
-      if (data.ok && canonicalProxyUrl(data.proxy_url) !== expectedUrl) {
-        throw new Error('代理配置已变化，请重新测试');
-      }
-      if (resultEl) {
-        if (data.ok) {
-          resultEl.textContent = `✓ 经代理连通 HuggingFace（${data.elapsed_ms ?? '?'}ms）`;
-          resultEl.className = 'proxy-test-result ok';
-        } else {
-          resultEl.textContent = '✗ ' + (data.error || '连接失败');
-          resultEl.className = 'proxy-test-result fail';
-        }
-      }
-    } catch (e) {
-      if (resultEl) {
-        resultEl.textContent = '✗ 测试失败：' + e.message;
-        resultEl.className = 'proxy-test-result fail';
-      }
-    } finally {
-      delete proxyTestBtn.dataset.testing;
-      proxyTestBtn.textContent = prevText;
-      updateProxyFieldsState();
-    }
-  });
+  installProxySettings({ saveSettingsBody });
 
   $('btn-show-key').addEventListener('click', () => {
     const inp = $('api-key');
@@ -531,20 +347,38 @@ export function installSettingsPanel() {
   updateTranslationBackendFields();
 
   $('api-target-lang')?.addEventListener('change', updateSubtitleModeLabels);
+  $('r-mode')?.addEventListener('change', updateSkipTransState);
+  updateSkipTransState();
 
   $('btn-save-translation')?.addEventListener('click', async () => {
+    const btn = $('btn-save-translation');
+    if (!btn || btn.disabled) return;
+    const prevText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '保存中…';
     try {
+      const glossaryEl = $('api-glossary');
+      const glossaryCheck = inspectGlossaryText(glossaryEl?.value || '');
+      if (glossaryCheck.convertedArrows > 0 && glossaryEl) {
+        glossaryEl.value = glossaryCheck.serialized;
+      }
       const result = await saveSettingsBody(buildSettingsBodyFromForm({ includeConnection: true }));
       saveFormMemory();
       await loadSettings({ previewsOnly: true });
-      if (result?.llama_runtime_prefetch === 'started') {
+      if (glossaryCheck.invalidLines.length > 0) {
+        showToast(
+          `翻译设置已保存到 config/config.json（已忽略 ${glossaryCheck.invalidLines.length} 行格式无效的术语，请使用“日文-译文”）`,
+        );
+      } else if (result?.llama_runtime_prefetch === 'started') {
         showToast('翻译设置已保存到 config/config.json，正在后台下载本地翻译引擎');
       } else {
         showToast('翻译设置已保存到 config/config.json');
       }
     } catch (e) {
       showToast('保存翻译设置失败：' + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = prevText;
     }
   });
-
 }

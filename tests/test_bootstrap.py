@@ -151,22 +151,145 @@ class TestProxyUrl:
 
 
 class TestApplyProxy:
-    def test_every_variant_is_exported(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        for key in bootstrap.PROXY_ENV_KEYS:
-            monkeypatch.delenv(key, raising=False)
+    def test_every_variant_is_exported_and_loopback_no_proxy_merged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setattr(bootstrap.os, "environ", dict(bootstrap.os.environ))
+        for key in bootstrap.PROXY_ENV_KEYS + bootstrap.NO_PROXY_ENV_KEYS:
+            bootstrap.os.environ.pop(key, None)
+        bootstrap.os.environ["NO_PROXY"] = "corp.internal"
         bootstrap.apply_proxy("http://127.0.0.1:7890")
         for key in bootstrap.PROXY_ENV_KEYS:
             assert bootstrap.os.environ[key] == "http://127.0.0.1:7890"
+        for key in bootstrap.NO_PROXY_ENV_KEYS:
+            entries = {item.strip() for item in bootstrap.os.environ[key].split(",")}
+            assert {"corp.internal", "127.0.0.1", "localhost", "::1"} <= entries
 
-    def test_an_empty_url_clears_stale_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A proxy the user has removed must not survive in the environment of
-        the process that downloads 1.8 GB."""
+    def test_an_empty_url_preserves_shell_proxy_by_default_and_clears_when_requested(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Default clear_existing=False keeps an external shell proxy intact;
+        explicit clear_existing=True removes stale proxy variables."""
         monkeypatch.setattr(bootstrap.os, "environ", dict(bootstrap.os.environ))
         bootstrap.apply_proxy("http://127.0.0.1:7890")
         bootstrap.apply_proxy("")
         for key in bootstrap.PROXY_ENV_KEYS:
+            assert bootstrap.os.environ[key] == "http://127.0.0.1:7890"
+
+        bootstrap.apply_proxy("", clear_existing=True)
+        for key in bootstrap.PROXY_ENV_KEYS:
             assert key not in bootstrap.os.environ
+        assert bootstrap.os.environ["PROXY_HOST"] == ""
+        assert bootstrap.os.environ["PROXY_PORT"] == ""
+
+    def test_opener_falls_back_to_all_proxy_and_preserves_system_proxy_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(bootstrap.os, "environ", dict(bootstrap.os.environ))
+        for key in bootstrap.PROXY_ENV_KEYS:
+            bootstrap.os.environ.pop(key, None)
+        bootstrap.os.environ["ALL_PROXY"] = "socks5://127.0.0.1:1080"
+        handler = bootstrap._build_proxy_handler()
+        assert handler.proxies == {
+            "http": "socks5://127.0.0.1:1080",
+            "https": "socks5://127.0.0.1:1080",
+        }
+
+        bootstrap.os.environ.pop("ALL_PROXY", None)
+        sentinel = {"http": "http://system-proxy.local:8080"}
+        monkeypatch.setattr(bootstrap.urllib.request, "getproxies", lambda: dict(sentinel))
+        fallback_handler = bootstrap._build_proxy_handler()
+        assert fallback_handler.proxies == sentinel
+
+
+class TestProxyPromptAndConfigSafety:
+    def test_prompt_proxy_strips_pasted_url_and_host_port(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        answers = iter(["socks5://127.0.0.1:1080"])
+        monkeypatch.setattr("builtins.input", lambda _p="": next(answers))
+        assert bootstrap.prompt_proxy() == {
+            "PROXY_PROTOCOL": "socks5",
+            "PROXY_HOST": "127.0.0.1",
+            "PROXY_PORT": "1080",
+        }
+
+        answers2 = iter(["127.0.0.1:7890", "https"])
+        monkeypatch.setattr("builtins.input", lambda _p="": next(answers2))
+        assert bootstrap.prompt_proxy() == {
+            "PROXY_PROTOCOL": "https",
+            "PROXY_HOST": "127.0.0.1",
+            "PROXY_PORT": "7890",
+        }
+
+    @pytest.mark.parametrize(
+        "inputs",
+        [
+            ["127.0.0.1", "0", "http"],
+            ["127.0.0.1", "99999", "http"],
+            ["127.0.0.1", "abc", "http"],
+            ["127.0.0.1/bad"],
+            ["127.0.0.1 7890"],
+            ["http://127.0.0.1:7890/extra"],
+            ["http://127.0.0.1:99999"],
+            ["socks4://127.0.0.1:1080"],
+        ],
+    )
+    def test_prompt_proxy_rejects_invalid_inputs(
+        self, inputs: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        answers = iter(inputs)
+        monkeypatch.setattr("builtins.input", lambda _p="": next(answers))
+        assert bootstrap.prompt_proxy() is None
+
+    def test_ensure_proxy_configured_validates_before_persisting_and_survives_bad_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = tmp_path / "config" / "config.json"
+        cfg.parent.mkdir(parents=True)
+        # Pre-existing corrupt proxy in config.json must NOT lock out launcher / --doctor.
+        cfg.write_text('{"PROXY_HOST": "127.0.0.1", "PROXY_PORT": "99999"}\n', encoding="utf-8")
+        monkeypatch.setattr(bootstrap, "CONFIG_PATH", cfg)
+        monkeypatch.setattr(bootstrap.os, "environ", dict(bootstrap.os.environ))
+        monkeypatch.setattr(bootstrap, "interactive", lambda: False)
+        bootstrap.ensure_proxy_configured(assume_yes=False)
+
+        # Interactive retry: if prompt_proxy yields invalid settings, apply_proxy rejects them
+        # BEFORE update_config_file is ever called; valid retry then persists cleanly.
+        monkeypatch.setattr(bootstrap, "interactive", lambda: True)
+        monkeypatch.setattr(bootstrap, "measure_download", lambda: (1024 * 1024.0, 1024 * 1024))
+        yes_answers = iter([True, True])
+        monkeypatch.setattr(bootstrap, "ask_yes", lambda _q, **_k: next(yes_answers))
+        prompts = iter(
+            [
+                {"PROXY_PROTOCOL": "http", "PROXY_HOST": "bad host", "PROXY_PORT": "99999"},
+                {"PROXY_PROTOCOL": "http", "PROXY_HOST": "127.0.0.1", "PROXY_PORT": "7890"},
+            ]
+        )
+        monkeypatch.setattr(bootstrap, "prompt_proxy", lambda: next(prompts))
+        writes: list[dict[str, str]] = []
+        real_update = bootstrap.update_config_file
+
+        def spy_update(settings: dict[str, str], path: Path | None = None) -> None:
+            writes.append(dict(settings))
+            real_update(settings, path)
+
+        monkeypatch.setattr(bootstrap, "update_config_file", spy_update)
+        bootstrap.ensure_proxy_configured(assume_yes=False)
+        assert writes == [{"PROXY_PROTOCOL": "http", "PROXY_HOST": "127.0.0.1", "PROXY_PORT": "7890"}]
+        assert bootstrap.read_config_file(cfg)["PROXY_PORT"] == "7890"
+
+    def test_update_config_file_cleans_temp_file_on_replace_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = tmp_path / "config" / "config.json"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text('{"API_KEY": "keep"}\n', encoding="utf-8")
+        monkeypatch.setattr(bootstrap, "_replace_atomically", lambda *_a, **_k: (_ for _ in ()).throw(PermissionError("locked")))
+        with pytest.raises(PermissionError):
+            bootstrap.update_config_file({"PROXY_HOST": "127.0.0.1"}, cfg)
+        assert list(cfg.parent.glob("*.tmp")) == []
+        assert bootstrap.read_config_file(cfg) == {"API_KEY": "keep"}
 
 
 class TestProbeTarget:
@@ -435,6 +558,71 @@ class TestUvDownload:
 
     def test_an_empty_index_yields_nothing_rather_than_raising(self) -> None:
         assert bootstrap.latest_uv_wheel_url("") == ""
+
+    def test_skips_yanked_and_prerelease_and_resolves_relative_url_with_sha256(self) -> None:
+        digest = "a" * 64
+        index = f"""<!DOCTYPE html><html><body>
+        <a href="../../packages/uv-0.14.0-py3-none-win_amd64.whl#sha256={"b" * 64}" data-yanked="broken">yanked</a>
+        <a href="../../packages/uv-0.15.0rc1-py3-none-win_amd64.whl#sha256={"c" * 64}">prerelease</a>
+        <a href="../../packages/uv-0.13.2-py3-none-win_amd64.whl?foo=1&amp;bar=2#sha256={digest}">stable</a>
+        </body></html>"""
+        url, sha = bootstrap._latest_uv_wheel(index, base_url="https://mirror.example/simple/uv/")
+        assert url == "https://mirror.example/packages/uv-0.13.2-py3-none-win_amd64.whl?foo=1&bar=2"
+        assert sha == digest
+
+    def test_download_uv_verifies_sha256_and_replaces_atomically(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import io
+        import zipfile
+
+        wheel_buf = io.BytesIO()
+        with zipfile.ZipFile(wheel_buf, "w") as zf:
+            zf.writestr("uv-0.13.2.data/scripts/uv.exe", b"real-uv-exe")
+        wheel_bytes = wheel_buf.getvalue()
+        good_sha = bootstrap.hashlib.sha256(wheel_bytes).hexdigest()
+        bad_sha = "0" * 64
+
+        class _Resp(io.BytesIO):
+            def __init__(self, data: bytes, url: str) -> None:
+                super().__init__(data)
+                self._url = url
+                self.headers = {"Content-Length": str(len(data))}
+
+            def geturl(self) -> str:
+                return self._url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.close()
+
+        monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+        monkeypatch.setattr(bootstrap, "UV_PYPI_INDEX", "https://mirror.example/simple/uv/")
+
+        bad_index = f'<a href="../../packages/uv-0.13.2-py3-none-win_amd64.whl#sha256={bad_sha}">uv</a>'.encode()
+        good_index = f'<a href="../../packages/uv-0.13.2-py3-none-win_amd64.whl#sha256={good_sha}">uv</a>'.encode()
+        wheel_url = "https://mirror.example/packages/uv-0.13.2-py3-none-win_amd64.whl"
+
+        current_index = [bad_index]
+
+        class _FakeOpener:
+            def open(self, req, timeout=20.0):
+                url = req.full_url if hasattr(req, "full_url") else str(req)
+                if url == bootstrap.UV_PYPI_INDEX:
+                    return _Resp(current_index[0], url)
+                assert url == wheel_url
+                return _Resp(wheel_bytes, url)
+
+        monkeypatch.setattr(bootstrap, "_opener", lambda: _FakeOpener())
+        assert bootstrap.download_uv() is None
+        assert not (tmp_path / "bin" / ("uv.exe" if bootstrap.os.name == "nt" else "uv")).exists()
+
+        current_index[0] = good_index
+        installed = bootstrap.download_uv()
+        assert installed is not None and installed.read_bytes() == b"real-uv-exe"
+        assert list((tmp_path / "bin").glob("*.tmp")) == []
 
     @pytest.mark.skipif(
         bootstrap.os.getenv("JAV_SUB_NETWORK_TESTS") != "1",
@@ -1461,3 +1649,72 @@ class TestOnlineSelfUpdate:
         monkeypatch.setattr(bootstrap, "ROOT", root_bad)
         monkeypatch.setattr(bootstrap, "CONFIG_PATH", root_bad / "config" / "config.json")
         assert bootstrap.main(["--update", "--yes", "--install-only"]) == 1
+
+    def test_finish_after_launch_and_main_update_return_nonzero_when_relaunch_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(bootstrap, "set_console_visible", lambda _v: None)
+        monkeypatch.setattr(bootstrap, "apply_pending_update", lambda **_k: ("applied", "1.9.2"))
+        monkeypatch.setattr(bootstrap, "_relaunch_updated_exe", lambda *_a, **_k: False)
+        assert bootstrap._finish_after_launch(bootstrap.UPDATE_EXIT_CODE, []) == 1
+
+        root = self._make_install(tmp_path / "install", "1.9.0")
+        monkeypatch.setattr(bootstrap, "ROOT", root)
+        monkeypatch.setattr(bootstrap, "CONFIG_PATH", root / "config" / "config.json")
+        monkeypatch.setattr(bootstrap, "stage_online_update_cli", lambda **_k: ("staged", "1.9.2"))
+        assert bootstrap.main(["--update", "--yes"]) == 1
+
+    def test_launch_with_recovery_retry_accepts_update_exit_code_quietly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        codes = iter([1, bootstrap.UPDATE_EXIT_CODE])
+        printed: list[str] = []
+        monkeypatch.setattr(bootstrap, "launch", lambda *_a, **_k: next(codes))
+        monkeypatch.setattr(bootstrap, "doctor", lambda **_k: (True, True))
+        monkeypatch.setattr(bootstrap, "log", lambda msg="": printed.append(str(msg)))
+        assert bootstrap.launch_with_recovery([], assume_yes=True, repaired_already=False) == bootstrap.UPDATE_EXIT_CODE
+        assert not any("重试后仍退出" in line for line in printed)
+
+    def test_apply_pending_update_defers_when_workspace_gate_is_held(
+        self, tmp_path: Path
+    ) -> None:
+        root = self._make_install(tmp_path / "install", "1.9.0")
+        self._stage_pending(root, "1.9.1")
+        with bootstrap._workspace_gate(root, wait_s=1.0) as acquired:
+            assert acquired is True
+            assert bootstrap.apply_pending_update(root, wait_instances_s=0.05) == ("deferred", "1.9.1")
+        assert bootstrap.apply_pending_update(root, wait_instances_s=0.05) == ("applied", "1.9.1")
+
+    def test_stage_online_update_cli_rejects_active_instance_and_unsafe_member_paths(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = self._make_install(tmp_path / "install", "1.9.0")
+        monkeypatch.setattr(bootstrap, "_other_launcher_instances_active", lambda _r, **_k: True)
+        assert bootstrap.stage_online_update_cli(root, assume_yes=True) == ("error", "")
+
+        for unsafe in ("", ".", "src/./a.py", "src/a.txt:ads", "src/CON.py", "src/NUL", "src/foo "):
+            with pytest.raises(ValueError):
+                bootstrap._validate_update_relpath(unsafe)
+
+        assert bootstrap._is_allowed_update_redirect(
+            "https://github.com/jaykwok/jav-sub/releases/download/v1.9.2/a.zip",
+            "https://objects.githubusercontent.com/bucket/a.zip",
+        ) is True
+        assert bootstrap._is_allowed_update_redirect(
+            "https://github.com/jaykwok/jav-sub/releases/download/v1.9.2/a.zip",
+            "http://objects.githubusercontent.com/bucket/a.zip",
+        ) is False
+        assert bootstrap._is_allowed_update_redirect(
+            "https://github.com/jaykwok/jav-sub/releases/download/v1.9.2/a.zip",
+            "https://evil.example.net/a.zip",
+        ) is False
+
+    def test_apply_pending_update_rejects_missing_required_payload_entry(
+        self, tmp_path: Path
+    ) -> None:
+        root = self._make_install(tmp_path / "install", "1.9.0")
+        staged = self._stage_pending(root, "1.9.1")
+        (staged / "uv.lock").unlink()
+        bootstrap.write_release_index(staged)
+        assert bootstrap.apply_pending_update(root, wait_instances_s=0.0) == ("invalid", "")
+        assert not (root / bootstrap.UPDATES_DIR).exists()

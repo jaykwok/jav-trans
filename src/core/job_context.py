@@ -9,7 +9,9 @@ from core.config import (
     DEFAULT_SETTINGS,
     normalize_reasoning_effort,
 )
+from core.typed_config import env_bool
 
+_DEFAULT_TRANSLATION_WORKERS = 4
 _MAX_TRANSLATION_WORKERS = 64
 
 
@@ -18,7 +20,22 @@ def _flag(value: Any, default: bool = False) -> bool:
         return default
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    return env_bool("_JOB_CONTEXT_FLAG", default, environ={"_JOB_CONTEXT_FLAG": str(value)})
+
+
+def _parse_translation_workers(
+    value: Any, default: int = _DEFAULT_TRANSLATION_WORKERS
+) -> int:
+    if value is None or isinstance(value, bool):
+        workers = default
+    elif isinstance(value, str) and not value.strip():
+        workers = default
+    else:
+        try:
+            workers = int(value)
+        except (TypeError, ValueError):
+            workers = default
+    return min(_MAX_TRANSLATION_WORKERS, max(1, workers))
 
 
 def _setting(key: str, default: str = "") -> str:
@@ -90,9 +107,9 @@ class JobContext:
                 "translation_glossary",
                 allow_empty_spec=True,
             ),
-            translation_max_workers=min(
-                _MAX_TRANSLATION_WORKERS,
-                max(1, int(getattr(spec, "translation_max_workers", 4))),
+            translation_max_workers=_parse_translation_workers(
+                getattr(spec, "translation_max_workers", None),
+                _DEFAULT_TRANSLATION_WORKERS,
             ),
             translation_cache_path=str(cache_path or ""),
             job_id=str(job_id or ""),
@@ -100,7 +117,10 @@ class JobContext:
             output_dir=str(getattr(spec, "output_dir", "") or "") or None,
             run_log_enabled=_flag(
                 getattr(spec, "run_log_enabled", None),
-                _flag(_setting("RUN_LOG_ENABLED", "1"), True),
+                env_bool(
+                    "RUN_LOG_ENABLED",
+                    _flag(DEFAULT_SETTINGS.get("RUN_LOG_ENABLED", "1"), True),
+                ),
             ),
             run_log_dir=str(
                 getattr(spec, "run_log_dir", None)

@@ -31,6 +31,7 @@ jobs:
       OPENAI_API_KEY: test-only-key
       OPENAI_COMPATIBILITY_BASE_URL: https://api.example.test/v1
       JAV_SUB_NETWORK_TESTS: '0'
+      JAV_SUB_CI_STRICT: '1'
 
     steps:
       - name: Check out source
@@ -71,7 +72,7 @@ jobs:
 
       - name: Check JavaScript and PowerShell syntax
         run: |
-          $jsFiles = @(Get-ChildItem src/web/static/js -Filter *.js) + @(Get-ChildItem tests/web/js -Filter *.cjs)
+          $jsFiles = @(Get-ChildItem src/web/static/js -Filter *.js) + @(Get-ChildItem tests/web/js -Filter *.cjs) + @(Get-ChildItem tests/web/js -Filter *.mjs)
           foreach ($file in $jsFiles) {
             node --check $file.FullName
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -90,10 +91,15 @@ jobs:
             throw 'packaging/build_setup.ps1 must remain ASCII-only'
           }
 
+      - name: Smoke-build setup launcher executable
+        run: |
+          uv run --no-sync python -m PyInstaller --noconfirm --distpath tmp/ci/setup-dist --workpath tmp/ci/setup-build packaging/jav-sub-setup.spec
+          & tmp/ci/setup-dist/jav-sub.exe --help | Out-Null
+
       - name: Run regression tests
         run: |
           New-Item -ItemType Directory -Force tmp/ci | Out-Null
-          uv run --no-sync pytest -q -ra --basetemp=tmp/ci/pt --junitxml=tmp/ci/pytest-results.xml
+          uv run --no-sync pytest -q -ra --durations=20 --basetemp=tmp/ci/pt --junitxml=tmp/ci/pytest-results.xml
 
       - name: Retain test results
         if: always()

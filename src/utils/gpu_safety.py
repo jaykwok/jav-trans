@@ -5,28 +5,45 @@ admission for the application lives in pipeline.memory_safety.
 """
 from __future__ import annotations
 
+import re
 
 from core.typed_config import env_float
 
 DEFAULT_VRAM_SAFETY_RATIO = 0.95
+_CUDA_DEVICE_RE = re.compile(r"^cuda(?::(\d+))?$")
 
 
 def resolve_inference_device(requested: str | None, *, stage: str):
-    """Require CUDA for model workloads, including an explicit device choice."""
+    """Require CUDA for model workloads, including strict syntax and device-count checks."""
     import torch
 
     value = str(requested or "auto").strip().lower()
     if value == "auto":
         value = "cuda"
-    if not value.startswith("cuda"):
+    match = _CUDA_DEVICE_RE.fullmatch(value)
+    if match is None:
         raise RuntimeError(
-            f"{stage} requires CUDA; device {value!r} is unsupported; "
-            "CPU fallback is disabled"
+            f"{stage} requires CUDA ('cuda' or 'cuda:<index>'); "
+            f"device {value!r} is unsupported; CPU fallback is disabled"
         )
     if not torch.cuda.is_available():
         raise RuntimeError(
             f"{stage} requested CUDA but CUDA is unavailable; CPU fallback is disabled"
         )
+    device_count = int(torch.cuda.device_count())
+    if device_count <= 0:
+        raise RuntimeError(
+            f"{stage} requested CUDA but no CUDA devices are available "
+            f"(device_count={device_count}); CPU fallback is disabled"
+        )
+    index_text = match.group(1)
+    if index_text is not None:
+        index = int(index_text)
+        if index >= device_count:
+            raise RuntimeError(
+                f"{stage} requested CUDA device {value!r}, but only {device_count} "
+                f"CUDA device(s) are available (valid indices: 0..{device_count - 1})"
+            )
     return torch.device(value)
 
 

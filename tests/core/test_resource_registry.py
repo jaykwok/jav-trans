@@ -464,3 +464,87 @@ def test_confirm_gone_keeps_a_record_that_still_holds_a_handle():
     assert resources.is_registered("worker", 1) is True
     assert resources.gpu_blocked() is False  # the process is gone
     assert resources.snapshot()["open_job_handles"] == 1
+
+
+def test_confirm_gone_with_open_handle_wakes_watchdog(monkeypatch):
+    woken: list[bool] = []
+    monkeypatch.setattr(resources, "_start_watchdog", lambda: woken.append(True))
+    resources.register(
+        resource_id="worker",
+        generation=1,
+        kind="asr_worker",
+        description="worker",
+        process=_FakeProcess(),
+        job_handle=77,
+        stopper=_stopper,
+        holds_gpu=True,
+    )
+
+    assert resources.confirm_gone("worker", 1) is False
+    assert woken == [True]
+
+
+def test_attach_handle_returns_status_and_wakes_watchdog_when_stopping(monkeypatch):
+    woken: list[bool] = []
+    monkeypatch.setattr(resources, "_start_watchdog", lambda: woken.append(True))
+    assert resources.attach_handle("missing", 1, 555) is False
+
+    _register(1, _FakeProcess(), state="stopping", process_state="alive")
+    woken.clear()
+    assert resources.attach_handle("worker", 1, 555) is True
+    assert woken == [True]
+    assert resources.snapshot()["open_job_handles"] == 1
+
+
+def test_request_stop_does_not_overwrite_concurrently_attached_handle():
+    entered = threading.Event()
+    proceed = threading.Event()
+
+    def slow_stopper(_process, job_handle):
+        assert job_handle is None
+        entered.set()
+        proceed.wait(timeout=3.0)
+        return resources.StopOutcome(process_state="gone", job_handle=None)
+
+    resources.register(
+        resource_id="worker",
+        generation=1,
+        kind="asr_worker",
+        description="worker",
+        process=_FakeProcess(),
+        job_handle=None,
+        stopper=slow_stopper,
+        holds_gpu=True,
+    )
+    results: list[resources.StopResult] = []
+    t = threading.Thread(target=lambda: results.append(resources.request_stop("worker", 1)))
+    t.start()
+    assert entered.wait(timeout=3.0)
+
+    # Concurrent owner finishes binding a Win32 Job Object handle while stopper is in flight.
+    assert resources.attach_handle("worker", 1, 9001) is True
+    proceed.set()
+    t.join(timeout=3.0)
+
+    assert len(results) == 1
+    assert results[0].stopped is True
+    assert results[0].handle_open is True
+    assert results[0].released is False
+    # Handle 9001 was preserved and stays tracked for cleanup instead of being leaked.
+    assert resources.is_registered("worker", 1) is True
+    assert resources.snapshot()["open_job_handles"] == 1
+
+
+def test_has_live_gpu_conflict_and_release_listener():
+    notifications: list[int] = []
+    unsub = resources.register_release_listener(lambda: notifications.append(1))
+    try:
+        _register(1, _FakeProcess(pid=42))
+        assert resources.has_live_gpu_conflict(frozenset({"local_server"})) is True
+        assert resources.has_live_gpu_conflict(frozenset({"asr_worker"})) is False
+
+        assert resources.request_stop("worker", 1).released is True
+        assert len(notifications) >= 1
+        assert resources.has_live_gpu_conflict(frozenset({"local_server"})) is False
+    finally:
+        unsub()

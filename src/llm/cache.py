@@ -235,26 +235,28 @@ def _translation_memory_key(
     glossary: str = "",
     target_lang: str = "简体中文",
     character_reference: str = "",
-    prompt_version: str,
-    model_name: str,
+    prompt_version: str = "",
+    model_name: str = "",
     reasoning_effort: str = "",
     context_signature: str = "",
     occurrence_id: int | None = None,
+    memory_sig: str | None = None,
 ) -> str:
     normalized_source = _normalize_translation_memory_source(source_text)
     if occurrence_id is not None:
         normalized_source = f"{occurrence_id}\n{normalized_source}"
     source_sig = hashlib.sha1(normalized_source.encode("utf-8")).hexdigest()[:16]
-    memory_sig = _compute_translation_memory_signature(
-        extra_glossary,
-        glossary=glossary,
-        target_lang=target_lang,
-        character_reference=character_reference,
-        prompt_version=prompt_version,
-        model_name=model_name,
-        reasoning_effort=reasoning_effort,
-        context_signature=context_signature,
-    )
+    if memory_sig is None:
+        memory_sig = _compute_translation_memory_signature(
+            extra_glossary,
+            glossary=glossary,
+            target_lang=target_lang,
+            character_reference=character_reference,
+            prompt_version=prompt_version,
+            model_name=model_name,
+            reasoning_effort=reasoning_effort,
+            context_signature=context_signature,
+        )
     return f"tm::{memory_sig}::{source_sig}"
 
 
@@ -290,12 +292,13 @@ def _translation_cache_key(
     glossary: str = "",
     target_lang: str = "简体中文",
     character_reference: str = "",
-    prompt_version: str,
-    model_name: str,
-    compact_system_prompt: bool,
+    prompt_version: str = "",
+    model_name: str = "",
+    compact_system_prompt: bool = False,
     reasoning_effort: str = "",
     prefix_mode: str = "",
     context_signature: str = "",
+    prompt_sig: str | None = None,
 ) -> str:
     source_payload = []
     for seg in batch_segments:
@@ -325,16 +328,17 @@ def _translation_cache_key(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()[:12]
-    prompt_sig = _compute_prompt_signature(
-        extra_glossary,
-        glossary=glossary,
-        target_lang=target_lang,
-        character_reference=character_reference,
-        prompt_version=prompt_version,
-        model_name=model_name,
-        compact_system_prompt=compact_system_prompt,
-        reasoning_effort=reasoning_effort,
-        prefix_mode=prefix_mode,
-        context_signature=context_signature,
-    )
+    if prompt_sig is None:
+        prompt_sig = _compute_prompt_signature(
+            extra_glossary,
+            glossary=glossary,
+            target_lang=target_lang,
+            character_reference=character_reference,
+            prompt_version=prompt_version,
+            model_name=model_name,
+            compact_system_prompt=compact_system_prompt,
+            reasoning_effort=reasoning_effort,
+            prefix_mode=prefix_mode,
+            context_signature=context_signature,
+        )
     return f"{prompt_sig}::{batch_index}::{source_sig}"

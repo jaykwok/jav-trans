@@ -410,7 +410,10 @@ class TestSignatureCoversWhatChangesTheText:
     def test_the_guard_thresholds_are_in_the_signature(self, monkeypatch) -> None:
         monkeypatch.delenv("ASR_DECODE_LOOP_MIN_REPEATS", raising=False)
         base = result_cache._signature_hash(result_cache.model_signature())
+        # Setting the default explicitly normalizes identically to unset.
         monkeypatch.setenv("ASR_DECODE_LOOP_MIN_REPEATS", "3")
+        assert result_cache._signature_hash(result_cache.model_signature()) == base
+        monkeypatch.setenv("ASR_DECODE_LOOP_MIN_REPEATS", "5")
         assert result_cache._signature_hash(result_cache.model_signature()) != base
 
     def test_the_guard_fraction_is_in_the_signature(self, monkeypatch) -> None:

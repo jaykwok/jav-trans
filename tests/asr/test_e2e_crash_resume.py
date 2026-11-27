@@ -12,6 +12,11 @@ from pipeline.cleanup import cleanup_job_temp
 from helpers import make_job_context, run_pipeline
 
 
+@pytest.fixture(autouse=True)
+def _isolate_project_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+
+
 def _cleanup_job_temp(job_temp_dir: Path) -> None:
     cleanup_job_temp(str(job_temp_dir))
 
@@ -123,13 +128,13 @@ def test_cleanup_removes_translation_cache_and_job_temp(monkeypatch, tmp_path):
     audio_path.parent.mkdir()
     audio_path.write_bytes(b"wav")
 
-    cache_path = tmp_path / "translation_cache.json"
+    cache_path = job_dir / "translation_cache.json"
     cache_path.write_text('{"0": ["zh-0"]}', encoding="utf-8")
-    cache_jsonl_path = tmp_path / "translation_cache.jsonl"
+    cache_jsonl_path = job_dir / "translation_cache.jsonl"
     cache_jsonl_path.write_text("", encoding="utf-8")
-    cache_memory_path = tmp_path / "translation_cache.memory.jsonl"
+    cache_memory_path = job_dir / "translation_cache.memory.jsonl"
     cache_memory_path.write_text("", encoding="utf-8")
-    glossary_cache_path = tmp_path / "translation_global_glossary.abc123.json"
+    glossary_cache_path = job_dir / "translation_global_glossary.abc123.json"
     glossary_cache_path.write_text("{}", encoding="utf-8")
     # The cross-job ASR result cache must survive job cleanup: that is the
     # whole point of content addressing.

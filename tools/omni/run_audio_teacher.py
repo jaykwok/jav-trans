@@ -16,10 +16,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
+if str(_REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools._common import ensure_src_on_path  # noqa: E402
+
+ensure_src_on_path()
 
 from tools.omni.openai_compat import (  # noqa: E402
     DEFAULT_API_KEY_ENV_CANDIDATES,

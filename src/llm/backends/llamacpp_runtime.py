@@ -40,6 +40,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from llm.async_transport import run_cancellable_request
+from llm.backends import llamacpp_env
 from llm.errors import TranslationCancelledError
 from utils import hf_progress
 from utils.model_paths import MODELS_ROOT
@@ -47,7 +49,9 @@ from utils.model_paths import MODELS_ROOT
 logger = logging.getLogger(__name__)
 
 _SERVER_EXE_NAMES = ("llama-server.exe", "llama-server")
-_INSTALL_LOCK = threading.RLock()
+_INSTALL_COND = threading.Condition(threading.Lock())
+_INSTALL_IN_PROGRESS = False
+_INSTALL_WAIT_POLL_S = 0.2
 _PREFETCH_LOCK = threading.Lock()
 _prefetch_thread: threading.Thread | None = None
 _DOWNLOAD_CHUNK_BYTES = 512 * 1024
@@ -130,11 +134,7 @@ def auto_download_allowed() -> bool:
 
 def detect_cuda_major(*, torch_lib_dir: Path | None = None) -> int:
     """Detect the installed PyTorch CUDA major version without importing torch."""
-    lib_dir = torch_lib_dir
-    if lib_dir is None:
-        from llm.backends.llamacpp_server import _torch_library_dir
-
-        lib_dir = _torch_library_dir()
+    lib_dir = torch_lib_dir if torch_lib_dir is not None else llamacpp_env._torch_library_dir()
     if lib_dir is not None and lib_dir.is_dir():
         majors: list[int] = []
         for pattern in ("cublas64_*.dll", "cudart64_*.dll"):
@@ -254,19 +254,22 @@ def resolve_latest_release_asset(
         else:
             import httpx
 
-            with httpx.Client(
-                follow_redirects=True,
-                trust_env=True,
-                timeout=httpx.Timeout(20.0, connect=15.0),
-                headers={
-                    "User-Agent": _USER_AGENT,
-                    "Accept": "application/vnd.github+json",
-                },
-            ) as client:
-                response = client.get(LLAMACPP_RELEASES_API)
-                response.raise_for_status()
-                payload = response.json()
-                releases = payload if isinstance(payload, list) else []
+            async def _fetch_once() -> list[dict]:
+                async with httpx.AsyncClient(
+                    follow_redirects=True,
+                    trust_env=True,
+                    timeout=httpx.Timeout(20.0, connect=15.0),
+                    headers={
+                        "User-Agent": _USER_AGENT,
+                        "Accept": "application/vnd.github+json",
+                    },
+                ) as client:
+                    response = await client.get(LLAMACPP_RELEASES_API)
+                    response.raise_for_status()
+                    payload = response.json()
+                    return payload if isinstance(payload, list) else []
+
+            releases = run_cancellable_request(_fetch_once, cancel_event=cancel_event)
         asset = select_release_asset(releases, cuda_major=cuda_major)
         if asset is not None:
             return asset
@@ -327,7 +330,7 @@ def _download_archive(
         )
 
     identity = hf_progress.current_identity()
-    started = time.perf_counter()
+    total_started = time.perf_counter()
     start_extra: dict[str, object] = {"file": display_name}
     if expected_size > 0:
         start_extra["size_mb"] = round(expected_size / (1024.0 * 1024.0), 2)
@@ -339,25 +342,29 @@ def _download_archive(
     try:
         for attempt in range(1, max_attempts + 1):
             _raise_if_cancelled(cancel_event)
-            hasher = hashlib.sha256()
-            downloaded = 0
-            total_bytes = expected_size
-            last_emit = 0.0
-            last_pct = -1
-            try:
-                with httpx.Client(
+            attempt_started = time.perf_counter()
+
+            async def _stream_once(started_at: float = attempt_started) -> str:
+                hasher = hashlib.sha256()
+                downloaded = 0
+                total_bytes = expected_size
+                last_emit = 0.0
+                last_pct = -1
+                async with httpx.AsyncClient(
                     follow_redirects=True,
                     trust_env=True,
                     timeout=httpx.Timeout(60.0, connect=20.0),
                     headers={"User-Agent": _USER_AGENT},
                 ) as client:
-                    with client.stream("GET", url) as resp:
+                    async with client.stream("GET", url) as resp:
                         resp.raise_for_status()
                         cl = resp.headers.get("content-length")
                         if cl and cl.isdigit():
                             total_bytes = int(cl)
                         with open(part, "wb") as handle:
-                            for chunk in resp.iter_bytes(chunk_size=_DOWNLOAD_CHUNK_BYTES):
+                            async for chunk in resp.aiter_bytes(
+                                chunk_size=_DOWNLOAD_CHUNK_BYTES
+                            ):
                                 _raise_if_cancelled(cancel_event)
                                 if not chunk:
                                     continue
@@ -374,10 +381,12 @@ def _download_archive(
                                     now - last_emit >= _PROGRESS_INTERVAL_S
                                     or pct >= last_pct + 5
                                 ):
-                                    elapsed = max(now - started, 1e-3)
+                                    elapsed = max(now - started_at, 1e-3)
                                     extra: dict[str, object] = {
                                         "file": display_name,
-                                        "downloaded_mb": round(downloaded / (1024.0 * 1024.0), 2),
+                                        "downloaded_mb": round(
+                                            downloaded / (1024.0 * 1024.0), 2
+                                        ),
                                         "speed_mb": round(
                                             downloaded / (1024.0 * 1024.0) / elapsed, 2
                                         ),
@@ -391,8 +400,12 @@ def _download_archive(
                                     hf_progress._emit("progress", extra, identity)
                                     last_emit = now
                                     last_pct = pct
+                return hasher.hexdigest().lower()
 
-                digest = hasher.hexdigest().lower()
+            try:
+                digest = run_cancellable_request(
+                    _stream_once, cancel_event=cancel_event
+                )
                 if clean_expected and digest != clean_expected:
                     raise RuntimeError(
                         f"{display_name} SHA-256 校验失败（期望 {clean_expected[:12]}…，"
@@ -403,7 +416,7 @@ def _download_archive(
                     "done",
                     {
                         "file": display_name,
-                        "elapsed_s": round(time.perf_counter() - started, 2),
+                        "elapsed_s": round(time.perf_counter() - total_started, 2),
                     },
                     identity,
                 )
@@ -442,7 +455,7 @@ def _download_archive(
             "error",
             {
                 "file": display_name,
-                "elapsed_s": round(time.perf_counter() - started, 2),
+                "elapsed_s": round(time.perf_counter() - total_started, 2),
                 "error": str(exc)[:300],
             },
             identity,
@@ -559,7 +572,7 @@ def _publish_staged_runtime(
         old_dir = target_dir.parent / f".old-{target_dir.name}-{uuid.uuid4().hex[:8]}"
         os.replace(target_dir, old_dir)
     try:
-        shutil.move(str(payload_dir), str(target_dir))
+        os.replace(payload_dir, target_dir)
     except BaseException:
         if old_dir is not None and old_dir.exists() and not target_dir.exists():
             os.replace(old_dir, target_dir)
@@ -585,23 +598,28 @@ def ensure_managed_llama_server(
     env_factory: Callable[[], dict[str, str]] | None = None,
 ) -> str:
     """Ensure a CUDA-verified ``llama-server`` exists under ``./models/runtime/llama-cpp/``."""
-    existing = managed_server_executable()
-    if existing is not None:
-        return str(existing)
+    global _INSTALL_IN_PROGRESS
 
-    _raise_if_cancelled(cancel_event)
-    with _INSTALL_LOCK:
+    while True:
+        _raise_if_cancelled(cancel_event)
         existing = managed_server_executable()
         if existing is not None:
             return str(existing)
+        with _INSTALL_COND:
+            existing = managed_server_executable()
+            if existing is not None:
+                return str(existing)
+            if not _INSTALL_IN_PROGRESS:
+                _INSTALL_IN_PROGRESS = True
+                break
+            _INSTALL_COND.wait(timeout=_INSTALL_WAIT_POLL_S)
 
-        from llm.backends import llamacpp_server as server_mod
-
+    try:
         resolved_cuda_major = (
             int(cuda_major) if cuda_major is not None else detect_cuda_major()
         )
-        env = env_factory() if env_factory is not None else server_mod.server_environment()
-        probe = probe_devices or server_mod.probe_compute_devices
+        env = env_factory() if env_factory is not None else llamacpp_env.server_environment()
+        probe = probe_devices or llamacpp_env.probe_compute_devices
         downloader = download_fn or _download_archive
 
         target_dir = managed_runtime_dir()
@@ -691,8 +709,13 @@ def ensure_managed_llama_server(
         raise RuntimeError(
             "自动下载的 CUDA 版 llama-server 未检测到任何 NVIDIA CUDA 设备"
             f"（探测结果：{last_devices or '无'}），已拒绝安装以避免静默回退到 CPU。"
-            "请确认 NVIDIA 显卡驱动满足 CUDA 13 要求，或在 .env 中设置 LLAMACPP_SERVER_PATH 手动指定路径。"
+            f"请确认 NVIDIA 显卡驱动满足 CUDA {resolved_cuda_major} 要求，"
+            "或在 config/config.json 中设置 LLAMACPP_SERVER_PATH 手动指定路径。"
         ) from last_error
+    finally:
+        with _INSTALL_COND:
+            _INSTALL_IN_PROGRESS = False
+            _INSTALL_COND.notify_all()
 
 
 def start_managed_llama_server_prefetch() -> str:

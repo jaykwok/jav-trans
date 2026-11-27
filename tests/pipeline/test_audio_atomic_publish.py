@@ -235,6 +235,7 @@ def test_truncated_cache_is_re_extracted_by_the_pipeline(monkeypatch, tmp_path):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"fake-video")
     temp_root = tmp_path / "jobs"
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(main.asr_module, "get_backend_label", lambda: "mock_asr")
     monkeypatch.setattr(

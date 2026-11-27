@@ -8,13 +8,34 @@ export const state = {
   jobsRevision: -1,
   jobsEpoch: -1,
   jobsTombstones: {},
-  logLines: [],
   sse: null,
-  activePreset: 'standard',
   gpuState: null,
 };
 
 // 'cancelling' belongs here: the run is still going, so the page must keep
 // polling it until whoever owns it reports that it actually stopped.
-export const ACTIVE_STATUSES = new Set(['queued', 'asr', 'translating', 'writing', 'cancelling', 'saving']);
+export const ACTIVE_STATUSES = new Set([
+  'queued', 'asr', 'translating', 'writing', 'cancelling', 'saving',
+]);
+export const CLEARABLE_STATUSES = new Set([
+  'done', 'failed', 'cancelled', 'publish_failed', 'export_failed',
+]);
+export const ERROR_STATUSES = new Set([
+  'failed', 'save_failed', 'publish_failed', 'export_failed',
+]);
+export const DELIVERY_FAILURE_STATUSES = new Set([
+  'save_failed', 'publish_failed', 'export_failed',
+]);
+export const RETRYABLE_STATUSES = new Set([
+  'failed', 'cancelled', 'save_failed', 'publish_failed', 'export_failed',
+]);
+export const CANCELLABLE_STATUSES = new Set([
+  'queued', 'asr', 'translating', 'writing',
+]);
+export const SAVING_OR_DELIVERY_STATUSES = new Set([
+  'saving', 'save_failed', 'publish_failed', 'export_failed',
+]);
+export const TRANSLATION_RETRY_STAGES = new Set([
+  'translation_context', 'translation', 'write_output',
+]);
 export const MAX_LOG = 200;

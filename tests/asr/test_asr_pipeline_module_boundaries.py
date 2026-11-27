@@ -61,7 +61,6 @@ class TestNoDeadReExports:
     # picked a better one.
     RETIRED = {
         "_is_timed_out_result": (result_cache, "_is_timed_out_result"),
-        "_chunk_duration": (chunking, "_chunk_duration"),
         "_strip_punctuation": (transcribe, "_strip_punctuation"),
         "_collapse_repeated_noise": (transcribe, "_collapse_repeated_noise"),
         "_is_low_value_text": (transcribe, "_is_low_value_text"),
@@ -94,6 +93,14 @@ class TestNoDeadReExports:
         unwanted - so this half must keep passing."""
         owner, name = self.RETIRED[alias]
         assert hasattr(owner, name)
+
+    def test_removed_dead_helpers_stay_absent(self) -> None:
+        from asr import local_backend
+
+        assert not hasattr(pipeline, "_chunk_duration")
+        assert not hasattr(chunking, "_chunk_duration")
+        assert not hasattr(local_backend, "_strip_punctuation")
+        assert not hasattr(local_backend, "_is_fatal_cuda_oom")
 
 
 class TestSingleOwnerState:

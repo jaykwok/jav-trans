@@ -30,11 +30,10 @@ ASCII_OTHER_WEIGHT = 0.35
 _MARKUP_TAG_RE = re.compile(r"</?\s*(?:i|b|u|em|strong|font)(?:\s[^>]*)?>|\{\\[^}]*\}", re.IGNORECASE)
 _FULLWIDTH_DIGIT_TABLE = {ord(full): ord("0") + offset for offset, full in enumerate("０１２３４５６７８９")}
 _ELLIPSIS_SOURCE_RE = re.compile(r"(?:[…⋯‥]|\.{3,}|。{2,}|・{3,}|·{3,})+")
-_ELLIPSIS_RUN_RE = re.compile(r"…{2,}")
 _TERMINAL_COMBO_RE = re.compile(r"[？！]{2,}")
-_NUMERIC_COMMA_RE = re.compile(r"(?<=\d),(?=\d)")
-_NUMERIC_COMMA_SENTINEL = "\x00"
-_COMMA_PERIOD_RE = re.compile(r"[，,。]")
+# Match full-width commas/periods and any ASCII comma that is not a thousands
+# separator between digits, in a single pass without a sentinel character.
+_COMMA_PERIOD_RE = re.compile(r"[，。]|(?<!\d),|,(?!\d)")
 _HALFWIDTH_QUOTE_RE = re.compile(r'"([^"\n]*)"')
 _SPACE_RUN_RE = re.compile(r"[ \t　]+")
 _TRAILING_ENUM_COMMA_RE = re.compile(r"、+$")
@@ -68,14 +67,11 @@ def normalize_zh_subtitle_text(text: str) -> str:
     # can see a genuine period, and 、、、-style runs are not ellipses so they
     # fall through to the trailing-、 strip instead.
     normalized = _ELLIPSIS_SOURCE_RE.sub("…", normalized)
-    normalized = _ELLIPSIS_RUN_RE.sub("…", normalized)
     normalized = normalized.replace("?", "？").replace("!", "！")
     normalized = _TERMINAL_COMBO_RE.sub(lambda match: match.group(0)[0], normalized)
     # Thousands separators stay (half-width numerals rule); every other comma
     # and every period becomes the guide's single space.
-    normalized = _NUMERIC_COMMA_RE.sub(_NUMERIC_COMMA_SENTINEL, normalized)
     normalized = _COMMA_PERIOD_RE.sub(" ", normalized)
-    normalized = normalized.replace(_NUMERIC_COMMA_SENTINEL, ",")
     normalized = _HALFWIDTH_QUOTE_RE.sub("“\\1”", normalized)
     lines = [_normalize_zh_line(line) for line in normalized.replace("\\n", "\n").split("\n")]
     return "\n".join(line for line in lines if line)
@@ -84,19 +80,23 @@ def normalize_zh_subtitle_text(text: str) -> str:
 # Break-point preference for the two-line pyramid: a space is the guide's own
 # break point (it is the replaced comma or period, and General Requirements asks
 # for the break "after punctuation marks"), so it is free; after sentence
-# punctuation is likewise free, between hiragana→kanji readable, anywhere else
-# expensive. Splitting inside an ASCII word or number is effectively forbidden.
-_BREAK_AFTER_FREE = "！？…”》」』"
-_BREAK_BEFORE_BAD = "！？…、”》」』ー～"
+# punctuation or a closing quote/bracket is likewise free, anywhere else
+# expensive. Splitting inside an ASCII word/number or stranding an opening or
+# closing bracket across lines is effectively forbidden.
+_BREAK_AFTER_FREE = frozenset("！？…”’）】》〉」』")
+_BREAK_BEFORE_BAD = frozenset("！？…、”’）】》〉」』ー～—")
+_BREAK_AFTER_BAD = frozenset("“‘「『（【《〈")
 # 、 is not a break point: the guide allows it mid-sentence but not "at the end
 # of a line or subtitle", which is exactly what breaking after one produces.
-_BREAK_AFTER_BANNED = "、"
+_BREAK_AFTER_BANNED = frozenset("、")
 
 
 def _zh_break_cost(text: str, position: int) -> float:
     previous = text[position - 1]
     following = text[position]
     if following in _BREAK_BEFORE_BAD:
+        return 4.0
+    if previous in _BREAK_AFTER_BAD:
         return 4.0
     if previous.isascii() and previous.isalnum() and following.isascii() and following.isalnum():
         return 6.0
@@ -106,8 +106,6 @@ def _zh_break_cost(text: str, position: int) -> float:
         return 0.0
     if previous.isspace():
         return 0.0
-    if "ぁ" <= previous <= "ゟ" and "一" <= following <= "鿿":
-        return 0.5
     return 1.0
 
 
@@ -137,23 +135,29 @@ def wrap_zh_subtitle_text(
     flat = _SPACE_RUN_RE.sub(" ", str(text or "").replace("\\n", "\n").replace("\n", " ")).strip()
     if not flat:
         return ""
-    if line_max_units <= 0 or zh_display_units(flat, ascii_alnum_weight=ascii_alnum_weight) <= line_max_units:
+    if line_max_units <= 0:
         return flat
 
-    total_units = zh_display_units(flat, ascii_alnum_weight=ascii_alnum_weight)
+    widths = [
+        ascii_alnum_weight if (char.isascii() and char.isalnum()) else (ASCII_OTHER_WEIGHT if char.isascii() else 1.0)
+        for char in flat
+    ]
+    total_units = sum(widths)
+    if total_units <= line_max_units:
+        return flat
+
     best_position = None
     best_cost = float("inf")
     prefix_units = 0.0
     for position in range(1, len(flat)):
-        char = flat[position - 1]
-        if char.isascii() and char.isalnum():
-            prefix_units += ascii_alnum_weight
-        elif char.isascii():
-            prefix_units += ASCII_OTHER_WEIGHT
-        else:
-            prefix_units += 1.0
-        top_units = prefix_units
-        bottom_units = total_units - prefix_units
+        left_width = widths[position - 1]
+        prefix_units += left_width
+        # Deduct boundary whitespace that `.strip()` removes on line break so
+        # a break right next to a space never incurs phantom overflow penalties.
+        top_units = prefix_units - (left_width if flat[position - 1].isspace() else 0.0)
+        bottom_units = (total_units - prefix_units) - (
+            widths[position] if flat[position].isspace() else 0.0
+        )
         cost = _zh_break_cost(flat, position)
         # Bottom-heavy pyramid: a heavier top line costs, a heavier bottom is
         # merely imbalance. Fragment lines (≤2 units) are all but forbidden.

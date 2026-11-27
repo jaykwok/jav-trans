@@ -70,3 +70,60 @@ def test_proxy_change_does_not_close_a_download_that_is_still_running():
     assert not thread.is_alive()
     assert entered.is_set()
     assert seen[0] is not original
+
+
+def test_concurrent_downloads_with_same_signature_overlap_without_blocking():
+    both_inside = threading.Barrier(2, timeout=3.0)
+    errors: list[BaseException] = []
+
+    def worker():
+        try:
+            with hf_download.download_session():
+                both_inside.wait()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    # Seed the signature first so both workers share the reader path.
+    with hf_download.download_session():
+        pass
+
+    t1 = threading.Thread(target=worker, daemon=True)
+    t2 = threading.Thread(target=worker, daemon=True)
+    t1.start()
+    t2.start()
+    t1.join(3)
+    t2.join(3)
+    assert errors == []
+    assert not t1.is_alive()
+    assert not t2.is_alive()
+
+
+def test_hf_endpoint_and_token_path_changes_refresh_download_session():
+    with hf_download.download_session():
+        first = get_session()
+
+    os.environ["HF_ENDPOINT"] = "https://hf-mirror.example"
+    with hf_download.download_session():
+        second = get_session()
+    assert second is not first
+
+    os.environ["HF_TOKEN_PATH"] = "C:/tmp/custom-hf-token"
+    with hf_download.download_session():
+        third = get_session()
+    assert third is not second
+
+
+def test_reentrant_download_session_does_not_deadlock():
+    with hf_download.download_session():
+        outer = get_session()
+        with hf_download.download_session():
+            inner = get_session()
+        assert inner is outer
+
+
+def test_missing_xet_module_is_handled_defensively(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub.utils._xet", None)
+    with hf_download.download_session():
+        assert get_session() is not None

@@ -32,6 +32,9 @@ class _FakeCuda:
     def is_available(self) -> bool:
         return self._available
 
+    def device_count(self) -> int:
+        return 1 if self._available else 0
+
 
 class _FakeTorch:
     def __init__(self, available: bool) -> None:

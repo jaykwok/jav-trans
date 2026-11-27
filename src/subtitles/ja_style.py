@@ -42,17 +42,23 @@ FULLWIDTH_SPACE = "　"
 _MARKUP_TAG_RE = re.compile(r"</?\s*(?:i|b|u|em|strong|font)(?:\s[^>]*)?>|\{\\[^}]*\}", re.IGNORECASE)
 _TERMINAL_COMBO_RE = re.compile(r"[？！]{2,}")
 _SPACE_RUN_RE = re.compile(r"[ \t　]+")
+_CLOSING_BRACKETS = "」』）】》〉〕］｝”’)"
+# Periods/commas right before a closing quote or bracket are dropped instead of
+# turning into trailing spaces inside the quote (`「そうだ。」と言った`).
+_PUNCT_BEFORE_CLOSER_RE = re.compile(rf"[。、]+(?=[{re.escape(_CLOSING_BRACKETS)}])")
 # I.17: a full-width space follows ？ or ！ only "when a new sentence starts on
-# the same line", so the lookahead requires something after it on that line.
-_TERMINAL_MARK_RE = re.compile(r"([？！])(?=[^\s\n])")
+# the same line", never before whitespace, line end, or a closing quote/bracket.
+_TERMINAL_MARK_RE = re.compile(rf"([？！])(?=[^\s\n{re.escape(_CLOSING_BRACKETS)}])")
 
 
 def ja_display_units(text: str) -> float:
+    east_asian_width = unicodedata.east_asian_width
+    fullwidth_eaw = _FULLWIDTH_EAW
     units = 0.0
     for char in str(text or ""):
         if char == "\n":
             continue
-        units += 1.0 if unicodedata.east_asian_width(char) in _FULLWIDTH_EAW else 0.5
+        units += 1.0 if east_asian_width(char) in fullwidth_eaw else 0.5
     return units
 
 
@@ -71,8 +77,8 @@ def _collapse_spaces(line: str) -> str:
 
 def _normalize_ja_line(line: str) -> str:
     # Strip after collapsing: a sentence-final 。 has just become a trailing
-    # full-width space, and a line may not end on one.
-    return _collapse_spaces(line).strip().strip(FULLWIDTH_SPACE).strip()
+    # full-width space, and `str.strip()` strips both ASCII and U+3000 spaces.
+    return _collapse_spaces(line).strip()
 
 
 def normalize_ja_subtitle_text(text: str) -> str:
@@ -80,6 +86,7 @@ def normalize_ja_subtitle_text(text: str) -> str:
     normalized = _MARKUP_TAG_RE.sub("", normalized)
     normalized = normalized.replace("?", "？").replace("!", "！")
     normalized = _TERMINAL_COMBO_RE.sub(lambda match: match.group(0)[0], normalized)
+    normalized = _PUNCT_BEFORE_CLOSER_RE.sub("", normalized)
     # I.17's two replacements. Order does not matter - neither produces the
     # other's input - but both must run before spaces are collapsed.
     normalized = normalized.replace("、", HALFWIDTH_SPACE)
@@ -94,9 +101,9 @@ def normalize_ja_subtitle_text(text: str) -> str:
 # terminal mark. The rest is 禁則処理: a line may not open on a small kana, a
 # long-vowel mark, an iteration mark or a closing bracket, and may not close on
 # an opening bracket.
-_BREAK_AFTER_FREE = "？！…」』】》〉”"
-_BREAK_BEFORE_BAD = "ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮーー～？！…、。」』】》〉”々ゝゞ"
-_BREAK_AFTER_BAD = "「『【《〈“"
+_BREAK_AFTER_FREE = frozenset("？！…」』）】》〉”’")
+_BREAK_BEFORE_BAD = frozenset("ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮー〜～？！…、。」』）】》〉”’々ゝゞ")
+_BREAK_AFTER_BAD = frozenset("「『（【《〈“‘")
 
 
 def _is_katakana(char: str) -> bool:
@@ -159,17 +166,28 @@ def wrap_ja_subtitle_text(text: str, *, line_max_units: float = 13.0) -> str:
     flat = _collapse_spaces(str(text or "").replace("\\n", "\n").replace("\n", HALFWIDTH_SPACE)).strip()
     if not flat:
         return ""
-    if line_max_units <= 0 or ja_display_units(flat) <= line_max_units:
+    if line_max_units <= 0:
         return flat
 
-    total_units = ja_display_units(flat)
+    east_asian_width = unicodedata.east_asian_width
+    fullwidth_eaw = _FULLWIDTH_EAW
+    widths = [1.0 if east_asian_width(char) in fullwidth_eaw else 0.5 for char in flat]
+    total_units = sum(widths)
+    if total_units <= line_max_units:
+        return flat
+
     best_position = None
     best_cost = float("inf")
     prefix_units = 0.0
     for position in range(1, len(flat)):
-        prefix_units += ja_display_units(flat[position - 1])
-        top_units = prefix_units
-        bottom_units = total_units - prefix_units
+        left_width = widths[position - 1]
+        prefix_units += left_width
+        # Deduct boundary whitespace that `.strip()` removes on line break so
+        # a break right next to a space never incurs phantom overflow penalties.
+        top_units = prefix_units - (left_width if flat[position - 1].isspace() else 0.0)
+        bottom_units = (total_units - prefix_units) - (
+            widths[position] if flat[position].isspace() else 0.0
+        )
         cost = _ja_break_cost(flat, position)
         # Bottom-heavy: a heavier top line costs, a heavier bottom is merely
         # imbalance. Fragment lines (≤2 units) are all but forbidden. This
@@ -189,8 +207,8 @@ def wrap_ja_subtitle_text(text: str, *, line_max_units: float = 13.0) -> str:
 
     if best_position is None:
         return flat
-    top = flat[:best_position].strip().strip(FULLWIDTH_SPACE).strip()
-    bottom = flat[best_position:].strip().strip(FULLWIDTH_SPACE).strip()
+    top = flat[:best_position].strip()
+    bottom = flat[best_position:].strip()
     if not top or not bottom:
         return flat
     return f"{top}\n{bottom}"

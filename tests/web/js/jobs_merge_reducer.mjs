@@ -31,7 +31,7 @@ const cases = {
     });
     assert.equal(list.jobs.a, undefined);
     assert.equal(list.jobs.b.revision, 8);
-    assert.equal(list.revision, 8); // deletion must not advance the global list watermark
+    assert.equal(list.revision, 8);
     assert.equal(list.tombstones.a.revision, 10);
     const late = reduceJob(list.jobs, job('a', 9), {
       ...merge, tombstones: list.tombstones, appliedEpoch: 2, jobEpoch: 2, appliedRevision: 8,
@@ -62,7 +62,6 @@ const cases = {
     assert.deepEqual(result.tombstones, {});
   },
 
-  // The reported failure: two GETs for one job, the older answer landing last.
   'an overtaken response never wins'() {
     const running = job('a', 12, { status: 'translating', run_id: 'run-2' });
     const stale = job('a', 7, { status: 'failed', run_id: 'run-1' });
@@ -71,7 +70,6 @@ const cases = {
 
     assert.equal(jobs.a.status, 'translating');
     assert.equal(jobs.a.run_id, 'run-2');
-    // Unchanged map identity, so the page does not re-render for nothing.
     assert.equal(jobs.a, running);
   },
 
@@ -92,8 +90,6 @@ const cases = {
     assert.equal(jobs.a._download, undefined);
   },
 
-  // A list is a statement about membership as of one moment, so an older one
-  // cannot undo a newer one - including by re-adding what it deleted.
   'a list older than the applied one changes nothing'() {
     const held = { a: job('a', 20, { status: 'done' }) };
     const result = reduceJobList(held, [job('a', 5), job('b', 6)], {
@@ -134,8 +130,6 @@ const cases = {
   },
 
   'an in-flight single-job response cannot resurrect a deleted job'() {
-    // The GET was issued before the delete; its answer arrives after the list
-    // that recorded the removal.
     const jobs = reduceJob({}, job('a', 5, { status: 'done' }), {
       ...merge,
       appliedRevision: 9,
@@ -155,10 +149,6 @@ const cases = {
     assert.equal(kept, held);
   },
 
-  // Deleting every job and restarting resumes the counter from what survived -
-  // nothing - so the server's numbers restart below the page's. Without the
-  // epoch the page reads that as old news and shows a list of jobs that are
-  // gone, forever: nothing it receives can ever outrank what it holds.
   'a restarted server empties a list the page still holds'() {
     const held = { a: job('a', 100, { status: 'done' }) };
     const result = reduceJobList(held, [], {
@@ -187,8 +177,6 @@ const cases = {
 
     assert.equal(result.applied, true);
     assert.ok(result.jobs.fresh);
-    // The survival rule is a within-epoch rule: revision 100 says nothing about
-    // where a new server's clock stands, so the job it dated is not kept.
     assert.equal(result.jobs.a, undefined);
   },
 
@@ -211,10 +199,7 @@ const cases = {
     const held = { a: job('a', 5) };
     const opts = { ...merge, appliedRevision: 5, appliedEpoch: 2 };
 
-    // Older: an answer from the previous run of the service.
     assert.equal(reduceJob(held, job('a', 900, { status: 'failed' }), { ...opts, jobEpoch: 1 }), held);
-    // Newer: true, but the revisions held are now meaningless, and one job
-    // cannot restate a list. The caller refetches instead.
     assert.equal(reduceJob(held, job('a', 1, { status: 'done' }), { ...opts, jobEpoch: 3 }), held);
   },
 
@@ -227,16 +212,12 @@ const cases = {
   },
 
   'a job recreated after the delete is not removed by it'() {
-    // Same id, higher revision: created after the deletion was stamped, so the
-    // 410 is an answer about a job that no longer exists under that number.
     const held = { a: job('a', 9) };
 
     assert.equal(reduceDeletion(held, 'a', { deletedRevision: 7 }), held);
   },
 
   'an undated deletion still drops the card'() {
-    // Past the tombstone bound the server can only say "gone", not when. That
-    // is still better than leaving a card for a job nobody can open.
     const next = reduceDeletion({ a: job('a', 9) }, 'a', { deletedRevision: NO_REVISION });
 
     assert.deepEqual(Object.keys(next), []);
@@ -249,8 +230,6 @@ const cases = {
   },
 
   'an unlabelled response is judged on revisions alone'() {
-    // Every rule above is off when either side has no epoch, so a cached page
-    // talking to a server that does not send the header behaves as before.
     const result = reduceJobList({ a: job('a', 5) }, [job('a', 9)], {
       ...merge,
       listRevision: 9,
@@ -262,6 +241,24 @@ const cases = {
     assert.equal(result.applied, true);
     assert.equal(result.jobs.a.revision, 9);
     assert.equal(result.epoch, 7);
+  },
+
+  'a list without X-Jobs-Revision drops omitted jobs and preserves tombstones'() {
+    const held = { a: job('a', 5), b: job('b', 6) };
+    const tombstones = recordDeletion({}, 'gone', { deletedRevision: 10, deletedEpoch: 1, appliedEpoch: 1 });
+    const result = reduceJobList(held, [job('b', 6)], {
+      ...merge,
+      tombstones,
+      listRevision: NO_REVISION,
+      appliedRevision: 5,
+      listEpoch: 1,
+      appliedEpoch: 1,
+    });
+
+    assert.equal(result.applied, true);
+    assert.equal(result.jobs.a, undefined);
+    assert.ok(result.jobs.b);
+    assert.equal(result.tombstones.gone.revision, 10);
   },
 };
 

@@ -31,9 +31,12 @@ from pathlib import Path
 import sys
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+if str(_REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools._common import ensure_src_on_path  # noqa: E402
+
+ensure_src_on_path()
 
 from tools.audits.stats import (  # noqa: E402
     two_proportion_difference,

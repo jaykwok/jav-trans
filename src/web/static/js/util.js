@@ -1,8 +1,11 @@
 export const $ = id => document.getElementById(id);
 
 export const escHtml = s => String(s)
-  .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#39;');
 
 // FastAPI wraps every rejection as {"detail": ...}. Showing the raw body put
 // the JSON punctuation in front of the instruction the user needs to read.
@@ -19,10 +22,29 @@ export async function readErrorDetail(response) {
   return raw.trim() || `HTTP ${response.status}`;
 }
 
+const MAX_VISIBLE_TOASTS = 4;
+
+function getToastContainer() {
+  let container = document.querySelector('.toast-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.className = 'toast-container';
+    document.body.appendChild(container);
+  }
+  return container;
+}
+
 export function showToast(msg) {
+  const container = getToastContainer();
   const el = document.createElement('div');
   el.className = 'toast';
   el.textContent = msg;
-  document.body.appendChild(el);
-  setTimeout(() => el.remove(), 3500);
+  container.appendChild(el);
+  while (container.children.length > MAX_VISIBLE_TOASTS) {
+    container.removeChild(container.firstChild);
+  }
+  setTimeout(() => {
+    el.remove();
+    if (!container.children.length) container.remove();
+  }, 3500);
 }

@@ -17,7 +17,7 @@ import hashlib
 import math
 import re
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 CUEQC_FEATURE_SCHEMA_VERSION = 1
@@ -25,7 +25,8 @@ CUEQC_FEATURE_SCHEMA_VERSION = 1
 _COMPACT_TEXT_RE = re.compile(r"[^0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]+")
 _PUNCT_RE = re.compile(
     r"[\s\u3000\u3001\u3002\uff01\uff1f\uff0c\uff0e,.!?~\u301c"
-    r"\u30fc\u2010-\u2015\u300c\u300d\u300e\u300f()\[\]{}]+"
+    r"\u30fc\u2010-\u2015\u2026\u30fb\u300c\u300d\u300e\u300f"
+    r"\uff08\uff09\u3010\u3011()\[\]{}]+"
 )
 _KANA_RE = re.compile(r"^[\u3040-\u30ff]+$")
 
@@ -141,7 +142,7 @@ def _max_unit_repeat(compact: str) -> dict[str, Any]:
                     "chars": repeated_chars,
                     "ratio": round(ratio, 4),
                 }
-            index += max(1, repeated_chars if run > 1 else 1)
+            index += max(1, repeated_chars - unit_len + 1) if run > 1 else 1
     return best
 
 
@@ -195,10 +196,20 @@ def text_features(raw_text: Any, text: Any, *, duration_s: float) -> dict[str, A
     }
 
 
+def precompute_compact_texts(text_results: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Precompute ``_compact_text`` once per cue to keep candidate building O(N)."""
+    return [
+        _compact_text(str(result.get("text") or result.get("raw_text") or ""))
+        for result in text_results
+    ]
+
+
 def _neighbor_features(
     index: int,
     chunks: list[Mapping[str, Any]],
     text_results: list[Mapping[str, Any]],
+    *,
+    compact_values: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     chunk = chunks[index]
     start = _safe_float(chunk.get("start"))
@@ -207,23 +218,23 @@ def _neighbor_features(
     next_gap = None
     prev_text_same = False
     next_text_same = False
-    current_text = _compact_text(
-        str(text_results[index].get("text") or text_results[index].get("raw_text") or "")
-    )
+
+    def _compact_at(pos: int) -> str:
+        if compact_values is not None:
+            return compact_values[pos]
+        return _compact_text(
+            str(text_results[pos].get("text") or text_results[pos].get("raw_text") or "")
+        )
+
+    current_text = _compact_at(index)
     if index > 0:
         prev = chunks[index - 1]
         prev_gap = max(0.0, start - _safe_float(prev.get("end"), start))
-        prev_text = _compact_text(
-            str(text_results[index - 1].get("text") or text_results[index - 1].get("raw_text") or "")
-        )
-        prev_text_same = bool(current_text and current_text == prev_text)
+        prev_text_same = bool(current_text and current_text == _compact_at(index - 1))
     if index + 1 < len(chunks):
         nxt = chunks[index + 1]
         next_gap = max(0.0, _safe_float(nxt.get("start"), end) - end)
-        next_text = _compact_text(
-            str(text_results[index + 1].get("text") or text_results[index + 1].get("raw_text") or "")
-        )
-        next_text_same = bool(current_text and current_text == next_text)
+        next_text_same = bool(current_text and current_text == _compact_at(index + 1))
     return {
         "prev_gap_s": _round(prev_gap, 3),
         "next_gap_s": _round(next_gap, 3),
@@ -238,12 +249,14 @@ def _run_length_features(
     text_results: list[Mapping[str, Any]],
     *,
     max_gap_s: float = 1.0,
+    compact_values: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    compact_values = [
-        _compact_text(str(result.get("text") or result.get("raw_text") or ""))
-        for result in text_results
-    ]
-    current = compact_values[index] if 0 <= index < len(compact_values) else ""
+    resolved_compact = (
+        compact_values
+        if compact_values is not None
+        else precompute_compact_texts(text_results)
+    )
+    current = resolved_compact[index] if 0 <= index < len(resolved_compact) else ""
     if not current:
         return {"same_text_run_length": 0, "same_text_run_position": 0}
     left = index
@@ -252,7 +265,7 @@ def _run_length_features(
             0.0,
             _safe_float(chunks[left].get("start")) - _safe_float(chunks[left - 1].get("end")),
         )
-        if gap > max_gap_s or compact_values[left - 1] != current:
+        if gap > max_gap_s or resolved_compact[left - 1] != current:
             break
         left -= 1
     right = index
@@ -261,7 +274,7 @@ def _run_length_features(
             0.0,
             _safe_float(chunks[right + 1].get("start")) - _safe_float(chunks[right].get("end")),
         )
-        if gap > max_gap_s or compact_values[right + 1] != current:
+        if gap > max_gap_s or resolved_compact[right + 1] != current:
             break
         right += 1
     return {
@@ -312,6 +325,8 @@ def build_candidate(
     text_results: list[Mapping[str, Any]],
     audio_id: str = "",
     video_id: str = "",
+    include_audio_ref: bool = True,
+    compact_values: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     chunk_index = _safe_int(chunk.get("index"), position)
     start = _safe_float(chunk.get("start"))
@@ -325,6 +340,12 @@ def build_candidate(
         duration_s=duration,
     )
     sample_id = f"cueqc-{video_id or audio_id or 'audio'}-chunk{chunk_index:05d}"
+    audio_path_raw = text_result.get("normalized_path") or chunk.get("path")
+    audio_payload = (
+        _audio_ref(audio_path_raw)
+        if include_audio_ref
+        else {"path": str(audio_path_raw or "").strip(), "exists": False, "sha1": ""}
+    )
     return {
         "schema": "cueqc_candidate_v4",
         "schema_version": CUEQC_FEATURE_SCHEMA_VERSION,
@@ -336,7 +357,7 @@ def build_candidate(
         "start": round(start, 3),
         "end": round(end, 3),
         "duration_s": round(duration, 3),
-        "audio": _audio_ref(text_result.get("normalized_path") or chunk.get("path")),
+        "audio": audio_payload,
         "source_audio_path": str(chunk.get("source_audio_path") or ""),
         "text": features["text"],
         "raw_text": features["raw_text"],
@@ -367,8 +388,12 @@ def build_candidate(
             if key in chunk
         },
         "adjacency": {
-            **_neighbor_features(position, chunks, text_results),
-            **_run_length_features(position, chunks, text_results),
+            **_neighbor_features(
+                position, chunks, text_results, compact_values=compact_values
+            ),
+            **_run_length_features(
+                position, chunks, text_results, compact_values=compact_values
+            ),
         },
         "cue_features": observation,
         "asr_signals": {

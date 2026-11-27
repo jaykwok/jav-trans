@@ -30,11 +30,16 @@ import time
 
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_ROOT = PROJECT_ROOT / "src"
-for root in (PROJECT_ROOT, SRC_ROOT):
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
+if str(_REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools._common import (  # noqa: E402
+    PROJECT_ROOT,
+    ensure_src_on_path,
+    read_jsonl as _read_jsonl,
+)
+
+ensure_src_on_path()
 
 from asr.alignment import (  # noqa: E402
     ENCODER_FPS,
@@ -49,16 +54,6 @@ from tools.align.checkpoint_io import resolve_device  # noqa: E402
 SAMPLE_RATE = 16000
 FEATURE_DIM = 2048
 SHARD_SCHEMA = "asr_alignment_feature_cache_v1"
-
-
-def _read_jsonl(path: Path) -> list[dict]:
-    rows: list[dict] = []
-    with path.open(encoding="utf-8-sig") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
 
 
 def _held_out_ids(composite_manifest: Path | None) -> set[str]:

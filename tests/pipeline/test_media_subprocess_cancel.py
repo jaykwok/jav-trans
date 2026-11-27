@@ -292,3 +292,75 @@ def test_extract_timeout_probe_inherits_the_cancel_event(monkeypatch):
         cancel_event=cancel_event,
     ) == 360.0
     assert seen["cancel_event"] is cancel_event
+
+
+def test_run_cancellable_validates_arguments_before_spawning(monkeypatch):
+    spawned: list[bool] = []
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *a, **kw: (spawned.append(True), None)[1],
+    )
+
+    with pytest.raises(ValueError, match="empty"):
+        run_cancellable([])
+    with pytest.raises(ValueError, match="poll_interval_s"):
+        run_cancellable([sys.executable, "-c", "pass"], poll_interval_s=0.0)
+    with pytest.raises(ValueError, match="timeout_s"):
+        run_cancellable([sys.executable, "-c", "pass"], timeout_s=float("nan"))
+    assert spawned == []
+
+
+def test_run_cancellable_sets_devnull_stdin_and_preserves_partial_stderr_on_timeout():
+    script = (
+        "import sys, time\n"
+        "sys.stderr.write('partial-diag-line\\n')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(10)\n"
+    )
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        run_cancellable(
+            [sys.executable, "-c", script],
+            timeout_s=0.4,
+            poll_interval_s=0.05,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    assert excinfo.value.stderr is not None
+    assert "partial-diag-line" in excinfo.value.stderr
+
+    # Child attempting to read stdin gets immediate EOF because stdin=DEVNULL.
+    completed = run_cancellable(
+        [sys.executable, "-c", "import sys; print(repr(sys.stdin.read()))"],
+        timeout_s=5.0,
+        capture_output=True,
+        encoding="utf-8",
+        check=True,
+    )
+    assert completed.stdout.strip() == "''"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Objects only exist on Windows")
+def test_bind_process_to_kill_on_close_job_binds_popen_and_pid():
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        stdin=subprocess.DEVNULL,
+        **subprocess_tools.no_window_subprocess_kwargs(),
+    )
+    job = None
+    try:
+        # Passing job_handle=None creates and binds a fresh kill-on-close job by PID.
+        job = subprocess_tools.bind_process_to_kill_on_close_job(None, proc.pid)
+        assert isinstance(job, int) and job > 0
+        # Closing the job immediately kills the bound process.
+        assert subprocess_tools.close_kill_on_close_job(job) is True
+        job = None
+        proc.wait(timeout=5.0)
+        assert proc.poll() is not None
+    finally:
+        if job is not None:
+            subprocess_tools.close_kill_on_close_job(job)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)

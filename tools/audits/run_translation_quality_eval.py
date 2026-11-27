@@ -19,8 +19,12 @@ import threading
 import time
 import traceback
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "src"))
+if str(_REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools._common import PROJECT_ROOT as ROOT, ensure_src_on_path  # noqa: E402
+
+ensure_src_on_path()
 
 from core.config import load_config
 

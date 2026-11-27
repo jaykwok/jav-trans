@@ -1,4 +1,5 @@
 from collections import Counter
+from dataclasses import dataclass
 import gc
 import hashlib
 import logging
@@ -11,7 +12,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from asr import chunking, result_cache, transcribe
+from asr import audio_encoder, chunking, result_cache, transcribe
 from asr.alignment import (
     ENCODER_FRAME_S,
     FRAME_CLASSES,
@@ -29,12 +30,16 @@ from asr.chunking import (
     _get_wav_duration,
     plan_chunk_cuts,
 )
-from asr.cue_features import build_candidate as build_cue_candidate
+from asr.cue_features import (
+    build_candidate as build_cue_candidate,
+    precompute_compact_texts as precompute_cue_compact_texts,
+)
 from asr.postgate import POSTGATE_SCHEMA, review_all as postgate_review_all
 from asr.transcribe import (
     _align_TRANSCRIPTION_results,
     _alignment_outcome_for_chunk,
     _build_transcript_chunks,
+    _check_allocated_vram_budget,
     _delete_path_for_cleanup,
     _group_words_to_segments,
     _postprocess_segments,
@@ -53,27 +58,54 @@ _JSON_PAYLOAD_INLINE_ARRAY_LIMIT = 4096
 _FEATURE_CHUNK_S = 30.0
 
 
-def _load_asr_model_for_features() -> tuple[Any, Any]:
+@dataclass(frozen=True)
+class ChunkPlan:
+    """Immutable chunking output returned by ``_build_processing_spans``.
+
+    Implements the read-only sequence protocol over ``spans`` so callers and
+    tests expecting a sequence of ``(start, end)`` tuples work unchanged while
+    pipeline orchestration reads provenance and frame tracks without relying on
+    mutable module globals.
+    """
+
+    spans: tuple[tuple[float, float], ...]
+    boundary_signature: dict[str, Any]
+    cut_provenance: dict[str, Any]
+    frame_class_track: dict[str, Any] | None = None
+
+    def __iter__(self):
+        return iter(self.spans)
+
+    def __len__(self) -> int:
+        return len(self.spans)
+
+    def __getitem__(self, index):
+        return self.spans[index]
+
+    def __bool__(self) -> bool:
+        return bool(self.spans)
+
+
+def _load_asr_model_for_features(device: str = "cuda") -> tuple[Any, Any]:
     from utils.gpu_safety import resolve_inference_device
-
-    device = resolve_inference_device("cuda", stage="Qwen3-ASR feature extraction")
-
-    import torch
-    from transformers import AutoModelForMultimodalLM, AutoProcessor
-
-    from asr.backends.qwen import active_qwen_asr_model_id, active_qwen_asr_model_path
     from utils.model_paths import resolve_model_spec
+    from asr.backends.qwen import active_qwen_asr_model_id, active_qwen_asr_model_path
 
+    resolved_device = resolve_inference_device(
+        device, stage="Qwen3-ASR feature extraction"
+    )
+    device_str = str(resolved_device)
+    dtype = audio_encoder.detect_asr_dtype(device_str)
+    attention = audio_encoder.detect_asr_attention(device_str)
     spec = resolve_model_spec(
         active_qwen_asr_model_path() or None, active_qwen_asr_model_id(), download=True
     )
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    processor = AutoProcessor.from_pretrained(spec)
-    model = AutoModelForMultimodalLM.from_pretrained(
-        spec, dtype=dtype, device_map=str(device)
+    return audio_encoder.load_qwen_asr_model(
+        model_spec=spec,
+        device=device_str,
+        dtype=dtype,
+        attention=attention,
     )
-    model.eval()
-    return model, processor
 
 
 def _release_feature_model_vram() -> None:
@@ -332,36 +364,59 @@ def _blank_runs_for_audio(
     audio_path: str,
     *,
     on_stage: Callable[[str], None] | None = None,
+    backend: Any | None = None,
 ) -> tuple[list[tuple[float, float]], float, str, dict | None]:
     """Pauses found by the alignment head, or nothing if it is not configured.
 
-    Returns `(runs, duration_s, source)`. `source` records which path produced
-    the cuts, because "the head was not loaded" and "the head found no pauses"
-    lead to the same chunking and must not be indistinguishable in the log.
+    Returns ``(runs, duration_s, source, frame_track)``. When ``backend`` is
+    supplied, shares its resident ASR model and ``AlignmentHead`` instead of
+    loading a duplicate copy, and uses GPU-batched argmax / frame posteriors to
+    avoid multi-gigabyte CPU CTC buffers.
     """
     duration_s = float(_get_wav_duration(audio_path))
     head = None
-    try:
-        head = AlignmentHead.from_env()
-    except Exception as error:  # noqa: BLE001
-        if is_fatal_cuda_error(error):
-            raise
-        _pipeline_logger.warning("[chunking] alignment head unavailable: %s", error)
-        return [], duration_s, "fixed_length_head_unavailable", None
+    if backend is not None and getattr(backend, "_alignment_head", False) not in (
+        False,
+        None,
+    ):
+        head = backend._alignment_head
+    else:
+        try:
+            head = AlignmentHead.from_env()
+        except Exception as error:  # noqa: BLE001
+            if is_fatal_cuda_error(error):
+                raise
+            _pipeline_logger.warning("[chunking] alignment head unavailable: %s", error)
+            return [], duration_s, "fixed_length_head_unavailable", None
+        if head is not None and backend is not None and getattr(
+            backend, "_alignment_head", False
+        ) is False:
+            backend._alignment_head = head
     if head is None:
         return [], duration_s, "fixed_length_no_head_configured", None
 
     model = None
     processor = None
+    owns_model = False
     try:
         import numpy as _np
         import torch
 
-        from asr.qwen_native import move_processor_inputs, prepare_transcription_inputs
         from audio.loading import load_audio_16k_mono
-        from asr.encoder_features import qwen3_asr_audio_output_lengths
 
-        model, processor = _load_asr_model_for_features()
+        if backend is not None:
+            if getattr(backend, "model", None) is None:
+                loader = getattr(backend, "load", None)
+                if callable(loader):
+                    loader(on_stage=on_stage)
+            model = getattr(backend, "model", None)
+            processor = getattr(backend, "processor", None)
+            if model is None or processor is None:
+                return [], duration_s, "fixed_length_model_unavailable", None
+        else:
+            model, processor = _load_asr_model_for_features()
+            owns_model = True
+
         audio, rate = load_audio_16k_mono(audio_path)
         if rate != 16000:
             return [], duration_s, "fixed_length_unexpected_sample_rate", None
@@ -369,13 +424,6 @@ def _blank_runs_for_audio(
         duration_s = len(clip) / 16000.0
 
         width = int(_FEATURE_CHUNK_S * 16000)
-        # Overlap-save rather than butt-jointed windows. The head convolves over
-        # ~2.35 s, so a frame at a seam used to be computed against zeros where
-        # the rest of the file was: at one seam per 30 s that is ~2.3 s of
-        # degraded pause map every window, ~7.6% of a 40-minute timeline. The
-        # overlap is the head's own one-sided receptive field, asked for rather
-        # than hardcoded, and it costs ~10% more encoder passes - 0.2 s on the
-        # 40-minute measurement below.
         context_frames = head.context_frames
         plan = plan_head_windows(
             len(clip), window_samples=width, context_frames=context_frames
@@ -385,102 +433,68 @@ def _blank_runs_for_audio(
         ]
         bases = [base for _, _, base in plan]
 
-        # Batched because this is a pure encoder pass; the windows are
-        # fixed-length by construction, so batching adds no padding waste.
-        #
-        # Measured on an RTX 4060 Ti (8 GiB), 80 windows from 40 minutes of
-        # audio, timing this loop alone with the model already resident:
-        #
-        #   batch  1 -> 2.93 s (36.6 ms/window), peak 4.02 GiB
-        #   batch  4 -> 2.14 s (27.5 ms/window), peak 4.67 GiB
-        #   batch  8 -> 2.11 s (26.4 ms/window), peak 5.54 GiB
-        #   batch 16 -> 136.99 s (1712 ms/window), peak 7.26 GiB
-        #
-        # So the win is 1.37x and it is spent by batch 4; 8 buys 0.03 s for
-        # another 0.87 GiB. Batch 16 is not a slow batch, it is a **65x cliff**:
-        # 7.26 GiB on an 8 GiB card spills into WDDM shared memory and every
-        # access crosses PCIe. The default is 4 to keep that cliff two doublings
-        # away rather than one, because free VRAM is not ours alone - a browser
-        # on the same GPU moves it.
+        cfg = _chunking_config()
+        has_frame_head = bool(getattr(head, "frame_head_available", False))
+        use_gpu_head_batch = hasattr(head, "forward_batch_from_gpu_features")
+        skip_ctc = (
+            use_gpu_head_batch
+            and cfg["pause_reading"] == "speech"
+            and has_frame_head
+        )
+
         batch_size = env_int("ASR_FEATURE_BATCH_SIZE", 4, minimum=1)
-        pieces = []
+        pieces: list = []
         frame_pieces: list = []
         returned_frames: list[int] = []
+        language = _asr_language_for_chunking()
+        model_device = getattr(model, "device", getattr(backend, "device", "cuda"))
+        model_dtype = getattr(model, "dtype", getattr(backend, "dtype", None))
+
         for start in range(0, len(windows), batch_size):
             group = windows[start : start + batch_size]
-            inputs = prepare_transcription_inputs(
-                processor, audio=group, language=_asr_language_for_chunking()
+            features, lengths = audio_encoder.encode_audio_features_batch(
+                model,
+                processor,
+                group,
+                device=model_device,
+                dtype=model_dtype,
+                language=language,
+                stage_label="chunking",
             )
-            moved = move_processor_inputs(
-                inputs, device=model.device, dtype=model.dtype
-            )
-            with torch.inference_mode():
-                features = model.get_audio_features(
-                    input_features=moved["input_features"],
-                    input_features_mask=moved["input_features_mask"],
-                ).pooler_output
-            lengths = [
-                int(value)
-                for value in qwen3_asr_audio_output_lengths(
-                    moved["input_features_mask"].sum(dim=1)
+            if use_gpu_head_batch:
+                ctc_batch, frame_batch = head.forward_batch_from_gpu_features(
+                    features,
+                    lengths,
+                    need_ctc_log_probs=not skip_ctc,
+                    argmax_only=True,
+                    need_frames=has_frame_head,
                 )
-            ]
-            # `pooler_output` concatenates the batch along the frame axis rather
-            # than returning [B, T, D]; each window's frames are its own slice.
-            hidden = features.detach().float().cpu().numpy()
-            expected_frames = sum(lengths)
-            if expected_frames != int(hidden.shape[0]):
-                raise RuntimeError(
-                    "ASR encoder output length mismatch during chunking: "
-                    f"expected_frames={expected_frames} actual_frames={int(hidden.shape[0])}"
+                pieces.extend(ctc_batch)
+                frame_pieces.extend(frame_batch)
+                returned_frames.extend(lengths)
+            else:
+                hidden_list = audio_encoder.split_encoded_features_numpy(
+                    features, lengths
                 )
-            offset = 0
-            for length in lengths:
-                # Both readings off ONE head pass. The frame classes describe the
-                # same audio the blank runs do, and computing them separately
-                # would let the chunker and the subtitle filter disagree about a
-                # second of film for no reason other than two forward passes.
-                ctc, frames = head.log_probs_with_frames(
-                    hidden[offset : offset + length]
-                )
-                pieces.append(ctc)
-                frame_pieces.append(frames)
-                returned_frames.append(int(length))
-                offset += length
+                for hidden_slice, length in zip(hidden_list, lengths, strict=True):
+                    ctc, frames = head.log_probs_with_frames(hidden_slice)
+                    pieces.append(ctc)
+                    frame_pieces.append(frames)
+                    returned_frames.append(int(length))
             if on_stage is not None and windows:
                 processed = min(len(windows), start + len(group))
                 on_stage(f"切分 {processed}/{len(windows)}")
-        if not pieces:
+
+        if not returned_frames:
             return [], duration_s, "fixed_length_no_features", None
-        # Drop each window's overlap, then concatenate. Deriving the runs from
-        # one tensor rather than per window is load-bearing on its own: a pause
-        # straddling a seam would otherwise arrive as two shorter runs, fail the
-        # minimum length, and stop being a legal cut point exactly at the seams.
+
         keep = overlap_save_slices(
-            list(zip(bases[: len(pieces)], returned_frames)),
+            list(zip(bases[: len(returned_frames)], returned_frames)),
             context_frames=context_frames,
         )
-        kept = [
-            piece[begin * head.upsample : finish * head.upsample]
-            for piece, (begin, finish) in zip(pieces, keep)
-            if finish > begin
-        ]
-        if not kept:
-            return [], duration_s, "fixed_length_no_features", None
-        log_probs = torch.cat(kept, dim=0) if len(kept) > 1 else kept[0]
-        cfg = _chunking_config()
-        runs = blank_runs(
-            log_probs,
-            upsample=head.upsample,
-            min_seconds=cfg["min_blank_s"],
-            # A punctuation frame inside a silence is not evidence of sound, and
-            # letting it end the run hides the pause from the cut search below.
-            silent_classes=head.silent_classes,
-        )
-        # Same overlap-save trim as the CTC side, or the two readings would be
-        # indexed differently and every cue's class shares would be offset by the
-        # window context.
+
         frame_track = None
+        posteriors = None
         if frame_pieces and all(piece is not None for piece in frame_pieces):
             kept_frames = [
                 piece[begin * head.upsample : finish * head.upsample]
@@ -488,20 +502,24 @@ def _blank_runs_for_audio(
                 if finish > begin
             ]
             if kept_frames:
-                stacked = (
-                    torch.cat(kept_frames, dim=0)
-                    if len(kept_frames) > 1
-                    else kept_frames[0]
-                )
-                posteriors = stacked.exp().detach().cpu().numpy()
+                if isinstance(kept_frames[0], _np.ndarray):
+                    posteriors = (
+                        _np.concatenate(kept_frames, axis=0)
+                        if len(kept_frames) > 1
+                        else kept_frames[0]
+                    )
+                else:
+                    stacked = (
+                        torch.cat(kept_frames, dim=0)
+                        if len(kept_frames) > 1
+                        else kept_frames[0]
+                    )
+                    posteriors = stacked.exp().detach().cpu().numpy()
                 frame_track = _encode_frame_class_track(
                     posteriors,
                     frame_s=ENCODER_FRAME_S / float(head.upsample),
                 )
                 if cfg["pause_reading"] == "speech":
-                    # The same question the blank runs answer - "is anyone
-                    # talking here" - but read off the class that answers it
-                    # instead of inferred from the absence of a character.
                     runs = non_speech_runs(
                         posteriors,
                         upsample=head.upsample,
@@ -509,6 +527,26 @@ def _blank_runs_for_audio(
                         speech_threshold=cfg["speech_threshold"],
                     )
                     return runs, duration_s, "alignment_head_speech_runs", frame_track
+
+        kept = [
+            piece[begin * head.upsample : finish * head.upsample]
+            for piece, (begin, finish) in zip(pieces, keep)
+            if piece is not None and finish > begin
+        ]
+        if not kept:
+            return [], duration_s, "fixed_length_no_features", frame_track
+        if isinstance(kept[0], _np.ndarray):
+            ctc_sequence = (
+                _np.concatenate(kept, axis=0) if len(kept) > 1 else kept[0]
+            )
+        else:
+            ctc_sequence = torch.cat(kept, dim=0) if len(kept) > 1 else kept[0]
+        runs = blank_runs(
+            ctc_sequence,
+            upsample=head.upsample,
+            min_seconds=cfg["min_blank_s"],
+            silent_classes=head.silent_classes,
+        )
         return runs, duration_s, "alignment_head_blank_runs", frame_track
     except Exception as error:  # noqa: BLE001
         if is_fatal_cuda_error(error):
@@ -520,7 +558,7 @@ def _blank_runs_for_audio(
         )
         return [], duration_s, "fixed_length_blank_runs_failed", None
     finally:
-        if model is not None or processor is not None:
+        if owns_model and (model is not None or processor is not None):
             model = None
             processor = None
             _release_feature_model_vram()
@@ -530,64 +568,49 @@ def _build_processing_spans(
     audio_path: str,
     *,
     on_stage: Callable[[str], None] | None = None,
-) -> list[tuple[float, float]]:
+    backend: Any | None = None,
+) -> ChunkPlan:
     """Contiguous chunks covering the whole file, cut inside pauses.
 
-    This replaced the Scorer/Outer/Split/CueQC/Inner chain on 2026-07-31. That
-    chain decided *which audio to keep* from acoustics alone, before any text
-    existed, and its errors were unrecoverable - it had been unrunnable since
-    2026-07-18 because two of its stages were never trained.
-
-    What is here instead does not decide anything irreversible. The alignment
-    head's blank runs are used only to choose where the boundaries fall; the
-    output tiles the file exactly, so every second still reaches the decoder and
-    a badly placed cut costs a worse boundary rather than a lost line. The
-    stronger reading of the same signal - skipping the blank stretches entirely
-    - was measured on 2026-07-31 and falsified: it dropped real lines embedded
-    in non-semantic vocalisation. See `tools/align/pregate_reference.py`.
-
-    With no head configured this degrades to fixed-length chunks, which is a
-    placement change and not a correctness one.
+    Returns an immutable ``ChunkPlan`` (which also acts as a sequence of
+    ``(start, end)`` tuples) and atomically mirrors the module-level signature
+    cache for runtime-signature readers.
     """
     if on_stage is not None:
         on_stage("切分 0/1")
     cfg = _chunking_config()
-    if on_stage is not None:
+    if backend is not None:
+        runs, duration_s, source, frame_track = _blank_runs_for_audio(
+            audio_path, on_stage=on_stage, backend=backend
+        )
+    elif on_stage is not None:
         runs, duration_s, source, frame_track = _blank_runs_for_audio(
             audio_path, on_stage=on_stage
         )
     else:
         runs, duration_s, source, frame_track = _blank_runs_for_audio(audio_path)
-    # Stashed rather than returned: this function's contract is the spans, and
-    # every caller wants those. The track is picked up by the stage that builds
-    # `asr_details`, which is the only place it can reach the subtitle layer.
-    _set_last_frame_class_track(frame_track)
+
     spans, cut_provenance = plan_chunk_cuts(
         runs,
         duration_s,
         max_s=cfg["max_chunk_s"],
         min_s=cfg["min_chunk_s"],
     )
-    _set_last_chunk_cut_provenance({**cut_provenance, "source": source})
-    _set_last_boundary_signature(
-        {
-            "chunking": {
-                "schema": CHUNK_CUT_SCHEMA,
-                "source": source,
-                "pause_count": len(runs),
-                "chunk_count": len(spans),
-                "duration_s": round(duration_s, 3),
-                # The cuts themselves, not just how many there are. Caches keyed
-                # on this signature hold word timings measured against these
-                # exact boundaries, and counts alone can match across different
-                # geometry: encoding the blank-run pass at a different batch
-                # size was measured to move the run count by ±3 out of ~215 -
-                # different cuts, and once in a while the same count.
-                "spans_sha256": _spans_digest(spans),
-                **{key: cfg[key] for key in sorted(cfg)},
-            }
+    full_provenance = {**cut_provenance, "source": source}
+    boundary_signature = {
+        "chunking": {
+            "schema": CHUNK_CUT_SCHEMA,
+            "source": source,
+            "pause_count": len(runs),
+            "chunk_count": len(spans),
+            "duration_s": round(duration_s, 3),
+            "spans_sha256": _spans_digest(spans),
+            **{key: cfg[key] for key in sorted(cfg)},
         }
-    )
+    }
+    _set_last_frame_class_track(frame_track)
+    _set_last_chunk_cut_provenance(full_provenance)
+    _set_last_boundary_signature(boundary_signature)
     _pipeline_logger.info(
         "[chunking] source=%s pauses=%d chunks=%d hard_cuts=%d duration=%.2fs",
         source,
@@ -598,39 +621,18 @@ def _build_processing_spans(
     )
     if on_stage is not None:
         on_stage("切分 1/1")
-    return spans
-
-
+    return ChunkPlan(
+        spans=tuple((float(begin), float(end)) for begin, end in spans),
+        boundary_signature=boundary_signature,
+        cut_provenance=full_provenance,
+        frame_class_track=frame_track,
+    )
 
 
 def _span_boundaries(
     spans: list[tuple[float, float]],
 ) -> list[tuple[float, float]]:
     return [(float(start), float(end)) for start, end in spans]
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _record_stage_timing(
@@ -716,35 +718,19 @@ def _record_cuda_memory(
 
 
 def _vram_budget_mb() -> float:
-    raw = env_text("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "0", lower=True)
-    if raw in {"0", "false", "no", "off", "none"}:
-        return 0.0
-    return env_float("ASR_STAGE_WORKER_VRAM_BUDGET_MB", 0.0, minimum=0.0)
+    return transcribe._vram_budget_mb()
 
 
 def _shared_vram_spill_tolerance_mb() -> float:
-    # The Windows PDH "GPU Process Memory shared usage" counter jitters by a
-    # few MB from driver-side staging buffers even when the CUDA allocator is
-    # hard-capped by set_per_process_memory_fraction and cannot spill. A real
-    # WDDM spill moves hundreds of MB of tensor pages, so a small tolerance
-    # separates counter noise from actual spill. A 4MB jitter once killed a
-    # fully finished transcription pass three times in a row.
-    return env_float("ASR_SHARED_VRAM_SPILL_TOLERANCE_MB", 64.0, minimum=0.0)
+    return transcribe._shared_vram_spill_tolerance_mb()
 
 
 def _enforce_vram_budget_from_snapshot(snapshot: dict) -> None:
-    try:
-        shared_vram_mb = float(snapshot.get("shared_vram_mb") or 0.0)
-    except (TypeError, ValueError):
-        shared_vram_mb = 0.0
-    if shared_vram_mb > _shared_vram_spill_tolerance_mb():
-        raise RuntimeError(
-            "GPU shared VRAM spill detected: "
-            f"stage={snapshot.get('stage', '')} shared_vram_mb={shared_vram_mb:.3f} "
-            f"raw_mb={snapshot.get('shared_vram_raw_mb', '')} "
-            f"baseline_mb={snapshot.get('shared_vram_baseline_mb', '')} "
-            f"tolerance_mb={_shared_vram_spill_tolerance_mb():.1f}"
-        )
+    spill_detail = transcribe._check_shared_vram_spill(
+        str(snapshot.get("stage", "")), snapshot
+    )
+    if spill_detail is not None:
+        raise RuntimeError(spill_detail)
     try:
         physical_ram_used_mb = float(snapshot.get("physical_ram_used_mb"))
         physical_ram_budget_mb = float(snapshot.get("physical_ram_budget_mb"))
@@ -760,12 +746,6 @@ def _enforce_vram_budget_from_snapshot(snapshot: dict) -> None:
     budget_mb = _vram_budget_mb()
     if budget_mb <= 0.0:
         return
-    # Enforce on peak *allocated* VRAM (the real working set that responds to
-    # batch size), not reserved. The caching allocator's reserved pool routinely
-    # fills dedicated VRAM on a 6GB card without spilling to shared memory, and
-    # it does not shrink when batch size is lowered, so a reserved-based budget
-    # false-positives and never converges under OOM-retry downshift. Allocated
-    # is reported in the message for diagnostics.
     allocated_values: list[float] = []
     reserved_values: list[float] = []
     for key in ("max_allocated_mb", "allocated_mb"):
@@ -781,17 +761,16 @@ def _enforce_vram_budget_from_snapshot(snapshot: dict) -> None:
     if not allocated_values:
         return
     peak_allocated = max(allocated_values)
-    if peak_allocated <= budget_mb:
-        return
-    peak_reserved = max(reserved_values) if reserved_values else peak_allocated
-    total_mb = snapshot.get("total_mb", "")
-    stage = snapshot.get("stage", "")
-    raise RuntimeError(
-        "GPU VRAM budget exceeded: "
-        f"stage={stage} allocated_mb={peak_allocated:.1f} "
-        f"reserved_mb={peak_reserved:.1f} "
-        f"budget_mb={budget_mb:.1f} total_mb={total_mb}"
+    peak_reserved = max(reserved_values) if reserved_values else None
+    detail = _check_allocated_vram_budget(
+        stage=str(snapshot.get("stage", "")),
+        allocated_mb=peak_allocated,
+        reserved_mb=peak_reserved,
+        budget_mb=budget_mb,
+        total_mb=snapshot.get("total_mb", ""),
     )
+    if detail is not None:
+        raise RuntimeError(detail)
 
 
 def _release_stage_gpu_cache(
@@ -875,6 +854,7 @@ def _apply_postgate(
         value = meta.get("alignment_score") if isinstance(meta, dict) else None
         scores.append(float(value) if isinstance(value, (int, float)) else None)
 
+    compact_values = precompute_cue_compact_texts(text_results)
     candidates = [
         build_cue_candidate(
             chunk=chunk,
@@ -882,6 +862,8 @@ def _apply_postgate(
             position=position,
             chunks=chunk_infos,
             text_results=text_results,
+            include_audio_ref=False,
+            compact_values=compact_values,
         )
         for position, chunk in enumerate(chunk_infos)
     ]
@@ -1049,99 +1031,98 @@ def _transcribe_and_align_local(
     _record_cuda_memory(log, cuda_memory, "asr_start", elapsed_s=0.0)
 
     try:
-        _notify("分析静音并切分音频...")
-        split_started = time.perf_counter()
-        _model_lifecycle_event(
-            model_manager,
-            stage="chunking",
-            action="load",
-            on_stage=on_stage,
-        )
-        chunk_spans = _build_processing_spans(audio_path, on_stage=on_stage)
-        _release_stage_gpu_cache(
-            log,
-            cuda_memory,
-            "chunking_released",
-            elapsed_s=time.perf_counter() - total_started,
-        )
-        _model_lifecycle_event(
-            model_manager,
-            stage="chunking",
-            action="unload",
-            on_stage=on_stage,
-        )
-        chunk_dir, chunk_infos = _extract_wav_chunks(
-            audio_path, _span_boundaries(chunk_spans), on_stage=on_stage
-        )
-        split_elapsed = time.perf_counter() - split_started
-        log.append(f"切分完成：共 {len(chunk_infos)} 个处理块")
-        _record_stage_timing(log, timings, "split_s", "静音分析与切块", split_elapsed)
-        _record_cuda_memory(
-            log,
-            cuda_memory,
-            "split_done",
-            elapsed_s=time.perf_counter() - total_started,
-        )
-        _release_stage_gpu_cache(
-            log,
-            cuda_memory,
-            "pre_asr_boundary_models_released",
-            elapsed_s=time.perf_counter() - total_started,
-        )
-
-        if not chunk_infos:
-            timings.update(
-                {
-                    "asr_model_load_s": 0.0,
-                    "asr_text_transcribe_s": 0.0,
-                    "asr_model_unload_s": 0.0,
-                    "alignment_s": 0.0,
-                    "alignment_model_unload_s": 0.0,
-                    "subtitle_segment_s": 0.0,
-                }
-            )
-            total_elapsed = time.perf_counter() - total_started
-            _record_stage_timing(
-                log,
-                timings,
-                "asr_alignment_total_s",
-                "ASR与字幕时间轴总计",
-                total_elapsed,
-            )
-            log.append("边界系统未检测到可处理语音块，跳过 ASR")
-            details = _json_payload({
-                "backend": get_backend_label(),
-                "audio_path": audio_path,
-                "device": device,
-                "chunk_count": 0,
-                "transcript_chunks": [],
-                "stage_timings": timings,
-                "cuda_memory": cuda_memory,
-                "word_count": 0,
-                "segment_count": 0,
-                "boundary_no_speech": True,
-                "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
-                "chunk_cuts": dict(_LAST_CHUNK_CUT_PROVENANCE),
-                "postgate": _empty_postgate_report(),
-            })
-            completed = True
-            return [], log, details
-
         backend = _resolve_asr_backend(device)
         word_dicts: list[dict] = []
         try:
+            _notify("分析静音并切分音频...")
+            split_started = time.perf_counter()
             _model_lifecycle_event(
                 model_manager,
                 stage="asr",
                 action="load_exclusive",
                 on_stage=on_stage,
             )
-            # No eager load. Every consumer below (transcribe_texts, the
-            # alignment pass) loads on demand, so a rerun whose chunks are all
-            # served from the result cache never pays for the weights at all -
-            # it used to spend ~5s loading a model it then immediately unloaded.
-            # The lifecycle event still fires here: it resets CUDA state for the
-            # exclusive-ownership window, which is about the window, not the load.
+            load_before_split_s = float(getattr(backend, "cumulative_load_s", 0.0))
+            chunk_plan = _build_processing_spans(
+                audio_path, on_stage=on_stage, backend=backend
+            )
+            split_load_s = max(
+                0.0,
+                float(getattr(backend, "cumulative_load_s", 0.0)) - load_before_split_s,
+            )
+            if isinstance(chunk_plan, ChunkPlan):
+                chunk_spans = chunk_plan.spans
+                boundary_signature = dict(chunk_plan.boundary_signature)
+                chunk_cut_provenance = dict(chunk_plan.cut_provenance)
+                frame_class_track = chunk_plan.frame_class_track
+            else:
+                chunk_spans = chunk_plan
+                boundary_signature = dict(_LAST_BOUNDARY_SIGNATURE)
+                chunk_cut_provenance = dict(_LAST_CHUNK_CUT_PROVENANCE)
+                frame_class_track = _LAST_FRAME_CLASS_TRACK
+
+            chunk_dir, chunk_infos = _extract_wav_chunks(
+                audio_path, _span_boundaries(chunk_spans), on_stage=on_stage
+            )
+            split_elapsed = max(0.0, time.perf_counter() - split_started - split_load_s)
+            log.append(f"切分完成：共 {len(chunk_infos)} 个处理块")
+            _record_stage_timing(log, timings, "split_s", "静音分析与切块", split_elapsed)
+            _release_stage_gpu_cache(
+                log,
+                cuda_memory,
+                "split_done",
+                elapsed_s=time.perf_counter() - total_started,
+            )
+
+            if not chunk_infos:
+                backend.unload_model(on_stage=on_stage)
+                _model_lifecycle_event(
+                    model_manager,
+                    stage="asr",
+                    action="unload",
+                    on_stage=on_stage,
+                )
+                timings.update(
+                    {
+                        "asr_model_load_s": float(
+                            getattr(backend, "cumulative_load_s", 0.0)
+                        ),
+                        "asr_text_transcribe_s": 0.0,
+                        "asr_model_unload_s": 0.0,
+                        "alignment_s": 0.0,
+                        "alignment_model_unload_s": 0.0,
+                        "subtitle_segment_s": 0.0,
+                    }
+                )
+                total_elapsed = time.perf_counter() - total_started
+                _record_stage_timing(
+                    log,
+                    timings,
+                    "asr_alignment_total_s",
+                    "ASR与字幕时间轴总计",
+                    total_elapsed,
+                )
+                log.append("边界系统未检测到可处理语音块，跳过 ASR")
+                details = _json_payload({
+                    "backend": get_backend_label(),
+                    "audio_path": audio_path,
+                    "device": device,
+                    "chunk_count": 0,
+                    "transcript_chunks": [],
+                    "stage_timings": timings,
+                    "cuda_memory": cuda_memory,
+                    "word_count": 0,
+                    "segment_count": 0,
+                    "boundary_no_speech": True,
+                    "boundary_signature": boundary_signature,
+                    "chunk_cuts": chunk_cut_provenance,
+                    "postgate": _empty_postgate_report(),
+                })
+                completed = True
+                return [], log, details
+
+            # No duplicate load: chunking and transcription share this backend,
+            # and a fully cached rerun with no head configured never loads weights.
             load_before_text_s = float(getattr(backend, "cumulative_load_s", 0.0))
             text_results, text_timings = _transcribe_asr_chunks_text_only(
                 backend,
@@ -1149,18 +1130,9 @@ def _transcribe_and_align_local(
                 "ASR 文本转写",
                 on_stage=on_stage,
             )
-            # Loading now happens inside whichever stage first needs the weights,
-            # so that stage's wall clock contains it. Report the load separately
-            # and net it out of the host stage, or the summary double-counts it
-            # and the rows stop adding up to the total.
-            text_load_s = (
-                float(getattr(backend, "cumulative_load_s", 0.0)) - load_before_text_s
-            )
-            _record_cuda_memory(
-                log,
-                cuda_memory,
-                "asr_model_load_done",
-                elapsed_s=time.perf_counter() - total_started,
+            text_load_s = max(
+                0.0,
+                float(getattr(backend, "cumulative_load_s", 0.0)) - load_before_text_s,
             )
             _record_stage_timing(
                 log,
@@ -1173,7 +1145,7 @@ def _transcribe_and_align_local(
                 if timing_key == "text_transcribe_s":
                     continue
                 timings[timing_key] = timing_value
-            _record_cuda_memory(
+            _release_stage_gpu_cache(
                 log,
                 cuda_memory,
                 "asr_text_transcribe_done",
@@ -1186,11 +1158,6 @@ def _transcribe_and_align_local(
             ]
 
             unload_started = time.perf_counter()
-            # With an alignment head configured, finalize immediately re-reads
-            # encoder features off this same model; unloading here would force
-            # a pointless multi-second reload inside _align_TRANSCRIPTION_
-            # results (which owns the unload on that path). Without a head the
-            # early unload stays: proportional finalize never touches the GPU.
             head_owns_unload = alignment_head_configured()
             if not head_owns_unload:
                 backend.unload_model(on_stage=on_stage)
@@ -1221,9 +1188,6 @@ def _transcribe_and_align_local(
                 on_stage=on_stage,
             )
             if head_owns_unload:
-                # The alignment pass did the unload (it needed the model through
-                # finalize); the manager's CUDA reset belongs after that, not
-                # before it.
                 _model_lifecycle_event(
                     model_manager,
                     stage="asr",
@@ -1290,9 +1254,6 @@ def _transcribe_and_align_local(
                             "start": chunk["start"] + float(word["start"]),
                             "end": chunk["start"] + float(word["end"]),
                             "word": word["word"],
-                            # The writer's anchor guard reads this to refuse
-                            # synthetic word starts; dropping it here silently
-                            # disarmed that guard for every production run.
                             "timestamp_kind": str(word.get("timestamp_kind") or ""),
                             "source_chunk_index": chunk.get("index", idx - 1),
                             "alignment_mode": outcome.get("alignment_mode", ""),
@@ -1400,14 +1361,14 @@ def _transcribe_and_align_local(
             "cuda_memory": cuda_memory,
             "word_count": len(word_dicts),
             "segment_count": len(segments),
-            "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
-            "chunk_cuts": dict(_LAST_CHUNK_CUT_PROVENANCE),
+            "boundary_signature": boundary_signature,
+            "chunk_cuts": chunk_cut_provenance,
             # Absent on a v1 head, and every reader has to treat it that way: a
             # promoted head outlives the code that trained it, and rolling back
             # must not disable the subtitle filter.
             **(
-                {"frame_class_track": _LAST_FRAME_CLASS_TRACK}
-                if _LAST_FRAME_CLASS_TRACK
+                {"frame_class_track": frame_class_track}
+                if frame_class_track
                 else {}
             ),
             "postgate": postgate_report,

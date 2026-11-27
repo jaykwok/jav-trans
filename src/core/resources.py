@@ -28,7 +28,7 @@ from __future__ import annotations
 import itertools
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -99,7 +99,8 @@ class _Record:
     def handle_open(self) -> bool:
         return bool(self.job_handle)
 
-    def view(self) -> dict[str, Any]:
+    def view(self, *, now_monotonic: float | None = None) -> dict[str, Any]:
+        current = time.monotonic() if now_monotonic is None else now_monotonic
         return {
             "resource_id": self.resource_id,
             "generation": self.generation,
@@ -115,7 +116,7 @@ class _Record:
             "last_error": self.last_error,
             "since": self.since,
             "next_retry_in_s": (
-                max(0.0, self.next_retry_at - time.time()) if self.next_retry_at else 0.0
+                max(0.0, self.next_retry_at - current) if self.next_retry_at else 0.0
             ),
             # A stop was asked for and has not been confirmed.
             "blocked": self.state == "stopping" and self.process_state != "gone",
@@ -132,6 +133,34 @@ _WAKE = threading.Condition(_LOCK)
 _RECORDS: dict[tuple[str, int], _Record] = {}
 _WATCHDOG: threading.Thread | None = None
 _ID_SEQ = itertools.count(1)
+_RELEASE_LISTENERS: list[Callable[[], None]] = []
+
+
+def register_release_listener(callback: Callable[[], None]) -> Callable[[], None]:
+    """Subscribe to resource/GPU release notifications; returns an unsubscribe callable."""
+    with _LOCK:
+        if callback not in _RELEASE_LISTENERS:
+            _RELEASE_LISTENERS.append(callback)
+
+    def _unsubscribe() -> None:
+        with _LOCK:
+            try:
+                _RELEASE_LISTENERS.remove(callback)
+            except ValueError:
+                pass
+
+    return _unsubscribe
+
+
+def _notify_release_listeners() -> None:
+    """Invoke release subscribers strictly outside ``_LOCK`` to avoid lock inversion."""
+    with _LOCK:
+        listeners = list(_RELEASE_LISTENERS)
+    for listener in listeners:
+        try:
+            listener()
+        except Exception:
+            pass
 
 
 class ResourceIdentityError(RuntimeError):
@@ -200,7 +229,7 @@ def register(
         )
         if state == "stopping":
             record.attempts = 1
-            record.next_retry_at = time.time() + _backoff_s(1)
+            record.next_retry_at = time.monotonic() + _backoff_s(1)
         _RECORDS[record.key] = record
     if state == "stopping":
         _start_watchdog()
@@ -218,16 +247,31 @@ def schedule_stop(resource_id: str, generation: int) -> None:
             return
         if record.state == "live":
             record.state = "stopping"
-            record.next_retry_at = time.time() + RETRY_MIN_S
+            record.next_retry_at = time.monotonic() + RETRY_MIN_S
     _start_watchdog()
 
 
-def attach_handle(resource_id: str, generation: int, job_handle: Any) -> None:
-    """Bind a Job Object handle to a resource that is already registered."""
+def attach_handle(resource_id: str, generation: int, job_handle: Any) -> bool:
+    """Bind a Job Object handle to a resource that is already registered.
+
+    Returns ``True`` if the record still exists and accepted the handle,
+    ``False`` if the record has already been removed (the caller should close
+    the handle immediately). If the record is already in ``stopping`` state,
+    the cleanup watchdog is woken so the newly attached handle will be closed.
+    """
+    wake_watchdog = False
     with _LOCK:
         record = _RECORDS.get((resource_id, generation))
-        if record is not None:
-            record.job_handle = job_handle
+        if record is None:
+            return False
+        record.job_handle = job_handle
+        if record.state == "stopping" and record.handle_open:
+            if not record.next_retry_at:
+                record.next_retry_at = time.monotonic()
+            wake_watchdog = True
+    if wake_watchdog:
+        _start_watchdog()
+    return True
 
 
 def confirm_gone(resource_id: str, generation: int) -> bool:
@@ -236,16 +280,31 @@ def confirm_gone(resource_id: str, generation: int) -> bool:
     Refuses to drop a record that still holds an unclosed handle: "the process
     is gone" and "there is nothing left to close" are different claims.
     """
+    wake_watchdog = False
+    notify_released = False
     with _LOCK:
         record = _RECORDS.get((resource_id, generation))
         if record is None:
             return True
+        was_occupying_gpu = record.holds_gpu and record.process_state != "gone"
         record.process_state = "gone"
+        if was_occupying_gpu:
+            notify_released = True
         if record.handle_open:
             record.state = "stopping"
-            return False
-        _RECORDS.pop(record.key, None)
-        return True
+            if not record.next_retry_at:
+                record.next_retry_at = time.monotonic()
+            wake_watchdog = True
+            released = False
+        else:
+            _RECORDS.pop(record.key, None)
+            notify_released = True
+            released = True
+    if notify_released:
+        _notify_release_listeners()
+    if wake_watchdog:
+        _start_watchdog()
+    return released
 
 
 def request_stop(resource_id: str, generation: int) -> StopResult:
@@ -282,13 +341,14 @@ def request_stop(resource_id: str, generation: int) -> StopResult:
             )
         record.claimed = True
         record.state = "stopping"
-        record.last_attempt_at = time.time()
+        record.last_attempt_at = time.monotonic()
         stopper = record.stopper
         process = record.process
-        job_handle = record.job_handle
+        passed_job_handle = record.job_handle
+        was_occupying_gpu = record.holds_gpu and record.process_state != "gone"
 
     try:
-        outcome = stopper(process, job_handle)
+        outcome = stopper(process, passed_job_handle)
         if not isinstance(outcome, StopOutcome):  # pragma: no cover - defensive
             raise TypeError(f"stopper returned {outcome!r}, expected StopOutcome")
     except BaseException as exc:
@@ -298,7 +358,8 @@ def request_stop(resource_id: str, generation: int) -> StopResult:
                 record.process_state = "unknown"
                 record.attempts += 1
                 record.last_error = f"stopper raised: {exc!r}"
-                record.next_retry_at = time.time() + _backoff_s(record.attempts)
+                record.next_retry_at = time.monotonic() + _backoff_s(record.attempts)
+            handle_open_after = record.handle_open
             record.claimed = False
         _start_watchdog()
         if isinstance(exc, Exception):
@@ -307,7 +368,7 @@ def request_stop(resource_id: str, generation: int) -> StopResult:
                 generation=generation,
                 stopped=False,
                 process_state="unknown",
-                handle_open=bool(job_handle),
+                handle_open=handle_open_after,
                 detail=f"stopper raised: {exc!r}",
             )
         raise
@@ -315,9 +376,13 @@ def request_stop(resource_id: str, generation: int) -> StopResult:
     # Commit and release the claim in one lock section: a claim released before
     # the result is written is a window where another retry takes the record and
     # acts on the handle that was just closed.
+    notify_released = False
     with _LOCK:
         record.process_state = outcome.process_state
-        record.job_handle = outcome.job_handle
+        # Only overwrite job_handle if nothing attached a new handle concurrently
+        # while the stopper was running outside `_LOCK`.
+        if record.job_handle == passed_job_handle:
+            record.job_handle = outcome.job_handle
         stopped = outcome.process_state == "gone"
         # Remove *this* record, never "whatever is filed under this key". The
         # key alone is not proof of identity, and a result belonging to a
@@ -329,19 +394,24 @@ def request_stop(resource_id: str, generation: int) -> StopResult:
             record.claimed = False
             record.last_error = ""
             record.next_retry_at = 0.0
+            notify_released = True
         else:
             record.attempts += 1
             record.last_error = outcome.detail or record.last_error
-            record.next_retry_at = time.time() + _backoff_s(record.attempts)
+            record.next_retry_at = time.monotonic() + _backoff_s(record.attempts)
             record.claimed = False
+            if stopped and was_occupying_gpu:
+                notify_released = True
         result = StopResult(
             resource_id=resource_id,
             generation=generation,
             stopped=stopped,
             process_state=outcome.process_state,
-            handle_open=bool(outcome.job_handle),
+            handle_open=record.handle_open,
             detail=outcome.detail,
         )
+    if notify_released:
+        _notify_release_listeners()
     if not result.released:
         _start_watchdog()
     return result
@@ -369,8 +439,9 @@ def retry_pending(kind: str | None = None) -> dict[str, Any]:
 def pending(kind: str | None = None) -> list[dict[str, Any]]:
     """Resources that were asked to stop and have not confirmed."""
     with _LOCK:
+        now = time.monotonic()
         return [
-            record.view()
+            record.view(now_monotonic=now)
             for record in _RECORDS.values()
             if record.state == "stopping" and (kind is None or record.kind == kind)
         ]
@@ -378,11 +449,40 @@ def pending(kind: str | None = None) -> list[dict[str, Any]]:
 
 def live(kind: str | None = None) -> list[dict[str, Any]]:
     with _LOCK:
+        now = time.monotonic()
         return [
-            record.view()
+            record.view(now_monotonic=now)
             for record in _RECORDS.values()
             if record.state == "live" and (kind is None or record.kind == kind)
         ]
+
+
+def has_live_gpu_conflict(tolerated_kinds: Collection[str] = ()) -> bool:
+    """Allocation-free check for any live GPU record outside ``tolerated_kinds``."""
+    with _LOCK:
+        for record in _RECORDS.values():
+            if (
+                record.state == "live"
+                and record.holds_gpu
+                and record.process_state != "gone"
+                and record.kind not in tolerated_kinds
+            ):
+                return True
+        return False
+
+
+def live_gpu_conflict_label(tolerated_kinds: Collection[str] = ()) -> str:
+    """Return ``"<kind> pid=<pid>"`` for the first live GPU conflict, or ``""``."""
+    with _LOCK:
+        for record in _RECORDS.values():
+            if (
+                record.state == "live"
+                and record.holds_gpu
+                and record.process_state != "gone"
+                and record.kind not in tolerated_kinds
+            ):
+                return f"{record.kind} pid={getattr(record.process, 'pid', None)}"
+        return ""
 
 
 def is_registered(resource_id: str, generation: int) -> bool:
@@ -428,21 +528,33 @@ def open_handles() -> list[dict[str, Any]]:
     process and closing it would kill that process tree.
     """
     with _LOCK:
+        now = time.monotonic()
         return [
-            record.view()
+            record.view(now_monotonic=now)
             for record in _RECORDS.values()
             if record.handle_open and record.state == "stopping"
         ]
 
 
 def snapshot() -> dict[str, Any]:
-    """One status shape for the page, the queue and the diagnostics panel."""
-    pending_records = pending()
-    handles = open_handles()
-    blocked = gpu_blocked()
-    next_retry = [
-        record["next_retry_in_s"] for record in pending_records if record["next_retry_in_s"]
-    ]
+    """One atomic status shape for the page, the queue and the diagnostics panel."""
+    with _LOCK:
+        now = time.monotonic()
+        pending_records: list[dict[str, Any]] = []
+        open_handle_count = 0
+        blocked = False
+        next_retry: list[float] = []
+        for record in _RECORDS.values():
+            if record.state != "stopping":
+                continue
+            view = record.view(now_monotonic=now)
+            pending_records.append(view)
+            if record.handle_open:
+                open_handle_count += 1
+            if record.holds_gpu and record.process_state != "gone":
+                blocked = True
+            if view["next_retry_in_s"]:
+                next_retry.append(view["next_retry_in_s"])
     return {
         "blocked": blocked,
         # 正在清理 / 清理失败 / 已释放 - derived from the records, not stored
@@ -452,8 +564,8 @@ def snapshot() -> dict[str, Any]:
             "cleanup_failed" if blocked else "cleaning" if pending_records else "released"
         ),
         "pending": pending_records,
-        "handle_open": bool(handles),
-        "open_job_handles": len(handles),
+        "handle_open": open_handle_count > 0,
+        "open_job_handles": open_handle_count,
         "next_retry_in_s": min(next_retry) if next_retry else 0.0,
     }
 
@@ -465,6 +577,7 @@ def forget_all() -> None:
         # So a parked watchdog retires now rather than at the end of a backoff
         # it computed for records that no longer exist.
         _WAKE.notify_all()
+    _notify_release_listeners()
 
 
 def _start_watchdog() -> None:
@@ -517,7 +630,7 @@ def _watchdog_loop() -> None:
             if not schedule:
                 _WATCHDOG = None
                 return
-            now = time.time()
+            now = time.monotonic()
             ready = [
                 (record.resource_id, record.generation)
                 for record in _RECORDS.values()

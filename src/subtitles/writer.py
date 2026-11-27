@@ -1,26 +1,38 @@
-import re
 import logging
 import math
+import os
+import re
+import tempfile
 from pathlib import Path
 from typing import Callable, Literal
 
+from subtitles.ja_style import normalize_ja_subtitle_text, wrap_ja_subtitle_text
 from subtitles.options import SubtitleOptions
 from subtitles.source_boundaries import source_boundary_hints
-from subtitles.ja_style import normalize_ja_subtitle_text, wrap_ja_subtitle_text
-from subtitles.vocalisation import drop_vocalisation_runs, is_decoration_only, vocalisation_run_boundaries
-from subtitles.zh_style import normalize_zh_subtitle_text, wrap_zh_subtitle_text
+from subtitles.vocalisation import (
+    drop_vocalisation_runs,
+    is_decoration_only,
+    vocalisation_run_boundaries,
+)
+from subtitles.zh_style import (
+    normalize_zh_subtitle_text,
+    wrap_zh_subtitle_text,
+    zh_display_units,
+)
 
 logger = logging.getLogger(__name__)
+
+LAYOUT_VERSION = "subtitle_layout_v4"
 
 
 def format_timestamp(seconds: float) -> str:
     clamped = _safe_float(seconds, 0.0)
     if clamped < 0.0:
         clamped = 0.0
-    hours = int(clamped // 3600)
-    minutes = int((clamped % 3600) // 60)
-    secs = int(clamped % 60)
-    millis = min(999, int((clamped - int(clamped)) * 1000))
+    total_ms = math.floor(clamped * 1000.0 + 1e-9)
+    total_secs, millis = divmod(total_ms, 1000)
+    hours, rem = divmod(total_secs, 3600)
+    minutes, secs = divmod(rem, 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
@@ -34,20 +46,12 @@ def _safe_float(value, default: float = 0.0) -> float:
         return float(default)
     return parsed if math.isfinite(parsed) else float(default)
 
+
 def _count_text_units(text: str, *, ascii_char_weight: float = 0.55) -> float:
-    compact = _COMPACT_SPACE_RE.sub("", (text or "").strip())
+    compact = _COMPACT_SPACE_RE.sub("", str(text or "").strip())
     if not compact:
         return 0.0
-
-    units = 0.0
-    for char in compact:
-        if char.isascii() and char.isalnum():
-            units += ascii_char_weight
-        elif char.isascii():
-            units += 0.35
-        else:
-            units += 1.0
-    return units
+    return zh_display_units(compact, ascii_alnum_weight=ascii_char_weight)
 
 
 def _coerce_options(options: SubtitleOptions | None = None) -> SubtitleOptions:
@@ -100,46 +104,28 @@ def _resolve_subtitle_window(
     block = blocks[idx - 1]
     start = float(block["start"])
     raw_end = max(start, float(block["end"]))
-    if options.timeline_mode in {"alignment", "aligned", "raw"}:
-        end = raw_end
-        if idx < len(blocks):
-            next_start = max(start + 0.05, float(blocks[idx]["start"]))
-            end = min(end, max(start + 0.05, next_start - gap_s))
-        end = max(end, start + min_duration_s)
-        if idx < len(blocks):
-            next_start = float(blocks[idx]["start"])
-            end = min(end, max(start + 0.05, next_start - gap_s))
-        if end <= start:
-            end = start + 0.05
-        return start, end
-
-    target_duration = max(_estimate_reading_duration(block, options=options), min_duration_s)
-    trim_cap_duration = max(
-        target_duration * options.duration_ratio_cap,
-        target_duration + options.duration_grace,
-        min_duration_s,
+    next_limit = (
+        max(start + 0.05, float(blocks[idx]["start"]) - gap_s)
+        if idx < len(blocks)
+        else None
     )
-
-    end = raw_end
-
-    next_limit = None
-    if idx < len(blocks):
-        next_limit = max(start + 0.05, float(blocks[idx]["start"]) - gap_s)
-        end = min(end, next_limit)
-
-    end = min(end, start + trim_cap_duration)
-
-    min_end = start + target_duration
-    if next_limit is not None:
-        min_end = min(min_end, next_limit)
-
-    end = max(end, min_end)
-
+    if options.timeline_mode in {"alignment", "aligned", "raw"}:
+        end = max(raw_end, start + min_duration_s)
+    else:
+        target_duration = max(
+            _estimate_reading_duration(block, options=options),
+            min_duration_s,
+        )
+        trim_cap_duration = max(
+            target_duration * options.duration_ratio_cap,
+            target_duration + options.duration_grace,
+            min_duration_s,
+        )
+        end = max(min(raw_end, start + trim_cap_duration), start + target_duration)
     if next_limit is not None:
         end = min(end, next_limit)
     if end <= start:
         end = start + 0.05
-
     return start, end
 
 
@@ -302,15 +288,21 @@ _DURATION_OVERFLOW_WEIGHT = 1000.0
 
 
 def _source_word_boundaries(
-    words: list[dict], *, vocalisation_min_run: int | None = None
+    words: list[dict],
+    *,
+    vocalisation_min_run: int | None = None,
+    text: str | None = None,
+    lexical_extent: _LexicalExtents | None = None,
 ) -> dict[int, tuple[str, float]]:
-    text = "".join(str(word["word"]) for word in words)
-    hints = source_boundary_hints(text)
+    source_text = (
+        text if text is not None else "".join(str(word["word"]) for word in words)
+    )
+    hints = source_boundary_hints(source_text)
     if vocalisation_min_run is not None:
-        for offset in vocalisation_run_boundaries(text, vocalisation_min_run):
+        for offset in vocalisation_run_boundaries(source_text, vocalisation_min_run):
             if hints.get(offset) != "sentence_punctuation":
                 hints[offset] = "vocalisation_boundary"
-    extent = _LexicalExtents(words)
+    extent = lexical_extent if lexical_extent is not None else _LexicalExtents(words)
     boundaries: dict[int, tuple[str, float]] = {}
     offset = 0
     for index, word in enumerate(words[:-1], start=1):
@@ -346,15 +338,26 @@ def _exact_safe_dp_plan(
         return {"pieces": [], "reason": map_status, "score": 0.0}
 
     word_count = len(words)
+    lexical_extent = _LexicalExtents(words)
     # Legacy callers may already have a translated secondary field. Keep their
     # cue intact: source offsets never identify positions in another language.
     has_translation = any(
         str(block.get(key) or "") not in {"", text}
         for key in ("ja_text", "zh_text", "text")
     )
-    boundaries = {} if has_translation else _source_word_boundaries(
-        words,
-        vocalisation_min_run=options.vocalisation_min_run if options.drop_vocalisation_only_cues else None,
+    boundaries = (
+        {}
+        if has_translation
+        else _source_word_boundaries(
+            words,
+            vocalisation_min_run=(
+                options.vocalisation_min_run
+                if options.drop_vocalisation_only_cues
+                else None
+            ),
+            text=text,
+            lexical_extent=lexical_extent,
+        )
     )
     candidates = [0, *sorted(boundaries), word_count]
 
@@ -365,16 +368,24 @@ def _exact_safe_dp_plan(
         char_prefix.append(char_prefix[-1] + _compact_source_length(token))
         text_prefix.append(text_prefix[-1] + len(token))
 
-    lexical_extent = _LexicalExtents(words)
     char_cap = max(1, int(options.max_source_chars))
     duration_cap_s = _subtitle_max_display_duration_s(options)
     best: dict[int, tuple[float, int | None]] = {0: (0.0, None)}
-    sentence_start = 0
-    for end_index in candidates[1:]:
+    sentence_start_pos = 0
+    for end_pos in range(1, len(candidates)):
+        end_index = candidates[end_pos]
+        if end_index == word_count:
+            kind, _gap = "end", 0.0
+        else:
+            kind, _gap = boundaries[end_index]
+        clause_penalty = 0.10 if kind == "clause_with_pause" else 0.0
         best_cost = float("inf")
         best_start: int | None = None
-        for start_index in candidates:
-            if start_index < sentence_start or start_index >= end_index or start_index not in best:
+        for start_pos in range(sentence_start_pos, end_pos):
+            start_index = candidates[start_pos]
+            if start_index >= end_index:
+                break
+            if start_index not in best:
                 continue
             extent = lexical_extent(start_index, end_index)
             if extent is None:
@@ -391,14 +402,10 @@ def _exact_safe_dp_plan(
                 0.0,
                 (char_cap * 0.35 - length) / max(1.0, float(char_cap)),
             )
-            if end_index == word_count:
-                kind, gap = "end", 0.0
-            else:
-                kind, gap = boundaries[end_index]
             cost = (
                 best[start_index][0]
                 + 1.0
-                + (0.10 if kind == "clause_with_pause" else 0.0)
+                + clause_penalty
                 + underfill * 0.25
                 + float(char_overflow * char_overflow) * _CHAR_OVERFLOW_WEIGHT
                 + float(duration_overflow * duration_overflow)
@@ -409,8 +416,8 @@ def _exact_safe_dp_plan(
                 best_start = start_index
         if best_start is not None:
             best[end_index] = (best_cost, best_start)
-        if end_index in boundaries and boundaries[end_index][0] != "clause_with_pause":
-            sentence_start = end_index
+            if end_index in boundaries and kind != "clause_with_pause":
+                sentence_start_pos = end_pos
 
     if word_count not in best:
         return {"pieces": [], "reason": "no_complete_safe_path", "score": 0.0}
@@ -590,7 +597,7 @@ def _split_long_display_block(
                 "measured_safe_boundaries_unavailable"
             )
         item["layout_engine"] = options.layout_engine
-        item["layout_version"] = "subtitle_layout_v4"
+        item["layout_version"] = LAYOUT_VERSION
         item["timing_model"] = options.timing_model
         item["exact_measured_timeline"] = True
         item["layout_timeline_locked"] = True
@@ -718,9 +725,10 @@ def _normalize_subtitle_timeline(
     blocks: list[dict],
     *,
     options: SubtitleOptions | None = None,
+    presorted: bool = False,
 ) -> list[dict]:
     options = _coerce_options(options)
-    normalized = _copy_sorted_blocks(blocks)
+    normalized = blocks if presorted else _copy_sorted_blocks(blocks)
     if len(normalized) < 2:
         return normalized
 
@@ -767,9 +775,10 @@ def _polish_subtitle_timeline(
     blocks: list[dict],
     *,
     options: SubtitleOptions | None = None,
+    presorted: bool = False,
 ) -> list[dict]:
     options = _coerce_options(options)
-    polished = _copy_sorted_blocks(blocks)
+    polished = blocks if presorted else _copy_sorted_blocks(blocks)
     if not options.timing_polish_enabled or not polished:
         return polished
 
@@ -917,7 +926,7 @@ def _finalize_layout_fields(
             display_end - acoustic_end,
         )
         item.setdefault("layout_engine", options.layout_engine)
-        item.setdefault("layout_version", "subtitle_layout_v4")
+        item.setdefault("layout_version", LAYOUT_VERSION)
         item.setdefault("timing_model", options.timing_model)
         item["duration_soft_cap_violation"] = bool(
             max_display_s > 0.0 and item["display_duration"] > max_display_s
@@ -955,6 +964,7 @@ def _prepare_subtitle_blocks(
     acoustic_classes: Callable[[float, float], dict | None] | None = None,
 ) -> list[dict]:
     options = _coerce_options(options)
+
     def stage(name: str, current: int, total: int) -> None:
         if on_stage is not None:
             on_stage(name, current, total)
@@ -964,7 +974,7 @@ def _prepare_subtitle_blocks(
     # Reading-duration display policy, kept for inputs without measured word
     # timing. Exact pieces created below overwrite these provisional windows
     # with their lexical edges and are then exempt from later polish/normalize.
-    prepared = _normalize_subtitle_timeline(prepared, options=options)
+    prepared = _normalize_subtitle_timeline(prepared, options=options, presorted=True)
     for idx in range(1, len(prepared) + 1):
         start, end = _resolve_subtitle_window(prepared, idx, options=options)
         prepared[idx - 1]["start"] = start
@@ -983,7 +993,7 @@ def _prepare_subtitle_blocks(
         )
     )
     stage("timeline_polish", 0, 1)
-    prepared = _polish_subtitle_timeline(prepared, options=options)
+    prepared = _polish_subtitle_timeline(prepared, options=options, presorted=True)
     stage("timeline_polish", 1, 1)
     # Only now are these the cues a viewer will see. Filtering earlier looks
     # cheaper but measures the wrong thing: before the DP runs, a "block" is a
@@ -1034,7 +1044,7 @@ def _prepare_subtitle_blocks(
             options=options,
             diagnostics=diagnostics,
         )
-    prepared = _normalize_subtitle_timeline(prepared, options=options)
+    prepared = _normalize_subtitle_timeline(prepared, options=options, presorted=True)
     prepared = _finalize_layout_fields(prepared, options=options)
     stage("layout_finalize", 1, 1)
     return prepared
@@ -1070,6 +1080,93 @@ def prepare_srt_blocks(
     )
 
 
+def _write_srt_blocks(
+    blocks: list[dict],
+    path: str,
+    *,
+    render_content: Callable[[dict], str],
+) -> list[dict]:
+    """Atomically write rendered SRT cues, dropping decoration-only entries.
+
+    Writes via a sibling temp file and `os.replace()` so a crash or error never
+    leaves a half-written SRT at `path`. When `exact_measured_timeline` is set,
+    enforces at least a 1 ms step so sub-millisecond cues never serialize as
+    zero-duration `T --> T` ranges.
+    """
+    copied_blocks = [dict(block) for block in blocks]
+    path_obj = Path(path)
+    path_obj.parent.mkdir(parents=True, exist_ok=True)
+    kept: list[dict] = []
+    dropped = 0
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8-sig",
+            dir=str(path_obj.parent),
+            prefix=f".{path_obj.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = Path(f.name)
+            for block in copied_blocks:
+                start = _safe_float(
+                    block.get("display_start", block.get("start")), 0.0
+                )
+                measured_exact = bool(block.get("exact_measured_timeline"))
+                min_step = 0.001 if measured_exact else 0.05
+                minimum_end = max(0.0, start) + min_step
+                end = max(
+                    minimum_end,
+                    _safe_float(block.get("display_end", block.get("end")), start),
+                )
+                block["start"] = start
+                block["end"] = end
+                block["display_start"] = start
+                block["display_end"] = end
+                block["display_duration"] = max(0.0, end - start)
+
+                content = render_content(block)
+                if not content.strip() or is_decoration_only(content):
+                    # Nothing displayable: the translation was empty, the style
+                    # rules (no periods or commas, no trailing 、) legitimately
+                    # cleared it, or what survived is punctuation and music
+                    # marks - the `...♪` the ASR writes over an opening with no
+                    # dialogue. A placeholder line here read as a translation
+                    # failure to the viewer; the cue is dropped instead, and the
+                    # returned list is what the quality report and the sidecar
+                    # see, so all three agree.
+                    #
+                    # Text alone decides. An earlier version also required the
+                    # frame head to report zero continuous speech, to spare a
+                    # 0.62s `...、...、...` sitting at 48% speech between two
+                    # lines of dialogue; listening to that cue settled it - it
+                    # is the tail of the previous line bleeding into the gap,
+                    # not speech of its own, and it has nothing to read either
+                    # way.
+                    dropped += 1
+                    continue
+                kept.append(block)
+                start_str = format_timestamp(start)
+                end_str = format_timestamp(end)
+                f.write(f"{len(kept)}\n{start_str} --> {end_str}\n{content}\n\n")
+        os.replace(tmp_path, path_obj)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    if dropped:
+        logger.warning(
+            "Dropped %s of %s cues with no displayable text",
+            dropped,
+            len(copied_blocks),
+        )
+    return kept
+
+
 def write_srt(
     blocks: list[dict],
     path: str,
@@ -1087,59 +1184,17 @@ def write_srt(
     keeping the 、 and 。 that the Japanese guide replaces with spaces.
     """
     options = _coerce_options(options)
-    blocks = [dict(block) for block in blocks]
-    path_obj = Path(path)
-    path_obj.parent.mkdir(parents=True, exist_ok=True)
-    kept: list[dict] = []
-    dropped = 0
-    with path_obj.open("w", encoding="utf-8-sig") as f:
-        for block in blocks:
-            start = _safe_float(block.get("display_start", block.get("start")), 0.0)
-            measured_exact = bool(block.get("exact_measured_timeline"))
-            minimum_end = start if measured_exact else start + 0.05
-            end = max(
-                minimum_end,
-                _safe_float(block.get("display_end", block.get("end")), start),
-            )
-            block["start"] = start
-            block["end"] = end
-            block["display_start"] = start
-            block["display_end"] = end
-            block["display_duration"] = max(0.0, end - start)
-
-            zh_text = str(block.get("zh_text", "")).strip()
-            wrapped = (
-                _render_ja_subtitle_text(zh_text, options=options)
-                if language == "ja"
-                else _render_zh_subtitle_text(zh_text, options=options)
-            )
-            if not wrapped or is_decoration_only(wrapped):
-                # Nothing displayable: the translation was empty, the style
-                # rules (no periods or commas, no trailing 、) legitimately
-                # cleared it, or what survived is punctuation and music marks -
-                # the `...♪` the ASR writes over an opening with no dialogue.
-                # A placeholder line here read as a translation failure to the
-                # viewer; the cue is dropped instead, and the returned list is
-                # what the quality report and the sidecar see, so all three
-                # agree.
-                #
-                # Text alone decides. An earlier version also required the frame
-                # head to report zero continuous speech, to spare a 0.62s
-                # `...、...、...` sitting at 48% speech between two lines of
-                # dialogue; listening to that cue settled it - it is the tail of
-                # the previous line bleeding into the gap, not speech of its
-                # own, and it has nothing to read either way.
-                dropped += 1
-                continue
-            kept.append(block)
-            start_str = format_timestamp(start)
-            end_str   = format_timestamp(end)
-            f.write(f"{len(kept)}\n{start_str} --> {end_str}\n{wrapped}\n\n")
-    if dropped:
-        logger.warning(
-            "Dropped %s of %s cues with no displayable text", dropped, len(blocks)
-        )
-    return kept
+    renderer = (
+        _render_ja_subtitle_text if language == "ja" else _render_zh_subtitle_text
+    )
+    return _write_srt_blocks(
+        blocks,
+        path,
+        render_content=lambda block: renderer(
+            str(block.get("zh_text", "")).strip(),
+            options=options,
+        ),
+    )
 
 
 def write_bilingual_srt(
@@ -1150,49 +1205,25 @@ def write_bilingual_srt(
 ):
     """blocks: [{start, end, ja_text, zh_text}] — Japanese line above Chinese."""
     options = _coerce_options(options)
-    blocks = [dict(block) for block in blocks]
-    path_obj = Path(path)
-    path_obj.parent.mkdir(parents=True, exist_ok=True)
-    kept: list[dict] = []
-    dropped = 0
-    with path_obj.open("w", encoding="utf-8-sig") as f:
-        for block in blocks:
-            start = _safe_float(block.get("display_start", block.get("start")), 0.0)
-            measured_exact = bool(block.get("exact_measured_timeline"))
-            minimum_end = start if measured_exact else start + 0.05
-            end = max(
-                minimum_end,
-                _safe_float(block.get("display_end", block.get("end")), start),
-            )
-            block["start"] = start
-            block["end"] = end
-            block["display_start"] = start
-            block["display_end"] = end
-            block["display_duration"] = max(0.0, end - start)
 
-            ja_line = _render_ja_subtitle_text(
-                str(block.get("ja_text", "")).strip(),
-                options=options,
-            )
-            zh_line = _render_zh_subtitle_text(
-                str(block.get("zh_text", "")).strip(),
-                options=options,
-            )
-            # No placeholder line: in this mode the Japanese is still worth
-            # showing on its own, and a cue is only dropped when neither side
-            # has anything to display.
-            content = "\n".join(
-                line for line in (ja_line + "\n" + zh_line).split("\n") if line.strip()
-            )
-            if not content.strip() or is_decoration_only(content):
-                dropped += 1
-                continue
-            kept.append(block)
-            start_str = format_timestamp(start)
-            end_str   = format_timestamp(end)
-            f.write(f"{len(kept)}\n{start_str} --> {end_str}\n{content}\n\n")
-    if dropped:
-        logger.warning(
-            "Dropped %s of %s cues with no displayable text", dropped, len(blocks)
+    def _render_bilingual(block: dict) -> str:
+        ja_line = _render_ja_subtitle_text(
+            str(block.get("ja_text", "")).strip(),
+            options=options,
         )
-    return kept
+        zh_line = _render_zh_subtitle_text(
+            str(block.get("zh_text", "")).strip(),
+            options=options,
+        )
+        # No placeholder line: in this mode the Japanese is still worth showing
+        # on its own, and a cue is only dropped when neither side has anything
+        # to display.
+        return "\n".join(
+            line for line in (ja_line + "\n" + zh_line).split("\n") if line.strip()
+        )
+
+    return _write_srt_blocks(
+        blocks,
+        path,
+        render_content=_render_bilingual,
+    )

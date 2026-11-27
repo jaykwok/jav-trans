@@ -490,12 +490,12 @@ def _perform_close(normalized: str, operation: _CloseOperation) -> None:
         confirmed = _close_instance(instance)
     finally:
         with _REGISTRY_LOCK:
+            if not confirmed and _BACKEND_INSTANCES.get(normalized) is None:
+                # Restore before clearing _CLOSING so lockless status readers
+                # (`_visible_instance`) never observe a None gap while cleanup is stuck.
+                _BACKEND_INSTANCES[normalized] = instance
             if _CLOSING.get(normalized) is instance:
                 _CLOSING.pop(normalized, None)
-            if not confirmed and _BACKEND_INSTANCES.get(normalized) is None:
-                # It still owns a process, refuses to start a replacement, and
-                # is the only thing that can retry the cleanup.
-                _BACKEND_INSTANCES[normalized] = instance
             operation.confirmed = confirmed
             if _CLOSE_OPERATIONS.get(normalized) is operation:
                 _CLOSE_OPERATIONS.pop(normalized, None)
@@ -551,8 +551,18 @@ def _visible_instance(normalized: str):
     status read has to see it - reporting "nothing here" for the seconds a close
     takes is the same all-clear-while-resident that these statuses exist to
     prevent.
+
+    Transitions publish the destination dict before removing from the source
+    dict in both directions (`_begin_close_locked` writes `_CLOSING` before
+    popping `_BACKEND_INSTANCES`; `_perform_close` restores `_BACKEND_INSTANCES`
+    before popping `_CLOSING`), so checking `instances -> closing -> instances`
+    is lockless and cannot observe a transient None gap in either direction.
     """
-    return _BACKEND_INSTANCES.get(normalized) or _CLOSING.get(normalized)
+    return (
+        _BACKEND_INSTANCES.get(normalized)
+        or _CLOSING.get(normalized)
+        or _BACKEND_INSTANCES.get(normalized)
+    )
 
 
 def local_backend_drain_status() -> dict:

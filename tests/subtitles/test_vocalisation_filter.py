@@ -5,10 +5,16 @@ import pytest
 from subtitles.options import SubtitleOptions
 from subtitles.vocalisation import (
     CueAcoustics,
+    CueSplit,
+    _apply_split,
+    _safe_seconds,
+    block_acoustics,
     classify_cue,
     drop_vocalisation_runs,
+    is_decoration_only,
     is_non_semantic_vocalisation,
     mixed_cue_split_point,
+    vocalisation_run_boundaries,
 )
 
 
@@ -700,3 +706,147 @@ class TestOptions:
     def test_it_can_be_switched_off(self, monkeypatch):
         monkeypatch.setenv("SUBTITLE_DROP_VOCALISATION_ONLY_CUES", "0")
         assert SubtitleOptions.from_env().drop_vocalisation_only_cues is False
+
+
+class TestKatakanaLexicalAndContractRegressions:
+    MOAN = CueAcoustics(
+        silence=0.05, vocalisation=0.92, speech=0.03, speech_max_run_s=0.0
+    )
+
+    @pytest.mark.parametrize(
+        "text",
+        ["ハハハ", "ハハハッ", "フフッ", "フフフ", "ハイ", "ハイッ", "イイ", "ウン", "アハハ", "ヘヘヘ", "ホホホ"],
+    )
+    def test_katakana_laughter_and_replies_are_protected(self, text):
+        assert not is_non_semantic_vocalisation(text)
+        verdict = classify_cue(text, self.MOAN)
+        assert not verdict.drop
+        assert verdict.reason == "protected"
+
+    @pytest.mark.parametrize(
+        "text",
+        ["チュッ", "ペロペロ", "ジュル", "チュパァ…", "ンングッ"],
+    )
+    def test_katakana_vocalisations_are_flagged(self, text):
+        assert is_non_semantic_vocalisation(text)
+
+    @pytest.mark.parametrize("text", ["ＯＫ", "ＮＧ", "Ｈ", "ａｂｃ", "１２３", "㐀", "福"])
+    def test_fullwidth_latin_digits_and_cjk_extensions_are_lexical(self, text):
+        assert not is_non_semantic_vocalisation(text)
+        verdict = classify_cue(text, self.MOAN)
+        assert not verdict.drop
+        assert verdict.reason == "lexical_text_vocal_audio"
+
+    def test_curly_quotes_and_brackets_are_decoration(self):
+        assert is_decoration_only("“”‘’【】《》〈〉…♪")
+        assert is_non_semantic_vocalisation("【あっ】")
+        assert not is_non_semantic_vocalisation("“はい”")
+
+    def test_overlapping_morpheme_regex_does_not_backtrack_exponentially(self):
+        assert is_non_semantic_vocalisation("んぐちゅぱ")
+        assert not is_non_semantic_vocalisation("んぐちゅ" * 60 + "か")
+
+    @pytest.mark.parametrize("min_run", [0, -1])
+    def test_min_run_below_one_skips_text_run_filtering(self, min_run):
+        blocks = [{"text": "そうなんだ"}, {"text": "あっ"}, {"text": "んっ"}, {"text": "はぁ"}]
+        kept, diagnostics = drop_vocalisation_runs(blocks, min_run=min_run)
+
+        assert [b["text"] for b in kept] == ["そうなんだ", "あっ", "んっ", "はぁ"]
+        assert diagnostics["vocalisation_cues_dropped"] == 0
+        assert diagnostics["vocalisation_runs_dropped"] == 0
+        assert diagnostics["vocalisation_cues_flagged"] == 3
+        assert diagnostics["vocalisation_min_run"] == min_run
+        assert vocalisation_run_boundaries("あっ、んっ、はぁ", min_run) == set()
+
+    def test_safe_seconds_and_block_acoustics_reject_non_finite_values(self):
+        assert _safe_seconds(float("inf"), 1.5) == 1.5
+        assert _safe_seconds(float("-inf"), float("nan")) == 0.0
+        assert block_acoustics(
+            {"acoustic_classes": {"silence": float("inf"), "vocalisation": 0.5, "speech": 0.1}}
+        ) is None
+
+    def test_apply_split_syncs_source_char_count_clears_stale_acoustics_and_clips_words(self):
+        text = "あっ、こんにちは、あんっ"
+        original_words = [
+            {"word": "あっ、こん", "start": 0.0, "end": 2.0},
+            {"word": "にちは、あんっ", "start": 2.0, "end": 6.0},
+        ]
+        block = {
+            "text": text,
+            "ja_text": text,
+            "start": 0.0,
+            "end": 6.0,
+            "acoustic_start": 0.0,
+            "acoustic_end": 6.0,
+            "display_start": 0.0,
+            "display_end": 6.5,
+            "source_char_count": len(text),
+            "acoustic_classes": {
+                "silence": 0.05,
+                "vocalisation": 0.78,
+                "speech": 0.17,
+                "speech_max_run_s": 1.0,
+            },
+            "words": [dict(w) for w in original_words],
+        }
+        split = CueSplit(
+            text="こんにちは",
+            removed_prefix="あっ、",
+            removed_suffix="、あんっ",
+            removed_seconds=3.0,
+            start_s=0.8,
+            end_s=3.2,
+            prefix_span=(0.0, 0.8),
+            suffix_span=(3.2, 6.0),
+        )
+
+        updated = _apply_split(block, split)
+
+        assert updated["text"] == "こんにちは"
+        assert updated["source_char_count"] == 5
+        assert "acoustic_classes" not in updated
+        assert "".join(w["word"] for w in updated["words"]) == "こんにちは"
+        assert updated["words"][0]["start"] == pytest.approx(0.8)
+        assert updated["words"][-1]["end"] == pytest.approx(3.2)
+        # Caller's original words were not mutated.
+        assert block["words"] == original_words
+
+    def test_mixed_cue_split_clears_false_source_char_violation_through_prepare(self):
+        from subtitles import writer
+
+        # Use ellipsis + commas without a 0.6s pause so the sentence planner
+        # keeps the cue intact and `split_mixed_cue` + `_apply_split` perform
+        # the trim inside `prepare_srt_blocks`.
+        speech = "お兄さまの…"
+        moan = "あっ、あんっ、あっ、あんっ、あっ、あんっ"
+        text = speech + moan
+        assert len(speech) <= 10 < len(text)
+        per_char = 6.0 / len(text)
+        words = [
+            {
+                "word": ch,
+                "start": index * per_char,
+                "end": (index + 1) * per_char,
+                "timestamp_kind": "ctc_forced_alignment",
+            }
+            for index, ch in enumerate(text)
+        ]
+        speech_end = len(speech) * per_char
+        block = {"ja_text": text, "start": 0.0, "end": 6.0, "words": words}
+
+        cues = writer.prepare_srt_blocks(
+            [block],
+            options=SubtitleOptions(
+                max_source_chars=12,
+                timing_polish_enabled=False,
+                vocalisation_min_run=99,
+            ),
+            acoustic_classes=_reader(speech_end),
+        )
+
+        assert len(cues) == 1
+        assert "vocalisation_split" in cues[0]
+        assert cues[0]["ja_text"] == speech
+        assert cues[0]["source_char_count"] == len(speech)
+        assert cues[0]["source_char_violation"] is False
+        assert "acoustic_classes" not in cues[0]

@@ -24,6 +24,13 @@ _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 # string value and trigger llama-server peg-native 500 parse failures.
 _NO_KANA_JSON_STRING_PATTERN = f'^[^{_KANA_CLASS}"\\\\\\u0000-\\u001F]+$'
 
+_WRAP_QUOTE_PAIRS: tuple[tuple[str, str], ...] = (
+    ('"', '"'),
+    ("'", "'"),
+    ("“", "”"),
+    ("‘", "’"),
+)
+
 TRANSLATION_OUTPUT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -106,11 +113,35 @@ def _parse_partial_translation_output_by_global_id(
 
 
 def _coerce_int(value) -> int | None:
+    if isinstance(value, bool):
+        return None
     if isinstance(value, int):
         return value
     if isinstance(value, str) and value.isdigit():
         return int(value)
     return None
+
+
+def _strip_paired_outer_quotes(text: str) -> str:
+    cleaned = text
+    while len(cleaned) >= 2:
+        stripped = False
+        for left, right in _WRAP_QUOTE_PAIRS:
+            if cleaned.startswith(left) and cleaned.endswith(right):
+                inner = cleaned[len(left) : len(cleaned) - len(right)].strip()
+                if left != right:
+                    if right in inner and (
+                        left not in inner or inner.index(right) < inner.index(left)
+                    ):
+                        break
+                elif left in inner:
+                    break
+                cleaned = inner
+                stripped = True
+                break
+        if not stripped:
+            break
+    return cleaned
 
 
 def _normalize_translation_text(text) -> str | None:
@@ -124,7 +155,7 @@ def _normalize_translation_text(text) -> str | None:
     cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = re.sub(r"^Translation>\s*", "", cleaned, flags=re.I)
     cleaned = re.sub(r"^Original>\s*", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"^['\"“”‘’]+|['\"“”‘’]+$", "", cleaned)
+    cleaned = _strip_paired_outer_quotes(cleaned)
     cleaned = "\n".join(line.strip() for line in cleaned.split("\n") if line.strip())
     cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
     cleaned = _LEADING_ROLE_LABEL_RE.sub("", cleaned, count=1)
@@ -163,11 +194,18 @@ def _reasoning_token_allowance(reasoning_effort: str | None = None) -> int:
     `high`'s 2,058/18,393/20,231, i.e. sometimes more. The base is sized over
     the worst of both.
     """
+    from llm import request_config
     from llm import settings as llm_settings
 
-    effort = llm_settings._normalize_reasoning_effort(
-        "none" if reasoning_effort == "" else (llm_settings.LLM_REASONING_EFFORT if reasoning_effort is None else reasoning_effort)
-    )
+    if reasoning_effort == "":
+        raw_effort = "none"
+    elif reasoning_effort is None:
+        raw_effort = request_config.getenv(
+            "LLM_REASONING_EFFORT", llm_settings.LLM_REASONING_EFFORT
+        )
+    else:
+        raw_effort = reasoning_effort
+    effort = llm_settings._normalize_reasoning_effort(raw_effort)
     if effort == "none":
         return 0
     return max(0, int(llm_settings.TRANSLATION_REASONING_TOKEN_ALLOWANCE))
@@ -247,22 +285,34 @@ class JsonProfile(TranslationProfile):
             _MIN_TEXT_MAX_LENGTH,
             int(longest * llm_settings.TRANSLATION_OUTPUT_CHAR_RATIO),
         )
-        schema = json.loads(json.dumps(TRANSLATION_OUTPUT_SCHEMA))
-        schema["properties"]["translations"]["items"]["properties"]["text"][
-            "maxLength"
-        ] = limit
+        id_prop: dict = {"type": "integer"}
+        text_prop: dict = {"type": "string", "maxLength": limit}
+        if forbid_kana:
+            text_prop["pattern"] = _NO_KANA_JSON_STRING_PATTERN
+        translations_prop: dict = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "id": id_prop,
+                    "text": text_prop,
+                },
+                "required": ["id", "text"],
+            },
+        }
         if ids:
-            translations_prop = schema["properties"]["translations"]
             translations_prop["minItems"] = len(ids)
             translations_prop["maxItems"] = len(ids)
-            translations_prop["items"]["properties"]["id"]["enum"] = [
-                int(idx) for idx in ids
-            ]
-        if forbid_kana:
-            schema["properties"]["translations"]["items"]["properties"]["text"][
-                "pattern"
-            ] = _NO_KANA_JSON_STRING_PATTERN
-        return schema
+            id_prop["enum"] = [int(idx) for idx in ids]
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "translations": translations_prop,
+            },
+            "required": ["translations"],
+        }
 
     def serialize_source(
         self,
@@ -284,6 +334,12 @@ class JsonProfile(TranslationProfile):
         ids: list[int],
         ctx: ProfileContext,
     ) -> list[dict]:
+        needs_source_payload = ctx.full_source_payload is None and not (
+            ctx.source_context is not None and ids and not ctx.warmup
+        )
+        source_payload_override = (
+            self.serialize_source(segments, ids=ids) if needs_source_payload else ""
+        )
         return prompt_module._build_batch_messages(
             segments,
             ctx.global_context,
@@ -293,7 +349,7 @@ class JsonProfile(TranslationProfile):
             extra_glossary=ctx.extra_glossary,
             target_lang=ctx.target_lang,
             glossary=ctx.glossary,
-            source_payload_override=self.serialize_source(segments, ids=ids),
+            source_payload_override=source_payload_override,
             full_source_payload=ctx.full_source_payload,
             requested_ids=list(ids),
             source_context=ctx.source_context,

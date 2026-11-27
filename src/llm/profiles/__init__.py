@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 
+from llm import request_config
 from llm.profiles.base import ProfileContext, TranslationProfile
 from llm.profiles.json_v3 import JsonProfile
 
@@ -75,9 +76,9 @@ def _detection_haystack(backend: str, *, model_name: str | None = None) -> str:
     if backend == "llamacpp":
         return " ".join(
             (
-                _env("LLAMACPP_GGUF_PATH"),
-                _env("LLAMACPP_MODEL_FILE"),
-                _env("LLAMACPP_MODEL_REPO"),
+                str(request_config.getenv("LLAMACPP_GGUF_PATH", "") or "").strip(),
+                str(request_config.getenv("LLAMACPP_MODEL_FILE", "") or "").strip(),
+                str(request_config.getenv("LLAMACPP_MODEL_REPO", "") or "").strip(),
             )
         ).lower()
     if backend == "openai":

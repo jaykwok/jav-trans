@@ -58,7 +58,7 @@ def test_parse_mmss_timestamp_crosses_minute_boundary(
 def test_parse_mmss_timestamp_rejects_ambiguous_or_malformed_values(
     value: object,
 ) -> None:
-    with pytest.raises(ValueError, match="MM:SS.mmm"):
+    with pytest.raises(ValueError, match=r"MM:SS\.mmm"):
         parse_mmss_timestamp(value)
 
 

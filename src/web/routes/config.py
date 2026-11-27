@@ -38,6 +38,7 @@ from web.models import (
 )
 
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 SUBTITLE_MODES = list(get_args(JobSpec.model_fields["subtitle_mode"].annotation))
@@ -46,6 +47,8 @@ DEFAULT_JOB_DEFAULTS = {
     for name, field in JobSpec.model_fields.items()
     if not field.is_required()
 }
+
+
 def _config_file_path() -> Path:
     return PROJECT_ROOT / "config" / "config.json"
 
@@ -54,28 +57,62 @@ def _setting(key: str) -> str:
     return os.getenv(key, DEFAULT_SETTINGS.get(key, ""))
 
 
-def _read_config_entry(key: str) -> tuple[bool, str]:
+def _read_config_entry_default(key: str) -> tuple[bool, str]:
     values = read_config_file(_config_file_path())
     if key in values:
         return True, values[key] or ""
     return False, ""
 
 
-def _read_config_value(key: str) -> str:
-    found, value = _read_config_entry(key)
+_read_config_entry = _read_config_entry_default
+
+
+def _load_config_cache_if_unpatched() -> dict[str, str] | None:
+    if _read_config_entry is _read_config_entry_default:
+        return read_config_file(_config_file_path())
+    return None
+
+
+def _lookup_config_entry(
+    key: str,
+    *,
+    config_values: dict[str, str] | None = None,
+) -> tuple[bool, str]:
+    if config_values is not None and _read_config_entry is _read_config_entry_default:
+        if key in config_values:
+            return True, config_values[key] or ""
+        return False, ""
+    return _read_config_entry(key)
+
+
+def _read_config_value(
+    key: str,
+    *,
+    config_values: dict[str, str] | None = None,
+) -> str:
+    found, value = _lookup_config_entry(key, config_values=config_values)
     return value if found else ""
 
 
-def _runtime_or_config_value(key: str) -> str:
+def _runtime_or_config_value(
+    key: str,
+    *,
+    config_values: dict[str, str] | None = None,
+) -> str:
     if key in os.environ:
         return os.environ.get(key, "").strip()
-    return _read_config_value(key)
+    return _read_config_value(key, config_values=config_values)
 
 
-def _runtime_or_config_or_setting(key: str, fallback: str = "") -> str:
+def _runtime_or_config_or_setting(
+    key: str,
+    fallback: str = "",
+    *,
+    config_values: dict[str, str] | None = None,
+) -> str:
     if key in os.environ:
         return os.environ.get(key, "").strip()
-    found, value = _read_config_entry(key)
+    found, value = _lookup_config_entry(key, config_values=config_values)
     if found:
         return value
     return _setting(key) or fallback
@@ -236,12 +273,17 @@ def _clear_cuda_environment_cache() -> None:
         _CUDA_ENV_CACHE = None
 
 
-def _proxy_settings_from_runtime() -> tuple[str, str, int | None]:
-    protocol = _runtime_or_config_or_setting("PROXY_PROTOCOL", "http").lower()
+def _proxy_settings_from_runtime(
+    *,
+    config_values: dict[str, str] | None = None,
+) -> tuple[str, str, int | None]:
+    protocol = _runtime_or_config_or_setting(
+        "PROXY_PROTOCOL", "http", config_values=config_values
+    ).lower()
     if protocol not in {"http", "https", "socks5"}:
         protocol = "http"
-    host = _runtime_or_config_or_setting("PROXY_HOST", "")
-    port_text = _runtime_or_config_or_setting("PROXY_PORT", "")
+    host = _runtime_or_config_or_setting("PROXY_HOST", "", config_values=config_values)
+    port_text = _runtime_or_config_or_setting("PROXY_PORT", "", config_values=config_values)
     try:
         port = int(port_text) if str(port_text).strip() else None
     except (TypeError, ValueError):
@@ -251,7 +293,11 @@ def _proxy_settings_from_runtime() -> tuple[str, str, int | None]:
     return protocol, host, port
 
 
-def _proxy_settings_changes(update: SettingsUpdate) -> dict[str, str] | None:
+def _proxy_settings_changes(
+    update: SettingsUpdate,
+    *,
+    config_values: dict[str, str] | None = None,
+) -> dict[str, str] | None:
     proxy_fields_present = any(
         value is not None
         for value in (update.proxy_protocol, update.proxy_host, update.proxy_port)
@@ -259,7 +305,9 @@ def _proxy_settings_changes(update: SettingsUpdate) -> dict[str, str] | None:
     if not proxy_fields_present:
         return None
 
-    current_protocol, current_host, current_port = _proxy_settings_from_runtime()
+    current_protocol, current_host, current_port = _proxy_settings_from_runtime(
+        config_values=config_values
+    )
     protocol = (update.proxy_protocol or current_protocol or "http").strip().lower()
     if protocol not in {"http", "https", "socks5"}:
         raise HTTPException(status_code=422, detail="proxy_protocol must be http, https, or socks5")
@@ -283,8 +331,16 @@ def _proxy_settings_changes(update: SettingsUpdate) -> dict[str, str] | None:
     }
 
 
-def _clear_saved_hf_mirror_if_present(changes: dict[str, str]) -> None:
-    endpoint = _runtime_or_config_or_setting("HF_ENDPOINT", "").strip().rstrip("/")
+def _clear_saved_hf_mirror_if_present(
+    changes: dict[str, str],
+    *,
+    config_values: dict[str, str] | None = None,
+) -> None:
+    endpoint = (
+        _runtime_or_config_or_setting("HF_ENDPOINT", "", config_values=config_values)
+        .strip()
+        .rstrip("/")
+    )
     if endpoint == "https://hf-mirror.com":
         changes["HF_ENDPOINT"] = ""
 
@@ -325,22 +381,14 @@ def _model_id_from_item(item: dict) -> str | None:
 
 
 def _extract_model_ids(payload: Any) -> list[str]:
-    """Model ids from either OpenAI's `data[]` or a `models[]` variant.
-
-    bigmodel.cn's `/api/v1/models` (the Codex-CLI-compatible gateway) answers
-    200 with `{"models": [{"slug": "glm-5.3", ...}]}` instead of OpenAI's
-    `{"data": [{"id": ...}]}` - same list-of-models intent, different key
-    names, confirmed against the vendor with a live key on 2026-09-01.
-    """
+    """Model ids from either OpenAI's `data[]` or a `models[]` variant."""
     if not isinstance(payload, dict):
         return []
     for key in ("data", "models"):
         items = payload.get(key)
         if not isinstance(items, list):
             continue
-        ids = [
-            _model_id_from_item(item) for item in items if isinstance(item, dict)
-        ]
+        ids = [_model_id_from_item(item) for item in items if isinstance(item, dict)]
         ids = [model_id for model_id in ids if model_id]
         if ids:
             return sorted(ids)
@@ -351,19 +399,6 @@ _CUDA_PROBE_LOCK = threading.Lock()
 
 
 async def _cuda_environment_status_off_the_loop() -> dict[str, Any]:
-    """The probe, run where a 20-second child process cannot stop the server.
-
-    `_cuda_environment_status` spawns a torch-importing child and waits up to
-    20s for it. Called straight from an async route, that wait happens *on the
-    event loop*: every other request - the progress stream, 取消 - waits behind
-    it, because a coroutine only yields where it awaits. The result is cached,
-    so this was a first-load-only stall, which is exactly when the page is
-    trying to render.
-
-    The lock makes it single-flight: `lru_cache` does not deduplicate concurrent
-    callers, and two page loads racing would otherwise spawn two probes. The
-    second waits in a worker thread and gets the cached answer.
-    """
     return await asyncio.get_running_loop().run_in_executor(
         None, _cuda_environment_status_blocking
     )
@@ -374,74 +409,41 @@ def _cuda_environment_status_blocking() -> dict[str, Any]:
         return _cuda_environment_status()
 
 
-@router.get("/config")
-async def get_config() -> dict[str, Any]:
+def _load_required_models_blocking() -> list[dict[str, Any]]:
     load_config()
-    return {
-        "subtitle_modes": SUBTITLE_MODES,
-        "defaults": {
-            "subtitle_mode": DEFAULT_JOB_DEFAULTS["subtitle_mode"],
-            "skip_translation": DEFAULT_JOB_DEFAULTS["skip_translation"],
-            "translation_max_workers": DEFAULT_JOB_DEFAULTS["translation_max_workers"],
-        },
-    }
-
-
-@router.get("/model-requirements")
-async def get_model_requirements(
-    include_cuda: bool = Query(default=True),
-) -> dict[str, Any]:
-    """Model readiness, plus the CUDA probe unless the caller opts out.
-
-    The readiness notice re-checks itself on a timer while a model is still
-    missing (a first run downloads it while the notice is on screen). Those polls
-    pass include_cuda=0: the probe spawns a torch-importing child, which is not
-    something to repeat every few seconds next to a running job.
-    """
-    load_config()
-    # One ASR model serves transcription, the encoder features, and the
-    # alignment head; the optional aligner checkpoint rides on
-    # ASR_ALIGNMENT_HEAD_PATH and never blocks a run, so readiness is one model
-    # row plus the CUDA probe.
-    requirements = [
+    cfg = _load_config_cache_if_unpatched()
+    return [
         _model_requirement(
             repo_id=active_qwen_asr_model_id(),
-            explicit_path=_runtime_or_config_or_setting("ASR_MODEL_PATH"),
+            explicit_path=_runtime_or_config_or_setting("ASR_MODEL_PATH", config_values=cfg),
         ),
     ]
-    missing = [item for item in requirements if not item["present"]]
-    cuda_status = (
-        await _cuda_environment_status_off_the_loop() if include_cuda else None
-    )
-    gpu_ready = bool(cuda_status.get("ok")) if cuda_status else None
-    return {
-        "required_models": requirements,
-        "cuda": cuda_status,
-        "missing_count": len(missing),
-        "needs_download": any(item["download_enabled"] for item in missing),
-        "download_disabled": any(not item["download_enabled"] for item in missing),
-        "all_present": not missing,
-        "gpu_ready": gpu_ready,
-        "pipeline_ready": (not missing and gpu_ready) if cuda_status else None,
-    }
 
 
-@router.get("/settings", response_model=SettingsRead)
-async def get_settings() -> SettingsRead:
-    api_key = _runtime_or_config_value("API_KEY")
-    base_url = _runtime_or_config_or_setting("OPENAI_COMPATIBILITY_BASE_URL")
-    model = _runtime_or_config_or_setting("LLM_MODEL_NAME")
-    proxy_protocol, proxy_host, proxy_port = _proxy_settings_from_runtime()
-    translation_glossary = _runtime_or_config_or_setting("TRANSLATION_GLOSSARY")
+def _read_settings_snapshot_blocking() -> SettingsRead:
+    cfg = _load_config_cache_if_unpatched()
+    api_key = _runtime_or_config_value("API_KEY", config_values=cfg)
+    base_url = _runtime_or_config_or_setting("OPENAI_COMPATIBILITY_BASE_URL", config_values=cfg)
+    model = _runtime_or_config_or_setting("LLM_MODEL_NAME", config_values=cfg)
+    proxy_protocol, proxy_host, proxy_port = _proxy_settings_from_runtime(config_values=cfg)
+    translation_glossary = _runtime_or_config_or_setting("TRANSLATION_GLOSSARY", config_values=cfg)
     llm_reasoning_effort = _normalize_llm_reasoning_effort(
-        _runtime_or_config_or_setting("LLM_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
+        _runtime_or_config_or_setting(
+            "LLM_REASONING_EFFORT", DEFAULT_REASONING_EFFORT, config_values=cfg
+        )
     )
-    target_lang = _runtime_or_config_or_setting("TARGET_LANG", "简体中文")
-    translation_backend = _runtime_or_config_or_setting("TRANSLATION_BACKEND", "llamacpp")
+    target_lang = _runtime_or_config_or_setting("TARGET_LANG", "简体中文", config_values=cfg)
+    translation_backend = _runtime_or_config_or_setting(
+        "TRANSLATION_BACKEND", "llamacpp", config_values=cfg
+    )
     if translation_backend not in {"openai", "llamacpp"}:
         translation_backend = "llamacpp"
     disable_update_check = (
-        _runtime_or_config_or_setting("JAV_SUB_DISABLE_UPDATE_CHECK", "0").strip().lower()
+        _runtime_or_config_or_setting(
+            "JAV_SUB_DISABLE_UPDATE_CHECK", "0", config_values=cfg
+        )
+        .strip()
+        .lower()
         in {"1", "true", "yes", "on"}
     )
 
@@ -461,8 +463,10 @@ async def get_settings() -> SettingsRead:
     )
 
 
-@router.post("/settings")
-async def post_settings(update: SettingsUpdate) -> dict:
+def _prepare_settings_changes_blocking(
+    update: SettingsUpdate,
+) -> tuple[dict[str, str], dict[str, str] | None, bool]:
+    cfg = _load_config_cache_if_unpatched()
     changes: dict[str, str] = {}
     reset_llamacpp_translation_backend = False
     if update.api_key is not None:
@@ -471,7 +475,7 @@ async def post_settings(update: SettingsUpdate) -> dict:
         changes["OPENAI_COMPATIBILITY_BASE_URL"] = update.base_url
     if update.model is not None:
         changes["LLM_MODEL_NAME"] = update.model
-    proxy_changes = _proxy_settings_changes(update)
+    proxy_changes = _proxy_settings_changes(update, config_values=cfg)
     if proxy_changes is not None:
         changes.update(proxy_changes)
     if update.translation_glossary is not None:
@@ -491,7 +495,9 @@ async def post_settings(update: SettingsUpdate) -> dict:
                 status_code=422,
                 detail="translation_backend must be one of: openai, llamacpp",
             )
-        previous_backend = _runtime_or_config_or_setting("TRANSLATION_BACKEND", "llamacpp")
+        previous_backend = _runtime_or_config_or_setting(
+            "TRANSLATION_BACKEND", "llamacpp", config_values=cfg
+        )
         changes["TRANSLATION_BACKEND"] = update.translation_backend
         reset_llamacpp_translation_backend = (
             previous_backend != update.translation_backend
@@ -500,11 +506,63 @@ async def post_settings(update: SettingsUpdate) -> dict:
     if update.disable_update_check is not None:
         changes["JAV_SUB_DISABLE_UPDATE_CHECK"] = "1" if update.disable_update_check else "0"
     if changes:
-        _clear_saved_hf_mirror_if_present(changes)
+        _clear_saved_hf_mirror_if_present(changes, config_values=cfg)
+    return changes, proxy_changes, reset_llamacpp_translation_backend
+
+
+@router.get("/config")
+async def get_config() -> dict[str, Any]:
+    await asyncio.to_thread(load_config)
+    return {
+        "subtitle_modes": SUBTITLE_MODES,
+        "defaults": {
+            "subtitle_mode": DEFAULT_JOB_DEFAULTS["subtitle_mode"],
+            "skip_translation": DEFAULT_JOB_DEFAULTS["skip_translation"],
+            "translation_max_workers": DEFAULT_JOB_DEFAULTS["translation_max_workers"],
+        },
+    }
+
+
+@router.get("/model-requirements")
+async def get_model_requirements(
+    include_cuda: bool = Query(default=True),
+) -> dict[str, Any]:
+    requirements = await asyncio.to_thread(_load_required_models_blocking)
+    missing = [item for item in requirements if not item["present"]]
+    cuda_status = (
+        await _cuda_environment_status_off_the_loop() if include_cuda else None
+    )
+    gpu_ready = bool(cuda_status.get("ok")) if cuda_status else None
+    return {
+        "required_models": requirements,
+        "cuda": cuda_status,
+        "missing_count": len(missing),
+        "needs_download": any(item["download_enabled"] for item in missing),
+        "download_disabled": any(not item["download_enabled"] for item in missing),
+        "all_present": not missing,
+        "gpu_ready": gpu_ready,
+        "pipeline_ready": (not missing and gpu_ready) if cuda_status else None,
+    }
+
+
+@router.get("/settings", response_model=SettingsRead)
+async def get_settings() -> SettingsRead:
+    return await asyncio.to_thread(_read_settings_snapshot_blocking)
+
+
+@router.post("/settings")
+async def post_settings(update: SettingsUpdate) -> dict:
+    changes, proxy_changes, reset_llamacpp_translation_backend = await asyncio.to_thread(
+        _prepare_settings_changes_blocking, update
+    )
+    if changes:
         try:
-            _update_config_file(changes)
+            await asyncio.to_thread(_update_config_file, changes)
         except OSError as exc:
-            raise HTTPException(status_code=503, detail="保存设置失败，请检查程序目录的写入权限和磁盘空间。") from exc
+            raise HTTPException(
+                status_code=503,
+                detail="保存设置失败，请检查程序目录的写入权限和磁盘空间。",
+            ) from exc
         # Publish only after persistence succeeds. A failed save must leave the
         # running app using the same settings the next launch will read.
         os.environ.update(changes)
@@ -530,14 +588,6 @@ async def post_settings(update: SettingsUpdate) -> dict:
 
 @router.post("/proxy-test")
 async def test_proxy_connection() -> dict:
-    """Verify the configured network proxy can actually reach HuggingFace.
-
-    Use the configured proxy explicitly so NO_PROXY cannot turn this check
-    into a direct request. Any HTTP response (even 4xx) means the transport
-    works -- only a connection-level failure (timeout / refused / bad auth) means the proxy is
-    broken. Used by the Web「测试连接」button so a wrong port fails loud instead
-    of silently hanging model downloads.
-    """
     from core.config import network_proxy_url_from_env
 
     proxy_url = network_proxy_url_from_env()
@@ -558,9 +608,7 @@ async def test_proxy_connection() -> dict:
         }
     except (httpx.HTTPError, ValueError) as exc:
         safe_detail = redact_url_credentials(format_exception_chain(exc))
-        logging.getLogger(__name__).warning(
-            "Proxy test failed for %s: %s", safe_proxy_url, safe_detail
-        )
+        log.warning("Proxy test failed for %s: %s", safe_proxy_url, safe_detail)
         return {
             "ok": False,
             "proxy_url": safe_proxy_url,
@@ -575,10 +623,17 @@ async def test_proxy_connection() -> dict:
     }
 
 
+def _read_model_api_credentials_blocking() -> tuple[str, str]:
+    cfg = _load_config_cache_if_unpatched()
+    return (
+        _runtime_or_config_value("API_KEY", config_values=cfg),
+        _runtime_or_config_value("OPENAI_COMPATIBILITY_BASE_URL", config_values=cfg),
+    )
+
+
 @router.get("/models")
 async def get_models() -> dict[str, list[str]]:
-    api_key = _runtime_or_config_value("API_KEY")
-    base_url = _runtime_or_config_value("OPENAI_COMPATIBILITY_BASE_URL")
+    api_key, base_url = await asyncio.to_thread(_read_model_api_credentials_blocking)
     if not api_key or not base_url:
         missing = "API Key" if not api_key else "API Base URL"
         raise HTTPException(
@@ -590,19 +645,26 @@ async def get_models() -> dict[str, list[str]]:
     try:
         async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
             for url in _model_endpoint_candidates(base_url):
+                safe_url = redact_url_credentials(url)
                 try:
                     response = await client.get(
                         url,
                         headers={"Authorization": f"Bearer {api_key}"},
                     )
-                except httpx.HTTPError as exc:
-                    errors.append(f"{url}: {format_exception_chain(exc)}")
+                except (
+                    httpx.HTTPError,
+                    httpx.InvalidURL,
+                    ValueError,
+                    UnicodeEncodeError,
+                ) as exc:
+                    safe_err = redact_url_credentials(format_exception_chain(exc))
+                    errors.append(f"{safe_url}: {safe_err}")
                     continue
 
                 content_type = response.headers.get("content-type", "")
                 if response.status_code >= 400:
                     errors.append(
-                        f"{url}: HTTP {response.status_code}"
+                        f"{safe_url}: HTTP {response.status_code}"
                         + (f" ({content_type})" if content_type else "")
                     )
                     continue
@@ -611,7 +673,7 @@ async def get_models() -> dict[str, list[str]]:
                     payload = response.json()
                 except json.JSONDecodeError:
                     errors.append(
-                        f"{url}: HTTP {response.status_code} returned non-JSON"
+                        f"{safe_url}: HTTP {response.status_code} returned non-JSON"
                         + (f" ({content_type})" if content_type else "")
                     )
                     continue
@@ -619,13 +681,16 @@ async def get_models() -> dict[str, list[str]]:
                 models = _extract_model_ids(payload)
                 if models:
                     return {"models": models}
-                errors.append(f"{url}: JSON response did not contain data[].id")
+                errors.append(f"{safe_url}: JSON response did not contain data[].id")
     except ImportError as exc:
-        logging.getLogger(__name__).warning("HTTP client missing dependency in /api/models: %s", exc)
+        log.warning("HTTP client missing dependency in /api/models: %s", exc)
         raise HTTPException(
             status_code=500,
             detail="代理依赖不完整，请更新运行环境（SOCKS5 需要 httpx[socks] / socksio）",
         ) from exc
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, UnicodeEncodeError) as exc:
+        safe_err = redact_url_credentials(format_exception_chain(exc))
+        errors.append(safe_err)
 
     detail = (
         "获取模型列表失败：请确认「API Base URL」填的是服务商的接口地址"
@@ -633,5 +698,5 @@ async def get_models() -> dict[str, list[str]]:
         "https://api.deepseek.com），以及该 Key 是否可用。"
     )
     if errors:
-        detail += "\n尝试过的地址：" + "; ".join(errors)
+        detail += "\n尝试过的地址：" + "; ".join(redact_url_credentials(err) for err in errors)
     raise HTTPException(status_code=502, detail=detail)

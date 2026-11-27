@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ ASR_WORKER_DIAGNOSTIC_PREFIX = "ASR worker 诊断"
 _STAGE_LOG_RE = re.compile(
     r"^stage_(?P<phase>start|done|skip|blocked|degraded)\s+(?P<stage>[A-Za-z0-9_]+)(?:\s+(?P<extra>.*))?$"
 )
+_KEY_START_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=")
 _ASR_STAGE_MAP = {
     "切分": "audio_chunking",
     "音频切块": "audio_chunk_export",
@@ -64,13 +66,24 @@ def _event_ts() -> str:
 
 def _coerce_event_value(value: str) -> object:
     stripped = value.strip().rstrip(",")
-    if stripped.lower() == "true":
+    lowered = stripped.lower()
+    if lowered == "true":
         return True
-    if stripped.lower() == "false":
+    if lowered == "false":
         return False
+    if len(stripped) > 1 and stripped.endswith("s"):
+        numeric = stripped[:-1]
+        try:
+            parsed = float(numeric)
+            if math.isfinite(parsed):
+                return parsed
+        except ValueError:
+            return stripped
+        return stripped
     try:
         if any(marker in stripped for marker in (".", "e", "E")):
-            return float(stripped.rstrip("s"))
+            parsed = float(stripped)
+            return parsed if math.isfinite(parsed) else stripped
         return int(stripped)
     except ValueError:
         return stripped
@@ -80,13 +93,56 @@ def _parse_stage_extra(raw_extra: str | None) -> dict:
     extra: dict[str, object] = {}
     if not raw_extra:
         return extra
-    for token in raw_extra.split():
-        if "=" not in token:
+    text = raw_extra.strip()
+    if not text:
+        return extra
+
+    # Locate top-level `key=` boundaries outside quotes and balanced parens so
+    # values like `error=RuntimeError('disk full on C:')` stay intact even when
+    # they contain spaces or inner `k=v` pairs.
+    boundaries: list[tuple[int, int, str]] = []
+    in_quote: str | None = None
+    escaped = False
+    paren_depth = 0
+    length = len(text)
+    index = 0
+    while index < length:
+        ch = text[index]
+        if escaped:
+            escaped = False
+            index += 1
             continue
-        key, value = token.split("=", 1)
-        if not key:
+        if in_quote is not None:
+            if ch == "\\":
+                escaped = True
+            elif ch == in_quote:
+                in_quote = None
+            index += 1
             continue
-        extra[key] = _coerce_event_value(value)
+        if ch in ("'", '"'):
+            in_quote = ch
+            index += 1
+            continue
+        if ch == "(":
+            paren_depth += 1
+            index += 1
+            continue
+        if ch == ")" and paren_depth > 0:
+            paren_depth -= 1
+            index += 1
+            continue
+        if paren_depth == 0 and (index == 0 or text[index - 1].isspace()):
+            match = _KEY_START_RE.match(text, index)
+            if match is not None:
+                boundaries.append((match.start(), match.end(), match.group(1)))
+                index = match.end()
+                continue
+        index += 1
+
+    for pos, (_start, val_start, key) in enumerate(boundaries):
+        val_end = boundaries[pos + 1][0] if pos + 1 < len(boundaries) else length
+        raw_value = text[val_start:val_end].strip()
+        extra[key] = _coerce_event_value(raw_value)
     return extra
 
 
@@ -120,13 +176,10 @@ def _emit_stage_log_event(video_path: str | None, message: str) -> None:
     match = _STAGE_LOG_RE.match(message)
     if not match:
         return
-    phase = match.group("phase")
-    if phase == "blocked":
-        phase = "blocked"
     _emit_stage_event(
         video_path,
         match.group("stage"),
-        phase,
+        match.group("phase"),
         _parse_stage_extra(match.group("extra")),
     )
 

@@ -166,3 +166,40 @@ def test_count_banned_punctuation_flags_line_final_enumeration_comma():
     assert count_banned_punctuation("苹果、\n香蕉、") == 2
     # Mid-sentence and mid-line is where the guide permits it.
     assert count_banned_punctuation("苹果、香蕉和橘子") == 0
+
+
+def test_normalize_keeps_multi_group_thousands_commas_and_replaces_other_commas():
+    assert normalize_zh_subtitle_text("一共1,000,000元, 谢谢") == "一共1,000,000元 谢谢"
+    assert normalize_zh_subtitle_text(",1,abc,") == "1 abc"
+
+
+def test_wrap_deducts_stripped_boundary_space_to_avoid_phantom_overflow():
+    # 16 units + space (0.35) + 14.55 units: counting the stripped space on the
+    # top line used to trigger a +35 phantom overflow and cut `了吧` in half.
+    text = "你去买苹果香蕉橘子葡萄和草莓了吧 我留在这里等他们全部都回来了a"
+    assert wrap_zh_subtitle_text(text) == (
+        "你去买苹果香蕉橘子葡萄和草莓了吧\n我留在这里等他们全部都回来了a"
+    )
+
+    exact_pair = "一二三四五六七八九十一二三四五六 一二三四五六七八九十一二三四五六"
+    lines = wrap_zh_subtitle_text(exact_pair).split("\n")
+    assert lines == ["一二三四五六七八九十一二三四五六", "一二三四五六七八九十一二三四五六"]
+    assert max(zh_display_units(line) for line in lines) == 16.0
+
+
+def test_wrap_does_not_strand_opening_brackets_or_quotes_at_line_end():
+    top, bottom = wrap_zh_subtitle_text("今天我们一起去（电影院）看片吧", line_max_units=8).split("\n")
+    assert not top.endswith("（")
+    assert bottom.startswith("（") or "（电影院）" in top
+
+    top2, bottom2 = wrap_zh_subtitle_text("今天他对我说“你好世界朋友”", line_max_units=8).split("\n")
+    assert not top2.endswith("“")
+    assert bottom2.startswith("“")
+
+
+def test_wrap_does_not_open_line_with_closing_brackets_or_emdash():
+    _top, bottom = wrap_zh_subtitle_text("甲乙丙丁（戊己）庚辛壬癸子", line_max_units=7).split("\n")
+    assert not bottom.startswith("）")
+
+    _top2, bottom2 = wrap_zh_subtitle_text("甲乙丙丁戊己—庚辛壬癸子", line_max_units=7).split("\n")
+    assert not bottom2.startswith("—")

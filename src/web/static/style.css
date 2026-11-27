@@ -12,6 +12,8 @@
   --surface:       rgba(22, 25, 42, 0.62);
   --surface-2:     rgba(28, 32, 52, 0.72);
   --surface-3:     rgba(38, 43, 66, 0.84);
+  --card-bg:       rgba(20, 23, 38, 0.86);
+  --card-bg-hover: rgba(26, 30, 48, 0.92);
   --popover-bg:    rgba(22, 26, 44, 0.94);
   --inset:         rgba(8, 10, 18, 0.58);
 
@@ -92,11 +94,11 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* ── 背景:极光光场（transform 驱动,GPU 合成,不触发重排） ── */
+/* ── 背景:静态极光光场（避免 60fps 全屏合成占用 GPU） ── */
 body::before {
   content: '';
   position: fixed;
-  inset: -30%;
+  inset: -12%;
   z-index: -2;
   pointer-events: none;
   background:
@@ -105,12 +107,6 @@ body::before {
     radial-gradient(40% 44% at 78% 88%, rgba(217, 70, 239, 0.16), transparent 62%),
     radial-gradient(34% 40% at 14% 86%, rgba(99, 102, 241, 0.18), transparent 64%),
     linear-gradient(165deg, var(--bg) 0%, var(--bg-deep) 100%);
-  animation: aurora-drift 60s ease-in-out infinite alternate;
-}
-@keyframes aurora-drift {
-  0%   { transform: translate3d(-2%, -1.5%, 0) scale(1); }
-  50%  { transform: translate3d(1.5%, 1%, 0) scale(1.04); }
-  100% { transform: translate3d(2.5%, -1%, 0) scale(1.02); }
 }
 /* 暗角 + 细颗粒,压住光场、增加质感 */
 body::after {
@@ -137,21 +133,15 @@ header {
   border-bottom: 1px solid var(--border);
   z-index: 10;
 }
-/* 头部底缘的一道渐变流光 */
+/* 头部底缘的一道静态渐变高光线 */
 header::after {
   content: '';
   position: absolute;
   left: 0; right: 0; top: 53px; height: 1px;
   background: linear-gradient(90deg,
     transparent 0%, var(--accent-glow) 22%, var(--accent2-glow) 55%, transparent 90%);
-  background-size: 220% 100%;
   opacity: .6;
-  animation: header-flow 9s linear infinite;
   pointer-events: none;
-}
-@keyframes header-flow {
-  from { background-position: 0% 0; }
-  to   { background-position: 220% 0; }
 }
 header .app-mark {
   width: 28px; height: 28px;
@@ -582,12 +572,10 @@ main {
   50%      { transform: translateY(-9px); }
 }
 
-/* ── 任务卡:玻璃 + 状态感知 ── */
+/* ── 任务卡:高不透明度深色卡片（避免重复元素 backdrop-filter 带来 GPU 负担） ── */
 .job-card {
   position: relative;
-  background: var(--surface);
-  backdrop-filter: blur(var(--blur-sm)) saturate(140%);
-  -webkit-backdrop-filter: blur(var(--blur-sm)) saturate(140%);
+  background: var(--card-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 14px 16px 13px 18px;
@@ -610,7 +598,7 @@ main {
 }
 .job-card:hover {
   border-color: var(--border-strong);
-  background: var(--surface-2);
+  background: var(--card-bg-hover);
   box-shadow: var(--shadow), 0 0 0 1px var(--accent-soft);
   transform: translateY(-1px);
 }
@@ -686,7 +674,7 @@ main {
   color: #fff;
 }
 
-/* ── 进度条:流动渐变 + 扫光 ── */
+/* ── 进度条:渐变 + GPU transform 扫光 ── */
 .progress-bar {
   position: relative;
   height: 6px;
@@ -699,19 +687,12 @@ main {
   position: relative;
   height: 100%;
   border-radius: var(--radius-pill);
-  background: linear-gradient(90deg, var(--accent2-deep), var(--accent-2), var(--accent), var(--accent2-deep));
-  background-size: 300% 100%;
+  background: linear-gradient(90deg, var(--accent2-deep), var(--accent-2), var(--accent));
   box-shadow: 0 0 14px var(--accent-glow);
   transition: width .5s var(--ease-out);
-  animation: progress-flow 3.2s linear infinite;
   overflow: hidden;
 }
-/* 渐变整体向左流动:进行中的"活着"感 */
-@keyframes progress-flow {
-  from { background-position: 0% 0; }
-  to   { background-position: -300% 0; }
-}
-/* 高光扫过:周期性一道白色斜光滑过整个填充区 */
+/* 高光扫过:周期性一道白色斜光滑过整个填充区（纯 transform 合成） */
 .progress-fill::after {
   content: '';
   position: absolute; inset: 0;
@@ -748,10 +729,6 @@ main {
 
 .btn-remove   { background: var(--error-soft);   color: var(--error);   border-color: rgba(251, 113, 133, 0.24); }
 .btn-remove:hover:not(:disabled) { background: rgba(251, 113, 133, 0.24); }
-.btn-open-artifact { background: var(--success-soft); color: var(--success); border-color: rgba(52, 211, 153, 0.24); }
-.btn-open-artifact:hover:not(:disabled) { background: rgba(52, 211, 153, 0.24); box-shadow: 0 0 12px rgba(52, 211, 153, 0.2); }
-.btn-dl       { background: var(--success-soft); color: var(--success); border-color: rgba(52, 211, 153, 0.24); }
-.btn-dl:hover:not(:disabled) { background: rgba(52, 211, 153, 0.24); }
 .btn-del      { background: var(--error-soft);   color: var(--error);   border-color: rgba(251, 113, 133, 0.24); }
 .btn-play     { background: var(--accent2-soft); color: var(--accent2); border-color: rgba(103, 232, 249, 0.24); }
 .btn-play:hover:not(:disabled) { box-shadow: 0 0 12px rgba(103, 232, 249, 0.2); }
@@ -817,12 +794,10 @@ main {
 }
 .dl-bar-fill {
   position: relative; height: 100%;
-  background: linear-gradient(90deg, var(--accent2-deep), var(--accent2), var(--accent), var(--accent2-deep));
-  background-size: 300% 100%;
+  background: linear-gradient(90deg, var(--accent2-deep), var(--accent2), var(--accent));
   border-radius: var(--radius-pill);
   transition: width .5s var(--ease-out);
   box-shadow: 0 0 12px var(--accent2-glow);
-  animation: progress-flow 3.2s linear infinite;
   overflow: hidden;
 }
 .dl-bar-fill::after {
@@ -891,10 +866,12 @@ main {
 .input-group { position: relative; display: flex; align-items: center; }
 .input-group input { padding-right: 36px; }
 .btn-icon {
-  position: absolute; right: 10px;
   background: none; border: none; cursor: pointer;
-  color: var(--muted); font-size: 14px; padding: 0; line-height: 1;
+  color: var(--muted); font-size: 14px; padding: 2px 4px; line-height: 1;
   transition: color .15s, transform .15s var(--ease-spring);
+}
+.input-group .btn-icon {
+  position: absolute; right: 10px; padding: 0;
 }
 .btn-icon:hover { color: var(--text); transform: scale(1.12); }
 
@@ -963,31 +940,6 @@ main {
   transition: background .12s, color .12s;
 }
 .paste-menu button:hover { background: rgba(139, 92, 246, 0.24); color: #fff; }
-
-/* ── 预设 chips ── */
-.preset-chips { display: flex; flex-wrap: wrap; gap: 8px; }
-.preset-chip {
-  padding: 5px 15px; border-radius: var(--radius-pill);
-  border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--text-2); font-size: 12px; font-weight: 600;
-  cursor: pointer; white-space: nowrap;
-  transition: border-color .15s, color .15s, background .15s,
-              transform .15s var(--ease-spring), box-shadow .2s;
-}
-.preset-chip:hover { border-color: var(--accent); color: var(--accent-text); transform: translateY(-1px); }
-.preset-chip:active { transform: scale(.95); }
-.preset-chip.active {
-  border-color: var(--accent);
-  background: var(--accent-soft); color: var(--accent-text);
-  box-shadow: 0 0 0 3px var(--accent-soft), 0 0 16px rgba(139, 92, 246, 0.18);
-}
-.preset-chip-custom { border-style: dashed; }
-.preset-chip-custom.active {
-  border-color: var(--warn);
-  background: var(--warn-soft); color: var(--warn);
-  box-shadow: 0 0 0 3px var(--warn-soft);
-}
 
 /* ── 跳过翻译时禁用面板 ── */
 .panel-collapsible.disabled > summary { opacity: 0.62; }
@@ -1083,23 +1035,40 @@ main {
 .update-modal-footer .spacer { flex: 1; }
 
 /* ── Toast ── */
-.toast {
-  position: fixed; top: 66px; left: 50%; transform: translateX(-50%);
+.toast-container {
+  position: fixed;
+  top: 66px;
+  left: 50%;
+  transform: translateX(-50%);
   z-index: 9000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  max-width: min(92vw, 520px);
+  pointer-events: none;
+}
+.toast {
   background: var(--popover-bg);
   backdrop-filter: blur(var(--blur)) saturate(150%);
   -webkit-backdrop-filter: blur(var(--blur)) saturate(150%);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
-  padding: 10px 22px;
-  font-size: 13px; color: var(--text);
+  padding: 10px 20px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
   box-shadow: var(--shadow-lg), 0 0 0 1px var(--accent-soft);
   animation: toast-in .3s var(--ease-spring);
-  white-space: nowrap;
+  max-width: 100%;
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-align: center;
+  pointer-events: auto;
 }
 @keyframes toast-in {
-  from { opacity: 0; transform: translateX(-50%) translateY(-12px) scale(.96); }
-  to   { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+  from { opacity: 0; transform: translateY(-12px) scale(.96); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
 }
 
 /* ── 滚动条 ── */

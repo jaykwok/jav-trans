@@ -16,8 +16,6 @@ config produces garbage output rather than an error.
 
 from __future__ import annotations
 
-import os
-
 from core.stage_errors import MISSING_API_KEY, MISSING_BASE_URL, MISSING_MODEL
 from llm import request_config
 from llm import settings as llm_settings
@@ -47,7 +45,7 @@ def _missing(name: str) -> bool:
 
 def _retired_gguf_model() -> bool:
     haystack = " ".join(
-        os.getenv(name, "")
+        request_config.getenv(name, "")
         for name in ("LLAMACPP_GGUF_PATH", "LLAMACPP_MODEL_FILE", "LLAMACPP_MODEL_REPO")
     ).lower()
     return any(token in haystack for token in RETIRED_GGUF_TOKENS)
@@ -107,7 +105,13 @@ def translation_budget_warnings() -> list[str]:
 
     backend_name = llm_settings.selected_backend_name()
     batch_size = max(1, int(llm_settings.batch_size_for_backend(backend_name)))
-    effort = "" if backend_name == "llamacpp" else llm_settings.LLM_REASONING_EFFORT
+    effort = (
+        ""
+        if backend_name == "llamacpp"
+        else request_config.getenv(
+            "LLM_REASONING_EFFORT", llm_settings.LLM_REASONING_EFFORT
+        )
+    )
     floor = profiles_module.select_profile().response_token_budget(
         [{"text": ""} for _ in range(batch_size)],
         reasoning_effort=effort,
@@ -119,14 +123,14 @@ def translation_budget_warnings() -> list[str]:
     # and then mark the endpoint as already-warned, so the run-time clamp - the
     # one that sees the real source text - would never say anything.
     effective = token_budget.plain_budget(
-        floor, backend_name=llm_settings.selected_backend_name()
+        floor, backend_name=backend_name
     )
     if effective >= floor:
         return []
     return [
         f"翻译预算下限 {floor} tokens 超过本端点实际可用的 {effective}，"
         "每个批次都会被压到这个上限，且回复被切断后无法再向上重试。"
-        f"（batch={batch_size}，推理档={llm_settings.LLM_REASONING_EFFORT}，"
+        f"（batch={batch_size}，推理档={effort or 'none'}，"
         f"推理配额={llm_settings.TRANSLATION_REASONING_TOKEN_ALLOWANCE}，"
         f"TRANSLATION_MAX_TOKENS={int(token_budget.CONFIGURED_MAX_TOKENS)}）"
         "调高 TRANSLATION_MAX_TOKENS，或调小批次/推理配额。"

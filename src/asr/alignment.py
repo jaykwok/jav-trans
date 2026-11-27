@@ -450,6 +450,7 @@ def forced_align(
     would move that threshold silently: the same audio and the same text would
     score differently because a timing knob was turned.
     """
+    import numpy as np
     import torch
 
     if log_probs.dim() != 2:
@@ -467,11 +468,6 @@ def forced_align(
         # the knob able to manufacture the defect it exists to correct.
         raise ValueError("blank_bias must be >= 0")
 
-    searched = log_probs
-    if blank_bias > 0.0:
-        searched = log_probs.clone()
-        searched[:, BLANK_INDEX] -= float(blank_bias)
-
     # The CTC lattice: blanks interleaved around every label, so that repeated
     # characters are forced apart by a blank and cannot collapse into one.
     extended = [BLANK_INDEX]
@@ -488,57 +484,115 @@ def forced_align(
             "raise the upsample factor or shorten the segment"
         )
 
-    device = log_probs.device
-    state_tokens = torch.tensor(extended, dtype=torch.long, device=device)
+    # Pre-extract only the target-lattice columns once (T, states) instead of
+    # indexing per frame or copying the full (T, V) matrix to host.
+    state_tokens = torch.tensor(extended, dtype=torch.long, device=log_probs.device)
+    orig_emissions = np.ascontiguousarray(
+        log_probs.index_select(1, state_tokens).detach().float().cpu().numpy(),
+        dtype=np.float32,
+    )
+    if blank_bias > 0.0:
+        emissions = orig_emissions.copy()
+        # Even lattice states (0, 2, 4, ...) are always BLANK_INDEX.
+        emissions[:, 0::2] -= np.float32(blank_bias)
+    else:
+        emissions = orig_emissions
+
     # A skip from s-2 to s is legal only when it hops a blank between two
     # DIFFERENT labels; between identical labels the blank is mandatory.
-    can_skip = torch.zeros(states, dtype=torch.bool, device=device)
+    can_skip = np.zeros(states, dtype=np.bool_)
     for s in range(2, states):
         if extended[s] != BLANK_INDEX and extended[s] != extended[s - 2]:
             can_skip[s] = True
+    skip_indices = np.flatnonzero(can_skip)
+    skip_src = skip_indices - 2
 
-    neg_inf = -1e30
-    scores = torch.full((states,), neg_inf, dtype=torch.float32, device=device)
-    scores[0] = searched[0, BLANK_INDEX]
+    neg_inf = np.float32(float("-inf"))
+    scores = np.full(states, neg_inf, dtype=np.float32)
+    scores[0] = emissions[0, 0]
     if states > 1:
-        scores[1] = searched[0, extended[1]]
-    backpointers = torch.zeros((frames, states), dtype=torch.uint8, device=device)
+        scores[1] = emissions[0, 1]
+
+    # Preallocated CPU float32 working buffers: zero per-frame tensor allocations.
+    backpointers = np.zeros((frames, states), dtype=np.uint8)
+    best = np.empty(states, dtype=np.float32)
+    mask_adv = np.empty(max(0, states - 1), dtype=np.bool_)
+    has_skips = skip_indices.size > 0
+    if has_skips:
+        skip_vals = np.empty(skip_indices.size, dtype=np.float32)
+        skip_best = np.empty(skip_indices.size, dtype=np.float32)
+        mask_skip = np.empty(skip_indices.size, dtype=np.bool_)
 
     for t in range(1, frames):
-        stay = scores
-        advance = torch.cat((torch.full((1,), neg_inf, device=device), scores[:-1]))
-        skip = torch.cat((torch.full((2,), neg_inf, device=device), scores[:-2]))
-        skip = torch.where(can_skip, skip, torch.full_like(skip, neg_inf))
-        stacked = torch.stack((stay, advance, skip), dim=0)
-        best, choice = stacked.max(dim=0)
-        scores = best + searched[t].index_select(0, state_tokens)
-        backpointers[t] = choice.to(torch.uint8)
+        bp_t = backpointers[t]
+        np.copyto(best, scores)
+        if states > 1:
+            adv = scores[:-1]
+            np.greater(adv, best[1:], out=mask_adv)
+            np.copyto(best[1:], adv, where=mask_adv)
+            np.copyto(bp_t[1:], 1, where=mask_adv)
+        if has_skips:
+            np.take(scores, skip_src, out=skip_vals)
+            np.take(best, skip_indices, out=skip_best)
+            np.greater(skip_vals, skip_best, out=mask_skip)
+            if mask_skip.any():
+                chosen_skip = skip_indices[mask_skip]
+                best[chosen_skip] = skip_vals[mask_skip]
+                bp_t[chosen_skip] = 2
+        np.add(best, emissions[t], out=scores)
 
     # A valid path ends on the last label or on the blank after it.
     tail = states - 1
-    state = tail if scores[tail] >= scores[tail - 1] else tail - 1
-    # Copy the compact uint8 lattice once. Reading a CUDA scalar for every
-    # frame synchronizes the device on every step of this serial traceback.
-    trace = backpointers.cpu().numpy()
+    score_tail = float(scores[tail])
+    score_prev = float(scores[tail - 1])
+    if math.isfinite(score_tail) and (
+        not math.isfinite(score_prev) or score_tail >= score_prev
+    ):
+        state = tail
+        best_final = score_tail
+    elif math.isfinite(score_prev):
+        state = tail - 1
+        best_final = score_prev
+    else:
+        raise ValueError("no finite alignment path")
+    if not math.isfinite(best_final):
+        raise ValueError("no finite alignment path")
+
     path = [0] * frames
     for t in range(frames - 1, -1, -1):
+        if state < 0 or state >= states:
+            raise RuntimeError(
+                f"alignment backtrace out of bounds: state={state} at frame={t}"
+            )
         path[t] = state
-        state -= int(trace[t, state])
+        state -= int(backpointers[t, state])
 
-    frame_scores = log_probs.detach().float().cpu()
+    # Single O(T) linear scan to extract all character spans and unbiased scores.
+    num_labels = len(targets)
+    first_frame = [-1] * num_labels
+    last_frame = [-1] * num_labels
+    score_sum = [0.0] * num_labels
+    frame_count = [0] * num_labels
+    for t in range(frames):
+        s = path[t]
+        if s & 1:
+            label_index = s >> 1
+            if first_frame[label_index] < 0:
+                first_frame[label_index] = t
+            last_frame[label_index] = t
+            score_sum[label_index] += float(orig_emissions[t, s])
+            frame_count[label_index] += 1
+
     spans: list[CharSpan] = []
-    for label_index in range(len(targets)):
-        state_index = 2 * label_index + 1
-        occupied = [t for t in range(frames) if path[t] == state_index]
-        if not occupied:
+    for label_index in range(num_labels):
+        count = frame_count[label_index]
+        if count == 0:
             # Unreachable for a valid Viterbi path, but a corrupt path would
             # otherwise produce a silently wrong timestamp rather than an error.
             raise RuntimeError(f"alignment path skipped character {label_index}")
-        start_frame, end_frame = occupied[0], occupied[-1] + 1
-        token = targets[label_index]
-        score = float(
-            sum(float(frame_scores[t, token]) for t in occupied) / len(occupied)
-        )
+        start_frame = first_frame[label_index]
+        end_frame = last_frame[label_index] + 1
+        score = score_sum[label_index] / count
         spans.append(
             CharSpan(
                 char=chars[label_index] if label_index < len(chars) else "",
@@ -641,6 +695,66 @@ def _spans_for_full_text(
     return spans
 
 
+def _mask_runs(
+    mask,
+    *,
+    upsample: int,
+    min_seconds: float,
+) -> list[tuple[float, float]]:
+    import numpy as np
+
+    if upsample < 1:
+        raise ValueError("upsample must be >= 1")
+    bool_mask = np.asarray(mask, dtype=np.bool_)
+    if bool_mask.size == 0 or not bool_mask.any():
+        return []
+    padded = np.empty(bool_mask.size + 2, dtype=np.int8)
+    padded[0] = 0
+    padded[-1] = 0
+    padded[1:-1] = bool_mask
+    edges = np.flatnonzero(np.diff(padded))
+    frame_s = ENCODER_FRAME_S / float(upsample)
+    runs: list[tuple[float, float]] = []
+    for start_idx, end_idx in zip(edges[0::2].tolist(), edges[1::2].tolist()):
+        begin = float(start_idx) * frame_s
+        end = float(end_idx) * frame_s
+        if end - begin >= min_seconds:
+            runs.append((begin, end))
+    return runs
+
+
+def _predicted_token_ids(log_probs):
+    import numpy as np
+
+    if isinstance(log_probs, np.ndarray):
+        if log_probs.ndim == 1:
+            return log_probs
+        if log_probs.ndim == 2:
+            return log_probs.argmax(axis=-1)
+        raise ValueError(
+            f"expected 1D argmax or 2D log-probs, got shape {log_probs.shape}"
+        )
+    ndim = getattr(log_probs, "ndim", None)
+    if ndim == 1 and hasattr(log_probs, "detach"):
+        tensor = log_probs.detach().cpu()
+        return tensor.numpy() if hasattr(tensor, "numpy") else np.asarray(tensor.tolist())
+    if hasattr(log_probs, "argmax"):
+        reduced = log_probs.argmax(dim=-1)
+        if hasattr(reduced, "detach"):
+            reduced = reduced.detach()
+        if hasattr(reduced, "cpu"):
+            reduced = reduced.cpu()
+        if hasattr(reduced, "numpy"):
+            return reduced.numpy()
+        return np.asarray(reduced.tolist())
+    array = np.asarray(log_probs)
+    if array.ndim == 1:
+        return array
+    if array.ndim == 2:
+        return array.argmax(axis=-1)
+    raise ValueError(f"expected 1D argmax or 2D log-probs, got shape {array.shape}")
+
+
 def blank_runs(
     log_probs,
     *,
@@ -650,37 +764,23 @@ def blank_runs(
 ):
     """Stretches the head covers entirely with blank, as (start_s, end_s).
 
-    This is the gate reading of the same tensor the alignment uses: a run of
-    blank is a run with no character evidence in it. It is deliberately computed
-    from the argmax rather than a tuned threshold, so the pre-gate has no free
-    parameter beyond the minimum run length.
-
-    `silent_classes` widens what counts as "no sound" beyond blank itself. A
-    punctuated vocabulary can spend a frame on `。` or `、` in the middle of a
-    silence, and one such frame ends the run - `cut_at_pauses` then sees two
-    short pauses where there was one long one, and below its floor it sees no
-    cut at all. Measured on four real films, that hides 27-303 silences per film
-    from the chunker (`tools/align/measure_pause_structure.py`). Punctuation has
-    no sound to be evidence of, so counting it as silence is a correction to the
-    reading, not a tuning knob: the alternative is a head that must never emit
-    punctuation, which costs the whole punctuated vocabulary.
+    Accepts either 2D ``(T, V)`` log-probabilities or 1D ``(T,)`` integer
+    argmax predictions.
     """
-    silent = {BLANK_INDEX} | set(silent_classes or ())
-    predicted = log_probs.argmax(dim=-1).detach().cpu().tolist()
-    runs: list[tuple[float, float]] = []
-    start: int | None = None
-    for frame, token in enumerate(list(predicted) + [-1]):
-        if token in silent:
-            if start is None:
-                start = frame
-            continue
-        if start is not None:
-            begin = frame_to_seconds(start, upsample=upsample)
-            end = frame_to_seconds(frame, upsample=upsample)
-            if end - begin >= min_seconds:
-                runs.append((begin, end))
-            start = None
-    return runs
+    import numpy as np
+
+    predicted = _predicted_token_ids(log_probs)
+    if predicted.size == 0:
+        return []
+    if not silent_classes:
+        mask = predicted == BLANK_INDEX
+    else:
+        silent_arr = np.fromiter(
+            {BLANK_INDEX, *(int(c) for c in silent_classes)},
+            dtype=np.int64,
+        )
+        mask = np.isin(predicted, silent_arr)
+    return _mask_runs(mask, upsample=upsample, min_seconds=min_seconds)
 
 
 def non_speech_runs(
@@ -696,42 +796,20 @@ def non_speech_runs(
     same question the chunker was always asking - "is anyone talking here" - but
     off the class that answers it, rather than off the absence of a character.
 
-    The difference bites exactly where the old reading was wrong. Under stripped
-    targets a moan is blank, so `blank_runs` offers the middle of a moaning
-    passage as a pause and the chunker cuts there; that is harmless for
-    boundaries but it also means blank stopped meaning silence. Here a moan is
-    `vocalisation`, which is not speech either, so a cut is still allowed - but
-    the two are now distinguishable, and callers that want real silence can ask
-    `span_class_shares` instead of inferring it.
-
     A threshold rather than an argmax, because the three classes are not equally
     costly to confuse: the chunker must not cut inside speech, so the test is on
     the speech posterior alone and its default sits at the coin flip.
     """
     import numpy as np
 
-    posteriors = np.asarray(frame_posteriors, dtype=np.float64)
+    posteriors = np.asarray(frame_posteriors)
     if posteriors.ndim != 2 or posteriors.shape[1] != len(FRAME_CLASSES):
         raise ValueError(
             f"frame posteriors must be (T, {len(FRAME_CLASSES)}), "
             f"got {posteriors.shape}"
         )
-    speech = posteriors[:, FRAME_CLASS_SPEECH]
-    runs: list[tuple[float, float]] = []
-    start: int | None = None
-    for frame in range(len(speech) + 1):
-        quiet = frame < len(speech) and speech[frame] < speech_threshold
-        if quiet:
-            if start is None:
-                start = frame
-            continue
-        if start is not None:
-            begin = frame_to_seconds(start, upsample=upsample)
-            end = frame_to_seconds(frame, upsample=upsample)
-            if end - begin >= min_seconds:
-                runs.append((begin, end))
-            start = None
-    return runs
+    mask = posteriors[:, FRAME_CLASS_SPEECH] < speech_threshold
+    return _mask_runs(mask, upsample=upsample, min_seconds=min_seconds)
 
 
 def span_class_shares(
@@ -744,20 +822,13 @@ def span_class_shares(
 ) -> dict:
     """Mean class posterior over one cue's span, plus its longest speech run.
 
-    The shares alone are a span average, and a span average is what made the old
-    blank-share reading unusable on mixed cues: one second of speech followed by
-    five of moaning reads as 0.83 non-speech, indistinguishable from six seconds
-    of pure moaning. `speech_max_run_s` is what separates them, and it is the
-    quantity the split rule needs - "is there a contiguous piece of speech in
-    here", not "how much speech on average".
-
-    An empty or inverted span returns zero shares rather than raising: a cue can
-    legitimately have no acoustic extent, and the caller's answer there is to
-    fall back to text, not to fail.
+    Zero-copy views the full posterior array, slices out only the cue's small
+    window, and accumulates column means in float64 without copying the entire
+    timeline.
     """
     import numpy as np
 
-    posteriors = np.asarray(frame_posteriors, dtype=np.float64)
+    posteriors = np.asarray(frame_posteriors)
     if posteriors.ndim != 2 or posteriors.shape[1] != len(FRAME_CLASSES):
         raise ValueError(
             f"frame posteriors must be (T, {len(FRAME_CLASSES)}), "
@@ -765,20 +836,26 @@ def span_class_shares(
         )
     frame_s = ENCODER_FRAME_S / max(1, int(upsample))
     first = max(0, int(math.floor(float(start_s) / frame_s)))
-    last = min(len(posteriors), int(math.ceil(float(end_s) / frame_s)))
+    last = min(int(posteriors.shape[0]), int(math.ceil(float(end_s) / frame_s)))
     empty = {name: 0.0 for name in FRAME_CLASSES}
     empty["speech_max_run_s"] = 0.0
     empty["frames"] = 0
     if last <= first:
         return empty
     window = posteriors[first:last]
-    speech = window[:, FRAME_CLASS_SPEECH]
-    longest = current = 0
-    for value in speech:
-        current = current + 1 if value >= speech_threshold else 0
-        longest = max(longest, current)
+    speech_mask = window[:, FRAME_CLASS_SPEECH] >= speech_threshold
+    if speech_mask.any():
+        padded = np.empty(speech_mask.size + 2, dtype=np.int8)
+        padded[0] = 0
+        padded[-1] = 0
+        padded[1:-1] = speech_mask
+        edges = np.flatnonzero(np.diff(padded))
+        longest = int((edges[1::2] - edges[0::2]).max())
+    else:
+        longest = 0
+    means = window.mean(axis=0, dtype=np.float64)
     shares = {
-        name: round(float(window[:, index].mean()), 6)
+        name: round(float(means[index]), 6)
         for index, name in enumerate(FRAME_CLASSES)
     }
     shares["speech_max_run_s"] = round(longest * frame_s, 6)
@@ -882,8 +959,7 @@ def speech_extent(
         return None
     if upsample < 1:
         raise ValueError("upsample must be >= 1")
-    predicted = log_probs.argmax(dim=-1).detach().cpu().tolist()
-    total = len(predicted)
+    total = int(log_probs.shape[0])
     if total <= 0:
         return None
 
@@ -894,15 +970,30 @@ def speech_extent(
     head = max(0, min(int(spans[0].start_frame), total))
     tail = max(0, min(int(spans[-1].end_frame), total))
 
-    steps = 0
-    while head > 0 and steps < back_limit and predicted[head - 1] == BLANK_INDEX:
-        head -= 1
-        steps += 1
+    def _slice_argmax(slice_tensor) -> list[int]:
+        if getattr(slice_tensor, "ndim", 2) == 1:
+            reduced = slice_tensor
+        else:
+            reduced = slice_tensor.argmax(dim=-1)
+        if hasattr(reduced, "detach"):
+            reduced = reduced.detach()
+        if hasattr(reduced, "cpu"):
+            reduced = reduced.cpu()
+        return reduced.tolist()
 
-    steps = 0
-    while tail < total and steps < forward_limit and predicted[tail] == BLANK_INDEX:
-        tail += 1
-        steps += 1
+    if head > 0 and back_limit > 0:
+        left_start = max(0, head - back_limit)
+        for token in reversed(_slice_argmax(log_probs[left_start:head])):
+            if token != BLANK_INDEX:
+                break
+            head -= 1
+
+    if tail < total and forward_limit > 0:
+        right_end = min(total, tail + forward_limit)
+        for token in _slice_argmax(log_probs[tail:right_end]):
+            if token != BLANK_INDEX:
+                break
+            tail += 1
 
     start_s = frame_to_seconds(head, upsample=upsample)
     end_s = frame_to_seconds(max(head, tail), upsample=upsample)
@@ -942,7 +1033,11 @@ def _parse_hf_reference(reference: str) -> tuple[str, str, str]:
     return repo, revision, filename
 
 
-def _bundled_head_path(filename: str) -> str:
+def _revision_marker(head_path: Path) -> Path:
+    return head_path.with_name(head_path.name + ".revision")
+
+
+def _bundled_head_path(filename: str, revision: str = "") -> str:
     """A copy shipped inside the packaged app, or "" when there is none.
 
     The Windows build carries the head next to the ASR weights, because a first
@@ -950,6 +1045,10 @@ def _bundled_head_path(filename: str) -> str:
     than silently falling back to proportional ones. Consulted only when frozen,
     so a stray file in a source checkout's models/ cannot displace the pinned
     revision without anyone noticing.
+
+    When ``revision`` is pinned, the sibling ``<filename>.revision`` sidecar
+    must match it so an explicit ``@<sha>`` pin is never silently bypassed by
+    an older bundled copy.
     """
     from utils.model_paths import BUNDLED_MODELS_ROOT
     from utils.runtime_paths import is_frozen
@@ -957,11 +1056,15 @@ def _bundled_head_path(filename: str) -> str:
     if not is_frozen():
         return ""
     candidate = BUNDLED_MODELS_ROOT / filename
-    return str(candidate) if candidate.is_file() else ""
-
-
-def _revision_marker(head_path: Path) -> Path:
-    return head_path.with_name(head_path.name + ".revision")
+    if not candidate.is_file():
+        return ""
+    if not revision:
+        return str(candidate)
+    try:
+        recorded = _revision_marker(candidate).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return str(candidate) if recorded == revision else ""
 
 
 def _downloaded_head_path(filename: str, revision: str) -> str:
@@ -1003,7 +1106,10 @@ def resolve_alignment_head_path(reference: str, *, download: bool = True) -> str
         return reference
 
     repo, revision, filename = _parse_hf_reference(reference)
-    for local in (_bundled_head_path(filename), _downloaded_head_path(filename, revision)):
+    for local in (
+        _bundled_head_path(filename, revision),
+        _downloaded_head_path(filename, revision),
+    ):
         if local:
             return local
     if not download:
@@ -1219,15 +1325,155 @@ class AlignmentHead:
         import numpy as np
         import torch
 
-        tensor = torch.as_tensor(np.asarray(features, dtype=np.float32))
-        with torch.inference_mode():
-            ctc, frames = self.module.forward_with_frames(
-                tensor.unsqueeze(0).to(self.device)
+        if torch.is_tensor(features):
+            tensor = features.detach().to(device=self.device, dtype=torch.float32)
+        else:
+            tensor = torch.as_tensor(
+                np.asarray(features, dtype=np.float32),
+                dtype=torch.float32,
+                device=self.device,
             )
+        with torch.inference_mode():
+            ctc, frames = self.module.forward_with_frames(tensor.unsqueeze(0))
         return (
             ctc[0].float().cpu(),
             None if frames is None else frames[0].float().cpu(),
         )
+
+    def forward_batch_from_gpu_features(
+        self,
+        features,
+        lengths: Sequence[int],
+        *,
+        need_ctc_log_probs: bool = True,
+        argmax_only: bool = False,
+        need_frames: bool = True,
+    ) -> tuple[list, list]:
+        """Batched GPU inference directly from encoder ``pooler_output + lengths``.
+
+        Accepts either concatenated 2D ``(sum(lengths), D)`` encoder output or
+        padded 3D ``(B, T_max, D)`` features already on-device, avoiding any
+        GPU->CPU->GPU feature roundtrip.
+
+        When ``argmax_only=True``, ``ctc.argmax(dim=-1)`` executes on GPU and
+        transfers only 1D ``int32`` predictions (plus ``(T*upsample, 3)``
+        float32 frame posteriors when ``need_frames=True`` and a frame head is
+        present).
+        """
+        import numpy as np
+        import torch
+
+        lengths_list = [int(value) for value in lengths]
+        batch_size = len(lengths_list)
+        if batch_size == 0:
+            return [], []
+        if any(length < 0 for length in lengths_list):
+            raise ValueError("feature lengths must be non-negative")
+        max_len = max(lengths_list)
+        if max_len == 0:
+            empty_ctc = (
+                [None] * batch_size
+                if not need_ctc_log_probs
+                else [
+                    np.empty(0, dtype=np.int32)
+                    if argmax_only
+                    else torch.empty((0, self.vocab.size), dtype=torch.float32)
+                    for _ in range(batch_size)
+                ]
+            )
+            empty_frames = (
+                [
+                    np.empty((0, len(FRAME_CLASSES)), dtype=np.float32)
+                    for _ in range(batch_size)
+                ]
+                if need_frames and self.frame_head_available
+                else [None] * batch_size
+            )
+            return empty_ctc, empty_frames
+
+        if features.ndim == 2:
+            expected_frames = sum(lengths_list)
+            actual_frames = int(features.shape[0])
+            if expected_frames != actual_frames:
+                raise ValueError(
+                    "alignment head feature length mismatch: "
+                    f"expected={expected_frames} actual={actual_frames}"
+                )
+            src = features.detach().to(device=self.device, dtype=torch.float32)
+            feat_dim = int(src.shape[1])
+            if all(length == max_len for length in lengths_list):
+                padded = src.reshape(batch_size, max_len, feat_dim)
+                lengths_tensor = None
+            else:
+                padded = torch.zeros(
+                    (batch_size, max_len, feat_dim),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                offset = 0
+                for row, length in enumerate(lengths_list):
+                    if length > 0:
+                        padded[row, :length] = src[offset : offset + length]
+                    offset += length
+                lengths_tensor = torch.tensor(
+                    lengths_list, dtype=torch.long, device=self.device
+                )
+        elif features.ndim == 3:
+            if int(features.shape[0]) != batch_size:
+                raise ValueError(
+                    "alignment head batch size mismatch: "
+                    f"expected={batch_size} actual={int(features.shape[0])}"
+                )
+            padded = features.detach().to(device=self.device, dtype=torch.float32)
+            max_len = int(padded.shape[1])
+            if all(length == max_len for length in lengths_list):
+                lengths_tensor = None
+            else:
+                lengths_tensor = torch.tensor(
+                    lengths_list, dtype=torch.long, device=self.device
+                )
+        else:
+            raise ValueError(
+                f"expected 2D or 3D features tensor, got shape {tuple(features.shape)}"
+            )
+
+        with torch.inference_mode():
+            ctc, frames = self.module.forward_with_frames(
+                padded,
+                lengths_tensor,
+                compute_ctc=need_ctc_log_probs,
+                compute_frames=need_frames,
+            )
+            if not need_ctc_log_probs or ctc is None:
+                ctc_outputs: list = [None] * batch_size
+            elif argmax_only:
+                pred_cpu = ctc.argmax(dim=-1).to(torch.int32).cpu().numpy()
+                ctc_outputs = [
+                    np.ascontiguousarray(
+                        pred_cpu[row, : length * self.upsample], dtype=np.int32
+                    )
+                    for row, length in enumerate(lengths_list)
+                ]
+            else:
+                ctc_cpu = ctc.float().cpu()
+                ctc_outputs = [
+                    ctc_cpu[row, : length * self.upsample].clone()
+                    if batch_size > 1 or length < max_len
+                    else ctc_cpu[row, : length * self.upsample]
+                    for row, length in enumerate(lengths_list)
+                ]
+
+            if not need_frames or frames is None:
+                frame_outputs: list = [None] * batch_size
+            else:
+                probs_cpu = frames.exp().float().cpu().numpy()
+                frame_outputs = [
+                    np.ascontiguousarray(
+                        probs_cpu[row, : length * self.upsample], dtype=np.float32
+                    )
+                    for row, length in enumerate(lengths_list)
+                ]
+        return ctc_outputs, frame_outputs
 
     def frame_posteriors(self, features):
         """(T*upsample, 3) class probabilities, or None on a v1 head.
@@ -1252,21 +1498,12 @@ class AlignmentHead:
         aligned = self.align_extent(features, text)
         return None if aligned is None else aligned[0]
 
-    def align_extent(self, features, text: str):
-        """`(spans, start_s, end_s)`, or None when it cannot be aligned.
-
-        The extent is returned alongside rather than folded into the spans on
-        purpose: a character's span is a measurement of that character, and
-        widening the first one to the acoustic boundary would make it report a
-        stretch of audio the character does not occupy. Line edges want the
-        extent; per-character timing wants the spans; conflating them would
-        quietly corrupt the alignment scores the post-gate reads.
-        """
+    def align_extent_from_log_probs(self, log_probs, text: str):
+        """`(spans, start_s, end_s)` from precomputed CTC log-probs, or None."""
         normalized = normalize_text(text)
         if not normalized:
             return None
         try:
-            log_probs = self.log_probs(features)
             spans = align_text(
                 log_probs,
                 text,
@@ -1290,6 +1527,35 @@ class AlignmentHead:
         if extent is None:
             return None
         return spans, extent[0], extent[1]
+
+    def align_extent(self, features, text: str):
+        """`(spans, start_s, end_s)`, or None when it cannot be aligned.
+
+        The extent is returned alongside rather than folded into the spans on
+        purpose: a character's span is a measurement of that character, and
+        widening the first one to the acoustic boundary would make it report a
+        stretch of audio the character does not occupy. Line edges want the
+        extent; per-character timing wants the spans; conflating them would
+        quietly corrupt the alignment scores the post-gate reads.
+        """
+        normalized = normalize_text(text)
+        if not normalized:
+            return None
+        try:
+            log_probs = self.log_probs(features)
+        except ValueError as exc:
+            logger.debug("Alignment declined: %s", exc)
+            return None
+        except RuntimeError as exc:
+            if is_fatal_cuda_error(exc):
+                raise
+            logger.warning(
+                "Alignment runtime error (falling back to proportional): %s",
+                exc,
+                exc_info=True,
+            )
+            return None
+        return self.align_extent_from_log_probs(log_probs, text)
 
 
 def build_head(
@@ -1429,8 +1695,15 @@ def build_head(
             """
             return self.forward_with_frames(features, lengths)[0]
 
-        def forward_with_frames(self, features: "torch.Tensor", lengths=None):
-            """`(ctc_log_probs, frame_log_probs)`; the second is None on a v1 head.
+        def forward_with_frames(
+            self,
+            features: "torch.Tensor",
+            lengths=None,
+            *,
+            compute_ctc: bool = True,
+            compute_frames: bool = True,
+        ):
+            """`(ctc_log_probs, frame_log_probs)`; either may be None if skipped.
 
             One trunk pass serves both. Training needs the pair, and so does
             inference: the filter reads frame classes over the same span the
@@ -1458,10 +1731,14 @@ def build_head(
             for block in self.blocks:
                 x = block(x, mask)
             trunk = self.output_norm(x)
-            ctc = nn.functional.log_softmax(self.classifier(trunk), dim=-1)
+            ctc = (
+                nn.functional.log_softmax(self.classifier(trunk), dim=-1)
+                if compute_ctc
+                else None
+            )
             frames = (
                 nn.functional.log_softmax(self.frame_classifier(trunk), dim=-1)
-                if self.frame_classifier is not None
+                if compute_frames and self.frame_classifier is not None
                 else None
             )
             return ctc, frames

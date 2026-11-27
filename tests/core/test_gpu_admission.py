@@ -263,3 +263,55 @@ def test_a_stale_release_never_frees_its_successors_permit():
 
     assert gpu_admission.release(first) is False
     assert gpu_admission.holder() is second
+
+
+def test_resource_release_wakes_waiter_immediately_without_waiting_poll_interval(monkeypatch):
+    # Use a long poll interval to prove wakeup comes from the release listener, not polling.
+    monkeypatch.setattr(gpu_admission, "_POLL_S", 5.0)
+    resource_id = _register_live(gpu_admission.LOCAL_LLM, pid=42)
+
+    acquired_at: list[float] = []
+    waiting = threading.Event()
+
+    def waiter() -> None:
+        waiting.set()
+        permit = gpu_admission.acquire(gpu_admission.ASR, timeout_s=5.0)
+        acquired_at.append(time.monotonic())
+        gpu_admission.release(permit)
+
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    assert waiting.wait(timeout=2.0)
+    time.sleep(0.05)
+
+    released_at = time.monotonic()
+    assert resources.request_stop(resource_id, 1).released is True
+    thread.join(timeout=3.0)
+    assert not thread.is_alive()
+    assert len(acquired_at) == 1
+    assert acquired_at[0] - released_at < 0.5
+
+
+def test_acquire_timeout_caps_wait_to_remaining_deadline(monkeypatch):
+    monkeypatch.setattr(gpu_admission, "_POLL_S", 5.0)
+    held = gpu_admission.acquire(gpu_admission.ASR)
+    try:
+        started = time.monotonic()
+        with pytest.raises(gpu_admission.GpuAdmissionTimeout):
+            gpu_admission.acquire(gpu_admission.LOCAL_LLM, timeout_s=0.08)
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.5
+    finally:
+        gpu_admission.release(held)
+
+
+def test_snapshot_reports_holder_and_claims_atomically():
+    permit = gpu_admission.acquire(gpu_admission.LOCAL_LLM, description="llama")
+    snap = gpu_admission.snapshot()
+    assert snap["held"] is True
+    assert snap["holder"]["kind"] == gpu_admission.LOCAL_LLM
+    assert snap["asr_blocked"] is True
+    gpu_admission.release(permit)
+    snap2 = gpu_admission.snapshot()
+    assert snap2["held"] is False
+    assert snap2["asr_blocked"] is False

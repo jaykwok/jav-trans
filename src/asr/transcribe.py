@@ -4,7 +4,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from asr.backends.base import BaseAsrBackend
 from asr.alignment import alignment_head_configured
@@ -47,6 +47,52 @@ def _vram_budget_mb() -> float:
     return env_float("ASR_STAGE_WORKER_VRAM_BUDGET_MB", 0.0, minimum=0.0)
 
 
+def _check_allocated_vram_budget(
+    *,
+    stage: str,
+    allocated_mb: float,
+    reserved_mb: float | None,
+    budget_mb: float,
+    total_mb: object = "",
+) -> str | None:
+    """Return an error detail string when peak allocated VRAM exceeds ``budget_mb``."""
+    if budget_mb <= 0.0 or allocated_mb <= budget_mb:
+        return None
+    peak_reserved = allocated_mb if reserved_mb is None else reserved_mb
+    return (
+        "GPU VRAM budget exceeded: "
+        f"stage={stage} allocated_mb={allocated_mb:.1f} "
+        f"reserved_mb={peak_reserved:.1f} "
+        f"budget_mb={budget_mb:.1f} total_mb={total_mb}"
+    )
+
+
+def _shared_vram_spill_tolerance_mb() -> float:
+    # The Windows PDH "GPU Process Memory shared usage" counter jitters by a
+    # few MB from driver-side staging buffers even when the CUDA allocator is
+    # hard-capped by set_per_process_memory_fraction and cannot spill. A real
+    # WDDM spill moves tens/hundreds of MB of tensor pages, so a small tolerance
+    # separates counter noise from actual spill.
+    return env_float("ASR_SHARED_VRAM_SPILL_TOLERANCE_MB", 64.0, minimum=0.0)
+
+
+def _check_shared_vram_spill(stage: str, snapshot: dict[str, Any]) -> str | None:
+    try:
+        shared_vram_mb = float(snapshot.get("shared_vram_mb") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    tolerance_mb = _shared_vram_spill_tolerance_mb()
+    if shared_vram_mb <= tolerance_mb:
+        return None
+    return (
+        "GPU shared VRAM spill detected: "
+        f"stage={stage} shared_vram_mb={shared_vram_mb:.3f} "
+        f"raw_mb={snapshot.get('shared_vram_raw_mb', '')} "
+        f"baseline_mb={snapshot.get('shared_vram_baseline_mb', '')} "
+        f"tolerance_mb={tolerance_mb:.1f}"
+    )
+
+
 def _enforce_vram_budget(stage: str, on_stage: Callable[[str], None] | None) -> None:
     budget_mb = _vram_budget_mb()
     if budget_mb <= 0.0:
@@ -58,31 +104,86 @@ def _enforce_vram_budget(stage: str, on_stage: Callable[[str], None] | None) -> 
             return
         device_index = torch.cuda.current_device()
         scale = 1024 * 1024
-        peak_mb = max(
-            torch.cuda.max_memory_reserved(device_index),
-            torch.cuda.memory_reserved(device_index),
-            torch.cuda.max_memory_allocated(device_index),
-            torch.cuda.memory_allocated(device_index),
-        ) / scale
-        if peak_mb <= budget_mb:
+        allocated_mb = (
+            max(
+                torch.cuda.max_memory_allocated(device_index),
+                torch.cuda.memory_allocated(device_index),
+            )
+            / scale
+        )
+        # Probe reserved memory for diagnostics and fatal CUDA error detection,
+        # but enforce the budget strictly on allocated memory (the working set
+        # that responds to batch size; caching-allocator reserved memory does not).
+        try:
+            reserved_mb: float | None = (
+                max(
+                    torch.cuda.max_memory_reserved(device_index),
+                    torch.cuda.memory_reserved(device_index),
+                )
+                / scale
+            )
+        except Exception as exc:
+            if is_fatal_cuda_error(exc):
+                raise
+            logger.debug(
+                "Reserved VRAM probe unavailable at stage=%s: %s", stage, exc
+            )
+            reserved_mb = None
+
+        logger.debug(
+            "VRAM budget check stage=%s allocated_mb=%.1f reserved_mb=%s budget_mb=%.1f",
+            stage,
+            allocated_mb,
+            f"{reserved_mb:.1f}" if reserved_mb is not None else "n/a",
+            budget_mb,
+        )
+        if allocated_mb <= budget_mb:
+            # Also catch Windows WDDM shared-VRAM spills right after batch 1
+            # (fail-fast) instead of burning minutes across all remaining batches.
+            try:
+                from pipeline import memory_safety
+
+                mem_snapshot = memory_safety.runtime_memory_snapshot(
+                    require_shared_vram=False
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Shared VRAM probe unavailable at stage=%s: %s", stage, exc
+                )
+                return
+            spill_detail = _check_shared_vram_spill(stage, mem_snapshot)
+            if spill_detail is not None:
+                _emit_progress(on_stage, f"[WARN] {spill_detail}")
+                raise RuntimeError(spill_detail)
             return
         try:
             _free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
-            total_mb = round(total_bytes / scale, 1)
+            total_mb: object = round(total_bytes / scale, 1)
         except Exception as exc:
             if is_fatal_cuda_error(exc):
                 raise
             total_mb = ""
     except Exception as exc:
-        if "GPU VRAM budget exceeded" in str(exc) or is_fatal_cuda_error(exc):
+        msg = str(exc)
+        if (
+            "GPU VRAM budget exceeded" in msg
+            or "GPU shared VRAM spill detected" in msg
+            or is_fatal_cuda_error(exc)
+        ):
             raise
-        logger.warning("VRAM budget probe failed at stage=%s: %s", stage, exc, exc_info=True)
+        logger.warning(
+            "VRAM budget probe failed at stage=%s: %s", stage, exc, exc_info=True
+        )
         return
-    detail = (
-        "GPU VRAM budget exceeded: "
-        f"stage={stage} peak_mb={peak_mb:.1f} "
-        f"budget_mb={budget_mb:.1f} total_mb={total_mb}"
+    detail = _check_allocated_vram_budget(
+        stage=stage,
+        allocated_mb=allocated_mb,
+        reserved_mb=reserved_mb,
+        budget_mb=budget_mb,
+        total_mb=total_mb,
     )
+    if detail is None:
+        return
     _emit_progress(on_stage, f"[WARN] {detail}")
     raise RuntimeError(detail)
 
@@ -135,6 +236,8 @@ def _with_alignment_window(chunk: dict, text_result: dict) -> dict:
     result["alignment_window_start_s"] = round(start_s, 6)
     result["alignment_window_end_s"] = round(end_s, 6)
     result["alignment_window_source"] = source
+    if chunk.get("audio_sha256") and not result.get("audio_sha256"):
+        result["audio_sha256"] = str(chunk["audio_sha256"])
     return result
 
 
@@ -227,18 +330,31 @@ def _transcribe_asr_chunks_text_only(
         return [], {"text_transcribe_s": 0.0}
 
     request_batch_size = max(1, int(getattr(backend, "request_batch_size", 1)))
+    cache_enabled = _result_cache_module.result_cache_enabled()
+    text_signature = _result_cache_module.model_signature() if cache_enabled else None
+    text_cache_dir = (
+        _result_cache_module._cache_dir(text_signature)
+        if text_signature is not None
+        else None
+    )
     # Content-addressed prefill: any chunk whose audio+model identity was
     # transcribed before — this run, a crashed run, or a different job over the
     # same source — comes straight from the cache.
     text_results_by_index: dict[int, dict] = {}
-    for chunk in chunks:
-        cached = _result_cache_module.lookup(chunk["path"])
-        if cached is None:
-            continue
-        text_results_by_index[int(chunk["index"])] = _result_cache_module.restore_text_result(
-            chunk,
-            cached,
-        )
+    if cache_enabled:
+        for chunk in chunks:
+            cached = _result_cache_module.lookup(
+                chunk["path"],
+                audio_sha256=chunk.get("audio_sha256"),
+                signature=text_signature,
+                cache_dir=text_cache_dir,
+            )
+            if cached is None:
+                continue
+            text_results_by_index[int(chunk["index"])] = _result_cache_module.restore_text_result(
+                chunk,
+                cached,
+            )
     if text_results_by_index and on_stage:
         on_stage(f"ASR 缓存命中 {len(text_results_by_index)}/{len(chunks)} 个块")
 
@@ -253,41 +369,57 @@ def _transcribe_asr_chunks_text_only(
                 "refusing to continue because positional pairing would shift "
                 "subsequent subtitle timestamps"
             )
-        for chunk, text_result in zip(batch_chunks, batch_text_results):
+        for chunk, text_result in zip(batch_chunks, batch_text_results, strict=True):
             text_results_by_index[int(chunk["index"])] = text_result
             # Per-chunk files land immediately, so a crash resumes for free.
-            _result_cache_module.store(chunk["path"], text_result)
+            if cache_enabled:
+                _result_cache_module.store(
+                    chunk["path"],
+                    text_result,
+                    audio_sha256=chunk.get("audio_sha256"),
+                    signature=text_signature,
+                    cache_dir=text_cache_dir,
+                )
 
     def _transcribe_batch(batch_chunks: list[dict]) -> list[dict]:
         audio_paths = [chunk["path"] for chunk in batch_chunks]
         return backend.transcribe_texts(audio_paths, on_stage=on_stage)
 
-    for batch_start in range(0, len(chunks), request_batch_size):
-        batch_chunks = chunks[batch_start : batch_start + request_batch_size]
-        pending_chunks = [
-            chunk
-            for chunk in batch_chunks
-            if int(chunk["index"]) not in text_results_by_index
-        ]
-        batch_number = batch_start // request_batch_size + 1
+    # Filter all pending chunks first, sort longest-first (for dense length
+    # bucketing, minimal padding waste, and OOM fail-fast on batch 1), then
+    # pack full `request_batch_size` batches without emitting empty `size=0` steps.
+    pending_chunks = [
+        chunk
+        for chunk in chunks
+        if int(chunk["index"]) not in text_results_by_index
+    ]
+    pending_chunks.sort(
+        key=lambda chunk: (
+            -max(0.0, float(chunk.get("end", 0.0)) - float(chunk.get("start", 0.0))),
+            int(chunk["index"]),
+        )
+    )
+
+    for batch_number, batch_start in enumerate(
+        range(0, len(pending_chunks), request_batch_size), 1
+    ):
+        batch_chunks = pending_chunks[batch_start : batch_start + request_batch_size]
         batch_started = time.perf_counter()
         _emit_progress(
             on_stage,
             (
                 f"{text_stage_label} {len(text_results_by_index)}/{len(chunks)} "
-                f"batch={batch_number} size={len(pending_chunks)} start"
+                f"batch={batch_number} size={len(batch_chunks)} start"
             ),
         )
-        if not pending_chunks:
-            continue
 
-        max_observed_batch_size = max(max_observed_batch_size, len(pending_chunks))
-        batch_text_results = _transcribe_batch(pending_chunks)
+        max_observed_batch_size = max(max_observed_batch_size, len(batch_chunks))
+        batch_text_results = _transcribe_batch(batch_chunks)
         _enforce_vram_budget(
             f"{text_stage_label}_batch_{batch_number}",
             on_stage,
         )
-        _store_text_results(pending_chunks, batch_text_results)
+        _store_text_results(batch_chunks, batch_text_results)
         batch_elapsed = time.perf_counter() - batch_started
         _emit_progress(
             on_stage,
@@ -490,8 +622,17 @@ def _align_TRANSCRIPTION_results(
         }
 
     head_configured = alignment_head_configured()
+    final_cache_enabled = head_configured and _result_cache_module.result_cache_enabled()
+    final_signature = (
+        _result_cache_module.finalize_signature() if final_cache_enabled else None
+    )
+    final_cache_dir = (
+        _result_cache_module._cache_dir(final_signature)
+        if final_signature is not None
+        else None
+    )
 
-    if head_configured:
+    if final_signature is not None:
         # Word timing is worth caching only on this path: with a head each
         # chunk pays an encoder forward + a Viterbi walk, and the output pins
         # one more artifact (the head checkpoint, hashed into the key).
@@ -502,6 +643,9 @@ def _align_TRANSCRIPTION_results(
             cached = _result_cache_module.finalize_lookup(
                 str(text_result.get("normalized_path") or ""),
                 text=str(text_result.get("text") or "").strip(),
+                audio_sha256=text_result.get("audio_sha256"),
+                signature=final_signature,
+                cache_dir=final_cache_dir,
             )
             if cached is None:
                 uncached_results.append(text_result)
@@ -514,8 +658,13 @@ def _align_TRANSCRIPTION_results(
         if cache_hits:
             _emit_progress(on_stage, f"字幕时间轴缓存命中 {cache_hits} 个块")
 
+    def _backend_has_gpu_state() -> bool:
+        return getattr(backend, "model", None) is not None or (
+            getattr(backend, "_alignment_head", False) not in (False, None)
+        )
+
     if not pending_results:
-        if getattr(backend, "model", None) is not None:
+        if _backend_has_gpu_state():
             backend.unload_model(on_stage=on_stage)
         # Still report the stage as run-and-finished. The web progress bar keys
         # off this label, and a fully cached run that skipped it silently made
@@ -554,7 +703,7 @@ def _align_TRANSCRIPTION_results(
                         on_stage,
                         f"[WARN] 对齐用 ASR 模型加载失败，本轮退化为比例时间轴: {error}",
                     )
-    elif getattr(backend, "model", None) is not None:
+    elif _backend_has_gpu_state():
         backend.unload_model(on_stage=on_stage)
 
     if on_stage:
@@ -565,17 +714,36 @@ def _align_TRANSCRIPTION_results(
             on_stage=on_stage,
         )
     finally:
-        if head_configured and getattr(backend, "model", None) is not None:
+        if head_configured and _backend_has_gpu_state():
             backend.unload_model(on_stage=on_stage)
-    if head_configured:
-        for text_result, finalized in zip(pending_results, finalized_batch):
-            finalized_result, finalized_log = finalized
-            _result_cache_module.finalize_store(
-                str(text_result.get("normalized_path") or ""),
-                text=str(text_result.get("text") or "").strip(),
-                result=finalized_result,
-                log=finalized_log,
+    if head_configured and final_cache_enabled:
+        # Head may have just been downloaded during finalize if it was absent on lookup.
+        store_signature = (
+            final_signature
+            if final_signature is not None
+            else _result_cache_module.finalize_signature()
+        )
+        store_cache_dir = (
+            final_cache_dir
+            if final_cache_dir is not None
+            else (
+                _result_cache_module._cache_dir(store_signature)
+                if store_signature is not None
+                else None
             )
+        )
+        if store_signature is not None:
+            for text_result, finalized in zip(pending_results, finalized_batch):
+                finalized_result, finalized_log = finalized
+                _result_cache_module.finalize_store(
+                    str(text_result.get("normalized_path") or ""),
+                    text=str(text_result.get("text") or "").strip(),
+                    result=finalized_result,
+                    log=finalized_log,
+                    audio_sha256=text_result.get("audio_sha256"),
+                    signature=store_signature,
+                    cache_dir=store_cache_dir,
+                )
     for result_index, finalized in zip(pending_indices, finalized_batch):
         prepared[result_index] = finalized
     if len(finalized_batch) < len(pending_results):
@@ -681,23 +849,17 @@ def _repair_postprocessed_segment_windows(segments: list[dict]) -> list[dict]:
     if not segments:
         return []
 
-    repaired: list[dict] = []
-    for idx, segment in enumerate(segments):
+    invalid_duration_s = _asr_invalid_segment_duration_s()
+    min_repaired_duration_s = _asr_min_repaired_segment_duration_s()
+
+    normalized: list[dict] = []
+    for segment in segments:
         text = str(segment.get("text", "")).strip()
         if not text:
             continue
-
         start = max(0.0, float(segment.get("start", 0.0)))
         end = max(start, float(segment.get("end", start)))
-        if repaired and start < float(repaired[-1]["end"]):
-            repaired[-1]["end"] = max(float(repaired[-1]["start"]), start)
-
-        duration = end - start
-        if duration <= _asr_invalid_segment_duration_s():
-            target_end = start + _asr_min_repaired_segment_duration_s()
-            end = max(end, target_end)
-
-        repaired.append(
+        normalized.append(
             {
                 "start": start,
                 "end": end,
@@ -707,26 +869,39 @@ def _repair_postprocessed_segment_windows(segments: list[dict]) -> list[dict]:
             }
         )
 
-    repaired.sort(key=lambda item: (item["start"], item["end"]))
-    non_overlapping: list[dict] = []
-    for segment in repaired:
-        start = float(segment["start"])
-        end = float(segment["end"])
-        if non_overlapping and start < float(non_overlapping[-1]["end"]):
-            non_overlapping[-1]["end"] = max(float(non_overlapping[-1]["start"]), start)
-        if end - start <= _asr_invalid_segment_duration_s():
-            end = start + _asr_min_repaired_segment_duration_s()
-        non_overlapping.append(
-            {
-                "start": start,
-                "end": end,
-                "text": str(segment["text"]).strip(),
-                "source_chunk_index": segment.get("source_chunk_index"),
-                "words": list(segment.get("words") or []),
-            }
-        )
+    normalized.sort(key=lambda item: (item["start"], item["end"]))
+    repaired: list[dict] = []
+    count = len(normalized)
+    for idx, segment in enumerate(normalized):
+        start = segment["start"]
+        end = segment["end"]
+        if end - start <= invalid_duration_s:
+            end = max(end, start + min_repaired_duration_s)
+        if idx + 1 < count:
+            next_start = normalized[idx + 1]["start"]
+            end = max(start, min(end, next_start))
+        segment["end"] = end
+        repaired.append(segment)
 
-    return non_overlapping
+    return repaired
+
+
+def _join_word_tokens(word_list: list[dict]) -> str:
+    parts: list[str] = []
+    for item in word_list:
+        token = str(item.get("word") or "")
+        if not token:
+            continue
+        if (
+            parts
+            and parts[-1][-1].isascii()
+            and parts[-1][-1].isalnum()
+            and token[0].isascii()
+            and token[0].isalnum()
+        ):
+            parts.append(" ")
+        parts.append(token)
+    return "".join(parts).strip()
 
 
 def _group_words_to_segments(words: list[dict]) -> list[dict]:
@@ -739,7 +914,7 @@ def _group_words_to_segments(words: list[dict]) -> list[dict]:
     def flush(word_list: list[dict]) -> None:
         if not word_list:
             return
-        text = "".join(w["word"] for w in word_list).strip()
+        text = _join_word_tokens(word_list)
         if not text:
             return
         if _TRIVIAL_SEGMENT.match(text):

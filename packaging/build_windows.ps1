@@ -74,6 +74,31 @@ if (-not (Test-Path $Exe)) {
     throw "Build finished but executable was not found: $Exe"
 }
 
+$SmokeOutput = Join-Path ([IO.Path]::GetTempPath()) ("jav-sub-smoke-" + [Guid]::NewGuid().ToString("N") + ".json")
+try {
+    $env:JAV_SUB_SMOKE_OUTPUT = $SmokeOutput
+    & $Exe --smoke-imports | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        if (Test-Path -LiteralPath $SmokeOutput) {
+            Get-Content -LiteralPath $SmokeOutput -Raw | Write-Host
+        }
+        throw "Built executable failed --smoke-imports (exit code $LASTEXITCODE)."
+    }
+    if (-not (Test-Path -LiteralPath $SmokeOutput)) {
+        throw "Built executable did not write smoke check output: $SmokeOutput"
+    }
+    $SmokeData = Get-Content -LiteralPath $SmokeOutput -Raw | ConvertFrom-Json
+    if (-not $SmokeData.ok) {
+        throw "Built executable --smoke-imports reported failure: $($SmokeData.error)"
+    }
+    Write-Host "Smoke check OK: torchcodec $($SmokeData.torchcodec_version) (FFmpeg major $($SmokeData.torchcodec_ffmpeg_major_version))"
+} finally {
+    Remove-Item Env:JAV_SUB_SMOKE_OUTPUT -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $SmokeOutput) {
+        Remove-Item -LiteralPath $SmokeOutput -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # Record what this build actually contains. The version says which commit; only
 # this says which weights, which binaries, and which lock file.
 $ManifestArgs = @("--dist", "dist/jav-sub")

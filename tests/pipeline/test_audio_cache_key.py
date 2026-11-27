@@ -26,8 +26,24 @@ def test_audio_cache_key_changes_with_timeline_filter(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         pipeline_audio,
-        "_AUDIO_TIMELINE_FILTER",
-        "aresample=16000:async=999:first_pts=0",
+        "audio_timeline_filter",
+        lambda *, sample_rate=None: "aresample=16000:async=999:first_pts=0",
     )
 
     assert get_audio_cache_key(str(video)) != old_key
+
+
+def test_audio_config_reads_env_at_call_time(monkeypatch, tmp_path):
+    video = tmp_path / "sample.mp4"
+    video.write_bytes(b"same-video")
+    default_key = get_audio_cache_key(str(video))
+
+    monkeypatch.setenv("AUDIO_SAMPLE_RATE", "24000")
+    assert pipeline_audio.audio_sample_rate() == 24000
+    assert "aresample=24000:" in pipeline_audio.build_audio_filter_chain()
+    assert get_audio_cache_key(str(video)) != default_key
+
+    monkeypatch.setenv("AUDIO_SAMPLE_RATE", "16000")
+    monkeypatch.setenv("AUDIO_FILTER", "highpass=f=120")
+    assert "highpass=f=120" in pipeline_audio.build_audio_filter_chain()
+    assert get_audio_cache_key(str(video)) != default_key

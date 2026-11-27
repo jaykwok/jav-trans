@@ -12,6 +12,7 @@ from pathlib import Path
 
 import xxhash
 
+from core import atomic_io
 from core.cancellation import PipelineCancelledError, cancel_requested
 from core.diagnostics import format_exit_code
 from core.typed_config import env_bool, env_float, env_int, env_text
@@ -19,17 +20,6 @@ from utils.subprocess_tools import SubprocessCancelledError, run_cancellable
 
 logger = logging.getLogger(__name__)
 
-_AUDIO_SAMPLE_RATE = env_int("AUDIO_SAMPLE_RATE", 16000, minimum=8000)
-_AUDIO_CHANNELS = env_int("AUDIO_CHANNELS", 1, minimum=1)
-_AUDIO_BASE_FILTER = env_text("AUDIO_FILTER", "highpass=f=70,lowpass=f=7600")
-# PCM WAV has no discontinuous timestamp axis. Without async resampling, ffmpeg
-# concatenates decoded packets across edit-list / PTS gaps and silently shortens
-# the ASR audio. Every CTC timestamp after such a gap then becomes early against
-# the source video. Fill/drop samples against input PTS before any other audio
-# processing so sample index / sample_rate remains the video's time coordinate.
-_AUDIO_TIMELINE_FILTER = (
-    f"aresample={_AUDIO_SAMPLE_RATE}:async=1000:first_pts=0"
-)
 _AUDIO_CACHE_SAMPLE_BYTES = 4 * 1024 * 1024
 _AUDIO_DYNAUDNORM_FILTER = "agate=threshold=0.01,dynaudnorm=f=250:g=15"
 _DEFAULT_AUDIO_EXTRACT_TIMEOUT_S = 3600.0
@@ -44,17 +34,46 @@ _PARTIAL_SUFFIX = ".partial"
 _PARTIAL_GLOB = f"*{_PARTIAL_SUFFIX}"
 _STALE_PARTIAL_AGE_S = 1800.0
 _WAV_SAMPLE_WIDTH = 2
-_AUDIO_USE_LOUDNORM = env_bool("AUDIO_USE_LOUDNORM", False)
-_AUDIO_DYNAUDNORM = env_bool("AUDIO_DYNAUDNORM", True)
 
 
-def build_audio_filter_chain() -> str:
-    dynaudnorm_enabled = env_bool("AUDIO_DYNAUDNORM", _AUDIO_DYNAUDNORM)
-    loudnorm_enabled = env_bool("AUDIO_USE_LOUDNORM", _AUDIO_USE_LOUDNORM)
+def audio_sample_rate() -> int:
+    return env_int("AUDIO_SAMPLE_RATE", 16000, minimum=8000)
 
-    filters = [_AUDIO_TIMELINE_FILTER]
-    if _AUDIO_BASE_FILTER:
-        filters.append(_AUDIO_BASE_FILTER)
+
+def audio_channels() -> int:
+    return env_int("AUDIO_CHANNELS", 1, minimum=1)
+
+
+def audio_base_filter() -> str:
+    return env_text("AUDIO_FILTER", "highpass=f=70,lowpass=f=7600")
+
+
+def audio_timeline_filter(*, sample_rate: int | None = None) -> str:
+    # PCM WAV has no discontinuous timestamp axis. Without async resampling, ffmpeg
+    # concatenates decoded packets across edit-list / PTS gaps and silently shortens
+    # the ASR audio. Every CTC timestamp after such a gap then becomes early against
+    # the source video. Fill/drop samples against input PTS before any other audio
+    # processing so sample index / sample_rate remains the video's time coordinate.
+    rate = audio_sample_rate() if sample_rate is None else int(sample_rate)
+    return f"aresample={rate}:async=1000:first_pts=0"
+
+
+def audio_use_loudnorm() -> bool:
+    return env_bool("AUDIO_USE_LOUDNORM", False)
+
+
+def audio_use_dynaudnorm() -> bool:
+    return env_bool("AUDIO_DYNAUDNORM", True)
+
+
+def build_audio_filter_chain(*, sample_rate: int | None = None) -> str:
+    dynaudnorm_enabled = audio_use_dynaudnorm()
+    loudnorm_enabled = audio_use_loudnorm()
+    base_filter = audio_base_filter()
+
+    filters = [audio_timeline_filter(sample_rate=sample_rate)]
+    if base_filter:
+        filters.append(base_filter)
     if dynaudnorm_enabled:
         filters.append(_AUDIO_DYNAUDNORM_FILTER)
         if loudnorm_enabled:
@@ -86,9 +105,11 @@ def video_content_sample_hash(video_path: str) -> str:
 
 def get_audio_cache_key(video_path: str) -> str:
     video_hash = video_content_sample_hash(video_path)
+    sample_rate = audio_sample_rate()
+    channels = audio_channels()
     payload = (
-        f"{_AUDIO_SAMPLE_RATE}|{_AUDIO_CHANNELS}|"
-        f"{build_audio_filter_chain()}|{video_hash}"
+        f"{sample_rate}|{channels}|"
+        f"{build_audio_filter_chain(sample_rate=sample_rate)}|{video_hash}"
     )
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
 
@@ -97,6 +118,7 @@ def _audio_extract_timeout_s(
     video_path: str,
     *,
     cancel_event: threading.Event | None = None,
+    duration_s: float | None = None,
 ) -> float:
     # 0 (or unset) means "derive it from the video's own duration", which is
     # what the caller wants far more often than a fixed number. A value that
@@ -105,7 +127,11 @@ def _audio_extract_timeout_s(
     override = env_float("AUDIO_EXTRACT_TIMEOUT_S", 0.0, minimum=0.0)
     if override > 0:
         return override
-    duration = probe_video_duration_s(video_path, cancel_event=cancel_event)
+    duration = (
+        float(duration_s)
+        if duration_s is not None and duration_s > 0
+        else probe_video_duration_s(video_path, cancel_event=cancel_event)
+    )
     if duration:
         return max(300.0, duration * 4.0 + 120.0)
     return _DEFAULT_AUDIO_EXTRACT_TIMEOUT_S
@@ -149,7 +175,7 @@ def audio_file_is_complete(path: str) -> bool:
     if header is None:
         return False
     channels, sample_rate, sample_width, frames = header
-    if channels != _AUDIO_CHANNELS or sample_rate != _AUDIO_SAMPLE_RATE:
+    if channels != audio_channels() or sample_rate != audio_sample_rate():
         return False
     if sample_width != _WAV_SAMPLE_WIDTH or frames <= 0:
         return False
@@ -158,18 +184,18 @@ def audio_file_is_complete(path: str) -> bool:
         actual_bytes = os.path.getsize(path)
     except OSError:
         return False
-    # The header is 44 bytes canonically; ffmpeg may add a LIST/INFO chunk.
+    # The header is 44 bytes canonically; ffmpeg may add a small LIST/INFO chunk.
     return declared_bytes <= actual_bytes <= declared_bytes + 4096
 
 
 def audio_cache_is_usable(path: str) -> bool:
     """Is this cached extraction safe to reuse instead of re-extracting?
 
-    Deliberately narrower than `audio_file_is_complete`: it only rejects a wav
-    that ffmpeg started and never finished. Files published before this project
-    wrote through a partial (and anything at that path that is not a RIFF/WAVE
-    at all) are left to the ASR stage to accept or reject, so this check can
-    only heal the truncation case, never invent a new way to miss the cache.
+    Deliberately narrower than `audio_file_is_complete`: it rejects empty files
+    and any WAV that ffmpeg started and never finished. Files published before
+    this project wrote through a partial (and non-empty non-RIFF/WAVE files)
+    are left to the ASR stage to accept or reject, so this check can only heal
+    truncation / zero-byte files, never invent a new way to miss the cache.
     """
     if not os.path.isfile(path):
         return False
@@ -178,6 +204,8 @@ def audio_cache_is_usable(path: str) -> bool:
             prefix = reader.read(12)
     except OSError:
         return False
+    if not prefix:
+        return False
     if not (prefix[:4] == b"RIFF" and prefix[8:12] == b"WAVE"):
         return True
     return audio_file_is_complete(path)
@@ -185,15 +213,7 @@ def audio_cache_is_usable(path: str) -> bool:
 
 def publish_audio_file(temp_path: str, out_path: str) -> None:
     """Make a validated extraction visible under its cache name, atomically."""
-    for attempt in range(5):
-        try:
-            os.replace(temp_path, out_path)
-            return
-        except PermissionError:
-            # Windows refuses the replace while a reader holds the target open.
-            if attempt >= 4:
-                raise
-            time.sleep(0.05 * (attempt + 1))
+    atomic_io.replace_atomically(temp_path, out_path, retries=5, base_delay_s=0.05)
 
 
 def reclaim_stale_partials(root: str | Path, *, max_age_s: float | None = None) -> int:
@@ -225,6 +245,7 @@ def extract_audio(
     out_path: str,
     *,
     cancel_event: threading.Event | None = None,
+    duration_s: float | None = None,
 ) -> None:
     """Extract to a partial file and publish it only once it is complete.
 
@@ -233,27 +254,38 @@ def extract_audio(
     which the cache reader does not look at. Deleting those is disk hygiene, not
     correctness - which matters, because a hard kill runs no cleanup at all.
     """
+    sample_rate = audio_sample_rate()
+    channels = audio_channels()
     temp_path = _partial_audio_path(out_path)
     command = [
         "ffmpeg",
+        "-nostdin",
         "-y",
         "-i",
         video_path,
         "-vn",
+        "-sn",
+        "-dn",
+        "-map_metadata",
+        "-1",
         "-acodec",
         "pcm_s16le",
         "-ar",
-        str(_AUDIO_SAMPLE_RATE),
+        str(sample_rate),
         "-ac",
-        str(_AUDIO_CHANNELS),
+        str(channels),
     ]
-    filter_chain = build_audio_filter_chain()
+    filter_chain = build_audio_filter_chain(sample_rate=sample_rate)
     if filter_chain:
         command.extend(["-af", filter_chain])
     # -f wav explicitly: the muxer used to be chosen from the ".wav" extension,
     # and the file being written is now named ".partial".
     command.extend(["-f", "wav", temp_path, "-loglevel", "error"])
-    timeout_s = _audio_extract_timeout_s(video_path, cancel_event=cancel_event)
+    timeout_s = _audio_extract_timeout_s(
+        video_path,
+        cancel_event=cancel_event,
+        duration_s=duration_s,
+    )
     try:
         run_cancellable(
             command,
@@ -268,7 +300,7 @@ def extract_audio(
         if not audio_file_is_complete(temp_path):
             raise RuntimeError(
                 "ffmpeg exited successfully but produced an unusable wav "
-                f"(expected {_AUDIO_SAMPLE_RATE}Hz/{_AUDIO_CHANNELS}ch PCM16): "
+                f"(expected {sample_rate}Hz/{channels}ch PCM16): "
                 f"{video_path}"
             )
         publish_audio_file(temp_path, out_path)
@@ -286,7 +318,9 @@ def extract_audio(
         )
         raise
     except subprocess.TimeoutExpired as exc:
-        raise TimeoutError(f"ffmpeg audio extraction timed out after {timeout_s:.1f}s: {video_path}") from exc
+        raise TimeoutError(
+            f"ffmpeg audio extraction timed out after {timeout_s:.1f}s: {video_path}"
+        ) from exc
     finally:
         _discard_partial(temp_path)
 

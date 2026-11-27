@@ -120,5 +120,5 @@ def test_the_repair_pass_takes_the_run_not_loose_arguments():
 def test_a_session_cannot_change_under_a_pass():
     session = _session()
 
-    with pytest.raises(Exception):
+    with pytest.raises(AttributeError):
         session.reasoning_effort = "high"

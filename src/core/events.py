@@ -23,7 +23,7 @@ class StageEvent(TypedDict):
     run_id: str
     video: str
     stage: str
-    phase: Literal["start", "done", "skip", "blocked", "degraded", "progress"]
+    phase: Literal["start", "done", "skip", "blocked", "degraded", "progress", "error"]
     extra: dict[str, Any]
 
 
@@ -39,29 +39,71 @@ class _FileSink:
         if target.parent != Path("."):
             target.parent.mkdir(parents=True, exist_ok=True)
         self._writer = target.open("a", encoding="utf-8", buffering=1)
+        self._write_lock = threading.Lock()
+        self._closed = False
 
     def write(self, event: StageEvent) -> None:
-        self._writer.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        line = json.dumps(event, ensure_ascii=False, default=str) + "\n"
+        with self._write_lock:
+            if self._closed:
+                return
+            self._writer.write(line)
 
     def close(self) -> None:
-        self._writer.close()
+        with self._write_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._writer.close()
 
 
 class _TcpSink:
+    """Lazy-connecting TCP event sink with dedicated send/state locks.
+
+    Network connects and writes never hold the module-level ``_lock``, so a
+    stalled peer cannot block ``configure_sink("")`` or unrelated emitters.
+    ``close()`` tears down the active socket immediately under ``_state_lock``
+    to unblock any in-flight send without waiting for ``_send_lock``.
+    """
+
     def __init__(self, host: str, port: int) -> None:
         self._host = host
         self._port = int(port)
         self._socket: socket.socket | None = None
-        self._last_reconnect_attempt = 0.0
-        self._connect()
+        self._closed = False
+        self._state_lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._last_reconnect_attempt: float | None = None
 
-    def _connect(self) -> None:
-        self._close_socket()
-        self._socket = socket.create_connection((self._host, self._port), timeout=1.0)
+    def _connect(self) -> socket.socket:
+        with self._state_lock:
+            if self._closed:
+                raise ConnectionError("event TCP sink is closed")
+        new_sock = socket.create_connection((self._host, self._port), timeout=1.0)
+        old_sock: socket.socket | None = None
+        with self._state_lock:
+            if self._closed:
+                old_sock = new_sock
+                new_sock = None
+            else:
+                old_sock = self._socket
+                self._socket = new_sock
+        if old_sock is not None:
+            try:
+                old_sock.close()
+            except OSError:
+                pass
+        if new_sock is None:
+            raise ConnectionError("event TCP sink is closed")
+        return new_sock
 
-    def _close_socket(self) -> None:
-        sock = self._socket
-        self._socket = None
+    def _close_socket(self, target: socket.socket | None = None) -> None:
+        with self._state_lock:
+            if target is not None and self._socket is not target:
+                sock = target
+            else:
+                sock = self._socket
+                self._socket = None
         if sock is not None:
             try:
                 sock.close()
@@ -70,44 +112,62 @@ class _TcpSink:
 
     def write(self, event: StageEvent) -> None:
         encoded = (json.dumps(event, ensure_ascii=False, default=str) + "\n").encode("utf-8")
-        if self._socket is None:
-            now = time.monotonic()
-            if now - self._last_reconnect_attempt < _RECONNECT_INTERVAL_S:
-                raise ConnectionError("event TCP sink temporarily disconnected")
-            self._last_reconnect_attempt = now
-            self._connect()
-        try:
-            assert self._socket is not None
-            self._socket.sendall(encoded)
-        except OSError:
-            # One immediate reconnect attempt recovers seamlessly if the listener
-            # recycled a connection without silently blackholing the whole session.
-            self._close_socket()
-            self._last_reconnect_attempt = time.monotonic()
-            self._connect()
-            assert self._socket is not None
-            self._socket.sendall(encoded)
+        with self._send_lock:
+            with self._state_lock:
+                if self._closed:
+                    return
+                sock = self._socket
+            if sock is None:
+                now = time.monotonic()
+                if (
+                    self._last_reconnect_attempt is not None
+                    and now - self._last_reconnect_attempt < _RECONNECT_INTERVAL_S
+                ):
+                    raise ConnectionError("event TCP sink temporarily disconnected")
+                self._last_reconnect_attempt = now
+                sock = self._connect()
+            try:
+                sock.sendall(encoded)
+            except OSError:
+                self._close_socket(sock)
+                with self._state_lock:
+                    if self._closed:
+                        return
+                # One immediate reconnect attempt recovers seamlessly if the listener
+                # recycled a connection without silently blackholing the whole session.
+                self._last_reconnect_attempt = time.monotonic()
+                sock = self._connect()
+                sock.sendall(encoded)
 
     def close(self) -> None:
-        self._close_socket()
+        with self._state_lock:
+            self._closed = True
+            sock = self._socket
+            self._socket = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 class _MemorySink:
-    def __init__(self, events: list[StageEvent]) -> None:
+    def __init__(self, events: list[StageEvent], lock: threading.Lock) -> None:
         self._events = events
+        self._lock = lock
 
     def write(self, event: StageEvent) -> None:
-        self._events.append(
-            {
-                "ts": str(event.get("ts", "")),
-                "job_id": str(event.get("job_id", "")),
-                "run_id": str(event.get("run_id", "")),
-                "video": str(event.get("video", "")),
-                "stage": str(event.get("stage", "")),
-                "phase": event.get("phase", "progress"),
-                "extra": dict(event.get("extra", {})),
-            }
-        )
+        copied: StageEvent = {
+            "ts": str(event.get("ts", "")),
+            "job_id": str(event.get("job_id", "")),
+            "run_id": str(event.get("run_id", "")),
+            "video": str(event.get("video", "")),
+            "stage": str(event.get("stage", "")),
+            "phase": event.get("phase", "progress"),
+            "extra": dict(event.get("extra", {})),
+        }
+        with self._lock:
+            self._events.append(copied)
 
     def close(self) -> None:
         return
@@ -130,6 +190,7 @@ def _current_run_id() -> str:
 
 def set_current_job_id(job_id: str) -> None:
     _thread_local.job_id = job_id
+    _thread_local.run_id = ""
 
 
 def set_current_run(job_id: str, run_id: str = "") -> None:
@@ -170,14 +231,16 @@ def configure_sink(sink_spec: str) -> None:
 
     spec = (sink_spec or "").strip()
     new_sink: _Sink | None = None
+    reset_memory = False
+    use_memory_sink = False
 
     try:
         if not spec:
-            _memory_events = []
+            reset_memory = True
             new_sink = None
         elif spec == "memory":
-            _memory_events = []
-            new_sink = _MemorySink(_memory_events)
+            reset_memory = True
+            use_memory_sink = True
         elif spec.startswith("file:"):
             path = spec[len("file:") :].strip()
             if path:
@@ -189,8 +252,14 @@ def configure_sink(sink_spec: str) -> None:
     except Exception as exc:
         logger.warning("Failed to configure event sink %r: %s", spec, exc)
         new_sink = None
+        reset_memory = False
+        use_memory_sink = False
 
     with _lock:
+        if reset_memory:
+            _memory_events = []
+        if use_memory_sink:
+            new_sink = _MemorySink(_memory_events, _lock)
         old_sink = _sink
         _sink = new_sink
 
@@ -205,15 +274,19 @@ def emit(event: StageEvent) -> None:
     global _last_emit_error_log
     with _lock:
         sink = _sink
-        if sink is None:
-            return
-        try:
-            sink.write(event)
-        except Exception as exc:
-            now = time.monotonic()
+    if sink is None:
+        return
+    try:
+        sink.write(event)
+    except Exception as exc:
+        now = time.monotonic()
+        should_log = False
+        with _lock:
             if now - _last_emit_error_log >= _ERROR_LOG_INTERVAL_S:
                 _last_emit_error_log = now
-                logger.warning("Event sink write failed: %s", exc)
+                should_log = True
+        if should_log:
+            logger.warning("Event sink write failed: %s", exc)
 
 
 def get_memory_events() -> list[StageEvent]:
